@@ -137,6 +137,9 @@ def test_tc1363_the_refresh_loop_installs_each_unit_and_skips_an_absent_one_llr1
         'fail_step() { echo "FAIL $*"; }\n'
         'install() { echo "install $*" >> "$CALLS"; }\n'
         'systemctl() { echo "systemctl $*" >> "$CALLS"; }\n'
+        # SR-112's drop-in retirement runs inside this block; its behaviour is
+        # TC-1421's, so here it is only recorded, in order.
+        'retire_obsolete_dropin() { echo "retire $1/$2" >> "$CALLS"; }\n'
         'PAYLOAD="%s"\n' % _px(payload)
     )
     script.write_bytes((preamble + _refresh_block() + "\necho BLOCK-DONE\n").encode("utf-8"))
@@ -146,5 +149,6 @@ def test_tc1363_the_refresh_loop_installs_each_unit_and_skips_an_absent_one_llr1
     got = calls.read_text(encoding="utf-8").splitlines()
     expected = ['install -m 0644 %s/%s /etc/systemd/system/%s' % (_px(payload), n, n)
                 for n in units if n != absent]
-    assert sorted(got[:-1]) == sorted(expected), got
+    assert sorted(got[:-2]) == sorted(expected), got
+    assert got[-2] == "retire /etc/systemd/system/wall-sync-frame.timer.d/10-cadence.conf"
     assert got[-1] == "systemctl daemon-reload"

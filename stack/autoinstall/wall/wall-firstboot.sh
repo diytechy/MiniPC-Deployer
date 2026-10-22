@@ -33,7 +33,7 @@
 #      configured (there are two sources on two hosts since OI-18 exit (b)).
 #      Plus OI-16a: wall-sync-resume.service enabled, so every wake from the
 #      nightly suspend re-triggers the sync (a resume is not a boot); and
-#      wall-sync-frame.timer enabled, the frame flow's every-minute cadence.
+#      wall-sync-frame.timer enabled and armed, the frame flow's 30-minute cadence.
 #  8d. WSN-019 — create and start the unprivileged Door stream broker. Extract
 #      only its allowlisted values into root-only /run files; systemd copies
 #      those into the broker's RAM-backed credential mount. No second persistent
@@ -173,6 +173,82 @@ enable_unit_optional() {
     fi
     warn "systemctl enable --now failed for: $*. The panel keeps working without it. Check: systemctl status $1"
     return 1
+}
+
+# retire_obsolete_dropin DIR NAME SHA256 KEEP_DIR — SR-112, LLR-1256.
+#
+# Moves DIR/NAME out of systemd's sight, into KEEP_DIR, ONLY when its bytes are
+# exactly SHA256: a drop-in whose content a tracked unit now carries itself. The
+# paired release refuses any drop-in over a unit it carries (`unit-has-dropin`),
+# and that refusal is right, so the one drop-in this removes is the one a commit
+# made redundant, identified by hash rather than by name. Anything else is left
+# where it is and named in the journal: a different 10-cadence.conf is somebody's
+# newer decision, and the release will (correctly) go on refusing it until that
+# decision is folded into the unit. Moved rather than deleted so a rollback to a
+# payload that predates the folding can be undone by hand with one `mv`.
+# Removes DIR if that leaves it empty. The caller reloads systemd.
+retire_obsolete_dropin() {
+    local dir="$1" name="$2" want="$3" keep="$4" path actual entry
+    path="$dir/$name"
+    if [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; }; then
+        warn "drop-in $path is not a regular file; LEFT IN PLACE (only the known obsolete file, by hash, is retired). A release will refuse the unit it overrides until it is resolved by hand."
+    elif [ -f "$path" ]; then
+        actual=$(sha256sum "$path" 2>/dev/null | cut -d' ' -f1) || actual=""
+        if [ "$actual" = "$want" ]; then
+            if mkdir -p "$keep" && mv -f "$path" "$keep/$name"; then
+                log "retired the obsolete drop-in $path (sha256 $want; its content is now in the unit itself) to $keep/$name"
+            else
+                fail_step "could not move the obsolete drop-in $path to $keep/ — the release will refuse the unit it overrides (unit-has-dropin). Move it by hand and: systemctl daemon-reload"
+            fi
+        else
+            warn "drop-in $path is NOT the known obsolete one (sha256 ${actual:-unreadable}, expected $want); LEFT IN PLACE. It overrides a unit the release carries, so the release will refuse it (unit-has-dropin) until its content is folded into the unit file or it is removed by hand."
+        fi
+    else
+        log "no obsolete drop-in at $path"
+    fi
+    if [ -d "$dir" ]; then
+        for entry in "$dir"/* "$dir"/.[!.]*; do
+            if [ -e "$entry" ] || [ -L "$entry" ]; then
+                warn "left in place under $dir: $entry (not the known obsolete drop-in; a release will refuse the unit it overrides)"
+            fi
+        done
+        rmdir "$dir" 2>/dev/null || :
+    fi
+    return 0
+}
+
+# arm_elapsed_timer UNIT — SR-112, LLR-1257.
+#
+# Makes sure UNIT (an enabled timer) has a trigger armed. A timer whose triggers
+# can none of them arm sits ActiveState=active SubState=elapsed with
+# NextElapseUSecMonotonic=infinity, looking healthy to `is-active` and to the
+# release verifier while never firing again — wall-sync-frame.timer's state from
+# 2026-09-15 to 2026-10-22 (open-items C47). `daemon-reload` does NOT re-arm an
+# elapsed timer, even when the new definition could fire (measured, systemd 255),
+# so installing the fixed unit is not enough on a running panel: only a stop/start
+# re-evaluates it. A timer that is merely `waiting` is left untouched, so a boot
+# or a re-run never pushes a pending trigger back; an inactive one is started.
+arm_elapsed_timer() {
+    local unit="$1" active sub
+    active=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null) || active=unknown
+    sub=$(systemctl show -p SubState --value "$unit" 2>/dev/null) || sub=unknown
+    case "$active:$sub" in
+        active:elapsed)
+            if systemctl restart "$unit" >/dev/null 2>&1; then
+                log "$unit was elapsed with no trigger armed (it would never fire again); restarted, so it fires again"
+            else
+                fail_step "$unit is elapsed with no trigger armed and could not be restarted: it will never fire. Check: systemctl status $unit ; then: systemctl restart $unit"
+            fi ;;
+        active:*)
+            log "$unit is armed ($sub)" ;;
+        *)
+            if systemctl start "$unit" >/dev/null 2>&1; then
+                log "$unit was $active; started"
+            else
+                fail_step "$unit is $active and could not be started: it will never fire. Check: systemctl status $unit ; then: systemctl start $unit"
+            fi ;;
+    esac
+    return 0
 }
 
 # ── 1. sanity ────────────────────────────────────────────────────────────────
@@ -472,16 +548,26 @@ fi
 # comments (its 15600 s budget was hand-patched to match 423e2ce).
 #
 # Installing is all this does: enabling stays where it always was (user-data for
-# wall-firstboot and wall-wakeprep, the steps below for the rest), and a drop-in
-# beside any of them (the panel's wall-sync-frame.timer.d/10-cadence.conf) is
-# left alone. The guard skips a unit a payload does not carry, which is the
-# release generator's convention too.
+# wall-firstboot and wall-wakeprep, the steps below for the rest). The guard skips
+# a unit a payload does not carry, which is the release generator's convention too.
+#
+# ONE DROP-IN IS RETIRED HERE, by hash, and no other (SR-112, LLR-1256): the
+# Owner's 2026-09-15 cadence override wall-sync-frame.timer.d/10-cadence.conf,
+# whose 30-minute cadence the timer installed above now carries itself. Left in
+# place it makes every paired release refuse at verification (unit-has-dropin,
+# 2026-10-22 14:02), and it is also why the timer never fired: its empty
+# `OnUnitInactiveSec=` reset the whole trigger list, OnBootSec with it (the
+# timer's own comment has the measurement). Any other file in that directory is
+# left alone and named in the journal.
 for _u in wall-firstboot.service wall-audio-router.service wall-wakeprep.service \
           wall-sleep.service wall-wake.service wall-occupancy.service wall-occupancy.timer \
           wall-sync.service wall-sync-frame.service wall-sync-frame.timer \
           wall-sync-resume.service wall-sync-suspend.service; do
     [ -f "$PAYLOAD/$_u" ] && install -m 0644 "$PAYLOAD/$_u" "/etc/systemd/system/$_u"
 done
+retire_obsolete_dropin /etc/systemd/system/wall-sync-frame.timer.d 10-cadence.conf \
+    3eb0011a319e0749b55a8674e989f8b3104df402a9bf014995e1029382df8e1e \
+    /var/backups/wall-panel/retired-dropins/wall-sync-frame.timer.d
 systemctl daemon-reload || fail_step "daemon-reload failed after refreshing the payload's unit files"
 
 # ── 6. D-W4 — the sleep window ───────────────────────────────────────────────
@@ -1079,8 +1165,8 @@ fi
 # ── 8. OI-15/OI-18 — the media cache and the pull units ──────────────────────
 # The panel PULLS its media (the Owner's ruling, 2026-07-29), from TWO hosts
 # since OI-18 exit (b) (2026-08-03): wall-sync.service mirrors BOTH flows at boot
-# and on resume, and wall-sync-frame.timer re-mirrors the frame flow every minute
-# (storage-map §4d). Firstboot's job here is only to make the destinations exist
+# and on resume, and wall-sync-frame.timer re-mirrors the frame flow every 30
+# minutes (the Owner's cadence; storage-map §4d said every minute). Firstboot's job here is only to make the destinations exist
 # and the units be enabled — the sync itself is NOT run from here, because a
 # first sync can be the whole music library over Wi-Fi and firstboot must not
 # block on it.
@@ -1942,15 +2028,19 @@ if [ -f /etc/systemd/system/wall-sync-suspend.service ]; then
 else
     fail_step "wall-sync-suspend.service is not installed (the autoinstall late-commands place it). Without it a media sync running at SLEEP_START blocks the freeze for 40 s (deep, then s2idle) and the panel does NOT sleep — measured on the real panel 2026-09-05. Copy it from $PAYLOAD/wall-sync-suspend.service and: systemctl enable wall-sync-suspend.service"
 fi
-# OI-18: the frame flow has its OWN cadence — every minute, per storage-map §4d
-# — so it has its own unit and timer. Enabling the TIMER is what matters; the
-# service it triggers is deliberately not enabled on its own (nothing should
-# start it at boot; wall-sync.service already covers the boot pass).
+# OI-18: the frame flow has its OWN cadence — every 30 minutes, the Owner's
+# 2026-09-15 cadence (storage-map §4d said every minute) — so it has its own unit
+# and timer. Enabling the TIMER is what matters; the service it triggers is
+# deliberately not enabled on its own (nothing should start it at boot;
+# wall-sync.service already covers the boot pass). Enabled is not armed: a timer
+# can be active and never fire (C47), so it is checked and, if elapsed, restarted
+# (SR-112, LLR-1257).
 if [ -f /etc/systemd/system/wall-sync-frame.timer ]; then
-    enable_unit "OI-18: wall-sync-frame.timer enabled — the frame share is re-checked every minute (skipped while Mini-serv sleeps)" \
+    enable_unit "OI-18: wall-sync-frame.timer enabled — the frame share is re-checked every 30 minutes (skipped while Mini-serv sleeps)" \
         wall-sync-frame.timer
+    arm_elapsed_timer wall-sync-frame.timer
 else
-    fail_step "wall-sync-frame.timer is not installed (the autoinstall late-commands place it). Without it the frame videos refresh only at boot/resume, not every minute — and the frame flow's whole design is that its silence is normal, so nothing would ever look wrong. Copy it from $PAYLOAD/ and: systemctl enable --now wall-sync-frame.timer"
+    fail_step "wall-sync-frame.timer is not installed (the autoinstall late-commands place it). Without it the frame videos refresh only at boot/resume, not every 30 minutes — and the frame flow's whole design is that its silence is normal, so nothing would ever look wrong. Copy it from $PAYLOAD/ and: systemctl enable --now wall-sync-frame.timer"
 fi
 
 # Report BOTH sources. Reported separately and named individually because they

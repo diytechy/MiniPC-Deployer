@@ -89,6 +89,24 @@ export WALL_PANEL_CONF_DIR="$TMP/etc"
 export WALL_PANEL_RUN_DIR="$TMP/run"
 mkdir -p "$WALL_PANEL_CONF_DIR" "$WALL_PANEL_RUN_DIR"
 printf 'bus\n' > "$WALL_PANEL_CONF_DIR/audio-mode"
+# And for /proc/asound. The applier defers everything while the 5.1 adapter's
+# card id is absent (282d45a), so without a planted card every case below would
+# measure only the deferral (2026-10-22: 37 assertions failed exactly so, with
+# "[: : integer expression expected" where a start line was expected). The
+# headset adapter is NOT planted: it is found by usbid, and every case here
+# that wants it present says so through a presence report.
+export WALL_PANEL_PROC_ASOUND="$TMP/proc-asound"
+mkdir -p "$WALL_PANEL_PROC_ASOUND/card1"
+printf 'ICUSBAUDIO7D\n' > "$WALL_PANEL_PROC_ASOUND/card1/id"
+
+# B0 — the gate itself: with no adapter card, apply-state defers, starts no
+# leg, and says why. Then the card is planted for everything after.
+mv "$WALL_PANEL_PROC_ASOUND/card1" "$WALL_PANEL_PROC_ASOUND/absent-card1"
+out="$(python3 "$APPLIER" --dry-run --state "$TMP/b0-state.json" apply-state 2>&1)"
+has "is not present: deferring apply" "$out" "B0 no adapter card: the apply is deferred, and says so"
+hasnt "systemctl start" "$out" "B0 no adapter card: no leg starts"
+mv "$WALL_PANEL_PROC_ASOUND/absent-card1" "$WALL_PANEL_PROC_ASOUND/card1"
+rm -f "$TMP/b0-state.json" "$WALL_PANEL_RUN_DIR"/*
 
 run() { python3 "$APPLIER" --dry-run --state "$STATE" "$@" 2>&1; }
 
@@ -309,7 +327,13 @@ run input-mute off >/dev/null
 out="$(run input-mute on)"
 has "input mute on" "$out" "B15 the mute is journaled"
 has "systemctl stop wall-mic-rear.service" "$out" "B15 the rear leg is STOPPED"
-has "systemctl stop wall-bt-call.service" "$out" "B15 the HFP return is STOPPED"
+# The HFP return is NOT stopped by the input mute, since 6d5ab88 (2026-09-19):
+# wall-bt-call also carries the FAR end of a call onto the bus, and muting your
+# microphone must not silence the person you are listening to (WSN-027). The
+# unit keys on `audible` (CALL_LEGS in wall_audio_state.py) and enforces the
+# input mute itself from the published switch, so the publication is asserted.
+hasnt "systemctl stop wall-bt-call.service" "$out" "B15 the call supervisor stays up (it carries the far end too)"
+has "audio-input-mute.env: muted" "$out" "B15 and the input mute it enforces in-process is published"
 has "sset Capture nocap" "$out" "B15 and the capture switch is closed as well"
 hasnt "systemctl start wall-mic-rear.service" "$out" "B15 nothing carries the mic"
 # The speakers are untouched: the two buttons are independent (ruling E).
@@ -368,14 +392,18 @@ eq "0" "$?" "B17 a bare render succeeds with no stored values at all"
 conf="$(cat "$WALL_PANEL_CONF_DIR/audio-mic.conf")"
 has "pcm.mic_rear_route" "$conf" "B17 the rendered file defines the rear route"
 has 'pcm "usb_out_mix"' "$conf" "B17 through the SHARED eight-channel dmix"
-has "ttable.0.4 1.0000" "$conf" "B17 the microphone on RL"
-has "ttable.0.5 1.0000" "$conf" "B17 and identically on RR"
+# The desktop's Line In is on the adapter's SIDE jack: the 2026-09-18 pair
+# probe (d439e1e) proved channels 6/7 reach that cable and a tone on the
+# nominal rear pair 4/5 moved nothing, so the "rear" route carries the mic on
+# SL/SR (MIC_REAR_CHANNELS) and 4/5 join the explicit zeros.
+has "ttable.0.6 1.0000" "$conf" "B17 the microphone on SL, the measured Line In pair"
+has "ttable.0.7 1.0000" "$conf" "B17 and identically on SR"
 has "ttable.0.0 0.0000" "$conf" "B17 an EXPLICIT zero on front left"
 has "ttable.0.1 0.0000" "$conf" "B17 and on front right"
 has "ttable.0.2 0.0000" "$conf" "B17 the mic never reaches the centre"
 has "ttable.0.3 0.0000" "$conf" "B17 nor the sub"
-has "ttable.0.6 0.0000" "$conf" "B17 nor the side pair"
-has "ttable.0.7 0.0000" "$conf" "B17 either half of it"
+has "ttable.0.4 0.0000" "$conf" "B17 nor the nominal rear pair"
+has "ttable.0.5 0.0000" "$conf" "B17 either half of it"
 
 out="$(mic capture_percent=30 rear_level=80)"
 has "capture_percent=30" "$out" "B17 a knob moves"

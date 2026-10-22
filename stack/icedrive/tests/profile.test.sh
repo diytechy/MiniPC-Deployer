@@ -39,6 +39,9 @@
 #   I18 under systemd the restarted client leaves the unit's cgroup, and one
 #       that did not is a FAILED capture (found on the hub 2026-10-19)
 #   I19 a restarted client that survives does not keep the capture lock
+#   I20 the restart switches account with runuser ONLY when it must: run as
+#       the profile's own user it starts the client directly (runuser refuses a
+#       non-root caller, which made I16-I19 measure nothing until 2026-10-22)
 #
 # Usage: bash profile.test.sh [--keep-tmp]
 set -uo pipefail
@@ -521,6 +524,17 @@ else
 fi
 pkill -u "$ME" -f '/opt/icedrive/Icedrive\.AppImage' 2>/dev/null || true
 kill "$FAKE_SESSION4" 2>/dev/null || true
+echo
+echo "== I20: runuser only to become another account =="
+# I16-I19 above are the behavioural half: run as $ME with --user $ME, the client
+# really started. This is the other half, which no non-root run can execute: as
+# root (the unit) the restart must still drop to the profile's user.
+if grep -qF 'as_user=(runuser -u "$PROF_USER" --)' "$SUT" \
+   && grep -qF '[ "$(id -un)" = "$PROF_USER" ] || as_user=' "$SUT"; then
+    pass "I20 a caller who is not the profile user still switches with runuser -u"
+else
+    fail "I20 the restart no longer switches to the profile user when it must"
+fi
 echo "──────────────────────────────────────────────────────────────"
 printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 if [ "$FAIL" -eq 0 ]; then exit 0; fi

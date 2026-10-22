@@ -555,7 +555,16 @@ start_client() {
     # the scope) would otherwise hold it forever, and every later capture would
     # see "another run holds the lock", exit 3 - which the unit counts as success
     # - and the archive would silently stop updating.
-    setsid ${launcher[@]+"${launcher[@]}"} runuser -u "$PROF_USER" -- env ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} nohup sh -c "$exec_line" </dev/null >/dev/null 2>&1 9>&- &
+    #
+    # `runuser` ONLY TO BECOME SOMEONE ELSE. It refuses outright for a non-root
+    # caller ("may not be used by non-root users"), so a capture run by the
+    # profile's own user - the hermetic suite's `--user "$ME"`, or the operator
+    # by hand - never started the client at all, and I16-I19 measured only
+    # "did NOT come back after 25s" (2026-10-22). The unit runs as root and
+    # still switches to $PROF_USER exactly as before.
+    local -a as_user=()
+    [ "$(id -un)" = "$PROF_USER" ] || as_user=(runuser -u "$PROF_USER" --)
+    setsid ${launcher[@]+"${launcher[@]}"} ${as_user[@]+"${as_user[@]}"} env ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} nohup sh -c "$exec_line" </dev/null >/dev/null 2>&1 9>&- &
     disown 2>/dev/null || true
 
     # Phase 1 — a process appears at all.

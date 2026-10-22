@@ -13,7 +13,8 @@
 # ROOT, because each of its three jobs is a root job: the block inhibitor,
 # `systemctl poweroff`, and wall-sleep.sh's display wake (which writes the
 # backlight and its /run stamps). The daemon reads /dev/input and writes only
-# /run/wall-power-button/state.json (IF-067).
+# /run/wall-power-button/state.json (IF-067); its alert route (panel-alert ->
+# homehub-alert.sh) writes only its rate-limit stamps in the StateDirectory.
 
 [Unit]
 Description=Wall panel: the power button asks before it shuts the panel down (press twice)
@@ -34,6 +35,11 @@ RestartSec=2
 # leave an `armed` document for the kiosk to show.
 RuntimeDirectory=wall-power-button
 RuntimeDirectoryMode=0755
+# The alert route's per-key rate-limit stamps (/var/lib/wall-panel-alert). Kept
+# across restarts and reboots, so a guard that keeps failing does not page the
+# hub on every restart.
+StateDirectory=wall-panel-alert
+StateDirectoryMode=0700
 UMask=0022
 
 NoNewPrivileges=true
@@ -45,10 +51,10 @@ ProtectHome=true
 ProtectKernelModules=true
 ProtectKernelLogs=true
 ProtectClock=true
-# systemd-inhibit and systemctl speak D-Bus and systemd's private socket.
-# The alert hook (ALERT_HOOK in the daemon) is not installed yet; the helper
-# that fills it will need AF_INET to reach the hub, and must widen this line.
-RestrictAddressFamilies=AF_UNIX
+# systemd-inhibit and systemctl speak D-Bus and systemd's private socket
+# (AF_UNIX); the alert route posts to the hub's ntfy over the LAN (AF_INET,
+# and AF_INET6 for curl's resolver). Nothing in the daemon listens.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true
 RestrictSUIDSGID=true
 LockPersonality=true

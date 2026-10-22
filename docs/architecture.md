@@ -806,7 +806,7 @@ sequenceDiagram
     end
 ```
 
-### The power button asks before it shuts down (SR-093, SR-094, LLR-1180..1187, IF-067)
+### The power button asks before it shuts down (SR-093, SR-094, LLR-1180..1189, IF-067)
 
 OfficeWallNaglight WSN-098, ruled 2026-10-22: one press warns, a second within
 5 s shuts down. logind is kept off the key by a `handle-power-key` block
@@ -843,7 +843,8 @@ sequenceDiagram
         E->>E: write {seq} to /run/wall-panel-renderer/power-warning-ack.json
     end
     alt no matching ack after 2 s
-        D->>D: <4> ALERT power-button-kiosk-unavailable; hook if installed (SR-094)
+        D->>D: <4> ALERT power-button-kiosk-unavailable (SR-094)
+        Note over D: off the press path: panel-alert, then homehub-alert.sh, then the hub's ntfy (LLR-1188)<br/>not delivered: the journal line is the alert
     end
     alt second counted press at or before the deadline
         D->>S: shutting-down

@@ -401,6 +401,24 @@ def test_tc1323_an_installed_hook_is_called_with_the_key_and_message(tmp_path):
     assert not any("NOT DELIVERED" in line for line, _ in shell.lines)
 
 
+@pytest.mark.parametrize("returncode,error,expected", [
+    (3, None, "alert k not re-sent: the hub was told less than 30 min ago"),
+    (4, None, "ALERT NOT DELIVERED k: the alert route could not reach the hub (exit 4)"),
+    (0, subprocess.TimeoutExpired("panel-alert", 10),
+     "ALERT NOT DELIVERED k: the alert route could not reach the hub (TimeoutExpired)"),
+])
+def test_tc1323_the_route_outcome_is_journaled(tmp_path, returncode, error, expected):
+    hook = tmp_path / "panel-alert"
+    hook.write_text("#!/bin/sh\n", encoding="utf-8")
+    hook.chmod(0o755)
+    if not os.access(hook, os.X_OK):
+        pytest.skip("this filesystem cannot mark a file executable")
+    shell = Recorder(machine(), hook=hook, returncode=returncode, run_error=error)
+    shell.alert("k", "message")
+    assert shell.lines[0] == ("ALERT k: message", 4)
+    assert any(line.startswith(expected) for line, _ in shell.lines[1:]), shell.lines
+
+
 def test_tc1323_an_unknown_action_is_refused_not_dropped():
     with pytest.raises(ValueError):
         Recorder(machine()).execute([("reboot",)], 0.0)
@@ -760,11 +778,19 @@ def test_tc1326_the_knob_is_documented_and_defaults_on():
 
 
 def test_tc1326_new_files_are_lf_and_the_daemon_is_executable_in_git():
-    for name in ("wall-power-button.py", "wall-power-button.service"):
+    for name in ("wall-power-button.py", "wall-power-button.service", "panel-alert.sh",
+                 "homehub-alert.sh"):
         assert b"\r" not in (WALL / name).read_bytes(), name
-    out = subprocess.run(["git", "-C", str(WALL), "ls-files", "-s", "wall-power-button.py"],
-                         capture_output=True, text=True, check=True).stdout
-    assert out.startswith("100755"), out
+    for name in ("wall-power-button.py", "panel-alert.sh", "homehub-alert.sh"):
+        out = subprocess.run(["git", "-C", str(WALL), "ls-files", "-s", name],
+                             capture_output=True, text=True, check=True).stdout
+        assert out.startswith("100755"), (name, out)
+
+
+def test_tc1326_the_unit_may_reach_the_hub_and_keeps_the_route_state():
+    unit = _directives(WALL / "wall-power-button.service")
+    assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6" in unit
+    assert "StateDirectory=wall-panel-alert" in unit and "StateDirectoryMode=0700" in unit
 
 
 # ── TC-1327: the firstboot block, executed ───────────────────────────────────
@@ -901,3 +927,253 @@ def test_tc1327_a_failing_restart_is_a_failed_step(tmp_path):
     done, calls = run_block(tmp_path, restart_status=1)
     _ok(done)
     assert any("did not restart onto its new definition" in c for c in _fails(calls))
+
+
+# ── TC-1329: the alert route, installed and executed (Sol review 2, F3) ──────
+#
+# The route is three files on the panel: panel-alert (the daemon's ALERT_HOOK),
+# homehub-alert.sh beside it, and /etc/wall-panel/panel-alert.env rendered by
+# the firstboot block. These tests build that layout in a fake root FROM THE
+# REAL ARTEFACTS (the payload files under their installed names, the env file
+# written by the real firstboot block) and drive it from the daemon's own Shell,
+# with a fake curl that records what it was asked to POST.
+
+needs_posix_bash = pytest.mark.skipif(BASH is None or os.name != "posix",
+                                      reason="runs the installed route: needs bash on a POSIX host")
+TEST_HUB = "192.0.2.10"            # RFC 5737 documentation address, not a real hub
+ROUTE_INSTALLS = [
+    "install -d -m 0755 /usr/local/lib/wall-panel",
+    "install -m 0755 {p}/homehub-alert.sh /usr/local/lib/wall-panel/homehub-alert.sh",
+    "install -m 0755 {p}/panel-alert.sh /usr/local/lib/wall-panel/panel-alert",
+]
+
+
+def route_block():
+    text = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
+    found = re.search(r"# BEGIN panel-alert-route\n(.*?)# END panel-alert-route\n", text, re.S)
+    assert found, "wall-firstboot.sh lost its panel-alert-route block"
+    return found.group(1)
+
+
+def run_route_block(tmp_path, env, *, fail_install=""):
+    """The block, cut out and run in bash under set -euo pipefail. install and
+    fail_step record; the env file is redirected into tmp_path (the one path
+    rewritten), so what it writes is the block's own output."""
+    calls = tmp_path / "route-calls"
+    target = tmp_path / "etc" / "panel-alert.env"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    rec = 'printf "%s\\n" "{kind} $*" >> "' + calls.as_posix() + '"'
+    body = route_block()
+    assert body.count("/etc/wall-panel/panel-alert.env") == 1
+    body = body.replace("/etc/wall-panel/panel-alert.env", target.as_posix())
+    assigns = ["{}='{}'".format(k, v) for k, v in env.items()]
+    script = "\n".join([
+        "set -euo pipefail",
+        'PAYLOAD="{}"'.format(WALL.as_posix()),
+        *assigns,
+        'log() { echo "[wall-firstboot] $*"; }',
+        'warn() { echo "[wall-firstboot] WARNING: $*" >&2; }',
+        'fail_step() { echo "[wall-firstboot] ERROR: $*" >&2; %s; }' % rec.format(kind="fail_step"),
+        'install() { %s; case "$*" in *"%s"*) [ -n "%s" ] && return 1 ;; esac; return 0; }'
+        % (rec.format(kind="install"), fail_install or "\x01", fail_install),
+        body,
+        "echo BLOCK-DONE",
+    ]) + "\n"
+    done = subprocess.run([BASH, "-s"], input=script, capture_output=True, timeout=60,
+                          text=True, encoding="utf-8", errors="replace")
+    lines = calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
+    return done, lines, target
+
+
+def installed_route(tmp_path, *, curl_exit=0, env_file=True):
+    """Fake root: lib/panel-alert + lib/homehub-alert.sh (the payload files under
+    their installed names), the env file the real block renders, a recording curl."""
+    lib = tmp_path / "usr" / "local" / "lib" / "wall-panel"
+    lib.mkdir(parents=True)
+    for source, name in (("panel-alert.sh", "panel-alert"), ("homehub-alert.sh", "homehub-alert.sh")):
+        shutil.copyfile(WALL / source, lib / name)
+        (lib / name).chmod(0o755)
+    env_path = tmp_path / "missing.env"
+    if env_file:
+        done, _calls, env_path = run_route_block(tmp_path, {"HUB_IP": TEST_HUB})
+        _ok(done)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    record = tmp_path / "curl-argv"
+    curl = bindir / "curl"
+    curl.write_text("#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '"
+                    + record.as_posix() + "'\nexit " + str(curl_exit) + "\n", encoding="utf-8")
+    curl.chmod(0o755)
+    env = {"PATH": bindir.as_posix() + os.pathsep + os.environ.get("PATH", ""),
+           "PANEL_ALERT_ENV_FILE": env_path.as_posix(),
+           "PANEL_ALERT_STATE_DIR": (tmp_path / "state").as_posix()}
+    return lib / "panel-alert", env, record
+
+
+class RouteShell(pb.Shell):
+    """The daemon's Shell with the REAL subprocess.run, the installed hook, a
+    journal recorder and synchronous spawns; poweroff is never really run."""
+
+    def __init__(self, m, hook, env):
+        self.lines, self.commands = [], []
+
+        def run(argv, **kwargs):
+            self.commands.append(tuple(argv))
+            if tuple(argv) == pb.POWEROFF_COMMAND:
+                return subprocess.CompletedProcess(argv, 0)
+            if tuple(argv) == pb.WAKE_COMMAND:
+                return subprocess.CompletedProcess(argv, 0)
+            done = subprocess.run(argv, env=env, capture_output=True, text=True, **kwargs)
+            self.lines.extend((line, "route") for line in done.stdout.splitlines())
+            return done
+
+        super().__init__(m, run=run, write=lambda _doc: None,
+                         log=lambda line, priority=6: self.lines.append((line, priority)),
+                         alert_hook=hook, spawn=lambda target: target())
+
+
+def test_tc1329_the_panels_alert_helper_is_the_hubs_byte_for_byte():
+    shipped = (WALL / "homehub-alert.sh").read_bytes()
+    assert shipped == (ROOT / "stack" / "monitoring" / "homehub-alert.sh").read_bytes(), \
+        "stack/autoinstall/wall/homehub-alert.sh must be a byte-identical copy of the hub's"
+
+
+@needs_posix_bash
+def test_tc1329_a_kiosk_unavailable_alert_is_posted_to_the_hubs_ntfy(tmp_path):
+    hook, env, record = installed_route(tmp_path)
+    m = machine()
+    shell = RouteShell(m, hook, env)
+    shell.execute(press(m, 10.0), 10.0)
+    shell.execute(m.tick(12.0, no_ack), 12.0)         # no acknowledgement: the alert
+    argv = record.read_text(encoding="utf-8").splitlines()
+    assert argv[-1] == "http://%s:8090/homehub-alerts" % TEST_HUB
+    assert "Title: Wall panel: power-button-kiosk-unavailable" in argv
+    assert "Priority: high" in argv
+    body = argv[argv.index("--data-binary") + 1]
+    assert body.startswith("the kiosk did not show power-button warning 101")
+    assert (tmp_path / "state" / "alerted-wall-panel.power-button-kiosk-unavailable").exists()
+    assert any("alert delivered to http://%s:8090/homehub-alerts [wall-panel.power-button-kiosk-unavailable]"
+               % TEST_HUB in line for line, _ in shell.lines), shell.lines
+    assert not any("NOT DELIVERED" in line for line, _ in shell.lines)
+    # A second occurrence inside 30 min is journaled but not re-sent.
+    record.unlink()
+    shell.alert("power-button-kiosk-unavailable", "again")
+    assert not record.exists()
+    assert any("not re-sent" in line for line, _ in shell.lines)
+
+
+@needs_posix_bash
+@pytest.mark.parametrize("curl_exit,env_file,route_says", [
+    (7, True, "ALERT NOT DELIVERED to http://%s:8090/homehub-alerts" % TEST_HUB),
+    (0, False, "ALERT NOT SENT (no usable NTFY_BIND_IP/LAN_IP"),
+])
+def test_tc1329_an_unreachable_or_unconfigured_hub_is_journaled_and_changes_nothing(
+        tmp_path, curl_exit, env_file, route_says):
+    hook, env, _record = installed_route(tmp_path, curl_exit=curl_exit, env_file=env_file)
+    m = machine()
+    shell = RouteShell(m, hook, env)
+    shell.execute(press(m, 10.0), 10.0)
+    shell.execute(m.tick(12.0, no_ack), 12.0)
+    assert any(route_says in line for line, _ in shell.lines), shell.lines
+    assert any(line.startswith("ALERT NOT DELIVERED power-button-kiosk-unavailable: the alert "
+                               "route could not reach the hub (exit 4)") for line, _ in shell.lines)
+    assert m.state == pb.ARMED
+    shell.execute(press(m, 13.0), 13.0)                # the blind second press
+    assert shell.commands[-1] == pb.POWEROFF_COMMAND and m.state == pb.SHUTTING_DOWN
+
+
+def test_tc1329_a_hung_alert_route_never_delays_the_second_press(tmp_path):
+    # Real threads (the daemon's own spawn) this time: the route blocks until
+    # released, and the second press must reach systemctl poweroff while the
+    # alert is still blocked.
+    import threading
+    hook = tmp_path / "panel-alert"
+    hook.write_text("#!/bin/sh\n", encoding="utf-8")
+    hook.chmod(0o755)
+    if not os.access(hook, os.X_OK):
+        pytest.skip("this filesystem cannot mark a file executable")
+    release, entered, commands = threading.Event(), threading.Event(), []
+
+    def run(argv, **_kwargs):
+        commands.append(tuple(argv))
+        if argv[0] == str(hook):
+            entered.set()
+            release.wait(10)
+        return subprocess.CompletedProcess(argv, 0)
+
+    m = machine()
+    shell = pb.Shell(m, run=run, write=lambda _doc: None, log=lambda *a: None, alert_hook=hook)
+    pressed = threading.Event()
+
+    def the_loop():                     # what run() does: the ack tick, then a press
+        shell.execute(m.tick(12.0, no_ack), 12.0)
+        shell.execute(press(m, 13.0), 13.0)
+        pressed.set()
+
+    try:
+        shell.execute(press(m, 10.0), 10.0)
+        threading.Thread(target=the_loop, daemon=True).start()
+        assert pressed.wait(3), "the second press waited for the alert route"
+        assert entered.wait(3), "the alert never started"
+        assert pb.POWEROFF_COMMAND in commands and not release.is_set()
+    finally:
+        release.set()
+
+
+@needs_bash
+def test_tc1329_firstboot_renders_the_route_from_wall_env(tmp_path):
+    done, calls, target = run_route_block(tmp_path, {"HUB_IP": TEST_HUB, "WALL_ALERT_NTFY_PORT": "8091",
+                                                     "WALL_ALERT_TOPIC": "panel-test"})
+    _ok(done)
+    p = WALL.as_posix()
+    assert [c for c in calls if c.startswith("install")] == [i.format(p=p) for i in ROUTE_INSTALLS]
+    assert _fails(calls) == []
+    lines = target.read_text(encoding="utf-8").splitlines()
+    assert [l for l in lines if not l.startswith("#")] == [
+        "LAN_IP=" + TEST_HUB, "NTFY_PORT=8091", "HOMEHUB_ALERT_TOPIC=panel-test"]
+    assert "panel alerts go to the hub's ntfy (port 8091, topic panel-test)" in done.stdout
+
+
+@needs_bash
+def test_tc1329_firstboot_defaults_port_and_topic_to_the_hubs(tmp_path):
+    done, _calls, target = run_route_block(tmp_path, {"HUB_IP": TEST_HUB})
+    _ok(done)
+    assert "NTFY_PORT=8090" in target.read_text(encoding="utf-8").splitlines()
+    assert "HOMEHUB_ALERT_TOPIC=homehub-alerts" in target.read_text(encoding="utf-8").splitlines()
+    env = (WALL / "wall.env.example").read_text(encoding="utf-8")
+    for line in ("HUB_IP=REPLACE_WITH_HUB_IP", "WALL_ALERT_NTFY_PORT=8090",
+                 "WALL_ALERT_TOPIC=homehub-alerts"):
+        assert re.search("^" + re.escape(line) + "$", env, re.M), line
+    hub_env = (ROOT / "stack" / ".env.example").read_text(encoding="utf-8")
+    assert re.search(r"^NTFY_PORT=8090$", hub_env, re.M)
+    assert re.search(r"^HOMEHUB_ALERT_TOPIC=homehub-alerts$", hub_env, re.M)
+
+
+@needs_bash
+@pytest.mark.parametrize("env,failed", [
+    ({"HUB_IP": ""}, False),
+    ({}, False),
+    ({"HUB_IP": "homehub.lan"}, True),
+    ({"HUB_IP": TEST_HUB, "WALL_ALERT_NTFY_PORT": "80;x"}, True),
+    ({"HUB_IP": TEST_HUB, "WALL_ALERT_TOPIC": "a/b"}, True),
+])
+def test_tc1329_no_or_bad_hub_address_leaves_the_route_journal_only(tmp_path, env, failed):
+    target = tmp_path / "etc" / "panel-alert.env"
+    target.parent.mkdir(parents=True)
+    target.write_text("LAN_IP=198.51.100.1\n", encoding="utf-8")   # a stale earlier render
+    done, calls, target = run_route_block(tmp_path, env)
+    _ok(done)
+    assert not target.exists(), "a stale route must not outlive its knob"
+    if failed:
+        assert any("is malformed; panel alerts are journal-only" in c for c in _fails(calls))
+    else:
+        assert _fails(calls) == []
+        assert "HUB_IP is not set in wall.env; panel alerts are journal-only" in done.stderr
+
+
+@needs_bash
+@pytest.mark.parametrize("failing", ["homehub-alert.sh", "panel-alert.sh"])
+def test_tc1329_a_failing_route_install_is_a_failed_step_and_the_block_finishes(tmp_path, failing):
+    done, calls, _target = run_route_block(tmp_path, {"HUB_IP": TEST_HUB}, fail_install=failing)
+    _ok(done)
+    assert any("could not install" in c and "journal-only" in c for c in _fails(calls))

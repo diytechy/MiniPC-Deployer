@@ -40,10 +40,12 @@ WHAT IT DOES:
     ACK_TIMEOUT_S journals the fact and raises an alert. Nothing else changes:
     the window still runs, and a blind second press still shuts down.
 
-ALERTS: journal lines at warning priority, then ALERT_HOOK if it exists. THE
-HOOK IS THE MARKED INTEGRATION POINT for the shared alert helper being built
-under HomeHub plan W3a; until it is installed the panel has no alert route to
-the hub (the same position as SR-083's low-disk alarm), and each alert says so.
+ALERTS: a journal line at warning priority first, always, then ALERT_HOOK:
+panel-alert, which hands the alert to the hub's own helper (homehub-alert.sh,
+SR-085: ntfy on the LAN, rate-limited per key). Both run on a spawned thread
+under a hard timeout, so a hung or unreachable hub can never delay a second
+press. When the route is missing or cannot deliver, the journal line is the
+alert, and a second line says ALERT NOT DELIVERED.
 
 ONE CLOCK, AND IT COUNTS SUSPENDED TIME (Sol review 2). Every instant here is
 CLOCK_BOOTTIME: the kernel stamps each device's events on it (EVIOCSCLOCKID)
@@ -140,10 +142,12 @@ SCHEMA_VERSION = 1
 # ── the commands ─────────────────────────────────────────────────────────────
 WAKE_COMMAND = ("/usr/local/sbin/wall-sleep.sh", "power-button-wake")
 POWEROFF_COMMAND = ("/usr/bin/systemctl", "poweroff")
-# THE HOOK POINT for the shared alert helper (HomeHub plan W3a). Called as
+# The panel's alert route (firstboot block panel-alert-route): called as
 # `panel-alert <key> <message>` with a bounded timeout when it exists and is
-# executable; absent today, so every alert is journal-only and says so.
+# executable. Its exit codes are homehub-alert.sh's: 0 delivered, 3 suppressed
+# by the per-key rate limit, anything else not delivered.
 ALERT_HOOK = Path("/usr/local/lib/wall-panel/panel-alert")
+ALERT_DELIVERED, ALERT_SUPPRESSED = 0, 3
 WAKE_TIMEOUT_S = 15
 POWEROFF_TIMEOUT_S = 30
 ALERT_TIMEOUT_S = 10
@@ -423,11 +427,18 @@ class Shell:
         wall-sleep.sh's own account of the wake (or of why it declined) sits
         beside the press that asked for it.
         """
+        status = self._status(argv, timeout)
+        if status == 0:
+            return None
+        return status if isinstance(status, str) else "exit %d" % status
+
+    def _status(self, argv, timeout):
+        """The command's exit status, or the name of the exception that ended it."""
         try:
             result = self.run(list(argv), timeout=timeout, stdin=subprocess.DEVNULL, check=False)
         except (OSError, subprocess.SubprocessError) as error:
             return type(error).__name__
-        return None if result.returncode == 0 else "exit %d" % result.returncode
+        return result.returncode
 
     def _wake(self) -> None:
         reason = self._command(WAKE_COMMAND, WAKE_TIMEOUT_S)
@@ -439,14 +450,22 @@ class Shell:
     def alert(self, key: str, message: str) -> None:
         self.log("ALERT %s: %s" % (key, message), 4)
         hook = self.alert_hook
-        if hook.is_file() and os.access(hook, os.X_OK):
-            reason = self._command((str(hook), key, message), ALERT_TIMEOUT_S)
-            if reason is not None:
-                self.log("ALERT NOT DELIVERED %s: the alert hook failed (%s)" % (key, reason), 4)
-        else:
-            self.log("ALERT NOT DELIVERED %s: no panel alert route is installed (%s is the hook "
-                     "point for the shared alert helper); the journal line above is the alert"
-                     % (key, hook), 4)
+        if not (hook.is_file() and os.access(hook, os.X_OK)):
+            self.log("ALERT NOT DELIVERED %s: no panel alert route is installed (%s is "
+                     "missing); the journal line above is the alert" % (key, hook), 4)
+            return
+        # The route journals its own outcome ("alert delivered to ...", "ALERT NOT
+        # DELIVERED to ..."); its output goes to this unit's journal.
+        status = self._status((str(hook), key, message), ALERT_TIMEOUT_S)
+        if status == ALERT_DELIVERED:
+            return
+        if status == ALERT_SUPPRESSED:
+            self.log("alert %s not re-sent: the hub was told less than 30 min ago (the route's "
+                     "rate limit); the journal line above is this occurrence" % key)
+            return
+        reason = status if isinstance(status, str) else "exit %d" % status
+        self.log("ALERT NOT DELIVERED %s: the alert route could not reach the hub (%s); the "
+                 "journal line above is the alert" % (key, reason), 4)
 
     def execute(self, actions: list, now: float) -> None:
         pending = list(actions)

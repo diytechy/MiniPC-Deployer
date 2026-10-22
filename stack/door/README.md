@@ -155,8 +155,13 @@ sudo python3 /opt/homehub/stack/door/door_relay.py probe --seconds 10
 #   (and the gate's gate-1..3, and cost's grey decoder) `docker rm -f` their own containers on a
 #   timeout, Ctrl-C, SIGTERM (an operator's `timeout`) or SIGHUP (a dropped ssh session), so a
 #   rerun is never refused with a name conflict and no consumer is left holding a session. A
-#   signalled verb logs `door: <verb> stopped by signal N; its consumers were removed` and exits
-#   128+N (143, 129).
+#   signal that lands while a removal (or the gate's cleanup) is already under way waits for it
+#   to finish, then stops the verb. A signalled verb exits 128+N (143, 129) and logs ONE of:
+#     door: <verb> stopped by signal N; its consumers were removed (<names>)
+#     door: <verb> stopped by signal N; removal NOT confirmed for <names> - check `docker ps -a ...`
+#     door: <verb> stopped by signal N; it had started no consumer
+#   The second means `docker rm -f` timed out, failed or never ran for those names: run
+#   `sudo docker ps -a --filter name=homehub-door-` and `sudo docker rm -f` what is listed.
 sudo python3 /opt/homehub/stack/door/door_relay.py gate --seconds 15
 #   readiness+geometry {"pass": true}; two-consumers {upstream_connections: 1, producers: 1, consumers >= 2};
 #   one-consumer-left {upstream_connections: 1, survivor_running: true, survivor_progressing: true,

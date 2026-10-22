@@ -162,7 +162,11 @@ EPOCH_MARKER = RUN_DIR / "audio-epoch.json"
 # adapter 0d8c:0102 (ICUSBAUDIO7D). The USB id is matched rather than the card
 # id because "Device" is what the kernel calls ANY nameless C-Media adapter.
 HEADSET_USB_ID = "0d8c:0014"
-PROC_ASOUND = Path("/proc/asound")
+# Overridable for the same reason CONF_DIR and RUN_DIR are. Since the adapter
+# presence gate (282d45a) an apply with no ICUSBAUDIO7D card under it defers
+# and starts nothing, so a hermetic run on a machine with no sound card could
+# only ever exercise the deferral; the suite plants a card*/id here instead.
+PROC_ASOUND = Path(os.environ.get("WALL_PANEL_PROC_ASOUND") or "/proc/asound")
 # Where udevadm is asked about the headset card; a seam for the tests, which
 # have neither a sound card nor udev.
 SYS_CLASS_SOUND = Path("/sys/class/sound")

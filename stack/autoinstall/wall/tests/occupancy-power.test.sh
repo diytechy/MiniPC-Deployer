@@ -496,7 +496,11 @@ eq "NONE" "$(armed_hhmm)" "A10 SLEEP_START with somebody present: no alarm armed
 # length (wall-sync-suspend.service exists to explain a suspend that failed for
 # 40 s) and prose about a mechanism is not a use of it.
 BACKLIGHT_MECHANISMS='class/backlight|brightnessctl|xbacklight|ddcutil|wlr-randr|dpms|light[[:space:]]+-S|backlight_set'
-SUSPEND_MECHANISMS='systemctl[[:space:]]+(--[a-z=-]+[[:space:]]+)*suspend|loginctl[[:space:]]+(suspend|hibernate)|systemd-run[^|]*suspend|pm-suspend|/sys/power/state|rtcwake[^|]*-m[[:space:]]*(mem|disk|standby|off|freeze)|dbus-send[^|]*Suspend|busctl[^|]*Suspend|zzz'
+SUSPEND_MECHANISMS='systemctl[[:space:]]+(--[a-z=-]+[[:space:]]+)*suspend|loginctl[[:space:]]+(suspend|hibernate)|systemd-run[^|]*suspend|pm-suspend|/sys/power/state|rtcwake[^|]*-m[[:space:]]*(mem|disk|standby|off|freeze)|dbus-send[^|]*Suspend|busctl[^|]*Suspend|(^|[^[:alnum:]_.-])zzz([^[:alnum:]_.-]|$)'
+# `zzz` (the BSD/Void suspend command) is matched as a WORD. Unanchored it
+# matched the ProjectM preset lists, whose 9,800 upstream file names include
+# "Surface Turbulence IIzzzzz hakanh mash-up", and booked presets.lock and
+# presets.select as a second sleep writer (2026-10-22 baseline).
 # power_writers REGEX — the basenames of the wall-tree files whose EXECUTABLE
 # lines match, one per line, deduplicated.
 power_writers() {
@@ -667,6 +671,16 @@ eq "" "$(readonly_power_reader "$PLANT/clean.py")" "A11 the audit passes the rea
 [ -n "$(readonly_power_reader "$PLANT/writer.sh")" ] \
     && pass "A11 the audit catches a shell redirect into the backlight node" \
     || fail "A11 the audit MISSED a shell redirect into the backlight node"
+# The word match still bites on the command, and not on a name containing it.
+for cmd in 'zzz' 'sudo zzz -z' 'x && zzz'; do
+    printf '%s\n' "$cmd" | grep -Eq "$SUSPEND_MECHANISMS" \
+        && pass "A11 the suspend audit catches the command: $cmd" \
+        || fail "A11 the suspend audit MISSED the command: $cmd"
+done
+printf '%s\n' 'b0  Hypnotic/Polar Static/Martin - QBikal - Surface Turbulence IIzzzzz hakanh mash-up k FLEXI.milk' \
+    | grep -Eq "$SUSPEND_MECHANISMS" \
+    && fail "A11 a preset NAME containing zzz was booked as a suspend" \
+    || pass "A11 a preset name containing zzz is not a suspend"
 # And at RUNTIME, not in the source: one tick, one decision. A second call would
 # be a second decision, which is the drift this block is built to prevent.
 scenario a11

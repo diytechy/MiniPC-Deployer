@@ -79,6 +79,14 @@ gates, and the ID scheme. The short version an agent needs every session:
   and flow checks at the repo's active gate (`docs/gate`);
   `--tier smoke` is the fast subset. Never report a result you didn't run —
   paste the real output.
+- **The shell suites are the second half of that bar:** `bash
+  stack/run-hermetic-tests.sh`, in WSL `Ubuntu` on a Windows host. It
+  **refuses root** by design (profile.test.sh stashes paths under `$HOME`), so
+  run it as an ordinary user, and preferably one **not** in `docker` or `sudo`:
+  `wsl -d Ubuntu -u <ordinary-user> -- bash -lc 'cd /mnt/c/Projects/<checkout>
+  && bash stack/run-hermetic-tests.sh'`. A privileged tester does not fail the
+  ai-cli guards; it makes the five that need an unprivileged account print
+  `SKIP ... needs an unprivileged tester`, which is a run that proved less.
 - **Behavior is reviewed as diagrams, not rows:** runtime flows (especially
   anything concurrent/non-blocking) are authored Mermaid sequence diagrams in
   [docs/architecture.md](docs/architecture.md) "Runtime flows", written with

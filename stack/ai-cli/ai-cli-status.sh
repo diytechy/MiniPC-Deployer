@@ -233,7 +233,9 @@ def required_gauges():
         return None
 
 
-# Evidence older than this is not evidence: 2x the usage timer's 10-minute cadence.
+# Evidence older than this is not evidence: 2x the longest interval a source may
+# be read at (ai_usage_feeder SOURCE_INTERVAL_MAX_SECONDS, 600 s), which was also
+# the timer's whole cadence before the per-minute timer (SR-095).
 EVIDENCE_MAX_AGE_SECONDS = int(os.environ.get("AI_CLI_EVIDENCE_MAX_AGE", "1200"))
 CYCLE_END = re.compile(r"ai-usage:\s+cycle complete\b")
 GAUGE_LINE = re.compile(r"ai-usage:\s+(ai-usage-[a-z0-9-]+)\s+(live|UNAVAILABLE)\s+(posted|POST FAILED)")
@@ -321,6 +323,11 @@ def feeder_evidence():
       latest finished evidence.
     - Optional gauges (Claude's Fable band) are never proof.
     - Evidence older than EVIDENCE_MAX_AGE_SECONDS is dropped.
+    - A SOURCE THE RUN SKIPPED is judged by the newest earlier completed run that
+      read it (SR-095, 2026-10-22): the feeder reads each source on its own
+      schedule, so a minute's run that was not due to read Codex says nothing
+      about Codex, and printing no gauge line for it is how it says so. The walk
+      back stops at a run that did not complete, and at the age limit.
     """
     required = required_gauges()
     if not required:
@@ -328,20 +335,32 @@ def feeder_evidence():
     runs = usage_invocations()
     if not runs:
         return set(), set()
-    latest = runs[-1]
-    if latest["complete"] is None and len(runs) > 1 \
+    latest_index = len(runs) - 1
+    if runs[-1]["complete"] is None and len(runs) > 1 \
             and usage_service_state() in ("active", "activating") \
-            and usage_service_invocation() == latest["id"]:
-        latest = runs[-2]
-    if latest["complete"] is None:
+            and usage_service_invocation() == runs[-1]["id"]:
+        latest_index -= 1
+    if runs[latest_index]["complete"] is None:
         return set(), set()
     now = float(os.environ.get("AI_CLI_NOW") or __import__("time").time())
-    age = now - latest["complete"]
-    if age > EVIDENCE_MAX_AGE_SECONDS or age < -60:
-        return set(), set()
+
+    def deciding_run(keys):
+        for run_ in reversed(runs[:latest_index + 1]):
+            if run_["complete"] is None:
+                return None
+            age = now - run_["complete"]
+            if age > EVIDENCE_MAX_AGE_SECONDS or age < -60:
+                return None
+            if any(k in run_["gauges"] for k in keys):
+                return run_
+        return None
+
     verified, failing = set(), set()
     for src, keys in required.items():
-        got = [latest["gauges"].get(k) for k in keys]
+        run_ = deciding_run(keys)
+        if run_ is None:
+            continue
+        got = [run_["gauges"].get(k) for k in keys]
         if all(g is not None and g[0] == "live" for g in got):
             (verified if all(g[1] for g in got) else failing).add(src)
     return verified, failing

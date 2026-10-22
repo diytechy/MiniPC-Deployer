@@ -2638,7 +2638,54 @@ else
 fi
 # END log-cap-and-disk-alarm
 
-# ── 8g. WSN-098 / SR-093 — the power button asks before it shuts down ───────
+# ── 8g. SR-090 — the compositor freeze watchdog (SN-048) ────────────────────
+# Three wedges on 2026-09-15 left no log line: grim never returned, cage sat in
+# ep_poll and the screen held its last frame. wall-freeze-watch.sh probes for a
+# frame every INTERVAL seconds, logs a heartbeat, and after FAIL_THRESHOLD
+# misses captures a forensic bundle under /var/log/wall-freeze BEFORE anything
+# restarts the session; with RECOVER=1 (as on the panel since 2026-09-15) it
+# then restarts getty@tty1.
+#
+# HAND-INSTALLED ON 2026-09-15 AND IN NO REPO UNTIL NOW. The three payload files
+# are the panel's live copies byte for byte (read 2026-10-22: script sha256
+# 4e4e7080..., unit cf070193..., env b2a6ae4c...), so this block takes them
+# over in place: on that panel nothing changes and nothing restarts. The env
+# file is the image's, not a seed: change a value in the payload, and the next
+# firstboot (or the paired release's system lane) carries it.
+#
+# One knob, WALL_FREEZE_WATCH_ENABLED (default true). Off stops and disables the
+# watchdog; the files stay installed so the release manifest's hashes hold.
+# The service restarts only when one of its files changed, so an ordinary boot
+# does not drop the watchdog's failure count.
+# BEGIN freeze-watch
+freeze_failed() { fail_step "SR-090: $*"; }
+: "${WALL_FREEZE_WATCH_ENABLED:=true}"
+if [ "$WALL_FREEZE_WATCH_ENABLED" != true ] && [ "$WALL_FREEZE_WATCH_ENABLED" != false ]; then
+    freeze_failed "WALL_FREEZE_WATCH_ENABLED must be exactly true or false"
+    WALL_FREEZE_WATCH_ENABLED=true
+fi
+_freeze_changed=0
+cmp -s "$PAYLOAD/wall-freeze-watch.sh" /usr/local/sbin/wall-freeze-watch.sh || _freeze_changed=1
+cmp -s "$PAYLOAD/wall-freeze-watch.service" /etc/systemd/system/wall-freeze-watch.service || _freeze_changed=1
+cmp -s "$PAYLOAD/wall-freeze-watch.env" /etc/wall-panel/freeze-watch.env || _freeze_changed=1
+install -m 0755 "$PAYLOAD/wall-freeze-watch.sh" /usr/local/sbin/wall-freeze-watch.sh || freeze_failed "could not install wall-freeze-watch.sh"
+install -m 0644 "$PAYLOAD/wall-freeze-watch.service" /etc/systemd/system/wall-freeze-watch.service || freeze_failed "could not install wall-freeze-watch.service"
+install -m 0644 "$PAYLOAD/wall-freeze-watch.env" /etc/wall-panel/freeze-watch.env || freeze_failed "could not install freeze-watch.env"
+systemctl daemon-reload >/dev/null 2>&1 || freeze_failed "daemon-reload failed; the freeze watchdog unit is not loaded"
+if [ "$WALL_FREEZE_WATCH_ENABLED" = true ]; then
+    enable_unit_now "SR-090: freeze watchdog enabled (frame probe, bundles in /var/log/wall-freeze)" wall-freeze-watch.service || :
+    if [ "$_freeze_changed" = 1 ]; then
+        systemctl restart wall-freeze-watch.service >/dev/null 2>&1 ||
+            freeze_failed "wall-freeze-watch.service did not restart on its new definition"
+    fi
+else
+    systemctl disable --now wall-freeze-watch.service >/dev/null 2>&1 || true
+    log "SR-090: freeze watchdog disabled (WALL_FREEZE_WATCH_ENABLED=false)"
+fi
+unset _freeze_changed
+# END freeze-watch
+
+# ── 8h. WSN-098 / SR-093 — the power button asks before it shuts down ───────
 # Ruled by the Owner 2026-10-22 after measuring that the button cannot report
 # a hold: one press shows a full-screen "press again within 5 s" warning, a
 # second press inside 5 s shuts the panel down, otherwise nothing happens.

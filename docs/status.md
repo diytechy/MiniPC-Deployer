@@ -19,12 +19,28 @@ shuts down. Branch `w5-power-button`, NOT merged, NOT deployed.**
   asks the new `wall-sleep.sh power-button-wake` arm to light a dark display; a second press within 5 s runs
   `systemctl poweroff`; presses are de-duplicated across the two `Power Button` devices only. No kiosk
   acknowledgement within 2 s raises a journal ALERT (hook point `/usr/local/lib/wall-panel/panel-alert` for the
-  W3a alert helper; absent today, so journal-only). firstboot step 8g, knob `WALL_POWER_BUTTON_GUARD`
+  W3a alert helper; absent today, so journal-only). firstboot step 8h, knob `WALL_POWER_BUTTON_GUARD`
   (default true), checks the inhibitor in `systemd-inhibit --list`.
 - `scripts/assert_wall_capabilities.py` names the panel's new site file `js/power-warning.js`, so this branch
   and OfficeWallNaglight `w5-power-warning` must merge together (TC-1232 compares the two).
 - Not proven: nothing ran on the panel; that logind honours a sessionless service's inhibitor, the warning on a
   dark screen and a real press are the installed checks and the Owner's acceptance.
+
+**2026-10-22 — SN-048 specified and built on `w3a-hub-monitoring` (HomeHub plan W3a); NOT deployed.**
+SR-085..SR-091: the shared alert helper (`stack/monitoring/homehub-alert.sh`, now also rustdesk-check's
+transport), the 30 s telemetry record with thermal/throttle/frequency alarms, the 15 min NVMe-only
+low-disk alarm, the 5 min watch table, the 60 s liveness probe with one evidence bundle per incident,
+firstboot step 6h with one knob per component (unset = on), and the panel's freeze watchdog taken into
+the wall image byte-identical (wall-firstboot 8g, SR-090). Record and alert only. Deploy, the live drills
+and the panel system release are the coordinator's (HomeHub FOLLOWUPS).
+
+**2026-10-22 — SR-084 built on `w2-touch-filter-statedir` (not merged, not deployed).**
+- `wall-touch-filter.service` gains `StateDirectory=wall-touch-filter` (`StateDirectoryMode=0700`) and nothing
+  wider (LLR-1142); `configure-touch-filter.sh` OFF deletes `protection.json` from it (LLR-1143); the unit still
+  reaches the panel only through firstboot, so the system lane carries it (LLR-1144). TC-1265..1268 in
+  `tests/test_touch_filter_persistence.py`. The application half is OfficeWallNaglight WSN-099
+  (`touchfilter/persist.py`); both ship in one paired release (HomeHub plan 2026-10-22, W2).
+- Not proven: anything on the panel (installed unit, restored protection after a reboot).
 
 **2026-10-19 — Correction (records only; nothing deployed by this entry).**
 - **Sure is live.** The 2026-10-18 entry below says "Sure is NOT started". That was true when written and is

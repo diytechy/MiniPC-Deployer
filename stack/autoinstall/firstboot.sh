@@ -2718,6 +2718,64 @@ else
     log "WARN: no $STACK_DIR/recovery on the payload - no pressure record, no boot accounting."
 fi
 
+
+# ── 6h. hub continuous monitoring (SN-048, SR-085..SR-089) ─────────────────
+# (stack/monitoring/README.md)
+#
+# RECORD AND ALERT ONLY. Four timers - the telemetry record with its thermal,
+# throttle and frequency alarms (30 s), the low-disk alarm (15 min), the
+# watched jobs (5 min) and the liveness probe with its evidence bundle (60 s).
+# None of them acts on anything; homehub-recoveryd above stays the only thing
+# that may, and only when HUB_WATCHDOG_ENABLED says so.
+#
+# EACH IS ITS OWN KNOB, and an UNSET knob means ON: like the hub-pressure
+# record, they are evidence, and a hub reimaged from a .env that predates them
+# should not come up blind. `false` disables the timer; any other value is
+# refused with a WARNING and leaves the timer as it was.
+#
+# DEPENDENCIES: python3, procps (top) and util-linux (dmesg) are in the base
+# server image; curl is in packages.list. Nothing to provision when a knob is
+# on. Units are (re)installed on every boot like every other host unit here.
+# BEGIN hub-monitoring
+if [ -d "$STACK_DIR/monitoring" ]; then
+    _mon="$STACK_DIR/monitoring"
+    # ISO9660 drops executable bits; the units run the .py files through
+    # python3 and the helper through bash, so this is for hand runs only.
+    chmod 0755 "$_mon/homehub-alert.sh" "$_mon/homehub-telemetry.py" "$_mon/homehub-disk-check.py" \
+        "$_mon/homehub-watch.py" "$_mon/homehub-liveness.py" 2>/dev/null || true
+    install -m 0644 "$_mon/homehub-telemetry.service"  /etc/systemd/system/homehub-telemetry.service  || log "WARN: could not install homehub-telemetry.service"
+    install -m 0644 "$_mon/homehub-telemetry.timer"    /etc/systemd/system/homehub-telemetry.timer    || log "WARN: could not install homehub-telemetry.timer"
+    install -m 0644 "$_mon/homehub-disk-check.service" /etc/systemd/system/homehub-disk-check.service || log "WARN: could not install homehub-disk-check.service"
+    install -m 0644 "$_mon/homehub-disk-check.timer"   /etc/systemd/system/homehub-disk-check.timer   || log "WARN: could not install homehub-disk-check.timer"
+    install -m 0644 "$_mon/homehub-watch.service"      /etc/systemd/system/homehub-watch.service      || log "WARN: could not install homehub-watch.service"
+    install -m 0644 "$_mon/homehub-watch.timer"        /etc/systemd/system/homehub-watch.timer        || log "WARN: could not install homehub-watch.timer"
+    install -m 0644 "$_mon/homehub-liveness.service"   /etc/systemd/system/homehub-liveness.service   || log "WARN: could not install homehub-liveness.service"
+    install -m 0644 "$_mon/homehub-liveness.timer"     /etc/systemd/system/homehub-liveness.timer     || log "WARN: could not install homehub-liveness.timer"
+    systemctl daemon-reload || log "WARN: systemctl daemon-reload failed"
+    _mon_converge() {   # TIMER KNOB - converge one monitor's timer to its knob
+        local _v
+        _v="$(_env_val "$2" | tr -d '"')"
+        case "${_v:-true}" in
+            true)
+                if systemctl enable --now "$1" >/dev/null 2>&1; then log "  $1 on ($2=${_v:-unset, default true})"
+                else log "WARN: could not enable $1 - that monitor is not running"; fi ;;
+            false)
+                systemctl disable --now "$1" >/dev/null 2>&1 || true
+                log "  $1 off ($2=false)" ;;
+            *)  log "WARN: $2='$_v' is not true or false - $1 left as it was" ;;
+        esac
+    }
+    log "hub monitoring (SN-048, record and alert only):"
+    _mon_converge homehub-telemetry.timer  HOMEHUB_TELEMETRY_ENABLED
+    _mon_converge homehub-disk-check.timer HOMEHUB_DISK_CHECK_ENABLED
+    _mon_converge homehub-watch.timer      HOMEHUB_WATCH_ENABLED
+    _mon_converge homehub-liveness.timer   HOMEHUB_LIVENESS_ENABLED
+    unset -f _mon_converge
+else
+    log "WARN: no $STACK_DIR/monitoring on the payload - no telemetry, disk alarm, watches or liveness probe."
+fi
+# END hub-monitoring
+
 # ── 7. done ──────────────────────────────────────────────────────────────────
 date > "$MARKER"
 # A defect found in step 4b is reported HERE, at the end, and as a NON-ZERO

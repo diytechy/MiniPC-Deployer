@@ -13,6 +13,14 @@ User=root
 Group=root
 RuntimeDirectory=wall-touch-filter
 RuntimeDirectoryMode=0755
+# Reboot-safe protection (SR-084, LLR-1142): the daemon keeps its last
+# qualifying fault renewal in $STATE_DIRECTORY/protection.json
+# (/var/lib/wall-touch-filter, root, 0700) and restores it at start, so a
+# reboot does not hand a known fault back to the kiosk until it is
+# re-detected. systemd adds this path to the writable set itself under
+# ProtectSystem=strict; nothing else is made writable.
+StateDirectory=wall-touch-filter
+StateDirectoryMode=0700
 UMask=0022
 Restart=always
 RestartSec=2

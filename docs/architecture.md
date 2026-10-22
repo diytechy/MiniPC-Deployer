@@ -174,6 +174,7 @@ graph LR
 | `stack/remote-ui/` | OPT-IN light RDP layer for GUI-only vendor apps (SR-015). **Nothing installs or calls it since 2026-08-27** — its only tenant moved to `stack/icedrive/` |
 | `stack/icedrive/` | the headless IceDrive CLI: pinned binary, one-time non-interactive sign-in, FUSE mount unit |
 | `stack/tracker/` | deprecated reference copies (NagLight owns the build) |
+| `stack/monitoring/` | SN-048: the hub's record-and-alert monitors (telemetry, low-disk alarm, watched jobs, liveness with evidence) and the one alert helper (SR-085..SR-091) |
 | `sim/` | V1 homehub-sim — the full stack vs fictional stand-ins (Dex, Samba, mock shims) |
 | `vmtest/` | V3 — the real autoinstall ISO booted in Hyper-V (SIM secrets only) |
 | `scripts/validate_config.py` | config-coverage validation (the product-layer check here) |
@@ -504,7 +505,7 @@ rows, and both are the acceptance criteria.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant T as systemd timer (10 min)
+    participant T as systemd timer (1 min; per-source schedule below)
     participant F as ai_usage_feeder (SR-021)
     participant X as codex app-server
     participant A as api.anthropic.com
@@ -534,6 +535,48 @@ sequenceDiagram
     Note over F: each gauge is built and posted in its own try -<br/>one refusable body must not end the cycle
     F->>S: write ONLY the sources that succeeded
     Note over S: open_for_write resolves symlinks, requires the path to sit<br/>inside StateDirectory=, and opens O_EXCL|O_NOFOLLOW -<br/>so no credential file can be written or truncated
+```
+
+### Which sources a minute's cycle reads, and how a vendor slows one down (SR-095, SR-096, LLR-1190, LLR-1191, LLR-1192, LLR-1193)
+
+The timer fires every minute, but a cycle is not a read of every source: each
+source's schedule rides in the state file, because the unit is a one-shot and
+nothing in memory survives. The behaviour worth reading here is what a skip
+does NOT do (read, post, or touch the schedule) and where a vendor's
+Retry-After lands.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T as systemd timer (1 min, +0..10 s)
+    participant F as ai_usage_feeder run_cycle (SR-095, LLR-1190)
+    participant S as state file __schedule__
+    participant V as vendor (one source)
+    participant N as NagLight /api/feed
+
+    T->>F: start (oneshot)
+    F->>S: load_state: schedule validated at the door
+    Note over S: an entry stamped in the FUTURE is a clock that<br/>stepped back - dropped, so the source is due now
+    alt schedule_wait > 0 (not due, or backing off)
+        F->>F: INFO "<source>: skipped - ..."
+        Note over F,N: no read, NO POST (NagLight keeps the last body,<br/>true reading at its true observed_at), entry unchanged
+    else due
+        F->>V: read (rate-limit headers -> the cycle's sink)
+        alt 200
+            V-->>F: reading
+            F->>N: gauges, observed_at = now
+            F->>S: next_due = now + interval; backoff and auth history cleared
+        else 429 / 5xx (Throttled)
+            V-->>F: Retry-After? + rate-limit headers
+            F->>N: last reading at its ORIGINAL observed_at
+            F->>S: next_due = Retry-After (hold, to the second)<br/>or interval x 2^level (to 10 min); backoff + 1
+        else 401 / token_expired (AuthFailure)
+            F->>S: auth_since kept, auth_attempts + 1
+            Note over F: CONFIRMED only at >= 2 attempts spanning >= 600 s:<br/>then markers replace the stored readings
+            F->>N: last reading, or the stale-on-arrival body once confirmed
+        end
+    end
+    F->>S: save_state (the one writable path)
 ```
 
 ### One weight cycle: where the goal comes from, and the two different refusals (SR-022, LLR-006, IF-014)
@@ -851,4 +894,40 @@ sequenceDiagram
         M->>M: stop petting
         K->>K: board reset within 60 s (L4); next boot counts it
     end
+```
+
+### A liveness incident on the hub: one bundle, then one alert (SR-089, SR-085, LLR-1160, LLR-1161, LLR-1163, LLR-1148)
+
+The probe and the bundle never act: nothing here restarts, stops or kills. The
+bundle is written BEFORE the alert, so the evidence exists even if ntfy is the
+thing that is down, and an alert ntfy did not take is retried by the next run.
+
+```mermaid
+sequenceDiagram
+    %% Renders SR-089, SR-085, LLR-1159, LLR-1160, LLR-1161, LLR-1163, LLR-1148, LLR-1147
+    participant T as homehub-liveness.timer (60 s)
+    participant L as homehub-liveness.py
+    participant X as Technitium / Caddy / docker
+    participant E as homehub_evidence.capture
+    participant H as homehub-alert.sh
+    participant N as ntfy
+    loop every 60 s
+        T->>L: start (oneshot, bounded)
+        L->>X: DNS (3 s), HTTPS HEAD (5 s), docker ps (15 s)
+        X-->>L: answers or timeouts
+        L->>L: advance(): failures += 1 or reset
+    end
+    Note over L: third consecutive failed run: event "open"
+    L->>E: capture(seq, plan, checks)
+    E->>E: per-command timeout + process-group kill, 90 s deadline,<br/>file and bundle byte caps, redact every line
+    E-->>L: manifest (complete or the items that failed)
+    L->>H: fire "liveness" (urgent, failing checks, bundle path)
+    H->>N: POST /homehub-alerts (bounded)
+    alt delivered
+        H-->>L: 0 (stamp written)
+    else ntfy down
+        H-->>L: 4 (journal ALERT NOT DELIVERED; next run retries)
+    end
+    Note over L: first fully passing run: event "close"
+    L->>H: clear "liveness.clear" (default)
 ```

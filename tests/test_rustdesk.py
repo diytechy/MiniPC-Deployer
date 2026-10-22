@@ -313,8 +313,21 @@ class _Rig:
             "RUSTDESK_CHECK_ENV_FILE": str(self.env_file),
             "RUSTDESK_CHECK_STACK_DIR": str(self.d),
             "RUSTDESK_CHECK_STATE_DIR": str(self.state),
-            "RUSTDESK_CHECK_WAIT_SEC": "1", "RUSTDESK_CHECK_POLL_SEC": "1",
+            # WAIT_SEC is the grace for the listeners to APPEAR, and the
+            # recovery loop gives up at WAIT_SEC + SETTLE_SEC after the
+            # recreate. At 1 s a loaded host failed the success path: one loop
+            # pass (a timeout'd systemctl stub, the ss stub, four awks) took
+            # over a second, so the listeners were seen but could not be
+            # stable for 2 s before the deadline ("STILL DOWN ... (ss failed)",
+            # check.py 2026-10-22; 5 of 5 alone passed). Success returns as
+            # soon as the window is met, so only the deliberate failure cases
+            # pay the extra seconds.
+            "RUSTDESK_CHECK_WAIT_SEC": "6", "RUSTDESK_CHECK_POLL_SEC": "1",
             "RUSTDESK_CHECK_SETTLE_SEC": "2",
+            # The stubs are bash scripts; on a loaded Windows host one once took
+            # >10 s (the hub's bound) to answer and the check, correctly, called
+            # the fence unverified. The bound is not what these tests assert.
+            "RUSTDESK_CHECK_CMD_TIMEOUT": "40",
             "RUSTDESK_CHECK_OWNER_LOCK": str(self.d / "owner.lock"),
         })
         env.update(extra)
@@ -471,6 +484,28 @@ def test_check_reads_the_rules_of_both_families_before_recreating_sr045(rig):
 
 
 @needs_bash
+def test_a_fence_read_that_outlasts_its_bound_fails_closed_sr045(rig):
+    """The rig raises RUSTDESK_CHECK_CMD_TIMEOUT for a loaded host; the bound
+    must still be real. An ip6tables read slower than it is a fence that was
+    not verified, and nothing is started."""
+    _w(rig.ss_now, SS_NO_HBBS)
+    rig._stub("ip6tables", 'echo "ip6tables $*" >>"$CALLS"\nsleep 5\ncat "$RIG/ipt6"\n')
+    r, calls = rig.run(RUSTDESK_CHECK_CMD_TIMEOUT="1")
+    assert r.returncode == 1 and "ip6tables -S INPUT failed" in r.stdout, r.stdout
+    assert not _has(calls, "docker"), "started a listener with the fence not verified"
+
+
+def test_on_the_hub_each_read_is_bounded_at_10_seconds_sr045():
+    """The knob is for the rig only: its default is the hub's 10 s, every read
+    uses it, and no unit sets it."""
+    text = CHECK.read_text(encoding="utf-8")
+    assert 'CMD_TIMEOUT="$(_int "${RUSTDESK_CHECK_CMD_TIMEOUT:-}" 10)"' in text
+    assert "timeout 10 " not in text
+    for unit in CHECK.parent.glob("*.service"):
+        assert "RUSTDESK_CHECK_CMD_TIMEOUT" not in unit.read_text(encoding="utf-8"), unit.name
+
+
+@needs_bash
 def test_check_takes_the_owner_lock_and_revalidates_the_owner_under_it_sr045(rig):
     _w(rig.ss_now, SS_NO_HBBS)
     # This test is about lock ORDER, not settling: a zero settle window keeps
@@ -596,8 +631,12 @@ def test_check_files_are_lf_and_the_units_are_wired_sr045():
 def test_check_script_bounds_its_calls_and_checks_the_fence_sr045():
     live = _live(CHECK.read_text(encoding="utf-8"))
     assert "set -u" in live
-    for call in ("ss -H -ltnu", "systemctl is-active", "docker compose", "curl "):
+    for call in ("ss -H -ltnu", "systemctl is-active", "docker compose", 'bash "$ALERT_HELPER"'):
         assert re.search(r"timeout[^\n]*" + re.escape(call), live), "%s is not bounded" % call
+    # The ntfy post moved into the shared helper (SR-085) with the rate limit; the
+    # curl it makes must still be bounded there.
+    helper = _live((ROOT / "stack" / "monitoring" / "homehub-alert.sh").read_text(encoding="utf-8"))
+    assert re.search(r"timeout[^\n]*curl ", helper), "the helper's curl is not bounded"
     assert "homehub-rustdesk-isolation.service" in live
     assert "iptables" in live and "ip6tables" in live and "flock" in live
 

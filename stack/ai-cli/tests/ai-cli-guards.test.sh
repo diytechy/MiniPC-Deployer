@@ -76,6 +76,28 @@ fail() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$*"; }
 # an expectation.
 ME="$(id -un 2>/dev/null || "$PY" -c 'import getpass;print(getpass.getuser())')"
 
+# THE PRECONDITION FOR A8-loopback, A9-true-account, A12 and A13: those run the
+# service's own --check AS $ME, and the service rightly refuses a privileged
+# account before it reads a bind or a registry row. On a build host where the
+# tester is in docker or sudo (the 2026-10-22 baseline ran as one) every one of
+# them failed for that reason and none for its own. So the precondition is read
+# from the OS -- not from the module under test -- and when it is absent those
+# assertions SKIP, out loud, naming why. Run as an ordinary user (MiniPC-Deployer
+# AGENTS.md: `-u smokeacct`) and they all run.
+PRIVILEGED_GROUP_NAMES="sudo admin wheel root docker adm"   # ai_cli_service.PRIVILEGED_GROUPS
+ME_PRIVILEGED=""
+for g in $(id -nG "$ME" 2>/dev/null); do
+    case " $PRIVILEGED_GROUP_NAMES " in *" $g "*) ME_PRIVILEGED="${ME_PRIVILEGED:+$ME_PRIVILEGED }$g" ;; esac
+done
+[ "$ME" = root ] && ME_PRIVILEGED="${ME_PRIVILEGED:+$ME_PRIVILEGED }(is root)"
+SKIP=0
+skip() { SKIP=$((SKIP + 1)); printf 'SKIP  %s\n' "$*"; }
+account_unfit() {  # $1 = the assertion; true (and SKIPs it) when $ME cannot be certified
+    [ -n "$ME_PRIVILEGED" ] || return 1
+    skip "$1 -- needs an unprivileged tester; $ME is privileged ($ME_PRIVILEGED), which the service refuses first"
+    return 0
+}
+
 # `setup` runs the script with a synthesised environment and returns its exit
 # code, capturing output. --check-only stops before anything is created.
 setup_rc() {
@@ -178,12 +200,22 @@ if setup_rc true homehub-ai 127.0.0.1; then
 else
     fail "A6 setup refused loopback: $LAST_OUT"
 fi
-# On a machine with no docker bridge — this one — a bridge-SHAPED address must
-# be refused, because membership of a range was never evidence of a bridge.
-if setup_rc true homehub-ai 172.17.0.1; then
-    fail "A6 setup accepted 172.17.0.1 with no docker bridge carrying it"
+# A bridge-SHAPED address that no local interface carries must be refused,
+# because membership of a range was never evidence of a bridge. The address is
+# CHOSEN so that is true here: 172.17.0.1 is docker's default and a build host
+# with docker carries it (the 2026-10-22 baseline, which then accepted it,
+# correctly, and failed this line), so take the first 172.N.0.1 nothing carries.
+carried="$( (ip -o -4 addr show 2>/dev/null || true) | awk '{print $4}' | cut -d/ -f1)"
+shaped=""
+for n in $(seq 17 31); do
+    printf '%s\n' "$carried" | grep -qx "172.$n.0.1" || { shaped="172.$n.0.1"; break; }
+done
+if [ -z "$shaped" ]; then
+    skip "A6 every 172.17-31.0.1 is carried by a local interface; no uncarried bridge-shaped address to try"
+elif setup_rc true homehub-ai "$shaped"; then
+    fail "A6 setup accepted $shaped with no local interface carrying it"
 else
-    pass "A6 setup refused a bridge-shaped address no bridge carries"
+    pass "A6 setup refused a bridge-shaped address no bridge carries ($shaped)"
 fi
 
 echo
@@ -212,11 +244,13 @@ if [ "$rc" != 0 ]; then
 else
     fail "A8 --check accepted the wildcard: $out"
 fi
+if ! account_unfit "A8 --check passes on loopback"; then
 out="$(check_rc 127.0.0.1)"; rc=$?
 if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'ai-cli OK'; then
     pass "A8 --check passes every enabled route's read-only check: $out"
 else
     fail "A8 --check failed on loopback (rc=$rc): $out"
+fi
 fi
 
 echo
@@ -232,11 +266,13 @@ if [ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'is not the account this proce
 else
     fail "A9 --check accepted a configured account nobody is running as (rc=$rc): $out"
 fi
+if ! account_unfit "A9 --check passes for the true account"; then
 out="$(check_rc 127.0.0.1 "$ME")"; rc=$?
 if [ "$rc" = 0 ]; then
     pass "A9 --check passes when they are the same account ($ME)"
 else
     fail "A9 --check refused the true account $ME (rc=$rc): $out"
+fi
 fi
 
 echo
@@ -313,6 +349,7 @@ bad_row() {
     printf 'BAD-ROW\n' > "$TMP/bad-enabled"
     REG="$TMP/bad.csv" ENA="$TMP/bad-enabled" check_rc 127.0.0.1
 }
+if ! account_unfit "A12-A13 bad registry rows refused at startup (3 assertions)"; then
 out="$(bad_row 'claude -p --model {model} --output-format json --permission-mode plan --allowedTools Read --disallowedTools Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch --dangerously-skip-permissions' '')"; rc=$?
 if [ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'dangerously'; then
     pass "A12 a copied ai-template row is REFUSED at startup"
@@ -334,9 +371,10 @@ if [ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'Env may not set'; then
 else
     fail "A13 an Env=PATH row was accepted (rc=$rc): $out"
 fi
+fi
 
 echo
 echo "──────────────────────────────────────────────────────────────"
-printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"
+printf '%s PASS  %s FAIL  %s SKIP\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

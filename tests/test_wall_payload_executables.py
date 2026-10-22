@@ -39,6 +39,8 @@ from pathlib import Path
 
 import pytest
 
+from git_retry import run_git  # transient shared-.git faults: see tests/git_retry.py
+
 ROOT = Path(__file__).resolve().parents[1]
 PAYLOAD = "stack/autoinstall/wall"
 BACKTICK = chr(96)
@@ -46,8 +48,7 @@ BACKTICK = chr(96)
 
 def tracked_modes():
     """path -> git index mode, for the payload subtree."""
-    out = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-s", PAYLOAD],
-                         capture_output=True, text=True, check=True).stdout
+    out = run_git(["git", "-C", str(ROOT), "ls-files", "-s", PAYLOAD]).stdout
     modes = {}
     for line in out.splitlines():
         if not line.strip():
@@ -95,8 +96,8 @@ def test_the_git_archive_the_release_ships_carries_the_executable_bit():
     import io
     import tarfile
 
-    blob = subprocess.run(["git", "-C", str(ROOT), "archive", "--format=tar",
-                           "HEAD", PAYLOAD], capture_output=True, check=True).stdout
+    blob = run_git(["git", "-C", str(ROOT), "archive", "--format=tar",
+                    "HEAD", PAYLOAD], text=False).stdout
     modes = {}
     with tarfile.open(fileobj=io.BytesIO(blob)) as tar:
         for member in tar:

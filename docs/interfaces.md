@@ -51,7 +51,11 @@ only the Contract cell's opening words; the CSV holds the contract.
 | **IF-036** | Consumes | NagLight | Implemented | v1 | — | v1 tracker-definitions guard producer (stack/tracker/tracker-defs-guard.sh; the timer runs --report). … |
 | **IF-037** | Consumes | NagLight | Draft | v1 | — | v1 Finance-Auditor colour lane. Producer is the finance-auditor service in stack/docker-compose.yml, whose … |
 | **IF-038** | Provides | HomeHub | Draft | v1 | SR-076, SR-077, SR-078 | v1 AI CLI provisioning contract (stack/ai-cli). (1) Manifest stack/ai-cli/ai-clis.manifest.tsv … |
+| **IF-065** | Provides | HomeHub | Implemented | v1 | SR-086, SR-087, SR-088, SR-089, SR-091 | v1 hub monitoring artefacts (stack/monitoring, SN-048). Status files under /var/lib/homehub-monitor (root … |
+| **IF-066** | Consumes | ntfy (stack compose service) | Implemented | v1 | SR-085 | v1 host-side alert post. POST http://&lt;NTFY_BIND_IP or LAN_IP>:&lt;NTFY_PORT>/&lt;HOMEHUB_ALERT_TOPIC, default … |
 | **IF-067** | Provides | OfficeWallNaglight | Implemented | v1 | SR-093, SR-094 | v1 power-button warning state (WSN-098). Producer: wall-power-button.service (root). … |
+| **IF-068** | Provides | Finance-Auditor | Draft | v1 | SR-098 | v1 accrual-gauge inputs (counterpart FA SR-035/SR-051): a host directory mounted read-only at /config holding … |
+| **IF-069** | Consumes | NagLight | Draft | v1 | SR-097 | v1 tracker bearer contract (NagLight SR-030/LLR-020, internal/web/auth.go): with TRACKER_API_TOKEN set every … |
 <!-- END GENERATED IF INDEX -->
 
 ## Notes on selected interfaces (hand-written)
@@ -157,11 +161,12 @@ panel; that repo owns the app):
   `window` is. **`observed_at` is when the value was TRUE**, which is how
   "unavailable" is said without inventing a number: a source that fails reposts
   its last real reading at its *original* stamp and goes stale on NagLight's
-  horizon — except a source whose login is confirmed dead over two consecutive
-  cycles (SR-068), which posts the stale-on-arrival body for every one of its ids
+  horizon — except a source whose login is confirmed dead by failed attempts
+  spanning ten minutes (SR-068), which posts the stale-on-arrival body for every one of its ids
   and keeps doing so — and one that has never succeeded posts a gauge with no `observed_at`
-  at all, stale on arrival. The timer runs every 10 minutes because most of the
-  gauges are `weekly`, whose horizon is 24 h. **Not provided:** OpenCode's
+  at all, stale on arrival. The timer runs every minute and each source is read on
+  its own interval, 60 s by default (Codex 120 s), backing off on 429/5xx
+  (SR-095); a source that is skipped is not posted, so NagLight keeps its last body. **Not provided:** OpenCode's
   `rolling` bucket, which publishes no window length — a window this repo would
   have had to invent. **Not proven:** the Gemini response shapes against a live
   call (the parser is written from the CLI's source). Details in

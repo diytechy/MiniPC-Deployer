@@ -35,6 +35,20 @@ has `logging: driver: none`, so docker keeps no second copy (`docker logs
 homehub-door-relay` answers "configured logging driver does not support
 reading" - that is the design, not a fault; read the journal).
 
+**No consumer is handed the credential in argv or in its environment.** The
+relay's consumer URL carries the doorbell's username and password, and an
+argument is readable from `/proc/<pid>/cmdline` by any local user (a
+container's processes are host processes), an environment variable from
+`docker inspect` and `/proc/<pid>/environ`. So every consumer the hub runs -
+the recorder, `probe`, the gate's consumers, the `cost` decoder - is built by
+one helper, `relay_consumer()`, as the panel's broker does it: ffmpeg/ffprobe
+is the container's entrypoint (no shell), reads `-f concat -i pipe:0`, and the
+URL arrives in a one-entry ffconcat document written to its stdin (`docker run
+-i`) and then closed. The rtsp options ride in the document (`option
+rtsp_transport tcp`, the recorder's `option timeout`). Lab check 11 samples every
+running consumer and finds the credential in no process's cmdline or environ and
+in no `docker inspect` field.
+
 **Credentials on the hub** are `DOOR_RELAY_UPSTREAM_HOST/PORT/PATH/USERNAME/
 PASSWORD` — deliberately not the panel's `DOORBELL_RTSP_*` names, because after
 the cutover the panel's `DOORBELL_RTSP_HOST` is the relay. The password is the
@@ -61,7 +75,11 @@ frame, so every file decodes.
   the panel broker's own input path, decodable video-only segments across a
   relay restart, no secret in any log, the cost tool, and (check 10) the relay
   run from its unit file's own Exec lines with the camera killed under a
-  consumer: the dropout warning arrives redacted and docker holds nothing.
+  consumer: the dropout warning arrives redacted and docker holds nothing;
+  (checks 4b, 4c) the gate fails when its survivor is SIGSTOPped before or just
+  after its first sample; (check 11) no
+  running consumer holds the credential in its cmdline, environ or docker
+  inspect.
 * `tests/door-cutover-panel.test.sh` (hermetic; TC-1398): the panel script's
   file verbs on a fake tree, and the probe and compat verdicts (their own Python
   bodies, extracted from the script) against a fake broker, `ss` and decoder.
@@ -135,7 +153,11 @@ sudo python3 /opt/homehub/stack/door/door_relay.py probe --seconds 10
 sudo python3 /opt/homehub/stack/door/door_relay.py gate --seconds 15
 #   readiness+geometry {"pass": true}; two-consumers {upstream_connections: 1, producers: 1, consumers >= 2};
 #   one-consumer-left {upstream_connections: 1, survivor_running: true, survivor_progressing: true,
-#   survivor_sent_bytes: [a, b] with b > a}; {"check": "gate-hub-half", "pass": true}
+#   survivor_frames: [a, b] with b > a, relay_sent_bytes: [..]}; {"check": "gate-hub-half", "pass": true}
+#   survivor_frames is the surviving consumer's OWN ffmpeg -progress frame count: the verdict, with
+#   survivor_last_frame_age <= 2.5 s (it must still be rising when the window ends).
+#   relay_sent_bytes is go2rtc's per-consumer sender counter, for the record only - it rises
+#   when a packet is queued for a consumer, so it keeps rising for one that reads nothing.
 # panel: the broker's OWN input path against the relay (the broker stays suppressed)
 sudo bash /tmp/w4/door/door-cutover-panel.sh compat <hub> 8554 /door 20
 #   {"frames": > 0, "stalled": false, "ended_early": false, ...}; it always ends within 20 s (+5 s to

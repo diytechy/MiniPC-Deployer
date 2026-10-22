@@ -683,6 +683,39 @@ def test_tc1325_each_device_is_asked_for_boot_clock_timestamps(tmp_path, monkeyp
             os.close(fd)
 
 
+@pytest.mark.parametrize("failing", [A, B])
+def test_tc1325_a_device_that_will_not_open_stops_the_guard_before_it_starts(monkeypatch, capsys, failing):
+    # Sol review 2 (F2): event0 opens and event4 does not (or the other way
+    # round). Guarding the subset would hold the inhibitor over a button that
+    # reports on the missing node, so main exits non-zero for the restart,
+    # closes what it opened, and never enters the loop.
+    opened, closed = [], []
+    real_close = os.close
+    monkeypatch.setattr(pb, "find_devices", lambda: [B, A])
+
+    def fake_open(path, flags):
+        if path == failing:
+            raise PermissionError(13, "Permission denied", path)
+        read_fd, write_fd = os.pipe()
+        real_close(write_fd)
+        opened.append(read_fd)
+        return read_fd
+
+    def fake_close(fd):
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(pb.os, "open", fake_open)
+    monkeypatch.setattr(pb.os, "close", fake_close)
+    monkeypatch.setattr(pb, "fcntl", None)
+    monkeypatch.setattr(pb, "run", lambda *a, **k: pytest.fail("run() entered with a device missing"))
+    assert pb.main() == 77
+    assert opened and sorted(closed) == sorted(opened)
+    out = capsys.readouterr().out
+    assert ("could not open %s (of %s, %s)" % (failing, B, A)) in out
+    assert "exiting without guarding" in out
+
+
 def test_tc1325_the_default_clock_is_the_boot_clock():
     assert pb.run.__kwdefaults__["clock"] is pb.boot_clock
     if hasattr(pb.time, "CLOCK_BOOTTIME"):

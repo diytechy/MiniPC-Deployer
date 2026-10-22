@@ -60,8 +60,8 @@ offline and hash-locked), as panel-volume-keys.py does.
 PURE CORE: `PowerButtonMachine` and `parse_events` do no I/O and read no clock;
 `main()` and the small `Shell` class are the thin I/O layer.
 
-Exit codes: 69 no "Power Button" device exists; 77 none could be opened;
-1 every device went away. Each exit releases the inhibitor (logind's default
+Exit codes: 69 no "Power Button" device exists; 77 a device that exists
+could not be opened (the daemon never guards a subset); 1 a device went away. Each exit releases the inhibitor (logind's default
 returns) and the unit restarts it.
 
 Implements: SR-093, SR-094, LLR-1180, LLR-1181, LLR-1182, LLR-1183, LLR-1184
@@ -587,8 +587,17 @@ def main() -> int:
                 % DEVICE_NAME, 3)
         return 69
     handles = open_devices(paths)
-    if not handles:
-        journal("power-button devices exist (%s) but none could be opened" % ", ".join(paths), 3)
+    if len(handles) < len(paths):
+        # ALL OR NOTHING (Sol review 2, F2). Only event4 has ever reported a
+        # press, so guarding with event0 alone would hold the inhibitor over a
+        # dead button. Exit instead: the inhibitor goes, logind's one-press
+        # default holds the button, and the restart looks again.
+        opened = {path for path, _ in handles.values()}
+        journal("could not open %s (of %s); exiting without guarding, so logind's default "
+                "holds the button until the restart finds them all"
+                % (", ".join(path for path in paths if path not in opened), ", ".join(paths)), 3)
+        for fd in handles:
+            os.close(fd)
         return 77
     machine = PowerButtonMachine(seq_start=int(time.time() * 1000))
     shell = Shell(machine)

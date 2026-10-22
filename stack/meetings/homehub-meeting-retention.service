@@ -1,0 +1,31 @@
+# homehub-meeting-retention - age the meeting recordings out of
+# /srv/scratch/meetings (WSN-097; SR-111): older than MEETING_RETENTION_DAYS
+# (default 14) go, and then the oldest while the directory is above
+# MEETING_QUOTA_HIGH_PCT (default 90) of its 2 GiB quota. The scratch writer
+# pattern, like the pull: it only deletes, but it deletes on the volume.
+[Unit]
+Description=Meeting recordings: retention on the scratch volume
+Documentation=file:///opt/homehub/stack/meetings/README.md
+RequiresMountsFor=/srv/scratch
+BindsTo=srv-scratch.mount
+After=srv-scratch.mount
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/bin/python3 /opt/homehub/stack/meetings/homehub_meetings.py condition
+ExecStartPre=/usr/bin/python3 /opt/homehub/stack/scratch/homehub_scratch.py guard --writer meetings
+ExecStart=/usr/bin/python3 /opt/homehub/stack/meetings/homehub_meetings.py retention
+SyslogIdentifier=homehub-meetings
+UMask=0077
+CapabilityBoundingSet=~CAP_SYS_RESOURCE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+TimeoutStartSec=5min
+Nice=10
+CPUAccounting=true
+CPUQuota=20%
+MemoryAccounting=true
+MemoryMax=64M
+TasksMax=16

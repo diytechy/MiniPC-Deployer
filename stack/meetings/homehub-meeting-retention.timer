@@ -1,0 +1,12 @@
+# Hourly: the period is in days, but the high-water rule should act soon after
+# a large pull, not at midnight.
+[Unit]
+Description=Meeting recordings: retention every hour
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

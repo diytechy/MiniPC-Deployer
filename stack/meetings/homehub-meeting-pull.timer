@@ -1,0 +1,12 @@
+# Every two minutes: a recording reaches the hub within a few minutes of the
+# meeting ending, and an idle run is one `list` over ssh.
+[Unit]
+Description=Meeting recordings: collect from the wall panel every 2 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

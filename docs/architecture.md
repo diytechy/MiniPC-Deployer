@@ -855,6 +855,60 @@ sequenceDiagram
     Note over I,D: any exit of either process drops the inhibitor;<br/>logind's default holds the button until Restart=always (2 s)
 ```
 
+### A meeting recorded both ways, only while the indicator is on the glass (SR-108..SR-111, LLR-1240..1252)
+
+OfficeWallNaglight WSN-097, ruled 2026-10-22 (HomeHub open-items A69): the panel
+control and a Bluetooth call for the dev PC both start a recording; an indicator
+is on the glass whenever capture runs. The recorder captures only while the
+kiosk's beats keep arriving, so every failure of the kiosk -- a crash, a frozen
+compositor, a dark screen -- stops the capture by doing nothing. The files leave
+the panel only when the hub pulls them, and are deleted there only after the hub
+holds the same bytes under their final name.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as wall-bt-call (call-state.json)
+    participant K as kiosk (Electron host + page)
+    participant R as wall-meeting-recorder.py
+    participant F as ffmpeg (mic_selected + bus_monitor)
+    participant S as panel spool (ready/)
+    participant H as homehub-meeting-pull (hub)
+    participant V as /srv/scratch/meetings
+
+    alt the panel control
+        K->>R: meeting-request.json {id, start} (acted on once, under 30 s old; LLR-1241)
+    else a call from a listed gateway
+        C->>R: state call, since S (fresh under 30 s; LLR-1240)
+    end
+    R->>K: state.json indicator true, seq N, phase waiting (LLR-1245)
+    loop every 500 ms while the indicator is painted, topmost, on a lit screen, clear of Pandora
+        K->>R: meeting-indicator-ack.json {seq N, beat} (two frames after paint)
+    end
+    R->>F: start: -fs = room - 256 KiB, -t = max minutes (LLR-1242, LLR-1243)
+    F->>S: recording/meeting-UTC.opus (left near, right far; every packet flushed)
+    alt beats stop (kiosk gone, dark, frozen)
+        R->>F: SIGINT within 2 s of the last beat; SIGKILL after 0.4 s
+        R->>S: finalise into ready/ + .sha256 (LLR-1244)
+        Note over R: manual ends; a call waits and resumes into a new file when beats return
+    else stop, the call ends, -fs or -t reached, or ffmpeg dies
+        R->>F: stop (or it has ended)
+        R->>S: finalise into ready/ + .sha256
+    end
+    loop every 2 min on the hub (MEETING_PULL_ENABLED)
+        H->>H: scratch guard (W4 IF-071), and again before every new file
+        H->>S: ssh forced command: list, get NAME (hashing as it streams)
+        alt size and sha256 match
+            H->>V: .incoming/NAME.part, fsync, rename to YYYY-MM-DD/NAME
+            H->>S: ack NAME SHA256: deleted only if the panel's own hash matches (LLR-1247, LLR-1249)
+        else short, oversize or mismatched
+            H->>H: remove the part; the panel keeps its copy; retried next run
+        end
+        H->>S: report ok, or full (no room / EDQUOT): the kiosk can then say both are full
+    end
+    Note over V: hourly retention: older than 14 days, then the oldest above 90 % of the 2 GiB quota (LLR-1252)
+```
+
 ### One memory episode on the hub: kill, reboot, hand-off (SR-050, SR-051, LLR-999, LLR-1000, LLR-1002)
 
 The supervisor's main thread never waits on a disk, journald or D-Bus; it only

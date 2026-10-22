@@ -730,6 +730,38 @@ sequenceDiagram
     end
 ```
 
+### The panel's log cap and low-disk alarm (SR-083, LLR-1140, LLR-1141)
+
+Two independent timers, neither of which can affect the kiosk. The point of
+drawing it is the second lane: the alarm READS and REPORTS, it never deletes
+anything, and when it cannot measure it says so and lets the status file go
+stale rather than writing a reassuring one.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant LT as logrotate.timer (stock, hourly via drop-in)
+    participant LR as logrotate.service
+    participant RS as /var/log/syslog et al.
+    participant DT as wall-disk-check.timer (15 min)
+    participant DC as wall-disk-check.py
+    participant J as journal (tag wall-disk)
+    participant S as /run/wall-disk/status.json
+
+    LT->>LR: start (SR-083, LLR-1140)
+    LR->>RS: daily, or now if > 100M: rotate, keep 7, gzip the one before
+    LR->>RS: postrotate: rsyslog-rotate (rsyslog reopens its files)
+    DT->>DC: ExecStart (SR-083, LLR-1141)
+    DC->>DC: df on / and the media cache; drop a path whose mount was already seen
+    alt df failed or its output did not parse
+        DC->>J: <4> wall-disk: ERROR ...
+        Note over DC,S: exit 1, previous file untouched, it goes stale after ttlMs
+    else measured
+        DC->>J: <4> LOW or <6> ok, one line per mount<br/>(LOW = Avail below min(10 % of size, 5 GB))
+        DC->>S: replace atomically {observedAt, ttlMs 30 min, low, mounts[]}
+    end
+```
+
 ### One memory episode on the hub: kill, reboot, hand-off (SR-050, SR-051, LLR-999, LLR-1000, LLR-1002)
 
 The supervisor's main thread never waits on a disk, journald or D-Bus; it only

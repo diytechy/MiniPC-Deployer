@@ -20,8 +20,12 @@ switch is `SURE_ENABLED`, not `COMPOSE_PROFILES`** (SR-100):
 - A start that fails half way (Postgres and Redis up, a health dependency never
   ready) is cleaned up by the unit's `ExecStopPost=` (`sure-unit.sh
   stop-after-failure`), because systemd never runs `ExecStop=` after a failed
-  start. With the knob then off, firstboot stops a failed or inactive unit's
-  containers with `sure-unit.sh stop` itself.
+  start. With the knob then off, firstboot stops a failed or inactive unit
+  with no job through `sure-unit.sh stop` itself; a unit that is activating,
+  deactivating or has a queued job goes through `systemctl stop`, which cancels
+  the start (or SIGTERMs a running `up -d`, then `ExecStopPost=` stops what it
+  had started) - a direct stop there would finish first and the start would
+  bring all four up after it.
 - The knob is read the same way by the unit, firstboot and the bake (the rules of
   `scripts/lib/envfile.sh`): `SURE_ENABLED='true'`, `"true"`, an indented line
   or ` = ` around the key all mean on.

@@ -285,9 +285,13 @@ sequenceDiagram
         FB->>SD: disable; stop --no-block
         SD->>Unit: stop
         Unit->>DC: --profile sure stop (web, worker, then redis, postgres)
-    else knob off, the unit was enabled and is failed or inactive
+    else knob off, the unit is activating, deactivating or has a job
+        FB->>SD: disable; stop --no-block (is-active read as text, show -p Job)
+        SD->>Unit: cancel the queued start, or SIGTERM the running up -d
+        Unit->>DC: ExecStopPost stop-after-failure (SERVICE_RESULT=signal): --profile sure stop
+    else knob off, the unit was enabled and is failed or inactive, no job
         FB->>SD: disable
-        FB->>DC: sure-unit.sh stop, directly (systemctl stop of a failed unit runs nothing)
+        FB->>DC: sure-unit.sh stop, directly (systemctl stop of a failed unit runs nothing; no start to race)
     else knob off or absent, unit never enabled
         FB->>FB: log only: no Sure container is touched
     end

@@ -193,7 +193,15 @@ log() { echo "[firstboot] $*"; }
 systemctl() {
     echo "systemctl $*" >> "$CALLS"
     if [ "$1" = is-enabled ]; then [ -n "${STUB_ENABLED:-}" ]; return; fi
-    if [ "$1" = is-active ]; then [ -n "${STUB_ACTIVE:-}" ]; return; fi
+    if [ "$1" = is-active ]; then
+        # as systemd 255 does: print the state (unless --quiet), exit 0 only for
+        # active, reloading and refreshing - nonzero for `activating`
+        local s="${STUB_STATE:-}"
+        [ -n "$s" ] || { [ -n "${STUB_ACTIVE:-}" ] && s=active || s=inactive; }
+        [ "${2:-}" = --quiet ] || echo "$s"
+        case "$s" in active|reloading|refreshing) return 0 ;; *) return 3 ;; esac
+    fi
+    if [ "$1" = show ]; then echo "${STUB_JOB:-}"; return 0; fi
     if [ "${STUB_SYSTEMCTL_FAIL:-}" = "$1" ]; then return 1; fi
     return 0
 }
@@ -202,7 +210,7 @@ install() { echo "install $*" >> "$CALLS"; return 0; }
 
 
 def _run_block(tmp_path, env_text, enabled=False, fail=None, payload=True, active=False,
-               docker_stub=DOCKER_STUB, extra_env=None):
+               docker_stub=DOCKER_STUB, extra_env=None, state=None, job=None):
     """Run firstboot's real 4-pre-a2b block. The payload is the real unit AND
     the real sure-unit.sh, because the off branch runs that script directly;
     its docker is a stub that logs `compose ...` into the same call log."""
@@ -224,6 +232,10 @@ def _run_block(tmp_path, env_text, enabled=False, fail=None, payload=True, activ
         env["STUB_ENABLED"] = "1"
     if active:
         env["STUB_ACTIVE"] = "1"
+    if state:
+        env["STUB_STATE"] = state
+    if job:
+        env["STUB_JOB"] = job
     if fail:
         env["STUB_SYSTEMCTL_FAIL"] = fail
     proc = subprocess.run([_bash(), _px(script)], env=env, capture_output=True, text=True)
@@ -263,7 +275,8 @@ def test_tc1361_knob_false_after_the_unit_owned_sure_disables_and_queues_the_sto
     proc, calls = _run_block(tmp_path, "SURE_ENABLED=false\n", enabled=True, active=True)
     assert calls[2:] == ["systemctl is-enabled homehub-sure.service",
                          "systemctl disable homehub-sure.service",
-                         "systemctl is-active --quiet homehub-sure.service",
+                         "systemctl is-active homehub-sure.service",
+                         "systemctl show -p Job --value homehub-sure.service",
                          "systemctl stop --no-block homehub-sure.service"], calls
     assert "DISABLED" in proc.stdout
 
@@ -274,9 +287,46 @@ def test_tc1361_knob_false_with_a_failed_unit_runs_the_stop_script_directly_sr10
     proc, calls = _run_block(tmp_path, "SURE_ENABLED=false\n", enabled=True, active=False)
     assert calls[2:] == ["systemctl is-enabled homehub-sure.service",
                          "systemctl disable homehub-sure.service",
-                         "systemctl is-active --quiet homehub-sure.service",
+                         "systemctl is-active homehub-sure.service",
+                         "systemctl show -p Job --value homehub-sure.service",
                          "compose --profile sure stop -t 60 sure-web sure-worker sure-redis sure-postgres"], calls
     assert "its stop script ran directly" in proc.stdout
+
+
+_OFF_PREFIX = ["systemctl is-enabled homehub-sure.service",
+               "systemctl disable homehub-sure.service",
+               "systemctl is-active homehub-sure.service",
+               "systemctl show -p Job --value homehub-sure.service"]
+
+
+@pytest.mark.parametrize("state,job", [
+    ("activating", "4711"),     # the review's case: a queued start still in ExecStart
+    ("activating", ""),
+    ("reloading", ""),
+    ("deactivating", "4712"),
+    ("inactive", "4711"),       # a start job queued but waiting (After=firstboot)
+    ("failed", "4711"),
+])
+def test_tc1361_knob_false_with_a_start_in_flight_stops_through_systemd_sr100(tmp_path, state, job):
+    """W10-sA review round 2 F1. `systemctl is-active` is nonzero for
+    `activating`, so the round-1 branch ran the stop script directly while the
+    start firstboot had queued was still inside `up -d`: compose stop finished
+    first, then the start brought all four up under unless-stopped. Anything
+    running or with a job must go through `systemctl stop`, which cancels the
+    job or SIGTERMs ExecStart= (then ExecStopPost= stop-after-failure cleans up),
+    and the script must not race it."""
+    proc, calls = _run_block(tmp_path, "SURE_ENABLED=false\n", enabled=True, state=state, job=job)
+    assert calls[2:] == _OFF_PREFIX + ["systemctl stop --no-block homehub-sure.service"], calls
+    assert not [c for c in calls if c.startswith("compose")], calls
+    assert "its stop queued; it was '%s'" % state in proc.stdout
+
+
+@pytest.mark.parametrize("state,job", [("inactive", ""), ("failed", ""), ("failed", "0"), ("unknown", "")])
+def test_tc1361_knob_false_with_an_idle_unit_runs_the_script_and_no_systemctl_stop_sr100(tmp_path, state, job):
+    proc, calls = _run_block(tmp_path, "SURE_ENABLED=false\n", enabled=True, state=state, job=job)
+    assert calls[2:] == _OFF_PREFIX + [
+        "compose --profile sure stop -t 60 sure-web sure-worker sure-redis sure-postgres"], calls
+    assert "it was '%s' with no job, so its stop script ran directly" % state in proc.stdout
 
 
 def test_tc1361_a_failed_direct_stop_is_a_warning_not_an_abort_sr100(tmp_path):

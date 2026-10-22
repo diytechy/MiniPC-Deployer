@@ -1474,22 +1474,41 @@ if [ -f "$STACK_DIR/sure/homehub-sure.service" ]; then
         fi
     elif systemctl is-enabled homehub-sure.service >/dev/null 2>&1; then
         systemctl disable homehub-sure.service >/dev/null 2>&1 || log "WARN: could not disable homehub-sure.service"
-        # AN ACTIVE UNIT IS STOPPED THROUGH SYSTEMD (its ExecStop= stops the
-        # containers); ANY OTHER STATE GETS THE STOP SCRIPT DIRECTLY. `systemctl
-        # stop` of a failed or inactive unit runs nothing, and a start that
-        # failed half way leaves Postgres and Redis up under `restart:
-        # unless-stopped` - they come back every boot with the knob off (Sol,
-        # W10-sA review F1; the unit's ExecStopPost= now cleans up at the
-        # failure, and this covers a failure from before it or one whose
-        # clean-up failed). Direct, not via systemctl: the unit is
-        # After=homehub-firstboot.service, so no job of it can run from in here.
-        # The script stops each container in 60 s at most; on an already
-        # stopped Sure it returns in seconds.
-        if systemctl is-active --quiet homehub-sure.service; then
+        # A UNIT THAT IS RUNNING, OR HAS A JOB, IS STOPPED THROUGH SYSTEMD; ONLY
+        # AN IDLE ONE (inactive or failed, no job) GETS THE STOP SCRIPT DIRECTLY.
+        #  - Through systemd: active, activating, reloading, refreshing and
+        #    deactivating, and any state with a queued job. `systemctl stop`
+        #    cancels a queued start, and a running ExecStart= (`up -d` waiting
+        #    on Postgres and Redis to report healthy, up to TimeoutStartSec=)
+        #    gets SIGTERM, after which ExecStopPost= stop-after-failure stops
+        #    what it had started (SERVICE_RESULT is `signal`, measured on
+        #    systemd 255). A direct stop here instead would race that start:
+        #    compose stop finishes first, then `up -d` brings all four up under
+        #    `restart: unless-stopped`, and the disabled unit's Sure comes back
+        #    every boot (Sol, W10-sA review round 2 F1). `is-active --quiet` is
+        #    not the test: it is nonzero for `activating`, so the state is read
+        #    as text. deploy_stack.py runs firstboot directly, so
+        #    After=homehub-firstboot.service does not keep a start out of this
+        #    window.
+        #  - Directly: `systemctl stop` of a failed or inactive unit runs
+        #    nothing, and a start that failed half way leaves Postgres and Redis
+        #    up under `restart: unless-stopped` - they come back every boot with
+        #    the knob off (Sol, W10-sA review F1; the unit's ExecStopPost= now
+        #    cleans up at the failure, and this covers a failure from before it
+        #    or one whose clean-up failed). With no job there is no start for
+        #    the script to race. It stops each container in 60 s at most; on an
+        #    already stopped Sure it returns in seconds.
+        _sure_state="$(systemctl is-active homehub-sure.service 2>/dev/null)" || true
+        _sure_job="$(systemctl show -p Job --value homehub-sure.service 2>/dev/null)" || _sure_job=""
+        case "$_sure_state" in
+            active|activating|reloading|refreshing|deactivating) _sure_busy=1 ;;
+            *) case "${_sure_job:-0}" in 0) _sure_busy=0 ;; *) _sure_busy=1 ;; esac ;;
+        esac
+        if [ "$_sure_busy" = 1 ]; then
             systemctl stop --no-block homehub-sure.service >/dev/null 2>&1 || log "WARN: could not queue the stop of homehub-sure.service"
-            log "sure: homehub-sure.service DISABLED and its stop queued (SURE_ENABLED='$_sure_enabled')"
+            log "sure: homehub-sure.service DISABLED and its stop queued; it was '${_sure_state:-unknown}'${_sure_job:+ with job $_sure_job} (SURE_ENABLED='$_sure_enabled')"
         elif STACK_DIR="$STACK_DIR" bash "$STACK_DIR/sure/sure-unit.sh" stop; then
-            log "sure: homehub-sure.service DISABLED; it was not active, so its stop script ran directly (SURE_ENABLED='$_sure_enabled')"
+            log "sure: homehub-sure.service DISABLED; it was '${_sure_state:-unknown}' with no job, so its stop script ran directly (SURE_ENABLED='$_sure_enabled')"
         else
             log "WARN: homehub-sure.service DISABLED, but its stop script failed - check: docker compose --profile sure ps"
         fi

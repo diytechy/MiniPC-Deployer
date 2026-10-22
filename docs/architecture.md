@@ -806,6 +806,55 @@ sequenceDiagram
     end
 ```
 
+### The power button asks before it shuts down (SR-093, SR-094, LLR-1180..1189, IF-067)
+
+OfficeWallNaglight WSN-098, ruled 2026-10-22: one press warns, a second within
+5 s shuts down. logind is kept off the key by a `handle-power-key` block
+inhibitor that the unit's `systemd-inhibit` wrapper takes BEFORE the daemon
+starts and that dies with it, so a dead guard returns the button to logind's
+one-press power-off rather than leaving it dead. The press path never waits:
+the display wake and every alert run off it, and the kiosk's warning is
+display only. Whether the kiosk painted is learned from its acknowledgement,
+and its absence changes nothing but the journal.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant K as kernel (event0, event4 "Power Button")
+    participant L as systemd-logind
+    participant I as systemd-inhibit (handle-power-key, block)
+    participant D as wall-power-button.py
+    participant S as /run/wall-power-button/state.json
+    participant P as wall-sleep.sh power-button-wake
+    participant E as kiosk (Electron host)
+
+    I->>L: Inhibit handle-power-key (SR-093, LLR-1186)
+    I->>D: run as child; the lock lives as long as this process
+    D->>S: idle (start document, LLR-1183)
+    K->>L: KEY_POWER press
+    L->>L: inhibited, so no power-off
+    K->>D: KEY_POWER 1 then 0 (same instant); echo on the other node within 150 ms is dropped (LLR-1182);<br/>waiting input is read before the window is allowed to expire
+    D->>S: armed {seq, deadline = now + 5 s} (LLR-1181, IF-067)
+    par off the press path
+        D->>P: power-button-wake (thread; lock, stamp, 6 s hold on every backlight-off, light only if dark, LLR-1185)
+    and
+        E->>S: watch / poll
+        E->>E: full-screen flashing warning + countdown
+        E->>E: write {seq} to /run/wall-panel-renderer/power-warning-ack.json
+    end
+    alt no matching ack after 2 s
+        D->>D: <4> ALERT power-button-kiosk-unavailable (SR-094)
+        Note over D: off the press path: panel-alert, then homehub-alert.sh, then the hub's ntfy (LLR-1188)<br/>not delivered: the journal line is the alert
+    end
+    alt second counted press at or before the deadline
+        D->>S: shutting-down
+        D->>L: systemctl poweroff
+    else deadline passes
+        D->>S: idle; the next press warns again
+    end
+    Note over I,D: any exit of either process drops the inhibitor;<br/>logind's default holds the button until Restart=always (2 s)
+```
+
 ### One memory episode on the hub: kill, reboot, hand-off (SR-050, SR-051, LLR-999, LLR-1000, LLR-1002)
 
 The supervisor's main thread never waits on a disk, journald or D-Bus; it only

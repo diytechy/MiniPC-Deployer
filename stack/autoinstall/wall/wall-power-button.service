@@ -1,0 +1,68 @@
+# wall-power-button.service — one press warns, a second within 5 s shuts down
+# (OfficeWallNaglight WSN-098, ruled by the Owner 2026-10-22; SR-093/SR-094).
+#
+# THE INHIBITOR IS THE WRAPPER. systemd-inhibit takes logind's
+# `handle-power-key` block lock, then runs the daemon as its child and holds the
+# lock until that child exits. So the lock exists before the daemon reads a
+# single event, and it disappears with the process for ANY reason -- a crash, a
+# stop, a kill of either process (the unit's whole cgroup is killed when the
+# main process goes). logind's default (power off on one press) then applies
+# again until the restart below takes the lock back: the button never goes
+# dead. Check: `systemd-inhibit --list` names WHO=wall-power-button.
+#
+# ROOT, because each of its three jobs is a root job: the block inhibitor,
+# `systemctl poweroff`, and wall-sleep.sh's display wake (which writes the
+# backlight and its /run stamps). The daemon reads /dev/input and writes only
+# /run/wall-power-button/state.json (IF-067); its alert route (panel-alert ->
+# homehub-alert.sh) writes only its rate-limit stamps in the StateDirectory.
+
+[Unit]
+Description=Wall panel: the power button asks before it shuts the panel down (press twice)
+Documentation=file:///opt/wall-panel/stack/autoinstall/wall/README.md
+After=systemd-logind.service
+Wants=systemd-logind.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/systemd-inhibit --what=handle-power-key --mode=block --who=wall-power-button "--why=The power button asks before it shuts the panel down (WSN-098)" /usr/bin/python3 /usr/local/lib/wall-panel/wall-power-button.py
+# Every exit restarts it, a clean one included: a running daemon is the only
+# thing standing between one press and a shutdown. 2 s keeps the unguarded gap
+# short; a panel with no power-button device (exit 69) burns the default start
+# limit within ten seconds and stays failed, which is the visible answer.
+Restart=always
+RestartSec=2
+# The state file's directory. Removed on stop, so a stopped service can never
+# leave an `armed` document for the kiosk to show.
+RuntimeDirectory=wall-power-button
+RuntimeDirectoryMode=0755
+# The alert route's per-key rate-limit stamps (/var/lib/wall-panel-alert). Kept
+# across restarts and reboots, so a guard that keeps failing does not page the
+# hub on every restart.
+StateDirectory=wall-panel-alert
+StateDirectoryMode=0700
+UMask=0022
+
+NoNewPrivileges=true
+PrivateTmp=true
+# `full`, not `strict`: wall-sleep.sh writes its lock and stamps under /run,
+# and the display wake writes sysfs. /usr, /boot and /etc stay read-only.
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+# systemd-inhibit and systemctl speak D-Bus and systemd's private socket
+# (AF_UNIX); the alert route posts to the hub's ntfy over the LAN (AF_INET,
+# and AF_INET6 for curl's resolver). Nothing in the daemon listens.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wall-power-button
+
+[Install]
+WantedBy=multi-user.target

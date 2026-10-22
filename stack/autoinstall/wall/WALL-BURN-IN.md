@@ -372,3 +372,29 @@ identities in the recorded evidence.
       `wall-audio-router` identity can reach the PipeWire user session through a
       narrow mechanism. The provisional unit uses `User=panel`; do not add a
       broad D-Bus rule merely to make a separate account convenient.
+
+## Power button: press twice to shut down (WSN-098, SR-093/SR-094)
+
+The image settles the logic (`tests/test_wall_power_button.py`); only the real
+panel settles that logind honours the guard's inhibitor and that the warning is
+readable on the wall. Pressing is physical, and a shutdown needs a physical
+press to come back, so do this with somebody at the panel.
+
+```sh
+systemd-inhibit --list --no-pager | grep wall-power-button   # handle-power-key, block
+journalctl -u wall-power-button -f                         # every press is a line
+```
+
+1. **One press.** The full-screen warning flashes with a 5 s countdown, the
+   panel stays up, and the journal says `warning N shown` then `warning N
+   cleared`. logind logs `Power key pressed short` and refuses to act
+   (inhibited). Repeat with the display dark: it lights first.
+2. **Two presses within 5 s.** `second press inside the window` and the panel
+   powers off.
+3. **Readable in a dark room.** Lights off; the text and countdown read from
+   across the room without glare.
+4. **Guard stopped** (`sudo systemctl stop wall-power-button`): the inhibitor is
+   gone from the list, and ONE press powers the panel off (logind's default).
+   `systemctl start wall-power-button` (or the next boot) restores the guard.
+5. A long hold (about 4 s or more) is the firmware's forced power-off whatever
+   software does; that is not this guard's to change.

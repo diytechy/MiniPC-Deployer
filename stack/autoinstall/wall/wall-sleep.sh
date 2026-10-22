@@ -159,6 +159,18 @@ ABSENT_SINCE_FILE="$ABSENCE_STATE_DIR/absent-since"
 # one backlight write) without leaving the panel unable to blank after a wake.
 WAKE_STAMP_FILE="$ABSENCE_STATE_DIR/last-wake"
 DISPLAY_OFF_WAKE_GUARD_S=3
+# THE POWER-BUTTON WARNING HOLD (WSN-098, LLR-1185). A first press of the power
+# button puts a full-screen "press again within 5 s" warning up, and NOTHING may
+# turn the backlight off under it: not the panel's display-off conclusion, not
+# the occupancy decider (WALL_ABSENCE_ENABLED=true), not a backlight-mode sleep.
+# The wake stamp above covers only a display-off already queued; this covers the
+# whole window. power-button-wake writes "hold until" (uptime seconds, window
+# plus one) and backlight_set off refuses while it holds -- refusing, not
+# deferring, because every caller already treats a failed off as "stay lit" and
+# the occupancy path then also declines to suspend (A19). Found by review
+# (Sol, 2026-10-22).
+POWER_BUTTON_HOLD_FILE="$ABSENCE_STATE_DIR/power-button-hold"
+POWER_BUTTON_HOLD_S=6
 AMP_SAFE_STATE="${POWER_TEST_ROOT}/run/wall-amp-trigger/off-verified"
 # A bare carriage return, built rather than escaped so it survives every editor
 # and every quoting layer between here and the panel.
@@ -351,6 +363,17 @@ wake_is_recent() {
     [ $((now - stamp)) -lt "$DISPLAY_OFF_WAKE_GUARD_S" ]
 }
 
+# True while a power-button warning is on screen. The stamp is bounded on both
+# sides: a stamp from before a reboot (uptime restarted, so it reads far in the
+# future) and an expired one both mean no hold.
+power_button_hold_active() {
+    local until now
+    until="$(cat "$POWER_BUTTON_HOLD_FILE" 2>/dev/null || echo "")"
+    case "$until" in ''|*[!0-9]*) return 1 ;; esac
+    now="$(power_now_s)"
+    [ "$now" -le "$until" ] && [ $((until - now)) -le "$POWER_BUTTON_HOLD_S" ]
+}
+
 backlight_set() {   # backlight_set off|on
     local d cur max want got
     if ! d="$(backlight_dir)"; then
@@ -359,6 +382,10 @@ backlight_set() {   # backlight_set off|on
         return 1
     fi
     max="$(cat "$d/max_brightness" 2>/dev/null || echo 100)"
+    if [ "$1" = "off" ] && power_button_hold_active; then
+        log "backlight off DECLINED: the power-button warning is on screen (WSN-098); it clears within ${POWER_BUTTON_HOLD_S}s."
+        return 1
+    fi
     if [ "$1" = "off" ]; then
         if ! stop_door_stream; then
             log "WARNING: Door stream broker could not be stopped — refusing to turn the display off."
@@ -901,8 +928,54 @@ case "${1:-}" in
             exit "$panel_display_off_status"
         fi
         ;;
+    power-button-wake)
+        # WSN-098 (SR-094, LLR-1185). wall-power-button.service counted a first
+        # press of the power button and is about to show the full-screen "press
+        # again within 5 s" warning, which must be readable on a dark panel.
+        # Root counted the press from a kernel input node, so like touch-wake
+        # this is witnessed evidence, not a peer's claim, and it is the same
+        # serialized restore: same lock, same stamp, same read-back.
+        #
+        # It also writes the warning HOLD (POWER_BUTTON_HOLD_FILE above), so no
+        # backlight-off can land while the warning is up.
+        #
+        # TWO DIFFERENCES FROM touch-wake, both deliberate:
+        #  * A LIT PANEL IS LEFT EXACTLY AS IT IS. The daemon calls this on
+        #    every first press, lit or dark, and `backlight_set on` on a lit
+        #    panel would write the remembered level over whatever the panel is
+        #    showing now. The stamp is still written, so a display-off that
+        #    was already queued behind the lock declines rather than blanking
+        #    the warning (wake_is_recent).
+        #  * The absence clock is cleared only when the screen was dark, like
+        #    the other wake arms; pressing a button is not a presence claim
+        #    beyond that.
+        if ! power_lock_acquire "the power-button wake"; then
+            log "power-button wake DECLINED: a power decision is in flight; the warning"
+            log "is shown on whatever the display is doing, and a second press still counts."
+            exit 75
+        fi
+        mark_wake
+        mkdir -p "$ABSENCE_STATE_DIR" 2>/dev/null || true
+        printf '%s' "$(( $(power_now_s) + POWER_BUTTON_HOLD_S ))" > "$POWER_BUTTON_HOLD_FILE" 2>/dev/null ||
+            log "WARNING: could not write $POWER_BUTTON_HOLD_FILE; the warning is not protected from a display-off"
+        if backlight_lit; then
+            log "power button pressed on a lit panel — display left as it is"
+            power_lock_release
+            exit 0
+        fi
+        log "power button pressed on the dark panel — restoring the backlight for the shutdown warning"
+        rm -f "$ABSENT_SINCE_FILE" 2>/dev/null || true
+        backlight_set on
+        power_button_wake_status=$?
+        power_lock_release
+        if [ "$power_button_wake_status" -ne 0 ]; then
+            log "power-button wake FAILED: the backlight did not come on (backlight_set exited"
+            log "$power_button_wake_status). The warning is not readable; a second press still shuts down."
+            exit "$power_button_wake_status"
+        fi
+        ;;
     *)
-        echo "usage: $0 start|end|occupancy|sensor-wake|touch-wake|panel-display-off" >&2
+        echo "usage: $0 start|end|occupancy|sensor-wake|touch-wake|panel-display-off|power-button-wake" >&2
         exit 2
         ;;
 esac

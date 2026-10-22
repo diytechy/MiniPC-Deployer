@@ -1210,6 +1210,110 @@ run touch-wake
 eq "0" "$?" "A26 a wake over a remembered 0 exits 0"
 eq "100" "$(brightness)" "A26 ...and lights the panel at max instead of restoring 0"
 
+# ── A27 (TC-1328/LLR-1185): the power-button-wake arm (WSN-098) ─────────────
+# wall-power-button.service counted a first press and is showing the "press
+# again within 5 s" warning, which must be readable on a dark panel. On a dark
+# panel the arm lights it exactly as touch-wake does; on a LIT panel it must
+# leave the level alone (the daemon calls it on every first press), and in both
+# cases it stamps the wake so a display-off queued behind the lock declines.
+scenario a27-dark
+write_env "SLEEP_MODE=backlight"
+printf '0' > "$ROOT/sys/class/backlight/intel_backlight/brightness"
+printf '70' > "$ROOT/run/wall-backlight.prev"
+mkdir -p "$ROOT/run/wall-occupancy"
+printf '%s' "$(date +%s)" > "$ROOT/run/wall-occupancy/absent-since"
+run power-button-wake
+eq "0" "$?" "A27 power-button-wake on a dark panel exits 0"
+eq "70" "$(brightness)" "A27 ...and restores the remembered level, so the warning is readable"
+[ ! -e "$ROOT/run/wall-occupancy/absent-since" ] \
+    && pass "A27 a dark-panel press clears the absence clock like the other wake arms" \
+    || fail "A27 a dark-panel press left the absence clock"
+[ -s "$ROOT/run/wall-occupancy/last-wake" ] \
+    && pass "A27 the press stamps the wake, so a queued display-off declines" \
+    || fail "A27 the press wrote no wake stamp"
+grep -q 'power button pressed on the dark panel' "$ROOT/out.log" \
+    && pass "A27 the restore is journaled as the power button's" \
+    || fail "A27 the restore is not attributable to the power button"
+eq "no" "$(suspended)" "A27 the arm never suspends"
+eq "0" "$(decider_calls)" "A27 the arm is display state only — it does not run the decider"
+
+scenario a27-lit
+write_env "SLEEP_MODE=backlight"
+printf '40' > "$ROOT/sys/class/backlight/intel_backlight/brightness"
+printf '90' > "$ROOT/run/wall-backlight.prev"
+mkdir -p "$ROOT/run/wall-occupancy"
+printf '%s' "$(date +%s)" > "$ROOT/run/wall-occupancy/absent-since"
+run power-button-wake
+eq "0" "$?" "A27 power-button-wake on a lit panel exits 0"
+eq "40" "$(brightness)" "A27 ...and leaves the level the panel is showing (not the remembered 90)"
+[ -e "$ROOT/run/wall-occupancy/absent-since" ] \
+    && pass "A27 a lit-panel press leaves the absence clock to the decider" \
+    || fail "A27 a lit-panel press cleared the absence clock"
+[ -s "$ROOT/run/wall-occupancy/last-wake" ] \
+    && pass "A27 a lit-panel press still stamps the wake" \
+    || fail "A27 a lit-panel press wrote no wake stamp"
+# THE STAMP DOES ITS JOB: a display-off that arrives right after the press is
+# overtaken by it and declines, leaving the warning on screen.
+run panel-display-off
+eq "75" "$?" "A27 a display-off just after the press declines (exit 75)"
+eq "40" "$(brightness)" "A27 ...and the warning's screen stays lit"
+
+# A27e: THE HOLD (Sol review 1). The occupancy decider is a second backlight
+# writer when WALL_ABSENCE_ENABLED=true; the wake stamp does not stop it, so the
+# arm's hold must: an absent-room tick right after the press leaves the warning
+# lit and does not suspend, and once the hold has expired the same tick darkens.
+scenario a27-hold
+write_env "SLEEP_MODE=suspend" "WALL_ABSENCE_ENABLED=true" "SLEEP_END=00:01" "SLEEP_START=23:59" \
+          "WALL_ABSENCE_TIMEOUT_MIN=60"
+presence absent
+absent_for 600
+run power-button-wake
+eq "100" "$(brightness)" "A27 the press leaves the lit warning lit"
+run occupancy
+eq "100" "$(brightness)" "A27 an absent-room occupancy tick inside the hold cannot blank the warning"
+eq "no" "$(suspended)" "A27 ...and nothing suspends under the warning"
+grep -q 'backlight off DECLINED: the power-button warning is on screen' "$ROOT/out.log" \
+    && pass "A27 the declined off says why" \
+    || fail "A27 the declined off is not attributed to the warning"
+printf '%s' "$(( $(awk '{print int($1)}' /proc/uptime) - 1 ))" > "$ROOT/run/wall-occupancy/power-button-hold"
+run occupancy
+eq "0" "$(brightness)" "A27 once the hold has expired the same tick darkens the panel"
+printf '%s' "999999999" > "$ROOT/run/wall-occupancy/power-button-hold"
+printf '100' > "$ROOT/sys/class/backlight/intel_backlight/brightness"
+run occupancy
+eq "0" "$(brightness)" "A27 a hold stamp from before a reboot (far future) is no hold"
+
+# A27c: the lock. A power decision in flight makes the arm decline (75) rather
+# than queue; the daemon journals that and the second press still counts.
+if command -v flock >/dev/null 2>&1; then
+    scenario a27-locked
+    write_env "SLEEP_MODE=backlight"
+    printf '0' > "$ROOT/sys/class/backlight/intel_backlight/brightness"
+    prepare_script
+    ( flock 9; sleep 4 ) 9>>"$ROOT/run/wall-power.lock" &
+    holder=$!
+    sleep 0.5
+    POWER_LOCK_WAIT=1 PANEL_POWER_TEST_ROOT="$ROOT" bash "$SCRIPT_UNDER_TEST" power-button-wake \
+        > "$ROOT/out.log" 2>&1
+    eq "75" "$?" "A27 a held power lock makes power-button-wake decline with 75"
+    eq "0" "$(brightness)" "A27 ...and it wrote nothing while declining"
+    kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+else
+    fail "A27 flock is unavailable; the lock case was not exercised"
+fi
+
+# A27d: a declared verb, and the one the daemon asks for by name.
+scenario a27-usage
+write_env "SLEEP_MODE=backlight"
+run nonsense
+grep -q 'usage: .*|power-button-wake' "$ROOT/out.log" \
+    && pass "A27 the usage arm lists power-button-wake" \
+    || fail "A27 the usage arm does not list power-button-wake"
+grep -q 'WAKE_COMMAND = ("/usr/local/sbin/wall-sleep.sh", "power-button-wake")' \
+    "$DIR/wall-power-button.py" \
+    && pass "A27 wall-power-button.py invokes the power-button-wake arm by name" \
+    || fail "A27 wall-power-button.py does not invoke power-button-wake"
+
 printf '\n%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

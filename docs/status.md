@@ -12,6 +12,24 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-10-22 — SR-093/SR-094 (SN-049, OfficeWallNaglight WSN-098): the panel's power button asks before it
+shuts down. Branch `w5-power-button`, NOT merged, NOT deployed.**
+- `wall-power-button.service` runs `wall-power-button.py` inside `systemd-inhibit --what=handle-power-key
+  --mode=block`; one press publishes `armed` in `/run/wall-power-button/state.json` (IF-067) for the kiosk and
+  asks the new `wall-sleep.sh power-button-wake` arm to light a dark display; a second press within 5 s runs
+  `systemctl poweroff`; presses are de-duplicated across the two `Power Button` devices only. No kiosk
+  acknowledgement within 2 s raises a journal ALERT and, off the press path, posts it to the hub's ntfy through
+  `/usr/local/lib/wall-panel/panel-alert` and a byte-identical copy of W3a's `homehub-alert.sh` (SR-094,
+  LLR-1188/1189; the hub's address from the new wall.env knob `HUB_IP` or, for a wall.env that predates it,
+  read-only from the single IPv4 nameserver in the installed netplan; journal-only with neither).
+  The window runs on CLOCK_BOOTTIME, so a suspend ends it; a device that will not open stops the guard.
+  firstboot step 8h, knob `WALL_POWER_BUTTON_GUARD` (default true), checks the inhibitor in
+  `systemd-inhibit --list`.
+- `scripts/assert_wall_capabilities.py` names the panel's new site file `js/power-warning.js`, so this branch
+  and OfficeWallNaglight `w5-power-warning` must merge together (TC-1232 compares the two).
+- Not proven: nothing ran on the panel; that logind honours a sessionless service's inhibitor, the warning on a
+  dark screen and a real press are the installed checks and the Owner's acceptance.
+
 **2026-10-22 — SN-048 specified and built on `w3a-hub-monitoring` (HomeHub plan W3a); NOT deployed.**
 SR-085..SR-091: the shared alert helper (`stack/monitoring/homehub-alert.sh`, now also rustdesk-check's
 transport), the 30 s telemetry record with thermal/throttle/frequency alarms, the 15 min NVMe-only

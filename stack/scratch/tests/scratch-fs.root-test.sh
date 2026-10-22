@@ -138,6 +138,10 @@ free_mib="$("$PY" -c 'import os,sys; s=os.statvfs(sys.argv[1]); print(s.f_bavail
 if [[ "$o_out" == *"quota exceeded"* ]] && [ "$free_mib" -ge 64 ]; then
     ok "7 all three writers at their quotas: ${free_mib} MiB still free (floor 64)"
 else bad "7 ottertube '$o_out' free=${free_mib} MiB"; fi
+# A 1 MiB dd stops at the first block that does not fit, so up to 1 MiB of door's quota can
+# still be free, and the guard's 4 KiB probe then rightly passes (seen on the hub's kernel 147).
+# Top door off in 4 KiB blocks so it is full to the guard's own granularity first.
+nocap dd if=/dev/zero of="$MP/door/top.bin" bs=4k count=262144 conv=fsync >/dev/null 2>&1 || true
 g_full="$(guard_nocap door)"; [[ "$g_full" == *"not writable (EDQUOT)"* ]] && ok "7b the guard reports a full writer: $g_full" || bad "7b guard on a full door/: $g_full"
 
 # 8 WHY the units drop the capability: with CAP_SYS_RESOURCE root writes THROUGH the quota
@@ -145,7 +149,7 @@ dd if=/dev/zero of="$MP/door/bypass.bin" bs=1M count=8 conv=fsync >/dev/null 2>&
 by=$(( $(stat -c %s "$MP/door/bypass.bin" 2>/dev/null || echo 0) / 1048576 ))
 [ "$by" = 8 ] && ok "8 a writer holding CAP_SYS_RESOURCE wrote 8 MiB past door's full quota (the bypass the unit closes)" \
     || bad "8 bypass expected 8 MiB, wrote $by"
-rm -f "$MP"/*/fill.bin "$MP/door/bypass.bin"
+rm -f "$MP"/*/fill.bin "$MP/door/top.bin" "$MP/door/bypass.bin"
 
 # 9 read-only -> refused; rw again -> accepted
 mount -o remount,ro "$MP"; g_ro="$(guard_nocap)"; mount -o remount,rw "$MP"

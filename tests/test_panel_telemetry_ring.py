@@ -217,3 +217,36 @@ def test_tc1367_a_flat_snapshot_keeps_the_revision_comparison_llr1214(tmp_path, 
     changes = [r for r in records if r.get("event") == "mode_change"]
     assert len(changes) == 1 and changes[0]["prev_revision"] == 1
     assert changes[0]["presentation"]["payload"]["revision"] == 2
+
+
+def test_tc1367_a_failed_write_is_retried_from_the_ring_not_skipped_llr1214(tmp_path, monkeypatch):
+    """W10-sA review F4: the cursor moved to the newest entry before anything
+    was written, and the write's result was dropped, so one failed append for
+    revision 2 recorded only revision 3 and never retried 2 though the ring
+    still held it. Poll 1 fails on 2 (and so writes nothing past it); poll 2,
+    with the same ring, records 2 then 3, prev_revision chained."""
+    clocks = Clocks()
+    t0 = clocks.boottime() * 1000.0
+    first = _rec(1, t0, "TABBED")
+    ring = [first, _rec(2, t0 + 300.0, "FULL", "DOOR"), _rec(3, t0 + 700.0, "TABBED")]
+    snapshots = [
+        {"current": first, "transitions": [first]},
+        {"current": ring[-1], "transitions": ring},
+        {"current": ring[-1], "transitions": ring},
+    ]
+    real_append = telemetry._append_record
+    failed = []
+
+    def flaky_append(state_dir, record):
+        rev = (record.get("transition") or {}).get("revision")
+        if rev == 2 and not failed:
+            failed.append(rev)
+            return False
+        return real_append(state_dir, record)
+
+    monkeypatch.setattr(telemetry, "_append_record", flaky_append)
+    records = _drive(tmp_path, monkeypatch, snapshots, clocks)
+    assert failed == [2], "the injected failure never happened"
+    changes = [r for r in records if r.get("source") == "transition-ring"]
+    assert [(c["transition"]["revision"], c["prev_revision"]) for c in changes] == [(2, 1), (3, 2)], changes
+    assert all(c["cursor_lost"] is False for c in changes)

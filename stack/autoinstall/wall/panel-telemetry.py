@@ -468,7 +468,9 @@ def _write_mode_change_record(state_dir, boot_id, session_id, mono_s, presentati
 def _write_transition_record(state_dir, boot_id, session_id, mono_s, transition, prev_revision, cursor_lost):
     """One drained ring entry. Its own monotonicMs (the host's stamp) dates
     it; `cursor_lost` says transitions before it may be missing (the ring
-    overflowed between polls, or the host restarted)."""
+    overflowed between polls, or the host restarted). Returns _append_record's
+    result: the caller advances its ring cursor past this entry only when it
+    was written, so a failed write is retried from the ring next poll."""
     record = {
         "v": core.SCHEMA_VERSION,
         "ts_utc": core.now_utc_iso(),
@@ -481,7 +483,7 @@ def _write_transition_record(state_dir, boot_id, session_id, mono_s, transition,
         "prev_revision": prev_revision,
         "cursor_lost": cursor_lost,
     }
-    _append_record(state_dir, record)
+    return _append_record(state_dir, record)
 
 
 def _boottime_s():
@@ -526,15 +528,28 @@ def cmd_run(args):
                 # recorded, so a mode shorter than this 1 s poll is still a
                 # record. The ring includes `current`, so this replaces the
                 # revision comparison below rather than adding to it.
-                drained, ring_cursor, cursor_lost = core.drain_transitions(transitions, ring_cursor)
+                #
+                # THE CURSOR MOVES ONLY PAST A WRITTEN ENTRY. Taking the newest
+                # entry's cursor before writing meant one failed append (disk
+                # full, a permission lost) skipped that transition for good,
+                # though it was still in the ring (W10-sA review F4). Now the
+                # cursor follows each successful write and draining stops at the
+                # first failure; the next poll drains again from the last entry
+                # written (or, if that has left the ring meanwhile, from the
+                # host clock, with cursor_lost set on the retried entry).
+                drained, newest_cursor, cursor_lost = core.drain_transitions(transitions, ring_cursor)
+                if not drained:
+                    # First sight records nothing but still knows where it is.
+                    ring_cursor = newest_cursor
+                    if transitions:
+                        last_revision = transitions[-1].get("revision")
                 for item in drained:
-                    _write_transition_record(state_dir, boot_id, session_id, tick_start,
-                                             item, last_revision, cursor_lost)
+                    if not _write_transition_record(state_dir, boot_id, session_id, tick_start,
+                                                    item, last_revision, cursor_lost):
+                        break
+                    ring_cursor = (item.get("monotonicMs"), item.get("revision"))
                     cursor_lost = False
                     last_revision = item.get("revision")
-                if transitions:
-                    # First sight records nothing but still knows where it is.
-                    last_revision = transitions[-1].get("revision")
             else:
                 if revision is not None and last_revision is not None and revision != last_revision:
                     _write_mode_change_record(state_dir, boot_id, session_id, tick_start, presentation, last_revision)

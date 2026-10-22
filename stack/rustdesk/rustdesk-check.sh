@@ -90,6 +90,13 @@ RECREATE_TIMEOUT="$(_int "${RUSTDESK_CHECK_RECREATE_TIMEOUT:-}" 90)"
 LOCK_WAIT_SEC="$(_int "${RUSTDESK_CHECK_LOCK_WAIT_SEC:-}" 30)"
 MAX_ATTEMPTS="$(_int "${RUSTDESK_CHECK_MAX_ATTEMPTS:-}" 3)"
 BACKOFF_SEC="$(_int "${RUSTDESK_CHECK_BACKOFF_SEC:-}" 3600)"
+# The bound on each ss / iptables / ip6tables read. Overridable ONLY so the
+# hermetic rig (tests/test_rustdesk.py) survives a heavily loaded build host,
+# where a stub that is a bash script once took longer than 10 s to `cat` its
+# rules and the check reported "FENCE NOT VERIFIED". The units never set it and
+# .env is never sourced, so on the hub it is always 10, which is what the
+# LOCK_HOLD_BUDGET_SEC arithmetic above assumes.
+CMD_TIMEOUT="$(_int "${RUSTDESK_CHECK_CMD_TIMEOUT:-}" 10)"; [ "$CMD_TIMEOUT" -ge 1 ] || CMD_TIMEOUT=1
 ATTEMPTS_FILE="$STATE_DIR/recreate-attempts"
 
 # One key from .env, read as text, never sourced. Last assignment wins; strips a
@@ -140,7 +147,7 @@ MISSING_LIST=()
 check_listeners() {
     local out want proto port
     MISSING_LIST=(); SS_FAILED=0
-    out="$(timeout 10 ss -H -ltnu 2>/dev/null)" || { SS_FAILED=1; return 1; }
+    out="$(timeout "$CMD_TIMEOUT" ss -H -ltnu 2>/dev/null)" || { SS_FAILED=1; return 1; }
     for want in hbbs:tcp/21115 hbbs:tcp/21116 hbbs:udp/21116 hbbr:tcp/21117; do
         proto="${want#*:}"; port="${proto#*/}"; proto="${proto%/*}"
         if ! awk -v p="$proto" -v port="$port" '
@@ -158,7 +165,7 @@ check_listeners() {
 FENCE_WHY=""
 fence_family_ok() {
     local bin="$1" proto ports rules; shift
-    rules="$(timeout 10 "$bin" -S INPUT 2>/dev/null)" || { FENCE_WHY="$bin -S INPUT failed"; return 1; }
+    rules="$(timeout "$CMD_TIMEOUT" "$bin" -S INPUT 2>/dev/null)" || { FENCE_WHY="$bin -S INPUT failed"; return 1; }
     for proto in tcp udp; do
         # The ports the checker is about to (re)start listeners on. A marked
         # rule that does not cover ALL of them leaves some listener unfenced.

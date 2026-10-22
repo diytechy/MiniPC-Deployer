@@ -195,6 +195,27 @@ case "$GAME_RELAY_ENABLED" in
         ;;
 esac
 
+# ── SURE: THE SAME SHAPE, A KNOB AND NOT A PROFILE (SR-100, 2026-10-22) ──────
+# Sure is started by homehub-sure.service and switched by SURE_ENABLED; `sure`
+# left COMPOSE_PROFILES on 2026-10-18 because the every-boot bulk `up -d` would
+# wait on its database. Reading only COMPOSE_PROFILES here then silently dropped
+# the fork from every bake: sure-auroleap:local has no registry home, so a
+# reimaged hub could never have started Sure again. The knob decides, exactly
+# `true` (firstboot and HomeHub's backup rows read it the same way), and a
+# `sure` profile in COMPOSE_PROFILES is refused like gunmaster3 above.
+case " $ENV_PROFILES " in
+    *" sure "*)
+        die "COMPOSE_PROFILES in $ENV_FILE contains 'sure'. Sure is enabled by SURE_ENABLED=true and started by homehub-sure.service; naming the profile here makes firstboot's every-boot 'docker compose up -d' wait on Sure's database and cache before DNS, Samba and recovery. Remove sure from COMPOSE_PROFILES and set SURE_ENABLED=true instead."
+        ;;
+esac
+SURE_ENABLED="$(env_file_value "$ENV_FILE" SURE_ENABLED | tr -d '[:space:]')"
+if [ "$SURE_ENABLED" = true ]; then
+    PROFILE_ARGS+=(--profile sure)
+    log "SURE_ENABLED=true in ${ENV_FILE##*/} — baking the Sure fork and its pinned database/cache images (--profile sure)"
+else
+    log "SURE_ENABLED is not true in ${ENV_FILE##*/} — the Sure images are NOT baked"
+fi
+
 for p in $ENV_PROFILES ${EXTRA_PROFILES:-}; do
     case " ${PROFILE_ARGS[*]} " in *" $p "*) continue ;; esac
     PROFILE_ARGS+=(--profile "$p")

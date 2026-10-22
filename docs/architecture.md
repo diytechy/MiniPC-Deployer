@@ -204,10 +204,11 @@ The honest ledger of what has and has not been exercised is
 
 ### Sure beside Actual and the nightly logical ledger dump (SR-060, SR-065, LLR-1040, LLR-1045)
 
-The `sure` profile is selected by default per Owner direction 2026-10-09;
-removing it opts out. Database/cache have only the
+Sure is on by default per Owner direction 2026-10-09, switched by
+`SURE_ENABLED` and started by `homehub-sure.service` (the next flow), never by
+naming its profile in `COMPOSE_PROFILES`. Database/cache have only the
 internal network; Rails retains provider egress. FA still chooses Actual.
-Backup-source generation includes Sure only with the selected profile; logical
+Backup-source generation includes Sure only when SURE_ENABLED is true; logical
 dump tooling remains inside the matching database image. No gate or deployment
 is implied by this authored flow.
 
@@ -253,6 +254,55 @@ sequenceDiagram
     end
     end
     Note over Backup,Drive: NEVER-OFFSITE; structural checks are not a restore
+```
+
+### Sure at boot: its own unit, never the bulk `up` (SR-100, LLR-1210, LLR-1211)
+
+What blocks on what is the point of this flow: firstboot's bulk `up -d` names
+no Sure service, so a sick finance database cannot hold back DNS, Samba or
+recovery; the Sure start is queued, never awaited, because the unit is ordered
+after firstboot.
+
+```mermaid
+sequenceDiagram
+    participant FB as homehub-firstboot (every boot)
+    participant SD as systemd
+    participant Unit as homehub-sure.service
+    participant DC as docker compose
+    Note over FB,DC: SR-100, LLR-1210, LLR-1211
+    FB->>DC: up -d (COMPOSE_PROFILES, no sure)
+    FB->>SD: install + daemon-reload homehub-sure.service
+    alt SURE_ENABLED is exactly true
+        FB->>SD: enable; start --no-block
+        FB-->>SD: firstboot exits (nothing waited on Sure)
+        SD->>Unit: start (After=homehub-firstboot)
+        Unit->>Unit: ExecCondition: SURE_ENABLED=true
+        Unit->>DC: --profile sure up -d --no-build --pull never (4 services)
+        opt up -d failed (SERVICE_RESULT not success)
+            Unit->>DC: ExecStopPost stop-after-failure: --profile sure stop
+        end
+    else knob off, the unit was enabled and is active
+        FB->>SD: disable; timeout 330 systemctl stop (waits until stopped)
+        SD->>Unit: stop
+        Unit->>DC: ExecStop: --profile sure stop (web, worker, then redis, postgres)
+        FB->>DC: sure-unit.sh stop, directly (idempotent, seconds on a stopped Sure)
+    else knob off, the unit is activating, deactivating or has a job
+        FB->>SD: disable; timeout 330 systemctl stop (is-active read as text, show -p Job)
+        SD->>Unit: cancel the queued start (no hook runs), or SIGTERM the running up -d
+        opt the start was running
+            Unit->>DC: ExecStopPost stop-after-failure (SERVICE_RESULT=signal): --profile sure stop
+        end
+        FB->>DC: sure-unit.sh stop, directly (what docker restarted itself while the start waited)
+        opt the unit is failed with Result signal and the script succeeded
+            FB->>SD: reset-failed (the cancellation firstboot caused, so verify-hub stays green)
+        end
+    else knob off, the unit was enabled and is failed or inactive, no job
+        FB->>SD: disable
+        FB->>DC: sure-unit.sh stop, directly (systemctl stop of a failed unit runs nothing; no start to race)
+    else knob off or absent, unit never enabled
+        FB->>FB: log only: no Sure container is touched
+    end
+    Note over Unit,DC: restart: unless-stopped stays, so a crash or a docker restart recovers without the unit
 ```
 
 Hand-authored sequence diagrams of the behaviour that is easiest to misread

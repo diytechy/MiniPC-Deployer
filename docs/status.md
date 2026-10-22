@@ -12,6 +12,22 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-10-22 — HomeHub plan W10 shortlist, lane W10-sA, on `w10a-shortlist` (not merged, not deployed).**
+- **SR-100 / LLR-1210:** Sure has its own owner, `stack/sure/homehub-sure.service` + `sure-unit.sh`,
+  switched by `SURE_ENABLED` (exactly `true`); firstboot 4-pre-a2b installs it, enables it and queues its
+  start; `sure` is refused in `COMPOSE_PROFILES` by the bake and the resolver, which now select the fork by
+  the knob (they keyed on the profile, so every bake since 2026-10-18 had silently dropped it). TC-1360..1362.
+- **SR-101 / LLR-1212:** wall-firstboot step 5c installs the twelve unit files only user-data placed, so
+  the paired release lane can update them. TC-1363.
+- **LLR-1213:** the AI CLI hands claude its schema inline (`--json-schema` parses JSON; it was handed a
+  file path and every request died 502). TC-1364, and TC-1365 runs the real CLI with no credential.
+- **LLR-1214:** panel-telemetry drains the host's transition ring and judges freshness on CLOCK_BOOTTIME.
+  TC-1366..1367.
+- **LLR-1211:** homehub-watch gains a `docker-restarts` kind; the shipped `restart-loops` row alerts a crash
+  loop (C58's shape) that never reads unhealthy. TC-1368..1369.
+- Not proven: any of it on a real box (deploys, a lab reboot with Sure, a signed-in `POST /v1/ask`, a panel
+  suspend). The coordinator's steps are in HomeHub FOLLOWUPS.
+
 **2026-10-22 — SR-093/SR-094 (SN-049, OfficeWallNaglight WSN-098): the panel's power button asks before it
 shuts down. Branch `w5-power-button`, NOT merged, NOT deployed.**
 - `wall-power-button.service` runs `wall-power-button.py` inside `systemd-inhibit --what=handle-power-key

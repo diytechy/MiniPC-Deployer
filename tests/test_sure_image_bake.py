@@ -1,7 +1,9 @@
 """Behavioural contracts for how the Sure fork and the digest-pinned images are baked.
 
 Verifies: SR-061, LLR-1041 (image knobs, bake-time digest verification, source-ref
-check, store-independent verification of loaded images, build recipe).
+check, store-independent verification of loaded images, build recipe); TC-1362
+(SR-100, LLR-1210: the bake and the resolver select Sure by SURE_ENABLED, never by
+a `sure` entry in COMPOSE_PROFILES, which both refuse).
 
 Everything here drives the REAL scripts (vmtest/export-images.sh,
 scripts/build-sure-image.sh, and verify_loaded_image extracted verbatim from
@@ -30,7 +32,8 @@ pytestmark = [pytest.mark.full, pytest.mark.smoke]
 PG_DIG = "sha256:" + "a" * 64
 RD_DIG = "sha256:" + "b" * 64
 REF = "auroleap-integration"
-ENV_TEXT = f"""COMPOSE_PROFILES=sure
+ENV_TEXT = f"""COMPOSE_PROFILES=
+SURE_ENABLED=true
 SURE_IMAGE=sure-auroleap:local
 SURE_SOURCE_REF={REF}
 SURE_POSTGRES_IMAGE_TAG=16.15
@@ -235,6 +238,80 @@ def test_empty_source_ref_knob_refuses(tmp_path):
                       present=[("sure-auroleap:local", "sha256:fork")],
                       env_text=ENV_TEXT.replace(f"SURE_SOURCE_REF={REF}\n", "SURE_SOURCE_REF=\n"))
     assert proc.returncode != 0 and "SURE_SOURCE_REF is empty" in _text(proc)
+
+
+# ── TC-1362: the knob, not the profile, selects Sure for the bake ───────────
+# Until 2026-10-22 both scripts asked "is `sure` in COMPOSE_PROFILES"; the hub's
+# config dropped the profile on 2026-10-18 (firstboot's bulk `up -d` would wait on
+# Sure's database), so every bake since would have left out sure-auroleap:local,
+# which has no registry home: a reimaged hub could never start Sure again.
+
+def _compose_calls(stub):
+    return [l for l in (stub / "calls.log").read_text().splitlines() if l.startswith("compose ")]
+
+
+def test_tc1362_sure_enabled_bakes_the_sure_profile_sr100(tmp_path):
+    proc, out, stub = _run(tmp_path, images=["sure-auroleap:local"],
+                           present=[("sure-auroleap:local", "sha256:fork")])
+    assert proc.returncode == 0, _text(proc)
+    calls = _compose_calls(stub)
+    assert calls and all("--profile sure" in c for c in calls), calls
+    assert "SURE_ENABLED=true" in _text(proc)
+
+
+@pytest.mark.parametrize("value", ["false", "True", "", "yes"])
+def test_tc1362_anything_but_exactly_true_bakes_no_sure_sr100(tmp_path, value):
+    proc, _, stub = _run(tmp_path, images=["postgres:16.15"], present=[],
+                         env_text=ENV_TEXT.replace("SURE_ENABLED=true\n", "SURE_ENABLED=%s\n" % value))
+    calls = _compose_calls(stub)
+    assert calls and not any("--profile sure" in c for c in calls), calls
+    assert "the Sure images are NOT baked" in _text(proc)
+
+
+@pytest.mark.parametrize("profiles", ["sure", "ntfy,sure", "sure,immich"])
+def test_tc1362_a_sure_profile_is_a_refused_bake_sr100(tmp_path, profiles):
+    proc, _, stub = _run(tmp_path, images=["sure-auroleap:local"],
+                         present=[("sure-auroleap:local", "sha256:fork")],
+                         env_text=ENV_TEXT.replace("COMPOSE_PROFILES=\n", "COMPOSE_PROFILES=%s\n" % profiles))
+    assert proc.returncode != 0 and "SURE_ENABLED=true instead" in _text(proc)
+    assert _compose_calls(stub) == [], "refused before resolving anything"
+
+
+RESOLVER = ROOT / "scripts" / "ensure-local-images.sh"
+RESOLVER_DOCKER = r"""#!/usr/bin/env bash
+# `image inspect`: everything is present except the Sure fork.
+if [ "$1" = image ] && [ "$2" = inspect ]; then
+  case "$3" in sure-auroleap*) exit 1 ;; *) exit 0 ;; esac
+fi
+exit 0
+"""
+
+
+def _resolve(tmp_path, env_text):
+    bash = _bash()
+    bindir = tmp_path / "rbin"
+    bindir.mkdir(exist_ok=True)
+    _w(bindir / "docker", RESOLVER_DOCKER)
+    (bindir / "docker").chmod(0o755)
+    envfile = tmp_path / "renv"
+    _w(envfile, env_text + "ACTUAL_IMAGE_TAG=26.1.0\n")
+    env = dict(os.environ, PATH=f"{_px(bindir)}:{os.environ['PATH']}", ENV_FILE=_px(envfile))
+    return subprocess.run([bash, _px(RESOLVER), "--dry-run"], env=env, capture_output=True, text=True)
+
+
+def test_tc1362_the_resolver_builds_the_fork_only_when_sure_enabled_sr100(tmp_path):
+    proc = _resolve(tmp_path, ENV_TEXT)
+    assert proc.returncode == 0, _text(proc)
+    assert "would build: sure-auroleap:local" in _text(proc)
+    proc = _resolve(tmp_path, ENV_TEXT.replace("SURE_ENABLED=true\n", "SURE_ENABLED=false\n"))
+    assert proc.returncode == 0, _text(proc)
+    assert "would build: sure-auroleap" not in _text(proc)
+    assert "SURE_ENABLED is not true" in _text(proc)
+
+
+def test_tc1362_the_resolver_refuses_a_sure_profile_sr100(tmp_path):
+    proc = _resolve(tmp_path, ENV_TEXT.replace("COMPOSE_PROFILES=\n", "COMPOSE_PROFILES=ntfy,sure\n"))
+    assert proc.returncode != 0 and "set SURE_ENABLED=true" in _text(proc)
 
 
 # ── firstboot: verify_loaded_image, extracted verbatim ───────────────────────

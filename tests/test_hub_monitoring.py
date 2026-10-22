@@ -679,7 +679,7 @@ TABLE = (MON / "watch.table").read_text(encoding="utf-8")
 def test_the_shipped_table_parses_and_honours_its_conditions_tc1289():
     rows, problems = watch.parse_table(TABLE, {})
     assert problems == []
-    assert [r["name"] for r in rows] == ["library-backup", "containers"]
+    assert [r["name"] for r in rows] == ["library-backup", "containers", "restart-loops"]
     env = {"ICEDRIVE_MODE": "appimage", "REMOTE_UI_ENABLED": "true", "HOMEHUB_WATCH_SYNTHETIC_PROCESS": "hh-drill",
            "HOMEHUB_WATCH_SYNTHETIC_ABSENT_MIN": "5", "HOMEHUB_WATCH_DISABLE": "library-backup"}  # fmt: skip
     rows, problems = watch.parse_table(TABLE, env)
@@ -688,6 +688,7 @@ def test_the_shipped_table_parses_and_honours_its_conditions_tc1289():
         "icedrive-client",
         "icedrive-profile",
         "containers",
+        "restart-loops",
         "synthetic",
     }
     assert (
@@ -806,6 +807,151 @@ def test_container_watch_is_per_container_and_unknown_when_docker_hangs_tc1292()
     assert v is None and st2 == st
     v, st, _ = watch.judge_containers(row, st, ["sure-web"], 1300.0, "b")
     assert v == {"sure-web": True, "immich": False}
+
+
+def test_tc1368_a_restart_loop_fires_per_container_and_clears_after_a_quiet_window_llr1211():
+    """C58: Immich died every ~14 s while `docker ps` said Up and its health
+    said starting - so docker-health never fired. Only RestartCount told."""
+    row = {"name": "r", "kind": "docker-restarts", "target": "*", "threshold_s": 1800}
+    v, st, _ = watch.judge_restarts(row, {}, {"immich-server": 10, "caddy": 0}, 0.0, "b")
+    assert v == {"immich-server": False, "caddy": False}, "first sight is a baseline, never an alert"
+    v, st, what = watch.judge_restarts(row, st, {"immich-server": 31, "caddy": 0}, 300.0, "b")
+    assert v == {"immich-server": True, "caddy": False} and "immich-server +21" in what
+    v, st, _ = watch.judge_restarts(row, st, {"immich-server": 31, "caddy": 2}, 600.0, "b")
+    assert v == {"immich-server": True, "caddy": False}, "two restarts is not a loop"
+    # Thirty quiet minutes later the old samples have aged out: cleared.
+    v, st, _ = watch.judge_restarts(row, st, {"immich-server": 31, "caddy": 2}, 2500.0, "b")
+    assert v == {"immich-server": False, "caddy": False}
+
+
+def test_tc1368_a_recreated_container_a_new_boot_and_a_hung_docker_llr1211():
+    row = {"name": "r", "kind": "docker-restarts", "target": "*", "threshold_s": 1800}
+    _, st, _ = watch.judge_restarts(row, {}, {"x": 50}, 0.0, "b")
+    v, st, _ = watch.judge_restarts(row, st, {"x": 0}, 300.0, "b")
+    assert v == {"x": False}, "a count that went down is a fresh container, not -50"
+    v, st, _ = watch.judge_restarts(row, st, {"x": 4}, 600.0, "b")
+    assert v == {"x": True}
+    v, st2, _ = watch.judge_restarts(row, st, None, 700.0, "b")
+    assert v is None and st2 == st, "docker not answering changes nothing"
+    v, st, _ = watch.judge_restarts(row, st, {"x": 9}, 5.0, "b2")
+    # A new boot restarts every history, but a loop that was alerting is not
+    # declared over by a reboot: it clears only after a whole window of the new
+    # boot with fewer than three restarts (W10-sA review F3).
+    assert v == {"x": True} and st["samples"] == {"x": [[5.0, 9]]}
+    v, st, _ = watch.judge_restarts(row, st, {"x": 10}, 1000.0, "b2")
+    assert v == {"x": True}, "less than a whole window of the new boot: no clear yet"
+    v, st, _ = watch.judge_restarts(row, st, {"x": 10}, 1805.0, "b2")
+    assert v == {"x": False}, "a whole window with one restart clears"
+    v, st, _ = watch.judge_restarts(row, st, {}, 1810.0, "b2")
+    assert v == {"x": False} and st["samples"] == {} and st["looping"] == [], "a container that is gone is cleared"
+
+
+def test_tc1368_the_baseline_brackets_the_window_so_no_restart_inside_it_is_lost_llr1211():
+    """The review's sequence (poll second, count), restarts really at 100, 800
+    and 1700 s, polled about every 301 s (the timer's AccuracySec=30s allows the
+    drift). All three lie inside the 30-minute window ending at 1806; pruning
+    every sample older than the window threw away the zero baseline and the
+    watch reported +2 and never fired."""
+    row = {"name": "r", "kind": "docker-restarts", "target": "*", "threshold_s": 1800}
+    st, seen = {}, []
+    for mono, count in ((0, 0), (301, 1), (602, 1), (903, 2), (1204, 2), (1505, 2), (1806, 3)):
+        v, st, what = watch.judge_restarts(row, st, {"immich-server": count}, float(mono), "b")
+        seen.append(v["immich-server"])
+    assert seen == [False] * 6 + [True], seen
+    assert "immich-server +3" in what
+    # The baseline kept is the newest sample at or before 1806 - 1800 = 6: (0, 0).
+    assert st["samples"]["immich-server"][0] == [0.0, 0]
+    # 2107: the window (307, 2107] holds 800 and 1700 only, from the baseline
+    # (301, 1), a whole window old: fewer than three, so it clears.
+    v, st, _ = watch.judge_restarts(row, st, {"immich-server": 3}, 2107.0, "b")
+    assert v == {"immich-server": False}
+
+
+def _restart_loop_verdicts(period, poll, until, stop_at=None, jitter=()):
+    """Drive judge_restarts with a container that restarts every `period`
+    seconds (until `stop_at`), polled every `poll` seconds (plus `jitter`)."""
+    row = {"name": "r", "kind": "docker-restarts", "target": "*", "threshold_s": 1800}
+    st, out, t, i = {}, [], 0.0, 0
+    while t <= until:
+        last = t if stop_at is None else min(t, stop_at)
+        count = int(last // period)
+        v, st, _ = watch.judge_restarts(row, st, {"c": count}, t, "b")
+        out.append((t, v["c"]))
+        t += poll + (jitter[i % len(jitter)] if jitter else 0.0)
+        i += 1
+    return out
+
+
+def test_tc1368_a_steady_loop_at_the_threshold_rate_fires_and_stays_fired_llr1211():
+    """Restarts every 600 s, polled every 301 s: exactly three per window. The
+    old pruning flapped fire/clear on every poll from 1505 s on, sending
+    'stopped restarting' while the loop ran."""
+    verdicts = _restart_loop_verdicts(period=600.0, poll=301.0, until=4 * 3600.0)
+    flips = [(a[0], b[0]) for a, b in zip(verdicts, verdicts[1:]) if a[1] and not b[1]]
+    assert flips == [], "cleared while the loop ran: %r" % flips[:5]
+    first = next(t for t, bad in verdicts if bad)
+    assert first <= 1800.0 + 301.0, first
+    assert all(bad for t, bad in verdicts if t >= first)
+    # the same loop with the timer's +-30 s drift
+    drift = _restart_loop_verdicts(period=600.0, poll=301.0, until=4 * 3600.0, jitter=(25.0, -20.0, 29.0, -30.0))
+    first = next(t for t, bad in drift if bad)
+    assert all(bad for t, bad in drift if t >= first), drift
+
+
+def test_tc1368_a_loop_clears_only_after_a_whole_window_with_fewer_llr1211():
+    """The loop stops at 7200 s (last restart there). While any whole 30-minute
+    window ending at the poll still holds three restarts the verdict stays
+    fired; it clears once one does not."""
+    verdicts = _restart_loop_verdicts(period=600.0, poll=301.0, until=4 * 3600.0, stop_at=7200.0)
+    restarts = [600.0 * k for k in range(1, 13)]
+    for t, bad in verdicts:
+        inside = sum(1 for r in restarts if t - 1800.0 < r <= t)
+        if t > 1800.0 + 301.0 and inside >= 3:
+            assert bad, (t, inside)
+    cleared = [t for t, bad in verdicts if t > 7200.0 and not bad]
+    assert cleared, "never cleared after the loop stopped"
+    assert cleared[0] >= 7200.0 - 1200.0 + 1800.0, cleared[0]   # 6000 s restart left the window
+    assert all(not bad for t, bad in verdicts if t >= cleared[0])
+
+
+def test_tc1369_the_watch_alerts_a_loop_once_and_clears_it_once_llr1211(tmp_path, monkeypatch):
+    sent = []
+    monkeypatch.setattr(watch.mc, "send_alert", lambda key, prio, title, *a, **k: sent.append((key, title))
+                        or mc.ALERT_DELIVERED)  # fmt: skip
+    monkeypatch.setattr(watch, "systemctl_show", lambda unit: _show(exit_ts=2_000_000_000))
+    monkeypatch.setattr(watch, "docker_unhealthy", lambda: [])
+    counts = {"immich-server": 0}
+    monkeypatch.setattr(watch, "docker_restart_counts", lambda: dict(counts))
+    clock = {"mono": 100.0}
+    monkeypatch.setattr(watch.time, "monotonic", lambda: clock["mono"])
+    monkeypatch.setattr(watch.time, "time", lambda: 2_000_000_100.0)
+    monkeypatch.setenv("HOMEHUB_MONITOR_OVERRIDE_FILE", str(tmp_path / "no-override"))
+    _w(tmp_path / "env", "")
+    _w(tmp_path / "proc/sys/kernel/random/boot_id", "b1\n")
+    args = ["--state-dir", str(tmp_path / "st"), "--env-file", str(tmp_path / "env"), "--proc-root",
+            str(tmp_path / "proc")]  # fmt: skip
+    for mono, count in ((100.0, 0), (400.0, 21), (700.0, 42), (2900.0, 42), (3200.0, 42)):
+        clock["mono"], counts["immich-server"] = mono, count
+        assert watch.main(args) == 0
+    loops = [t for k, t in sent if k.startswith("watch-restart-loops-immich-server")]
+    assert len(loops) == 2, sent
+    assert "restarting in a loop" in loops[0] and "stopped restarting" in loops[1]
+    status = json.loads((tmp_path / "st" / "watch-status.json").read_text(encoding="utf-8"))
+    assert {r["name"]: r["verdict"] for r in status["rows"]}["restart-loops"] == "ok"
+
+
+def test_tc1369_the_restart_counts_reader_parses_docker_and_refuses_garbage_llr1211(monkeypatch):
+    outputs = iter([mc_done(b"aaaaaaaaaaaa\nbbbbbbbbbbbb\n"),
+                    mc_done(b"/immich-server 2327\n/caddy 0\nnot a line\n")])
+    monkeypatch.setattr(watch.mc, "run_bounded", lambda *a, **k: next(outputs))
+    assert watch.docker_restart_counts() == {"immich-server": 2327, "caddy": 0}
+    monkeypatch.setattr(watch.mc, "run_bounded", lambda *a, **k: mc_done(b"", ok=False))
+    assert watch.docker_restart_counts() is None
+
+
+def mc_done(output, ok=True):
+    import types as _types
+    return _types.SimpleNamespace(ok=ok, output=output)
 
 
 def test_watch_main_drill_fires_and_clears_the_synthetic_watch_tc1293(
@@ -1159,7 +1305,8 @@ def test_no_monitor_acts_on_the_box_tc1302():
             ):
                 head = node.elts[0].value
                 if head in ("systemctl", "docker") and len(node.elts) > 1:
-                    assert node.elts[1].value in ("show", "ps", "stats"), (
+                    # `inspect` is a query too (homehub-watch's restart counts).
+                    assert node.elts[1].value in ("show", "ps", "stats", "inspect"), (
                         f,
                         head,
                         node.elts[1].value,

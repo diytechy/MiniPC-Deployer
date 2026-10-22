@@ -459,6 +459,31 @@ else
     fi
 fi
 
+# ── 5c. the unit files the autoinstall used to be the only one to place ──────
+# SR-101, LLR-1212. A unit only user-data copies is FROZEN AT INSTALL TIME on a
+# live panel: the paired release lane carries exactly what this script installs
+# (HomeHub scripts/deploy/panel_system_manifest.py reads these lines), so an
+# edit to any of these deployed "green" and changed nothing. The 2026-10-14
+# audit named eight (HomeHub FOLLOWUPS); a stricter reading of the same check
+# (a unit counts as carried only when the release holds its hash, not merely
+# because a later step enables it) found five more, of which wall-door-stream
+# already had its own refresh in step 8d. Measured 2026-10-22: twelve of the
+# panel's thirteen copies equal the payload's; wall-sync.service differs only in
+# comments (its 15600 s budget was hand-patched to match 423e2ce).
+#
+# Installing is all this does: enabling stays where it always was (user-data for
+# wall-firstboot and wall-wakeprep, the steps below for the rest), and a drop-in
+# beside any of them (the panel's wall-sync-frame.timer.d/10-cadence.conf) is
+# left alone. The guard skips a unit a payload does not carry, which is the
+# release generator's convention too.
+for _u in wall-firstboot.service wall-audio-router.service wall-wakeprep.service \
+          wall-sleep.service wall-wake.service wall-occupancy.service wall-occupancy.timer \
+          wall-sync.service wall-sync-frame.service wall-sync-frame.timer \
+          wall-sync-resume.service wall-sync-suspend.service; do
+    [ -f "$PAYLOAD/$_u" ] && install -m 0644 "$PAYLOAD/$_u" "/etc/systemd/system/$_u"
+done
+systemctl daemon-reload || fail_step "daemon-reload failed after refreshing the payload's unit files"
+
 # ── 6. D-W4 — the sleep window ───────────────────────────────────────────────
 # systemd cannot interpolate an env var into OnCalendar, so the two timers are
 # GENERATED here from the one schedule both sleep modes share.

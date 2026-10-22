@@ -1414,6 +1414,157 @@ else
     log "rustdesk: no payload at $STACK_DIR/rustdesk - skipping (correct for a build without it)"
 fi
 
+# ── 4-pre-a2b. SURE: ITS OWN UNIT, NEVER COMPOSE_PROFILES (SR-100, LLR-1211) ──
+# The household ledger is started by homehub-sure.service and switched by
+# SURE_ENABLED. It is NOT a profile in COMPOSE_PROFILES, because the bulk
+# `docker compose up -d` below is all-or-nothing and would wait on Sure's
+# database and cache before DNS, Samba and the recovery supervisor (the
+# 2026-10-18 Sure deploy review; stack/sure/sure-unit.sh carries the long form).
+#
+# START IS QUEUED, NEVER WAITED FOR. The unit is After=homehub-firstboot.service,
+# so a blocking `systemctl start` from in here would wait for this very script to
+# finish - the AI CLI's start found the same trap (TC-1259). --no-block hands
+# the job to systemd, which runs it the moment firstboot exits.
+#
+# THE OFF BRANCH STOPS ONLY WHAT THIS UNIT OWNED. A box whose .env predates the
+# knob (the live hub on 2026-10-22 carries no SURE_ENABLED line, and Sure runs
+# there from its first start, `restart: unless-stopped`) must not lose its
+# finance database to an upgrade of this script: with the unit never enabled
+# there, nothing is stopped and the log says so. A unit that WAS enabled and is
+# now switched off is disabled and stopped, so the knob means what it says.
+if [ -f "$STACK_DIR/sure/homehub-sure.service" ]; then
+    install -m 0644 "$STACK_DIR/sure/homehub-sure.service" /etc/systemd/system/ 2>/dev/null || log "WARN: could not install homehub-sure.service"
+    systemctl daemon-reload 2>/dev/null || log "WARN: systemctl daemon-reload failed"
+    # THE KNOB IS READ EXACTLY AS THE UNIT AND THE BAKE READ IT. This script
+    # never sources .env, so the value is read out of the file - by the body of
+    # scripts/lib/envfile.sh env_file_value, which the bake and the image
+    # resolver use and stack/sure/sure-unit.sh copies: whitespace around the key
+    # and the `=`, the last assignment, a trailing CR dropped, one pair of
+    # surrounding ' or " removed, an unquoted ` # comment` dropped. The RustDesk
+    # idiom above (`^KEY=`, double quotes only) read SURE_ENABLED='true' or an
+    # indented line as not-true while the unit read it as true, and on an
+    # enabled box this branch then disabled and stopped Sure (Sol, W10-sA review
+    # F2). TC-1361 runs the three readers on the same lines.
+    _sure_env() {
+        local v
+        [ -f "$STACK_DIR/.env" ] || return 0
+        v="$(sed -n "s/^[[:space:]]*$1[[:space:]]*=//p" "$STACK_DIR/.env" 2>/dev/null | tail -n1)"
+        v="${v%$'\r'}"
+        v="${v#"${v%%[![:space:]]*}"}"
+        case "$v" in
+            \"*\") v="${v#\"}"; v="${v%\"}" ;;
+            \'*\') v="${v#\'}"; v="${v%\'}" ;;
+            *) v="${v%%[[:space:]]#*}"
+               v="${v%"${v##*[![:space:]]}"}" ;;
+        esac
+        v="${v//\$\$/\$}"
+        printf '%s' "$v"
+    }
+    _sure_enabled="$(_sure_env SURE_ENABLED)" || _sure_enabled=""
+    _sure_profiles="$(_sure_env COMPOSE_PROFILES | tr -d '[:space:]')" || _sure_profiles=""
+    case ",$_sure_profiles," in
+        *,sure,*) log "WARN: COMPOSE_PROFILES names 'sure'. Remove it: the bulk 'docker compose up -d' now waits on Sure's database and cache, and homehub-sure.service (SURE_ENABLED) is what starts Sure." ;;
+    esac
+    if [ "$_sure_enabled" = "true" ]; then
+        systemctl enable homehub-sure.service >/dev/null 2>&1 || log "WARN: could not enable homehub-sure.service - Sure would not come back after a reboot"
+        if systemctl start --no-block homehub-sure.service >/dev/null 2>&1; then
+            log "sure: homehub-sure.service enabled and its start queued (SURE_ENABLED=true)"
+        else
+            log "WARN: could not queue the start of homehub-sure.service; start it by hand: systemctl start homehub-sure"
+        fi
+    elif systemctl is-enabled homehub-sure.service >/dev/null 2>&1; then
+        systemctl disable homehub-sure.service >/dev/null 2>&1 || log "WARN: could not disable homehub-sure.service"
+        # A UNIT THAT IS RUNNING, OR HAS A JOB, IS STOPPED THROUGH SYSTEMD FIRST;
+        # THEN, IN EVERY CASE, THE STOP SCRIPT RUNS DIRECTLY.
+        #  - Through systemd first: active, activating, reloading, refreshing and
+        #    deactivating, and any state with a queued job. `systemctl stop`
+        #    cancels a queued start, and a running ExecStart= (`up -d` waiting
+        #    on Postgres and Redis to report healthy, up to TimeoutStartSec=)
+        #    gets SIGTERM, after which ExecStopPost= stop-after-failure stops
+        #    what it had started (SERVICE_RESULT is `signal`, measured on
+        #    systemd 255). A direct stop BEFORE that would race the start:
+        #    compose stop finishes first, then `up -d` brings all four up under
+        #    `restart: unless-stopped`, and the disabled unit's Sure comes back
+        #    every boot (Sol, W10-sA review round 2 F1). `is-active --quiet` is
+        #    not the test: it is nonzero for `activating`, so the state is read
+        #    as text. deploy_stack.py runs firstboot directly, so
+        #    After=homehub-firstboot.service does not keep a start out of this
+        #    window.
+        #  - THE STOP WAITS, BOUNDED. It must have finished before the script
+        #    runs, or the script races the start again. It cannot wait on this
+        #    script: systemd orders a stop job before a start job whatever the
+        #    After=/Before= direction, and measured on systemd 255 a blocking
+        #    `systemctl stop` issued from INSIDE the oneshot the start waits on
+        #    (After=) cancelled that start in 17 ms. 330 s is TimeoutStopSec=
+        #    plus a margin; if it runs out, the stop job carries on in systemd
+        #    (its ExecStart= has had SIGTERM), so the script below can only
+        #    stop the same containers a second time.
+        #  - Then the script, always. Cancelling a start that was WAITING (the
+        #    every-boot case: the unit is WantedBy=multi-user.target and
+        #    After=homehub-firstboot.service, so its start job waits while this
+        #    script runs) runs no ExecStart=, no ExecStop= and no ExecStopPost=
+        #    (measured), but docker has meanwhile brought Sure's four back under
+        #    `restart: unless-stopped`, as it does on any boot. Stopping only
+        #    through systemd left them running, and the now-disabled unit never
+        #    took this branch again: Sure ran for good with the knob off (Sol,
+        #    W10-sA review round 3 F1). An idle unit (inactive or failed, no
+        #    job) gets the script alone, because `systemctl stop` of it runs
+        #    nothing - a start that failed half way, from before ExecStopPost=
+        #    cleaned up or one whose clean-up failed, leaves Postgres and Redis
+        #    up (W10-sA review F1). The script stops each container in 60 s at
+        #    most; on an already stopped Sure it returns in seconds.
+        #  - An interrupted start leaves the unit failed/signal even after its
+        #    clean-up succeeded (SIGTERM is not a clean exit for a oneshot), and
+        #    verify-hub.sh then reports the system degraded and the unit FAILED
+        #    (TC-H-R01, TC-H-R02) for an off switch that worked. So when the
+        #    systemd stop finished, the script succeeded and the unit is failed
+        #    with Result `signal` - the cancellation this branch caused - it is
+        #    reset-failed. Any other failure, a stop that ran out of time, or a
+        #    clean-up that failed stays red (W10-sA review round 3 F2).
+        _sure_state="$(systemctl is-active homehub-sure.service 2>/dev/null)" || true
+        _sure_job="$(systemctl show -p Job --value homehub-sure.service 2>/dev/null)" || _sure_job=""
+        case "$_sure_state" in
+            active|activating|reloading|refreshing|deactivating) _sure_busy=1 ;;
+            *) case "${_sure_job:-0}" in 0) _sure_busy=0 ;; *) _sure_busy=1 ;; esac ;;
+        esac
+        case "${_sure_job:-0}" in
+            0) _sure_was="it was '${_sure_state:-unknown}' with no job" ;;
+            *) _sure_was="it was '${_sure_state:-unknown}' with job $_sure_job" ;;
+        esac
+        _sure_sysd=none
+        if [ "$_sure_busy" = 1 ]; then
+            if timeout 330 systemctl stop homehub-sure.service >/dev/null 2>&1; then
+                _sure_sysd=stopped
+            else
+                _sure_sysd=unfinished
+                log "WARN: the systemd stop of homehub-sure.service did not finish in 330 s ($_sure_was); its stop job carries on in systemd, and the stop script runs anyway"
+            fi
+        fi
+        if STACK_DIR="$STACK_DIR" bash "$STACK_DIR/sure/sure-unit.sh" stop; then
+            if [ "$_sure_sysd" = stopped ]; then
+                _sure_after="$(systemctl is-active homehub-sure.service 2>/dev/null)" || true
+                _sure_result="$(systemctl show -p Result --value homehub-sure.service 2>/dev/null)" || _sure_result=""
+                if [ "$_sure_after" = failed ] && [ "$_sure_result" = signal ]; then
+                    if systemctl reset-failed homehub-sure.service >/dev/null 2>&1; then
+                        log "sure: the interrupted start left homehub-sure.service failed/signal; the clean-up succeeded, so it was reset-failed"
+                    else
+                        log "WARN: could not reset-failed homehub-sure.service (failed/signal from the cancelled start); verify-hub will report it until a reboot"
+                    fi
+                fi
+                log "sure: homehub-sure.service DISABLED; $_sure_was, so it was stopped through systemd and then its stop script ran directly (SURE_ENABLED='$_sure_enabled')"
+            else
+                log "sure: homehub-sure.service DISABLED; $_sure_was, and its stop script ran directly (SURE_ENABLED='$_sure_enabled')"
+            fi
+        else
+            log "WARN: homehub-sure.service DISABLED, but its stop script failed ($_sure_was) - check: docker compose --profile sure ps"
+        fi
+    else
+        log "sure: homehub-sure.service left disabled; no Sure container was touched (SURE_ENABLED='$_sure_enabled')"
+    fi
+else
+    log "sure: no payload at $STACK_DIR/sure - skipping (correct for a build without it)"
+fi
+
 # ── 4-pre-a3. DNS CONSOLE FENCE (ADMIN_PORTAL_PLAN_2026-09-22 §4.5, D-A5) ──
 # Technitium's console (tcp/5380) fenced to loopback and the pinned admin
 # network, ABOVE Tailscale's ts-input jump - see dns-console-fence.sh for why

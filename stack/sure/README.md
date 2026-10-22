@@ -1,9 +1,47 @@
 # Sure preparation (SR-060..SR-065)
 
 The `sure` profile defines web, Sidekiq, Postgres and Redis beside Actual.
-Owner direction 2026-10-09 includes it in shipped `COMPOSE_PROFILES` and
-HomeHub materialization defaults. Remove `sure` from the profile list to opt
-out. This config change does not start an installed hub. Sure owns household logins.
+Owner direction 2026-10-09 keeps Sure ON by default, and **since 2026-10-22 the
+switch is `SURE_ENABLED`, not `COMPOSE_PROFILES`** (SR-100):
+
+- `homehub-sure.service` (this directory, with `sure-unit.sh`) is the only thing
+  that passes `--profile sure`. firstboot installs it on every boot, enables it
+  and queues its start when `SURE_ENABLED=true`, and disables and stops it when
+  the knob is switched off after it had been enabled.
+- `sure` must never be in `COMPOSE_PROFILES`: firstboot's every-boot bulk
+  `docker compose up -d` is all-or-nothing and would wait on Sure's Postgres and
+  Redis before DNS provisioning, Samba and recovery (the 2026-10-18 Sure deploy
+  review). `vmtest/export-images.sh` and `scripts/ensure-local-images.sh` refuse
+  it and read `SURE_ENABLED` instead; firstboot warns.
+- The four services keep `restart: unless-stopped`, so a crash or a
+  docker.service restart brings them back without the unit; the unit's stop
+  marks them stopped, so after a reboot it is the unit that starts them, and a
+  disabled unit keeps them off.
+- A start that fails half way (Postgres and Redis up, a health dependency never
+  ready) is cleaned up by the unit's `ExecStopPost=` (`sure-unit.sh
+  stop-after-failure`), because systemd never runs `ExecStop=` after a failed
+  start. With the knob then off, firstboot stops a failed or inactive unit
+  with no job through `sure-unit.sh stop` itself. A unit that is active,
+  activating, deactivating or has a queued job first goes through a blocking
+  `timeout 330 systemctl stop`, which cancels the start (or SIGTERMs a running
+  `up -d`, then `ExecStopPost=` stops what it had started) - a direct stop
+  before it would finish first and the start would bring all four up after it.
+  Then `sure-unit.sh stop` runs directly anyway: cancelling a start that was
+  only waiting behind firstboot (every boot) runs no hook at all, while docker
+  has already brought the four back under `restart: unless-stopped`. The stop
+  job cannot wait on firstboot: systemd orders a stop before a start whatever
+  the `After=` direction (measured on systemd 255). A cancelled running start
+  leaves the unit `failed` with Result `signal`; firstboot resets that, and only
+  that, once its stop script has succeeded, so `verify-hub.sh` does not report
+  an off switch that worked as a failed unit.
+- The knob is read the same way by the unit, firstboot and the bake (the rules of
+  `scripts/lib/envfile.sh`): `SURE_ENABLED='true'`, `"true"`, an indented line
+  or ` = ` around the key all mean on.
+- An `.env` with no `SURE_ENABLED` line (the live hub on 2026-10-22) leaves the
+  unit disabled and touches no running Sure container.
+
+Turn it off: set `SURE_ENABLED=false` in `.env`, then `systemctl disable --now
+homehub-sure`. Sure owns household logins.
 Caddy accepts `LAN_CIDR` only, proxies to `sure-web:3000`, and injects no hub
 identity. Technitium provisions `SURE_SUBDOMAIN`. No service publishes a port.
 
@@ -23,7 +61,7 @@ current bridge rejects the former even on the Actual path. Its fix must cover
 `TRACKER_FEED_USER`, `SURE_API_KEY`, `SURE_URL` and `DATA_SOURCE`. Static tests
 prove mappings and defaults only, not that the current FA accepts them.
 
-## What changes with the profile off
+## What changes with Sure off (`SURE_ENABLED` not `true`)
 
 Sure containers stay off. The Caddy site and Technitium DNS provisioning remain
 active, following the repo's current household-site convention (Caddyfile's

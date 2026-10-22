@@ -1,0 +1,60 @@
+# wall-disk-check.service — measure free space on / and the media cache once.
+#
+# Driven by wall-disk-check.timer every 15 minutes (SR-083). Writes one
+# `wall-disk: LOW|ok <label> ...` journal line per mount and replaces
+# /run/wall-disk/status.json. Exits 0 when it measured, LOW or not: the journal
+# line at warning priority IS the alarm, and a red unit would only mean "the
+# check itself broke".
+#
+# Root without capabilities, because there is nothing it needs them for: df
+# only statfs()es the two mount points, and the one writable path is its own
+# RuntimeDirectory.
+#
+# RuntimeDirectoryPreserve=yes is load-bearing. This is a Type=oneshot with no
+# RemainAfterExit, so the unit stops the moment the script exits, and without
+# the preserve systemd would delete /run/wall-disk -- and the status file the
+# panel app is meant to read -- every single time.
+[Unit]
+Description=Wall panel: low-disk check (root and the media cache)
+Documentation=file:///opt/wall-panel/stack/autoinstall/wall/README.md
+After=local-fs.target
+
+[Service]
+Type=oneshot
+# WALL_DISK_MEDIA_PATH: the media cache path firstboot resolved from
+# WALL_MEDIA_CACHE. Optional (`-`): without it the script measures the image
+# default, /var/cache/wall-media.
+EnvironmentFile=-/etc/wall-panel/wall-disk.env
+ExecStart=/usr/bin/python3 /usr/local/sbin/wall-disk-check.py
+RuntimeDirectory=wall-disk
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+UMask=0022
+TimeoutStartSec=60
+Nice=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wall-disk
+
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateNetwork=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

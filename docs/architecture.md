@@ -730,6 +730,39 @@ sequenceDiagram
     end
 ```
 
+### The panel's single log store and low-disk alarm (SR-083, LLR-1140, LLR-1141)
+
+Firstboot leaves one log store, journald, under an explicit cap; rsyslog and
+syslog.socket are masked, so nothing writes the uncapped /var/log/syslog. The
+alarm on the timer lane READS and REPORTS, it never deletes anything, and when
+it cannot measure it says so and lets the status file go stale rather than
+writing a reassuring one.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant FB as wall-firstboot.sh step 8f
+    participant RS as rsyslog.service + syslog.socket
+    participant JD as systemd-journald (10-wall-cap.conf)
+    participant DT as wall-disk-check.timer (15 min)
+    participant DC as wall-disk-check.py
+    participant S as /run/wall-disk/status.json
+
+    FB->>RS: disable rsyslog (unless already masked), mask --now both (SR-083, LLR-1140)
+    FB->>RS: is-active? either still active is a failed step, firstboot continues
+    FB->>JD: install the cap; restart only if the drop-in changed
+    FB->>DT: enable_unit, restart, is-active (LLR-1141)
+    DT->>DC: ExecStart, WALL_DISK_MEDIA_PATH from /etc/wall-panel/wall-disk.env
+    DC->>DC: df on / and the media cache; drop a path whose mount was already seen
+    alt df failed or its output did not parse
+        DC->>JD: <4> wall-disk: ERROR ...
+        Note over DC,S: exit 1, previous file untouched, it goes stale after ttlMs
+    else measured
+        DC->>JD: <4> LOW or <6> ok, one line per mount<br/>(LOW = Avail below min(10 % of size, 5 GB))
+        DC->>S: replace atomically {observedAt, ttlMs 30 min, low, mounts[]}
+    end
+```
+
 ### One memory episode on the hub: kill, reboot, hand-off (SR-050, SR-051, LLR-999, LLR-1000, LLR-1002)
 
 The supervisor's main thread never waits on a disk, journald or D-Bus; it only

@@ -40,6 +40,9 @@
 #      secret file exists and the broker never receives unrelated wall secrets.
 #  8e. Item S — enable the read-only DynamicUser thermal/CPU/presentation-mode
 #      telemetry collector (WALL_TELEMETRY_ENABLED, default true).
+#  8f. SR-083 — mask rsyslog (journald, capped explicitly, is the only log
+#      store), and run the low-disk alarm (wall-disk-check.timer, every
+#      15 min). Always on.
 #   9. Stamp the marker.
 #
 # What this script deliberately does NOT do: guess. Where a fix needs a value only
@@ -2489,6 +2492,150 @@ else
     systemctl disable --now wall-panel-telemetry.service >/dev/null 2>&1 || true
     log "SN-S: panel telemetry collector disabled"
 fi
+
+# ── 8f. SR-083 — no classic syslog, a capped journal, a low-disk alarm ──────
+# 2026-10-18 00:02: the weekly logrotate gzipped a /var/log/syslog that had
+# grown to tens of GB and filled the root for two minutes; the kiosk's cookie
+# store stopped persisting and the next restart lost the Pandora sign-in.
+# Nothing capped rsyslog's file and nothing said the disk was filling.
+#
+# Installed HERE, on every boot, rather than by a late-command, because the
+# paired release lane can only carry what this script installs: its system
+# manifest is derived from these lines. Always on -- there is no knob.
+#
+# EVERY OPERATION BELOW IS GUARDED. This script runs under `set -e`, and an
+# unguarded failure here (a full disk is the very case this block exists for)
+# would abort every later step and the failure report with it. Each one
+# records a failed step through logcap_failed and the block carries on, so
+# the unit goes RED and the marker is withheld, but nothing after this block
+# is skipped. The install lines keep the plain payload-install form (mode,
+# quoted payload source, destination) with the guard AFTER it, because the
+# release manifest generator reads exactly that form and ignores any line that
+# says fail_step. (No example path here: the payload scanners read comments.)
+#
+# * rsyslog is STOPPED, DISABLED AND MASKED on the panel, with syslog.socket.
+#   journald already holds every message under its own explicit cap (below),
+#   and nothing on the panel or in its sibling repos reads /var/log/syslog,
+#   so the classic copy was only ever a second, uncapped store. Masking it
+#   rather than re-writing its logrotate stanza leaves the rsyslog package's
+#   conffiles and the stock logrotate configuration exactly as shipped (an
+#   earlier draft diverted the conffile; Debian policy forbids diverting
+#   conffiles, so any such diversion is undone here). Mask comes first, with
+#   --now, so syslog.socket cannot re-activate rsyslog in between. Undo:
+#   systemctl unmask rsyslog.service syslog.socket && systemctl enable --now
+#   rsyslog.service -- and remove this block, or the next boot masks it again.
+#   The files rsyslog already wrote are left alone: the stock stanza rotates
+#   them only while /var/log/syslog itself exists, so the generations it left
+#   behind stay until somebody deletes them.
+# * journald's cap is tracked: the same path and values as the drop-in
+#   written on the panel by hand on 2026-09-19, so this takes it over in
+#   place. journald is restarted only when the drop-in actually changed, so
+#   an ordinary boot does not bounce it.
+#   A second drop-in turns ForwardToSyslog off (there is no syslog daemon to
+#   forward to); it is named zz-... because systemd's own syslog.conf turns
+#   it on and drop-ins merge in file-name order.
+# * wall-disk-check.timer writes `wall-disk: LOW ...` to the journal and
+#   /run/wall-disk/status.json, for / and for the media cache AT THE PATH
+#   THIS SCRIPT RESOLVED (WALL_MEDIA_CACHE), handed over in the generated
+#   /etc/wall-panel/wall-disk.env. The panel has no alert route to the hub
+#   (the telemetry collector has no network by design), so the journal line
+#   and the status file are the whole of the alarm for now. The root is 98 GB.
+# BEGIN log-cap-and-disk-alarm
+logcap_failed() { fail_step "SR-083: $*"; }
+logcap_timer_live() {   # UNIT -- restart it on the current definition and prove it is active
+    systemctl restart "$1" >/dev/null 2>&1 || return 1
+    systemctl is-active --quiet "$1"
+}
+# Undo this branch's earlier design if it ever reached this box: our stanza
+# over a diverted rsyslog conffile, and the hourly logrotate.timer drop-in.
+if dpkg-divert --list /etc/logrotate.d/rsyslog 2>/dev/null | grep -qF ' to /etc/logrotate.rsyslog.distrib'; then
+    if rm -f /etc/logrotate.d/rsyslog && dpkg-divert --rename --remove /etc/logrotate.d/rsyslog >/dev/null 2>&1; then
+        log "SR-083: removed the old diversion of /etc/logrotate.d/rsyslog; the package's stanza is back"
+    else
+        logcap_failed "could not undo the diversion of /etc/logrotate.d/rsyslog (dpkg-divert --rename --remove /etc/logrotate.d/rsyslog)"
+    fi
+fi
+if [ -e /etc/systemd/system/logrotate.timer.d/60-wall-hourly.conf ]; then
+    rm -f /etc/systemd/system/logrotate.timer.d/60-wall-hourly.conf ||
+        logcap_failed "could not remove the old hourly logrotate.timer drop-in"
+fi
+# rsyslog off. Idempotent: a unit already masked is not disabled again (that
+# errors on a masked unit) and is simply re-asserted masked and stopped.
+_syslog_units=""
+for _syslog_unit in rsyslog.service syslog.socket; do
+    case "$(systemctl show -p LoadState --value "$_syslog_unit" 2>/dev/null)" in
+        not-found|'') ;;
+        *) _syslog_units="$_syslog_units $_syslog_unit" ;;
+    esac
+done
+unset _syslog_unit
+if [ -n "$_syslog_units" ]; then
+    _syslog_ok=1
+    if [ "$(systemctl show -p LoadState --value rsyslog.service 2>/dev/null)" = loaded ]; then
+        systemctl disable rsyslog.service >/dev/null 2>&1 ||
+            { logcap_failed "could not disable rsyslog.service"; _syslog_ok=0; }
+    fi
+    # shellcheck disable=SC2086  # the unit list is two fixed names
+    systemctl mask --now $_syslog_units >/dev/null 2>&1 ||
+        { logcap_failed "could not mask and stop$_syslog_units; the uncapped /var/log/syslog may still be growing"; _syslog_ok=0; }
+    for _syslog_unit in $_syslog_units; do
+        if systemctl is-active --quiet "$_syslog_unit"; then
+            logcap_failed "$_syslog_unit is still active after mask --now"
+            _syslog_ok=0
+        fi
+    done
+    unset _syslog_unit
+    if [ "$_syslog_ok" = 1 ]; then
+        log "SR-083: classic syslog off (masked:$_syslog_units); journald is the panel's only log store"
+    fi
+    unset _syslog_ok
+fi
+unset _syslog_units
+_journald_changed=0
+cmp -s "$PAYLOAD/wall-journald.conf" /etc/systemd/journald.conf.d/10-wall-cap.conf || _journald_changed=1
+cmp -s "$PAYLOAD/wall-journald-no-syslog.conf" /etc/systemd/journald.conf.d/zz-wall-no-syslog-forward.conf || _journald_changed=1
+install -d -m 0755 /etc/systemd/journald.conf.d ||
+    logcap_failed "could not create /etc/systemd/journald.conf.d"
+install -m 0644 "$PAYLOAD/wall-journald.conf" /etc/systemd/journald.conf.d/10-wall-cap.conf || logcap_failed "could not install the journald drop-in"
+install -m 0644 "$PAYLOAD/wall-journald-no-syslog.conf" /etc/systemd/journald.conf.d/zz-wall-no-syslog-forward.conf || logcap_failed "could not install the journald no-forwarding drop-in"
+install -m 0755 "$PAYLOAD/wall-disk-check.py" /usr/local/sbin/wall-disk-check.py || logcap_failed "could not install wall-disk-check.py"
+install -m 0644 "$PAYLOAD/wall-disk-check.service" /etc/systemd/system/wall-disk-check.service || logcap_failed "could not install wall-disk-check.service"
+install -m 0644 "$PAYLOAD/wall-disk-check.timer" /etc/systemd/system/wall-disk-check.timer || logcap_failed "could not install wall-disk-check.timer"
+# The media cache path the checker measures is the one THIS script resolved
+# (wall.env's WALL_MEDIA_CACHE, defaulted in step 8), never a second copy of
+# the default. Refused rather than written when it is not a plain absolute
+# path, because systemd's EnvironmentFile parser would read it differently.
+case "$WALL_MEDIA_CACHE" in
+    /*[[:space:]]*|*[\"\'\\]*|'') logcap_failed "WALL_MEDIA_CACHE=$WALL_MEDIA_CACHE is not a plain absolute path; the disk check measures / only" ;;
+    /*)
+{
+cat > /etc/wall-panel/wall-disk.env <<EOF
+# GENERATED by wall-firstboot.sh from WALL_MEDIA_CACHE (SR-083). Read by
+# wall-disk-check.service; edit wall.env and re-run firstboot instead.
+WALL_DISK_MEDIA_PATH=$WALL_MEDIA_CACHE
+EOF
+} || logcap_failed "could not write /etc/wall-panel/wall-disk.env; the disk check falls back to /var/cache/wall-media"
+chmod 0644 /etc/wall-panel/wall-disk.env || logcap_failed "could not chmod /etc/wall-panel/wall-disk.env"
+        ;;
+    *) logcap_failed "WALL_MEDIA_CACHE=$WALL_MEDIA_CACHE is not absolute; the disk check measures / only" ;;
+esac
+systemctl daemon-reload >/dev/null 2>&1 ||
+    logcap_failed "daemon-reload failed; the disk check units are not loaded"
+if [ "$_journald_changed" = 1 ]; then
+    if systemctl restart systemd-journald >/dev/null 2>&1; then
+        log "SR-083: journald cap applied (SystemMaxUse=500M, SystemKeepFree=2G)"
+    else
+        warn "SR-083: journald did not restart; its cap applies from the next boot"
+    fi
+fi
+unset _journald_changed
+enable_unit "SR-083: low-disk alarm enabled (every 15 min; journal 'wall-disk: LOW', /run/wall-disk/status.json)" wall-disk-check.timer || :
+if logcap_timer_live wall-disk-check.timer; then
+    log "SR-083: wall-disk-check.timer active"
+else
+    logcap_failed "wall-disk-check.timer is not active after a restart; the low-disk alarm is not running"
+fi
+# END log-cap-and-disk-alarm
 
 # ── 9. done — but only if it IS done ─────────────────────────────────────────
 # The marker means "this panel is provisioned", and units, scripts and humans all

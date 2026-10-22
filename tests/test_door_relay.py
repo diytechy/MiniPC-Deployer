@@ -700,11 +700,17 @@ class FakeConsumer:
         self.wait()
 
 
-def run_gate(monkeypatch, tmp_path, capsys, probe_result=None, counters=None, frames=None, **env):
+REAL_PROGRESS_READER = dr.ProgressReader
+
+
+def run_gate(monkeypatch, tmp_path, capsys, probe_result=None, counters=None, frames=None, docker=None, **env):
+    """The gate on fakes. With `docker` (a FakeDocker) the REAL probe runs
+    against it, and every `docker run`/`docker rm` goes through it."""
     import time as real_time
     real_sleep = real_time.sleep
     s = dr.RelaySettings(write_env(tmp_path, **env))
-    monkeypatch.setattr(dr, "probe", lambda *a, **k: dict(probe_result or HEALTHY))
+    if docker is None:
+        monkeypatch.setattr(dr, "probe", lambda *a, **k: dict(probe_result or HEALTHY))
     monkeypatch.setattr(dr, "upstream_count", lambda _s: 1)
     monkeypatch.setattr(dr, "streams", lambda _s: {"producers": 1, "consumers": 2})
     seq = iter(PROGRESS if counters is None else counters)
@@ -718,13 +724,13 @@ def run_gate(monkeypatch, tmp_path, capsys, probe_result=None, counters=None, fr
 
     now = [1000.0]  # the gate's clock: advanced only by its own (fake) sleeps
 
-    class Reader(dr.ProgressReader):
+    class Reader(REAL_PROGRESS_READER):  # not dr.ProgressReader: a second run_gate in one test patched it
         def __init__(self, stream):
             super().__init__(stream, clock=lambda: now[0])
             readers.append(self)
     monkeypatch.setattr(dr, "ProgressReader", Reader)
     monkeypatch.setattr(dr.subprocess, "Popen", popen)
-    monkeypatch.setattr(dr.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(dr.subprocess, "run", docker.run if docker else (lambda *a, **k: None))
     script = iter(RECEIVING if frames is None else frames)
     written = [0]
 
@@ -862,3 +868,113 @@ def test_tc1399_consumer_bytes_reads_the_senders_counters_of_the_pinned_api(monk
         raise OSError("connection refused")
     monkeypatch.setattr(dr, "api_stream", down)
     assert dr.consumer_bytes(s) is None
+
+
+# ── TC-1399 a probe that never finishes leaves no consumer behind (review F8) ─
+#
+# Killing the docker CLI does not stop its container: --rm removes it only
+# after ffprobe exits, and against a camera that accepts TCP but never answers
+# RTSP that is never. Measured against the pinned image: the container still
+# running after the client's timeout, and a retry refused with a name conflict.
+
+
+class FakeDocker:
+    """The docker CLI as a stateful fake. `docker run --name X` is refused
+    (rc 125, name conflict) while a container X exists. A run named in `stall`
+    (once) or `interrupt` (once) loses its CLI to the deadline or to Ctrl-C
+    and LEAVES its container running, as the real one does, until
+    `docker rm -f X`."""
+
+    def __init__(self, stall=(), interrupt=()):
+        self.running, self.calls = set(), []
+        self.stall, self.interrupt = set(stall), set(interrupt)
+
+    def run(self, argv, input=None, stdout=None, stderr=None, timeout=None, **_kw):
+        argv = list(argv)
+        self.calls.append(argv)
+        if argv[:3] == ["docker", "rm", "-f"]:
+            self.running.difference_update(argv[3:])
+            return dr.subprocess.CompletedProcess(argv, 0, None, None)
+        assert argv[:2] == ["docker", "run"] and timeout is not None
+        name = argv[argv.index("--name") + 1]
+        if name in self.running:
+            return dr.subprocess.CompletedProcess(
+                argv, 125, b"", b'docker: Error response from daemon: Conflict. The container name "/%s" '
+                                b'is already in use by container "0f".' % name.encode())
+        if name in self.stall | self.interrupt:
+            self.running.add(name)  # the client dies; the container does not
+            if name in self.stall:
+                self.stall.discard(name)
+                partial = ("[rtsp @ 0x5] method DESCRIBE failed for %s" % input.decode().split("'")[1]).encode()
+                raise dr.subprocess.TimeoutExpired(argv, timeout, output=b"", stderr=partial)
+            self.interrupt.discard(name)
+            raise KeyboardInterrupt
+        # ffprobe ran to the end and exited; --rm removed its container.
+        out = json.dumps({"streams": [{"codec_name": "h264", "width": 1536, "height": 1536,
+                                       "nb_read_packets": "51", "avg_frame_rate": "10/1"}]})
+        return dr.subprocess.CompletedProcess(argv, 0, out.encode(), b"")
+
+    def removed(self, name):
+        return [c for c in self.calls if c[:3] == ["docker", "rm", "-f"] and name in c[3:]]
+
+
+def test_tc1399_a_probe_timeout_removes_its_container_and_a_retry_succeeds(monkeypatch, tmp_path):
+    s = dr.RelaySettings(write_env(tmp_path))
+    docker = FakeDocker(stall={"homehub-door-probe"})
+    monkeypatch.setattr(dr.subprocess, "run", docker.run)
+    result = dr.probe(s, 7)
+    assert result["timeout"] is True and result["rc"] == -1 and result["timeout_sec"] == 67
+    assert docker.removed("homehub-door-probe") and docker.running == set()
+    reasons = dr.probe_verdict(result, s)
+    assert any("timed out after 67 s" in r for r in reasons), reasons
+    blob = json.dumps(result)
+    assert "rtsp://***@" in blob  # the partial stderr is kept, redacted
+    for form in dr.secret_forms(s) + [s.consumer_url()]:
+        assert form not in blob
+    # The retry under the SAME fixed name is not refused.
+    again = dr.probe(s, 7)
+    assert again["rc"] == 0 and dr.probe_verdict(again, s) == []
+
+
+def test_tc1399_an_interrupted_probe_removes_its_container_and_re_raises(monkeypatch, tmp_path):
+    s = dr.RelaySettings(write_env(tmp_path))
+    docker = FakeDocker(interrupt={"homehub-door-probe"})
+    monkeypatch.setattr(dr.subprocess, "run", docker.run)
+    with pytest.raises(KeyboardInterrupt):
+        dr.probe(s, 7)
+    assert docker.removed("homehub-door-probe") and docker.running == set()
+    assert dr.probe_verdict(dr.probe(s, 7), s) == []
+
+
+def test_tc1399_the_probe_verb_fails_a_timeout_and_its_retry_passes(monkeypatch, tmp_path, capsys):
+    docker = FakeDocker(stall={"homehub-door-probe"})
+    monkeypatch.setattr(dr.subprocess, "run", docker.run)
+    monkeypatch.setattr(dr, "image_ref", lambda: "example/go2rtc:1@sha256:0")
+    env = write_env(tmp_path)
+    assert dr.main(["--env-file", env, "probe", "--seconds", "1"]) == 1
+    first = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert first["pass"] is False and first["timeout"] is True
+    assert dr.main(["--env-file", env, "probe", "--seconds", "1"]) == 0
+
+
+def test_tc1399_a_stalled_gate_probe_leaves_no_consumer_and_the_gate_reruns(monkeypatch, tmp_path, capsys):
+    docker = FakeDocker(stall={"homehub-door-gate-1"})
+    code, checks = run_gate(monkeypatch, tmp_path, capsys, docker=docker)
+    assert code == 1 and checks["readiness+geometry"]["timeout"] is True
+    assert any("timed out" in r for r in checks["readiness+geometry"]["reasons"])
+    assert docker.removed("homehub-door-gate-1") and "homehub-door-gate-1" not in docker.running
+    code, checks = run_gate(monkeypatch, tmp_path, capsys, docker=docker)
+    assert code == 0 and checks["readiness+geometry"]["reasons"] == []
+
+
+def test_tc1399_a_gate_interrupted_in_its_probe_removes_gate_1(monkeypatch, tmp_path):
+    s = dr.RelaySettings(write_env(tmp_path))
+    docker = FakeDocker(interrupt={"homehub-door-gate-1"})
+    started = []
+    monkeypatch.setattr(dr.subprocess, "run", docker.run)
+    monkeypatch.setattr(dr.subprocess, "Popen", lambda *a, **k: started.append(a) or FakeConsumer(*a, **k))
+    monkeypatch.setattr(dr, "image_ref", lambda: "example/go2rtc:1@sha256:0")
+    with pytest.raises(KeyboardInterrupt):
+        dr.gate(s, 1)
+    assert docker.removed("homehub-door-gate-1") and docker.running == set()
+    assert started == []  # nothing else was started to be left behind

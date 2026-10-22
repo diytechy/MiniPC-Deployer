@@ -526,14 +526,46 @@ def start_consumer(argv: Sequence[str], payload: bytes, stdout=subprocess.DEVNUL
     return proc
 
 
+def remove_containers(*names: str) -> None:
+    """`docker rm -f` the named consumers, bounded, output discarded. Never
+    raises: it runs on cleanup paths, where its own failure must not replace
+    the error being cleaned up after."""
+    try:
+        subprocess.run(["docker", "rm", "-f"] + list(names), stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def probe(s: RelaySettings, seconds: int = 10, name: str = "homehub-door-probe") -> Dict[str, object]:
-    """One authenticated test consumer: what it decoded and in what geometry."""
+    """One authenticated test consumer: what it decoded and in what geometry.
+
+    Killing the docker client (on the deadline, or on Ctrl-C) does NOT stop
+    the container: --rm removes it only once ffprobe exits, and against a
+    camera that accepts TCP but never answers RTSP that is never. So on any
+    way out but a normal return the named container is removed here, or it
+    would keep a camera session and refuse every retry under its fixed name.
+    A timeout is a result (rc -1, timeout true: probe_verdict fails it);
+    anything else is re-raised after the removal.
+    """
     argv, payload = relay_consumer(
         s, name, "ffprobe", ["-v", "error"],
         ["-select_streams", "v:0", "-count_packets", "-read_intervals", "%%+%d" % seconds,
          "-show_entries", "stream=codec_name,width,height,nb_read_packets,avg_frame_rate", "-of", "json"])
-    raw = subprocess.run(argv, input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         timeout=seconds + 60)
+    deadline = seconds + 60
+    try:
+        raw = subprocess.run(argv, input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             timeout=deadline)
+    except subprocess.TimeoutExpired as exc:
+        remove_containers(name)
+        partial = exc.stderr or b""
+        if isinstance(partial, bytes):
+            partial = partial.decode("utf-8", "replace")
+        return {"rc": -1, "timeout": True, "timeout_sec": deadline, "removed": name,
+                "stderr": redact(partial.strip(), s)[-400:]}
+    except BaseException:
+        remove_containers(name)
+        raise
     done = subprocess.CompletedProcess(argv, raw.returncode, raw.stdout.decode("utf-8", "replace"),
                                        raw.stderr.decode("utf-8", "replace"))
     out: Dict[str, object] = {"rc": done.returncode, "stderr": redact(done.stderr.strip(), s)[-400:]}
@@ -655,7 +687,9 @@ def probe_verdict(result: Dict[str, object], s: RelaySettings) -> List[str]:
     Used by `probe` and by the gate, so the two cannot disagree.
     Implements: LLR-1226."""
     reasons = []
-    if result.get("rc") != 0:
+    if result.get("timeout"):
+        reasons.append("probe timed out after %s s; its container was removed" % result.get("timeout_sec"))
+    elif result.get("rc") != 0:
         reasons.append("probe exited %r" % result.get("rc"))
     if result.get("parse_error"):
         reasons.append("probe output did not parse")
@@ -763,15 +797,18 @@ def gate(s: RelaySettings, seconds: int, progress_sec: int = 5) -> int:
     Implements: LLR-1226.
     """
     ok = True
-    first = probe(s, seconds, GATE_CONSUMER % 1)
-    reasons = probe_verdict(first, s)
-    emit({"check": "readiness+geometry", "pass": not reasons, "reasons": reasons, **first})
-    ok &= not reasons
-    # gate-2 leaves; gate-3 is the survivor and reports its own progress.
-    leaver = start_consumer(*gate_consumer(s, 2, progress=False))
-    survivor = start_consumer(*gate_consumer(s, 3, progress=True), stdout=subprocess.PIPE)
-    reader = ProgressReader(survivor.stdout)
+    leaver = survivor = None
+    # Every consumer the gate names - gate-1 (the probe) included - is inside
+    # the try, so no way out leaves one holding a camera session or its name.
     try:
+        first = probe(s, seconds, GATE_CONSUMER % 1)
+        reasons = probe_verdict(first, s)
+        emit({"check": "readiness+geometry", "pass": not reasons, "reasons": reasons, **first})
+        ok &= not reasons
+        # gate-2 leaves; gate-3 is the survivor and reports its own progress.
+        leaver = start_consumer(*gate_consumer(s, 2, progress=False))
+        survivor = start_consumer(*gate_consumer(s, 3, progress=True), stdout=subprocess.PIPE)
+        reader = ProgressReader(survivor.stdout)
         time.sleep(max(8, seconds))
         both = {"check": "two-consumers", "upstream_connections": upstream_count(s)}
         try:
@@ -799,9 +836,10 @@ def gate(s: RelaySettings, seconds: int, progress_sec: int = 5) -> int:
         emit(after)
         ok &= after["upstream_connections"] == 1 and after["survivor_running"] and after["survivor_progressing"]
     finally:
-        subprocess.run(["docker", "rm", "-f", GATE_CONSUMER % 2, GATE_CONSUMER % 3],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        remove_containers(GATE_CONSUMER % 1, GATE_CONSUMER % 2, GATE_CONSUMER % 3)
         for proc in (leaver, survivor):
+            if proc is None:
+                continue
             try:
                 proc.wait(timeout=20)
             except subprocess.TimeoutExpired:

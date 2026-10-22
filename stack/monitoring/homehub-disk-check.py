@@ -49,6 +49,9 @@ import monitor_common as mc  # noqa: E402
 DEFAULT_MOUNTS = "/ /var/lib/docker /boot"
 DEFAULT_PERCENT = 10.0
 DEFAULT_FLOOR_BYTES = 5 * 10**9
+# Every alert of one run must have finished this long after the run started;
+# with monitor_common.SAVE_RESERVE_SEC it fits the unit's TimeoutStartSec=60.
+ALERT_DEADLINE_SEC = 45
 
 
 def parse_mount_spec(word: str) -> Optional[Tuple[str, Optional[Tuple[str, float]]]]:
@@ -156,6 +159,7 @@ def main(argv=None) -> int:
         "--proc-root", default=os.environ.get("HOMEHUB_MONITOR_PROC_ROOT", "/proc")
     )
     args = p.parse_args(argv)
+    budget = mc.AlertBudget(ALERT_DEADLINE_SEC)
     env = mc.read_knobs(args.env_file)
 
     try:
@@ -194,41 +198,49 @@ def main(argv=None) -> int:
 
     def sender(key, prio, title, body):
         return mc.send_alert(key, prio, title, body, args.env_file, args.state_dir, helper=args.alert_helper,
-                             repeat_sec=repeat, log_tag="homehub-disk-check")  # fmt: skip
+                             repeat_sec=repeat, log_tag="homehub-disk-check", budget=budget)  # fmt: skip
 
+    pending = []
     for r in results:
         mc.log(journal_line(r), warning=r["state"] in ("low", "absent", "error"))
         if r["state"] in ("low", "ok"):
-            mc.run_episode(
+            pending.append(mc.plan_episode(
                 episodes, "disk-low-" + r["label"], r["state"] == "low",
                 ("high", "HomeHub: %s is low on space (%s free)" % (r["mount"], _gb(r["freeBytes"])),
                  "%s has %s free of %s; the alarm floor is %s. Look at: du -xh --max-depth=2 %s | sort -h | tail"
                  % (r["mount"], _gb(r["freeBytes"]), _gb(r["totalBytes"]), _gb(r["floorBytes"]), r["mount"])),
                 ("HomeHub: %s has space again (%s free)" % (r["mount"], _gb(r["freeBytes"])),
                  "%s is back above its floor of %s." % (r["mount"], _gb(r["floorBytes"]))),
-                sender,
-            )  # fmt: skip
+            ))  # fmt: skip
         if r["state"] in ("absent", "ok", "low"):
-            mc.run_episode(
+            pending.append(mc.plan_episode(
                 episodes, "disk-absent-" + r["label"], r["state"] == "absent",
                 ("high", "HomeHub: %s is not mounted" % r["mount"],
                  "%s is configured in HOMEHUB_DISK_MOUNTS but is not a mount point; anything "
                  "writing there is filling its parent filesystem instead." % r["mount"]),
                 ("HomeHub: %s is mounted again" % r["mount"], "%s is a mount point again." % r["mount"]),
-                sender,
-            )  # fmt: skip
+            ))  # fmt: skip
     mc.drop_stale_episodes(
         episodes,
         {k + r["label"] for r in results for k in ("disk-low-", "disk-absent-")},
     )
     state["episodes"] = episodes
-    if not mc.save_json_atomic(state_path, state):
-        mc.log("disk: WARN could not save %s" % state_path, True)
+    # State (every owed alert pending) and status are written before any alert
+    # is attempted, and the state again after each attempt: a slow ntfy can cost
+    # this run its alerts, never its record.
+    saved = {"ok": mc.save_json_atomic(state_path, state)}
     status = {"ts": int(time.time()), "mounts": results}
     if not mc.save_json_atomic(
         os.path.join(args.state_dir, "disk-status.json"), status
     ):
         mc.log("disk: WARN could not write disk-status.json", True)
+
+    def checkpoint():
+        saved["ok"] = mc.save_json_atomic(state_path, state)
+
+    mc.deliver_pending(episodes, pending, sender, checkpoint)
+    if not saved["ok"]:
+        mc.log("disk: WARN could not save %s" % state_path, True)
     return 0
 
 

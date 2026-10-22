@@ -50,6 +50,11 @@ import monitor_common as mc  # noqa: E402
 HERE = os.path.dirname(os.path.realpath(__file__))
 DEFAULT_TABLE = os.path.join(HERE, "watch.table")
 KINDS = ("process", "unit-success", "docker-health")
+# Every alert of one run must have finished this long after the run started;
+# with monitor_common.SAVE_RESERVE_SEC it fits the unit's TimeoutStartSec=120,
+# however many containers turn unhealthy at once while ntfy (itself a
+# container) hangs.
+ALERT_DEADLINE_SEC = 100
 SUBST = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
 
@@ -288,6 +293,7 @@ def main(argv=None) -> int:
         "--proc-root", default=os.environ.get("HOMEHUB_MONITOR_PROC_ROOT", "/proc")
     )
     args = p.parse_args(argv)
+    budget = mc.AlertBudget(ALERT_DEADLINE_SEC)
     env = mc.read_knobs(args.env_file)
     try:
         with open(args.table, encoding="utf-8") as handle:
@@ -308,9 +314,9 @@ def main(argv=None) -> int:
 
     def sender(key, prio, title, body):
         return mc.send_alert(key, prio, title, body, args.env_file, args.state_dir, helper=args.alert_helper,
-                             repeat_sec=repeat, log_tag="homehub-watch")  # fmt: skip
+                             repeat_sec=repeat, log_tag="homehub-watch", budget=budget)  # fmt: skip
 
-    status, live_keys = [], set()
+    status, live_keys, pending = [], set(), []
     for row in rows:
         name, st = row["name"], rows_state.get(row["name"], {})
         if row["kind"] == "docker-health":
@@ -327,12 +333,11 @@ def main(argv=None) -> int:
             for cname, bad in (verdicts or {}).items():
                 key = "watch-%s-%s" % (name, cname)
                 live_keys.add(key)
-                mc.run_episode(episodes, key, bad,
+                pending.append(mc.plan_episode(episodes, key, bad,
                                ("high", "HomeHub: container %s unhealthy for %dm" % (cname, row["threshold_s"] // 60),
                                 "docker reports %s unhealthy. Look at: docker inspect --format '{{json .State.Health}}' %s"
                                 % (cname, cname)),
-                               ("HomeHub: container %s is healthy again" % cname, "%s is no longer unhealthy." % cname),
-                               sender)  # fmt: skip
+                               ("HomeHub: container %s is healthy again" % cname, "%s is no longer unhealthy." % cname)))  # fmt: skip
             bad = None if verdicts is None else any(verdicts.values())
         else:
             if row["kind"] == "process":
@@ -359,10 +364,10 @@ def main(argv=None) -> int:
             key = "watch-" + name
             live_keys.add(key)
             if bad is not None:
-                mc.run_episode(episodes, key, bad,
+                pending.append(mc.plan_episode(episodes, key, bad,
                                ("high", fire_title, "%s: %s. Look at: journalctl -u homehub-watch; the watch table "
                                 "is stack/monitoring/watch.table" % (row["target"], what)),
-                               (clear_title, "%s: %s." % (row["target"], what)), sender)  # fmt: skip
+                               (clear_title, "%s: %s." % (row["target"], what))))  # fmt: skip
         rows_state[name] = st
         verdict = "unknown" if bad is None else ("FIRING" if bad else "ok")
         mc.log("watch: %-17s %-8s %s" % (name, verdict, what), warning=bool(bad))
@@ -373,10 +378,20 @@ def main(argv=None) -> int:
     for name in list(rows_state):
         if name not in {r["name"] for r in rows}:
             del rows_state[name]
-    if not mc.save_json_atomic(state_path, {"rows": rows_state, "episodes": episodes}):
-        mc.log("watch: WARN could not save %s" % state_path, True)
+    # State (every owed alert pending) and status are written before any alert
+    # is attempted, and the state again after each attempt: a slow ntfy can cost
+    # this run its alerts, never its record.
+    state = {"rows": rows_state, "episodes": episodes}
+    saved = {"ok": mc.save_json_atomic(state_path, state)}
     mc.save_json_atomic(os.path.join(args.state_dir, "watch-status.json"),
                         {"ts": int(now), "rows": status, "problems": problems})  # fmt: skip
+
+    def checkpoint():
+        saved["ok"] = mc.save_json_atomic(state_path, state)
+
+    mc.deliver_pending(episodes, pending, sender, checkpoint)
+    if not saved["ok"]:
+        mc.log("watch: WARN could not save %s" % state_path, True)
     return 0
 
 

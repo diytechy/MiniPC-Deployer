@@ -68,6 +68,11 @@ DEFAULT_DATA_DIR = "/var/lib/homehub-telemetry"
 RETENTION_FILES = 7
 CAP_BYTES = 50 * 1024 * 1024
 INTERVAL_S = 30
+# Every alert of one sample must have finished this long after the run started:
+# with monitor_common.SAVE_RESERVE_SEC it fits homehub-telemetry.service's
+# TimeoutStartSec=25, so a slow ntfy defers alerts instead of getting the run
+# killed (and the next run killed the same way, for the whole incident).
+ALERT_DEADLINE_SEC = 15
 GAP_RESET_S = 4 * INTERVAL_S
 HYSTERESIS_C = 5.0
 FILE_RE = re.compile(r"^telemetry-([0-9]{8})\.jsonl$")
@@ -588,6 +593,7 @@ def collect(
 
 
 def cmd_sample(args) -> int:
+    budget = mc.AlertBudget(ALERT_DEADLINE_SEC)
     env = mc.read_knobs(args.env_file)
     cfg = config_from_env(env)
     state_path = os.path.join(args.state_dir, "telemetry-state.json")
@@ -608,13 +614,15 @@ def cmd_sample(args) -> int:
     def sender(key, prio, title, body):
         return mc.send_alert(key, prio, title, body, args.env_file, args.state_dir, helper=args.alert_helper,
                              repeat_sec=mc.knob_int(env, "HOMEHUB_ALERT_REPEAT_SEC", 1800, 0, 86400),
-                             log_tag="homehub-telemetry")  # fmt: skip
+                             log_tag="homehub-telemetry", budget=budget)  # fmt: skip
 
-    for rule in ("cpu-temp", "nvme-temp", "throttle", "freq-floor"):
-        fire, clear = alert_texts(rule, record, cfg)
-        mc.run_episode(
-            episodes, "telemetry-" + rule, verdicts[rule], fire, clear, sender
-        )
+    # The record and the state are written BEFORE any alert is attempted, with
+    # every owed alert stored as pending: recording must never depend on ntfy,
+    # which is slowest exactly when the box is in the trouble this records.
+    pending = [
+        mc.plan_episode(episodes, "telemetry-" + rule, verdicts[rule], *alert_texts(rule, record, cfg))
+        for rule in ("cpu-temp", "nvme-temp", "throttle", "freq-floor")
+    ]  # fmt: skip
     record["alarms"] = sorted(r for r, bad in verdicts.items() if bad)
     ok, why = append_record(args.data_dir, record)
     mc.log("telemetry: %s (cpu %s C, nvme %s C, busy %s%%, alarms %s)"
@@ -628,7 +636,13 @@ def cmd_sample(args) -> int:
             "boot_id": record["boot_id"],
         }
     )
-    if not mc.save_json_atomic(state_path, state):
+    saved = {"ok": mc.save_json_atomic(state_path, state)}
+
+    def checkpoint():
+        saved["ok"] = mc.save_json_atomic(state_path, state)
+
+    mc.deliver_pending(episodes, pending, sender, checkpoint)
+    if not saved["ok"]:
         mc.log(
             "telemetry: WARN could not save %s; the next sample starts its counts again"
             % state_path,

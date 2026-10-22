@@ -37,6 +37,18 @@ factored out of `stack/rustdesk/rustdesk-check.sh` (which now calls it):
   `ALERT NOT SENT` (no usable config, no curl) or `ALERT NOT DELIVERED` (ntfy
   down). When ntfy is down **the journal line is the record**.
 
+**Record first, then alert, inside the unit's timeout.** Each run writes its
+record (the telemetry sample, the status file) and saves its episode state with
+every owed alert marked pending *before* it attempts any alert, and saves the
+state again after each attempt. All the alerts of one run share one delivery
+budget (`ALERT_DEADLINE_SEC` in each script: 15 s telemetry, 45 s disk, 100 s
+watch, 160 s liveness, counted from the start of the run), which leaves at least
+`SAVE_RESERVE_SEC` (10 s) of the unit's `TimeoutStartSec`. Each attempt's curl
+timeout is cut to what is left, and the helper's process group is killed when
+the budget ends. An alert whose turn comes with less than 4 s left is journaled
+`ALERT DEFERRED` and stays pending for the next run. A slow ntfy costs a run
+its alerts, never its record, and never gets the run killed (SR-085, LLR-1168).
+
 Subscribe: `curl -s http://<lan-ip>:<NTFY_PORT>/<topic>/json?poll=1&since=1h`.
 
 ## What each one reads, and what it never touches

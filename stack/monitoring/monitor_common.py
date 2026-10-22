@@ -6,7 +6,7 @@ one alert helper, the once-per-episode alert state machine, atomic state files,
 the mount table, the "is this filesystem on the NVMe" test, a bounded
 subprocess runner and the secrets-floor redactor.
 
-PURE WHERE IT DECIDES. read_env_text, knob_*, episode_step/episode_record,
+PURE WHERE IT DECIDES. read_env_text, knob_*, episode_step/episode_record/plan_episode,
 parse_mountinfo, redact and the DNS packet helpers do no I/O and are what the
 tests exercise directly. The thin shells (send_alert, run_bounded, load/save
 state, is_nvme_backed) take their roots and paths as arguments so a test can
@@ -35,6 +35,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Dict, List, Optional, Tuple
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -49,6 +50,19 @@ DEFAULT_ALERT_HELPER = os.path.join(HERE, "homehub-alert.sh")
 ALERT_DELIVERED = "delivered"
 ALERT_SUPPRESSED = "suppressed"
 ALERT_FAILED = "failed"
+# Not attempted: this run's delivery budget was spent before the alert's turn.
+# Like a failure it leaves the episode pending, so the next run retries it.
+ALERT_DEFERRED = "deferred"
+
+# What a run keeps back, inside its unit's TimeoutStartSec, for everything that
+# is not alert delivery: interpreter start before the budget clock starts, and
+# the state and status saves after the last alert. A monitor's
+# ALERT_DEADLINE_SEC plus this must not exceed its unit's TimeoutStartSec
+# (asserted against the unit files by the tests).
+SAVE_RESERVE_SEC = 10
+# The least time an attempt is started with: bash, the helper's config read and
+# curl's 3 s connect timeout. With less than this left the alert is deferred.
+MIN_ALERT_SEC = 4
 
 
 # ── knobs ────────────────────────────────────────────────────────────────────
@@ -234,6 +248,42 @@ def episode_record(episode: dict, action: Optional[str], delivered: bool) -> dic
     return ep
 
 
+class AlertBudget:
+    """One run's time for alert delivery, shared by every alert the run sends.
+
+    `deadline_sec` counts from construction, which each monitor does first thing
+    in main(), so the time its checks took is already spent when the alerts go
+    out. The point is that the run finishes before systemd kills it: a killed
+    run saves nothing, and the next one would send - and be killed - again.
+    """
+
+    def __init__(self, deadline_sec: float, clock=time.monotonic):
+        self._clock = clock
+        self.deadline = clock() + max(0.0, float(deadline_sec))
+
+    def remaining(self) -> float:
+        return self.deadline - self._clock()
+
+
+def _helper_pass(proc, body: bytes, limit: float):
+    """Feed the helper its body and wait at most `limit` seconds.
+
+    Returns (returncode, output bytes, timed_out). At the limit the helper's
+    whole process GROUP (bash, its `timeout`, curl) is killed, so nothing it
+    started outlives the run's budget.
+    """
+    try:
+        out, _ = proc.communicate(input=body, timeout=max(0.1, limit))
+        return proc.returncode, out or b"", False
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        try:
+            out, _ = proc.communicate(timeout=2)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            out = b""
+        return proc.returncode, out or b"", True
+
+
 def send_alert(
     key: str,
     priority: str,
@@ -246,13 +296,31 @@ def send_alert(
     timeout: int = 6,
     tags: str = "warning",
     log_tag: str = "homehub-monitor",
+    budget: Optional["AlertBudget"] = None,
 ) -> str:
-    """Raise one alert through homehub-alert.sh; returns delivered|suppressed|failed.
+    """Raise one alert through homehub-alert.sh; returns delivered|suppressed|failed|deferred.
 
     The helper writes the journal line itself (its stdout is passed through), so
     every alert is journaled whether or not ntfy took it. Bounded: the helper's
-    own curl timeout plus this outer one.
+    own curl timeout plus this outer one, which kills the helper's process
+    group. With a `budget` the attempt fits in what is left of it - curl's
+    --max-time is cut to fit and the outer limit ends with the budget - and an
+    alert whose turn comes with less than MIN_ALERT_SEC left is not attempted
+    at all (deferred, journaled here).
     """
+    hard = float(timeout + 15)
+    if budget is not None:
+        left = budget.remaining()
+        if left < MIN_ALERT_SEC:
+            log(
+                "ALERT DEFERRED (this run's alert-delivery budget is spent; the next run retries it) [%s]: %s"
+                % (key, title),
+                True,
+            )
+            return ALERT_DEFERRED
+        # The helper wraps curl in `timeout T+2`; keep a second for bash itself.
+        timeout = max(1, min(timeout, int(left) - 3))
+        hard = min(hard, left)
     # The interpreter is overridable for the dev-PC tests, where a bare "bash"
     # can resolve to the WSL launcher instead of the shell the suite runs under.
     argv = [
@@ -262,12 +330,12 @@ def send_alert(
         "--log-tag", log_tag,
     ]  # fmt: skip
     try:
-        done = subprocess.run(
+        proc = subprocess.Popen(
             argv,
-            input=body.encode("utf-8", "replace")[:4096],
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=timeout + 15,
+            start_new_session=True,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         log(
@@ -276,13 +344,71 @@ def send_alert(
             True,
         )
         return ALERT_FAILED
-    for line in done.stdout.decode("utf-8", "replace").splitlines():
-        log(line, warning=done.returncode != 0)
-    if done.returncode == 0:
+    rc, out, timed_out = _helper_pass(
+        proc, body.encode("utf-8", "replace")[:4096], hard
+    )
+    for line in out.decode("utf-8", "replace").splitlines():
+        log(line, warning=rc != 0)
+    if timed_out:
+        log(
+            "ALERT NOT DELIVERED (the alert helper was stopped after %.0fs, at this run's delivery limit) [%s]: %s"
+            % (hard, key, title),
+            True,
+        )
+        return ALERT_FAILED
+    if rc == 0:
         return ALERT_DELIVERED
-    if done.returncode == 3:
+    if rc == 3:
         return ALERT_SUPPRESSED
     return ALERT_FAILED
+
+
+def plan_episode(
+    episodes: dict,
+    key: str,
+    bad: bool,
+    fire: Tuple[str, str, str],
+    clear: Tuple[str, str],
+) -> Optional[dict]:
+    """Step one keyed episode, store it as NOT yet delivered, and return the send
+    it owes (None when it owes nothing).
+
+    Phase one of two. The episode is stored in its pending form at once, so the
+    caller can save its state BEFORE any alert is attempted: a run killed while
+    delivering has still recorded the episode, and the next run retries the
+    send. fire = (priority, title, body); clear = (title, body), sent at
+    `default` under `<key>.clear` so the rate limit on the start of an episode
+    never swallows its end.
+    """
+    episode, action = episode_step(episodes.get(key), bad)
+    episodes[key] = episode_record(episode, action, False)
+    if action == "fire":
+        return {"key": key, "action": action, "send": (key, fire[0], fire[1], fire[2])}
+    if action == "clear":
+        return {"key": key, "action": action,
+                "send": (key + ".clear", "default", clear[0], clear[1])}  # fmt: skip
+    return None
+
+
+def deliver_pending(episodes: dict, pending, sender, checkpoint=None) -> int:
+    """Phase two: attempt each owed send in order, fold each result back into
+    `episodes`, and call `checkpoint()` (the caller's state save) after every
+    attempt. `sender(key, priority, title, body)` returns
+    delivered|suppressed|failed|deferred; anything but delivered leaves the
+    episode pending for the next run. Returns how many were not delivered.
+    """
+    undelivered = 0
+    for item in pending:
+        if item is None:
+            continue
+        delivered = sender(*item["send"]) == ALERT_DELIVERED
+        episodes[item["key"]] = episode_record(
+            episodes[item["key"]], item["action"], delivered
+        )
+        undelivered += 0 if delivered else 1
+        if checkpoint is not None:
+            checkpoint()
+    return undelivered
 
 
 def run_episode(
@@ -293,22 +419,9 @@ def run_episode(
     clear: Tuple[str, str],
     sender,
 ) -> None:
-    """Step one keyed episode and send what it asks for, in place.
-
-    fire = (priority, title, body); clear = (title, body), sent at `default`.
-    `sender(key, priority, title, body)` returns delivered|suppressed|failed.
-    The clear goes out under its own key (`<key>.clear`) so the rate limit on
-    the start of an episode never swallows its end.
-    """
-    episode, action = episode_step(episodes.get(key), bad)
-    delivered = False
-    if action == "fire":
-        delivered = sender(key, fire[0], fire[1], fire[2]) == ALERT_DELIVERED
-    elif action == "clear":
-        delivered = (
-            sender(key + ".clear", "default", clear[0], clear[1]) == ALERT_DELIVERED
-        )
-    episodes[key] = episode_record(episode, action, delivered)
+    """plan_episode then deliver_pending for one episode, with no save between
+    them. The monitors use the two phases; this is the one-step form."""
+    deliver_pending(episodes, [plan_episode(episodes, key, bad, fire, clear)], sender)
 
 
 def drop_stale_episodes(episodes: dict, live_keys) -> None:

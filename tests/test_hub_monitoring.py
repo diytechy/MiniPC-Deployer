@@ -3,8 +3,8 @@ episode machine, the telemetry record and its alarms, the low-disk alarm, the
 watched jobs, and the liveness probe with its evidence bundle.
 
 Verifies: SR-085, SR-086, SR-087, SR-088, SR-089
-          LLR-1147 .. LLR-1166
-Cases:    TC-1275 .. TC-1305
+          LLR-1147 .. LLR-1166, LLR-1168
+Cases:    TC-1275 .. TC-1305, TC-1313
 
 Everything here is hermetic: fake sysfs/procfs trees in tmp_path, a stub alert
 helper or a stub curl, injected statfs/runner/writer seams. The Linux-only
@@ -1295,3 +1295,223 @@ def test_env_example_declares_every_monitoring_knob_tc1304():
     for k in ("HOMEHUB_TELEMETRY_ENABLED", "HOMEHUB_DISK_CHECK_ENABLED", "HOMEHUB_WATCH_ENABLED",
               "HOMEHUB_LIVENESS_ENABLED"):  # fmt: skip
         assert re.search("^%s=true$" % k, ENVEX.read_text(encoding="utf-8"), re.M)
+
+
+# ── delivery budget: record first, alerts within the unit's timeout (SR-085, LLR-1168) ──
+
+HOT = dict(cpu_c=99, nvme_c=99, mhz=(400, 400), throttle=(5, 5),
+           stat_line="cpu  1100 0 1100 810 0 0 0 0 0 0\n")  # fmt: skip
+RULE_KEYS = ["telemetry-cpu-temp", "telemetry-nvme-temp", "telemetry-throttle", "telemetry-freq-floor"]
+
+
+class _FakeClock:
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def _tel_rig(tmp_path, monkeypatch):
+    """telemetry main() over a fake machine where sample 2 raises all four alarms at once."""
+    monkeypatch.setenv("HOMEHUB_MONITOR_OVERRIDE_FILE", str(tmp_path / "no-override"))
+    _w(tmp_path / "env", "HOMEHUB_THERMAL_SAMPLES=1\nHOMEHUB_FREQ_SAMPLES=1\nLAN_IP=192.0.2.10\nNTFY_PORT=8081\n")
+    data, st = tmp_path / "data", tmp_path / "st"
+
+    def run(helper=None, **machine):
+        sysr, procr = _fake_machine(tmp_path / "m", **machine)
+        argv = ["--data-dir", str(data), "--state-dir", str(st), "--env-file", str(tmp_path / "env"),
+                "--sys-root", str(sysr), "--proc-root", str(procr)]  # fmt: skip
+        if helper:
+            argv += ["--alert-helper", str(helper)]
+        return tel.main(argv + ["sample"])
+
+    def lines():
+        files = sorted(data.glob("telemetry-*.jsonl"))
+        return files[0].read_text(encoding="utf-8").splitlines() if files else []
+
+    def episodes():
+        p = st / "telemetry-state.json"
+        return json.loads(p.read_text(encoding="utf-8")).get("episodes", {}) if p.exists() else {}
+
+    return run, lines, episodes
+
+
+def _pending(eps, keys):
+    return all(eps.get(k, {}).get("active") is True and eps[k].get("fired") is False for k in keys)
+
+
+def _hung_helper(tmp_path):
+    """An alert helper that records the call and then never returns (ntfy hung)."""
+    calls = tmp_path / "calls"
+    hung = _w(tmp_path / "hung.sh", 'echo "$@" >>"%s"\nexec sleep 30\n' % calls.as_posix())
+    return hung, calls
+
+
+def test_alert_budget_defers_an_alert_without_running_the_helper_tc1313(tmp_path):
+    clock = _FakeClock()
+    budget = mc.AlertBudget(10, clock=clock)
+    assert budget.remaining() == 10
+    clock.t += 10 - mc.MIN_ALERT_SEC + 0.5
+    got = mc.send_alert("k", "high", "t", "b", "/env", str(tmp_path), helper=str(tmp_path / "absent.sh"),
+                        budget=budget)  # fmt: skip
+    assert got == mc.ALERT_DEFERRED, "too little left: not attempted, and not a delivery"
+    eps = {}
+    item = mc.plan_episode(eps, "k", True, FIRE, CLEAR)
+    assert eps["k"] == {"active": True, "fired": False, "clear_pending": False}, "planned = stored as pending"
+    assert mc.deliver_pending(eps, [item], lambda *a: mc.ALERT_DEFERRED) == 1
+    assert eps["k"]["fired"] is False, "a deferred alert stays pending for the next run"
+
+
+@needs_bash
+def test_send_alert_cuts_the_helper_to_the_budget_and_stops_it_there_tc1313(tmp_path, monkeypatch):
+    import time as _t
+
+    hung, calls = _hung_helper(tmp_path)
+    monkeypatch.setenv("HOMEHUB_ALERT_BASH", _bash)
+    t0 = _t.monotonic()
+    got = mc.send_alert("k", "high", "t", "b", "/env", str(tmp_path / "st"), helper=str(hung),
+                        budget=mc.AlertBudget(5))  # fmt: skip
+    took = _t.monotonic() - t0
+    assert got == mc.ALERT_FAILED and took < 8, took
+    assert re.search(r"--timeout [12]( |$)", calls.read_text(encoding="utf-8")), (
+        "curl's --max-time is cut to what the budget leaves"
+    )
+
+
+def test_telemetry_records_and_saves_every_alert_pending_before_sending_tc1313(tmp_path, monkeypatch):
+    run, lines, episodes = _tel_rig(tmp_path, monkeypatch)
+    seen = []
+
+    def sender(key, *a, **k):
+        seen.append((key, len(lines()), episodes()))
+        return mc.ALERT_FAILED
+
+    monkeypatch.setattr(tel.mc, "send_alert", sender)
+    assert run() == 0 and seen == []
+    assert run(**HOT) == 0
+    assert [k for k, _, _ in seen] == RULE_KEYS
+    _, n_lines, saved = seen[0]
+    assert n_lines == 2, "the sample is on disk before the first alert is attempted"
+    assert json.loads(lines()[-1])["alarms"] == ["cpu-temp", "freq-floor", "nvme-temp", "throttle"]
+    assert _pending(saved, RULE_KEYS), "every owed alert is saved as pending before the first attempt"
+    assert _pending(seen[-1][2], RULE_KEYS[-1:]) and seen[-1][2][RULE_KEYS[0]]["fired"] is False
+    assert _pending(episodes(), RULE_KEYS), "undelivered: all four still pending"
+    monkeypatch.setattr(tel.mc, "send_alert", lambda key, *a, **k: seen.append((key, 0, {})) or mc.ALERT_DELIVERED)
+    assert run(**HOT) == 0
+    assert [k for k, _, _ in seen[4:]] == RULE_KEYS, "the next run retries all four"
+    assert all(episodes()[k]["fired"] for k in RULE_KEYS)
+
+
+@needs_bash
+def test_simultaneous_alarms_and_a_hung_ntfy_fit_the_telemetry_deadline_tc1313(tmp_path, monkeypatch, capsys):
+    """The real send_alert, a helper that hangs, four alarms at once: the run ends
+    at its deadline (scaled down to 6 s here) with the sample and every alert
+    saved as pending, instead of being killed by its unit with nothing saved."""
+    import time as _t
+
+    hung, calls = _hung_helper(tmp_path)
+    good = _w(tmp_path / "good.sh", 'echo "stub delivered"\nexit 0\n')
+    monkeypatch.setenv("HOMEHUB_ALERT_BASH", _bash)
+    monkeypatch.setattr(tel, "ALERT_DEADLINE_SEC", 6)
+    run, lines, episodes = _tel_rig(tmp_path, monkeypatch)
+    assert run(helper=hung) == 0
+    t0 = _t.monotonic()
+    assert run(helper=hung, **HOT) == 0
+    took = _t.monotonic() - t0
+    out = capsys.readouterr().out
+    assert took < 6 + 3, "the run must end at its delivery deadline (took %.1fs)" % took
+    assert len(lines()) == 2 and json.loads(lines()[-1])["alarms"]
+    assert _pending(episodes(), RULE_KEYS)
+    assert len(calls.read_text(encoding="utf-8").splitlines()) == 1, "one attempt, then the budget is spent"
+    assert out.count("ALERT DEFERRED") == 3 and "stopped after" in out
+    assert run(helper=good, **HOT) == 0
+    assert all(episodes()[k]["fired"] for k in RULE_KEYS), "delivered on the next run"
+
+
+@needs_bash
+def test_many_unhealthy_containers_and_a_hung_ntfy_fit_the_watch_deadline_tc1313(tmp_path, monkeypatch, capsys):
+    import time as _t
+
+    hung, calls = _hung_helper(tmp_path)
+    # The helper copies the state file as it stands when the first alert goes out.
+    hung = _w(tmp_path / "hung-snap.sh", 'cp "$SNAP_SRC" "$SNAP_DST" 2>/dev/null\nexec bash "%s" "$@"\n' % hung.as_posix())
+    monkeypatch.setenv("SNAP_SRC", str(tmp_path / "st" / "watch-state.json"))
+    monkeypatch.setenv("SNAP_DST", str(tmp_path / "snap.json"))
+    monkeypatch.setenv("HOMEHUB_ALERT_BASH", _bash)
+    monkeypatch.setattr(watch, "ALERT_DEADLINE_SEC", 6)
+    names = ["c%d" % i for i in range(8)]
+    monkeypatch.setattr(watch, "docker_unhealthy", lambda: list(names))
+    monkeypatch.setattr(watch, "systemctl_show", lambda unit: _show(exit_ts=2_000_000_000))
+    clock = {"mono": 100.0}
+    monkeypatch.setattr(watch.time, "monotonic", lambda: clock["mono"])
+    monkeypatch.setattr(watch.time, "time", lambda: 2_000_000_100.0)
+    monkeypatch.setenv("HOMEHUB_MONITOR_OVERRIDE_FILE", str(tmp_path / "no-override"))
+    _w(tmp_path / "env", "LAN_IP=192.0.2.10\nNTFY_PORT=8081\n")
+    _w(tmp_path / "proc/sys/kernel/random/boot_id", "b1\n")
+    args = ["--state-dir", str(tmp_path / "st"), "--env-file", str(tmp_path / "env"), "--proc-root",
+            str(tmp_path / "proc"), "--alert-helper", str(hung)]  # fmt: skip
+    assert watch.main(args) == 0
+    clock["mono"] = 100.0 + 11 * 60
+    t0 = _t.perf_counter()
+    assert watch.main(args) == 0
+    took = _t.perf_counter() - t0
+    keys = ["watch-containers-" + n for n in names]
+    saved = json.loads((tmp_path / "st" / "watch-state.json").read_text(encoding="utf-8"))
+    assert took < 6 + 3, took
+    assert _pending(saved["episodes"], keys), "eight unhealthy containers, all saved as pending"
+    snap = json.loads((tmp_path / "snap.json").read_text(encoding="utf-8"))
+    assert _pending(snap["episodes"], keys), "saved as pending BEFORE the first alert was attempted"
+    assert len(calls.read_text(encoding="utf-8").splitlines()) == 1
+    assert capsys.readouterr().out.count("ALERT DEFERRED") == 7
+    assert (tmp_path / "st" / "watch-status.json").exists()
+
+
+def test_every_monitor_runs_its_alerts_on_one_budget_that_fits_its_unit_tc1313(tmp_path, monkeypatch):
+    """Each monitor builds ONE AlertBudget at the start of main() and passes it to
+    every send; its deadline plus the save reserve fits the unit's TimeoutStartSec;
+    and the disk and liveness state is on disk, pending, before the first send."""
+    import time as _t
+
+    for module, unit in ((tel, "homehub-telemetry"), (disk, "homehub-disk-check"),
+                         (watch, "homehub-watch"), (live, "homehub-liveness")):  # fmt: skip
+        svc = (MON / (unit + ".service")).read_text(encoding="utf-8")
+        limit = int(re.search(r"^TimeoutStartSec=(\d+)$", svc, re.M).group(1))
+        assert 0 < module.ALERT_DEADLINE_SEC and module.ALERT_DEADLINE_SEC + mc.SAVE_RESERVE_SEC <= limit, unit
+
+    def capture(module, state_file, into):
+        def sender(key, prio, title, body, env_file, state_dir, **k):
+            p = tmp_path / "st" / state_file
+            into.append((key, k.get("budget"), json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}))
+            return mc.ALERT_FAILED
+
+        monkeypatch.setattr(module.mc, "send_alert", sender)
+
+    monkeypatch.setenv("HOMEHUB_MONITOR_OVERRIDE_FILE", str(tmp_path / "no-override"))
+    got = []
+    capture(disk, "disk-state.json", got)
+    monkeypatch.setattr(disk.mc, "is_nvme_backed", lambda mm, root: True)
+    monkeypatch.setattr(disk.os, "statvfs", lambda p: type("S", (), {"f_blocks": 100, "f_frsize": 10**8,
+                                                                    "f_bavail": 1})(), raising=False)  # fmt: skip
+    _w(tmp_path / "proc/self/mountinfo", "29 1 253:0 / / rw - ext4 /dev/vg rw\n31 29 259:2 / /boot rw - ext4 /dev/n rw\n")
+    _w(tmp_path / "env", 'HOMEHUB_DISK_MOUNTS="/ /boot"\n')
+    t0 = _t.monotonic()
+    disk.main(["--state-dir", str(tmp_path / "st"), "--env-file", str(tmp_path / "env"),
+               "--proc-root", str(tmp_path / "proc")])  # fmt: skip
+    assert [k for k, _, _ in got] == ["disk-low-root", "disk-low-boot"]
+    assert got[0][1] is got[1][1] and isinstance(got[0][1], mc.AlertBudget), "one budget for the run"
+    assert abs(got[0][1].deadline - (t0 + disk.ALERT_DEADLINE_SEC)) < 2
+    assert _pending(got[0][2]["episodes"], ["disk-low-root", "disk-low-boot"])
+
+    got = []
+    capture(live, "liveness-state.json", got)
+    monkeypatch.setattr(live.ev, "capture", lambda root, seq, plan, checks: {"path": root + "/b", "complete": True,
+                                                                            "prune": {"errors": []}})  # fmt: skip
+    monkeypatch.setattr(live, "check_dns", lambda s, n: (False, "down"))
+    monkeypatch.setattr(live, "check_https", lambda h, p, n: (True, "ok"))
+    monkeypatch.setattr(live, "check_docker", lambda: (True, "ok"))
+    _w(tmp_path / "env", "HOMEHUB_LIVENESS_FAILURES=1\n")
+    live.main(["--state-dir", str(tmp_path / "st"), "--env-file", str(tmp_path / "env"),
+               "--evidence-dir", str(tmp_path / "ev")])  # fmt: skip
+    assert [k for k, _, _ in got] == ["liveness"] and isinstance(got[0][1], mc.AlertBudget)
+    assert _pending(got[0][2]["episodes"], ["liveness"]) and got[0][2]["incident"]["incident"]

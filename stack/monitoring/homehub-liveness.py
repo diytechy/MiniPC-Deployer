@@ -52,6 +52,11 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import homehub_evidence as ev  # noqa: E402
 import monitor_common as mc  # noqa: E402
 
+# Every alert of one run must have finished this long after the run started -
+# after the checks and any evidence capture (its own 90 s deadline) - and with
+# monitor_common.SAVE_RESERVE_SEC it fits the unit's TimeoutStartSec=180.
+ALERT_DEADLINE_SEC = 160
+
 
 def targets_from_env(env: Dict[str, str]) -> dict:
     """The probe's targets and thresholds from the stack .env (pure)."""
@@ -181,6 +186,7 @@ def main(argv=None) -> int:
         "--proc-root", default=os.environ.get("HOMEHUB_MONITOR_PROC_ROOT", "/proc")
     )
     args = p.parse_args(argv)
+    budget = mc.AlertBudget(ALERT_DEADLINE_SEC)
     env = mc.read_knobs(args.env_file)
     t = targets_from_env(env)
 
@@ -213,7 +219,7 @@ def main(argv=None) -> int:
 
     def sender(key, prio, title, body):
         return mc.send_alert(key, prio, title, body, args.env_file, args.state_dir, helper=args.alert_helper,
-                             repeat_sec=repeat, log_tag="homehub-liveness")  # fmt: skip
+                             repeat_sec=repeat, log_tag="homehub-liveness", budget=budget)  # fmt: skip
 
     if event == "open":
         checks = {k: {"ok": ok, "detail": d} for k, (ok, d) in results.items()}
@@ -232,21 +238,29 @@ def main(argv=None) -> int:
     fire_body = "%d consecutive liveness runs failed: %s. Evidence: %s%s" % (
         inc.get("failures", 0), "; ".join("%s: %s" % (k, results[k][1]) for k in failing) or "see journal",
         inc.get("bundle", "?"), "" if inc.get("bundle_complete", True) else " (incomplete)")  # fmt: skip
-    mc.run_episode(
+    pending = [mc.plan_episode(
         episodes, "liveness", bool(inc.get("incident")),
         ("urgent", "HomeHub: liveness failing (%s)" % (", ".join(failing) or "see journal"), fire_body),
         ("HomeHub: liveness restored", "DNS, HTTPS and docker all answered again. Evidence from the "
          "incident: %s" % inc.get("bundle", "?")),
-        sender,
-    )  # fmt: skip
+    )]  # fmt: skip
+    # State (the owed alert pending) and status are written before the alert is
+    # attempted, and the state again after it: a slow ntfy can cost this run its
+    # alert, never its incident record.
     state.update(incident=inc, episodes=episodes)
-    if not mc.save_json_atomic(state_path, state):
-        mc.log("liveness: WARN could not save %s" % state_path, True)
+    saved = {"ok": mc.save_json_atomic(state_path, state)}
     mc.save_json_atomic(os.path.join(args.state_dir, "liveness-status.json"), {
         "ts": int(time.time()), "ok": all_ok,
         "checks": {k: {"ok": ok, "detail": d} for k, (ok, d) in results.items()},
         "incident": bool(inc.get("incident")), "bundle": inc.get("bundle"),
     })  # fmt: skip
+
+    def checkpoint():
+        saved["ok"] = mc.save_json_atomic(state_path, state)
+
+    mc.deliver_pending(episodes, pending, sender, checkpoint)
+    if not saved["ok"]:
+        mc.log("liveness: WARN could not save %s" % state_path, True)
     return 0
 
 

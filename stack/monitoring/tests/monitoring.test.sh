@@ -9,7 +9,9 @@
 #   * the alert helper bounded against a curl that hangs (TC-1308);
 #   * a docker that blocks for ever, and a journalctl that floods, killed with
 #     their whole process group at the evidence item's timeout and cap
-#     (TC-1309, TC-1310), and a descendant that escapes the group (TC-1312).
+#     (TC-1309, TC-1310), and a descendant that escapes the group (TC-1312);
+#   * four simultaneous alarms against a hung ntfy, through the real helper
+#     and the shipped delivery deadline (TC-1314).
 # Nothing here needs root, a network, docker or a real disk.
 #
 # Run by stack/run-hermetic-tests.sh.
@@ -172,6 +174,64 @@ print("timed_out=%s" % r.timed_out)
 else
     echo "SKIP  TC-1312 (no setsid)"
 fi
+
+# ── four alarms at once and a hung ntfy, through the REAL deadline path ────
+# The real telemetry script, the real alert helper, a curl that never returns
+# and the shipped ALERT_DEADLINE_SEC: the run must finish inside the unit's
+# TimeoutStartSec with the sample appended and all four alerts saved as pending
+# (TC-1314). Before the fix, four serial alerts could outlast the unit and the
+# kill took the sample and the state with it.
+H="$TMP/hot"
+hot_machine() { # cpu_millic nvme_millic khz throttle stat_line
+    mkdir -p "$H/sys/class/thermal/thermal_zone0" "$H/sys/class/hwmon/hwmon1" \
+             "$H/sys/devices/system/cpu/cpu0/cpufreq" "$H/sys/devices/system/cpu/cpu0/thermal_throttle" \
+             "$H/proc/pressure" "$H/proc/self" "$H/proc/sys/kernel/random"
+    echo x86_pkg_temp >"$H/sys/class/thermal/thermal_zone0/type"
+    echo "$1" >"$H/sys/class/thermal/thermal_zone0/temp"
+    echo nvme >"$H/sys/class/hwmon/hwmon1/name"
+    echo Composite >"$H/sys/class/hwmon/hwmon1/temp1_label"
+    echo "$2" >"$H/sys/class/hwmon/hwmon1/temp1_input"
+    echo "$3" >"$H/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"
+    echo "$4" >"$H/sys/devices/system/cpu/cpu0/thermal_throttle/core_throttle_count"
+    echo "$4" >"$H/sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count"
+    echo "$5" >"$H/proc/stat"
+    echo "0.50 0.40 0.30 1/200 999" >"$H/proc/loadavg"
+    echo "some avg10=1.00 avg60=0.50 avg300=0.1 total=1" >"$H/proc/pressure/cpu"
+    echo "29 1 253:0 / / rw - ext4 /dev/mapper/vg-root rw" >"$H/proc/self/mountinfo"
+    echo hotboot >"$H/proc/sys/kernel/random/boot_id"
+}
+printf 'LAN_IP=192.0.2.10\nNTFY_PORT=8081\nHOMEHUB_THERMAL_SAMPLES=1\nHOMEHUB_FREQ_SAMPLES=1\n' >"$H.env"
+printf '#!/usr/bin/env bash\nexec sleep %s\n' "$NAP" >"$TMP/bin/curl"
+chmod +x "$TMP/bin/curl"
+tel_run() {
+    PATH="$TMP/bin:$PATH" python3 "$MON/homehub-telemetry.py" --data-dir "$H/data" --state-dir "$H/st" \
+        --env-file "$H.env" --alert-helper "$MON/homehub-alert.sh" --sys-root "$H/sys" --proc-root "$H/proc" sample 2>&1
+}
+hot_machine 50000 40000 2000000 0 'cpu  100 0 100 800 0 0 0 0 0 0'
+tel_run >/dev/null
+hot_machine 99000 99000 400000 5 'cpu  1100 0 1100 810 0 0 0 0 0 0'
+limit="$(sed -n 's/^TimeoutStartSec=\([0-9]*\)$/\1/p' "$MON/homehub-telemetry.service")"
+start=$(date +%s)
+out="$(tel_run)"; rc=$?
+took=$(( $(date +%s) - start ))
+leftover="$(pgrep -f "sleep $NAP" | wc -l)"
+verdict="$(python3 - "$H" <<'EOF'
+import glob, json, sys
+lines = open(glob.glob(sys.argv[1] + "/data/telemetry-*.jsonl")[0]).read().splitlines()
+eps = json.load(open(sys.argv[1] + "/st/telemetry-state.json"))["episodes"]
+keys = ["telemetry-" + r for r in ("cpu-temp", "nvme-temp", "throttle", "freq-floor")]
+pending = all(eps[k]["active"] and not eps[k]["fired"] for k in keys)
+print("lines=%d alarms=%d pending=%s" % (len(lines), len(json.loads(lines[-1])["alarms"]), pending))
+EOF
+)"
+if [ "$rc" = 0 ] && [ -n "$limit" ] && [ "$took" -lt "$limit" ] && [ "$verdict" = "lines=2 alarms=4 pending=True" ] \
+   && printf '%s' "$out" | grep -q 'ALERT NOT DELIVERED' && printf '%s' "$out" | grep -q 'ALERT DEFERRED' \
+   && [ "$leftover" = 0 ]; then
+    pass "TC-1314 four alarms and a hung ntfy: done in ${took}s of the unit's ${limit}s, sample and pending alerts saved"
+else
+    fail "TC-1314 rc=$rc took=${took}s limit=$limit leftover=$leftover verdict=$verdict out=$out"
+fi
+pkill -f "sleep $NAP" 2>/dev/null
 
 mode="$(stat -c %a "$TMP/ev")"
 if [ "$mode" = 700 ]; then pass "TC-1310 the evidence root is 0700"; else fail "TC-1310 evidence root mode $mode"; fi

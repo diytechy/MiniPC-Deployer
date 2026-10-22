@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import json
 import os
 import re
@@ -387,6 +388,55 @@ def redact_run(s: RelaySettings, argv: Sequence[str], out=None) -> int:
     return rc if rc >= 0 else 128 - rc
 
 
+class Stopped(SystemExit):
+    """A SIGTERM or SIGHUP turned into an exception (code 128+N), so a verb's
+    except/finally cleanup runs before the process ends."""
+
+    def __init__(self, signum: int):
+        super().__init__(128 + signum)
+        self.signum = signum
+
+
+@contextlib.contextmanager
+def stop_signals_raise():
+    """While the probe, gate and cost verbs run: SIGTERM and SIGHUP raise
+    Stopped, as Ctrl-C already raises KeyboardInterrupt.
+
+    Python's default action for both is to die WITHOUT unwinding, and those
+    verbs start named consumer containers that their except/finally remove:
+    killing the docker client leaves the container holding a relay or camera
+    session under its fixed name, refusing every retry. The README runs these
+    verbs by hand over ssh, where a dropped session is SIGHUP and an
+    operator's `timeout` is SIGTERM. The first signal raises; any later one
+    is swallowed, so the cleanup it started (bounded: every removal and wait
+    has its own timeout) is not cut short. The previous handlers are restored
+    on the way out. redact_run's forwarding handlers are its own and are not
+    involved. Implements: LLR-1226.
+    """
+    previous = {}
+
+    def swallow(_sig, _frame):
+        pass
+
+    def stop(signum, _frame):
+        for sig in previous:
+            signal.signal(sig, swallow)
+        raise Stopped(signum)
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:  # SIGHUP does not exist on the dev PC's Windows Python
+            continue
+        try:
+            previous[sig] = signal.signal(sig, stop)
+        except ValueError:  # not the main thread: the caller owns signals
+            pass
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
 def api_stream(s: RelaySettings) -> Dict[str, object]:
     """The relay API's entry for our stream (GET /api/streams, Basic auth)."""
     req = urllib.request.Request("http://127.0.0.1:%d/api/streams" % s.api_port)
@@ -540,8 +590,8 @@ def remove_containers(*names: str) -> None:
 def probe(s: RelaySettings, seconds: int = 10, name: str = "homehub-door-probe") -> Dict[str, object]:
     """One authenticated test consumer: what it decoded and in what geometry.
 
-    Killing the docker client (on the deadline, or on Ctrl-C) does NOT stop
-    the container: --rm removes it only once ffprobe exits, and against a
+    Killing the docker client (on the deadline, on Ctrl-C, or on the SIGTERM
+    or SIGHUP that main() turns into Stopped) does NOT stop the container: --rm removes it only once ffprobe exits, and against a
     camera that accepts TCP but never answers RTSP that is never. So on any
     way out but a normal return the named container is removed here, or it
     would keep a camera session and refuse every retry under its fixed name.
@@ -906,6 +956,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.verb == "upstream-count":
         emit({"upstream_connections": upstream_count(s), "upstream": "%s:%d" % (s.host, s.port)})
         return 0
+    if args.verb in ("probe", "gate", "cost"):
+        try:
+            with stop_signals_raise():
+                return measure(s, args)
+        except Stopped as exc:
+            mc.log("door: %s stopped by signal %d; its consumers were removed" % (args.verb, exc.signum),
+                   warning=True)
+            return exc.code
+    p.print_help()
+    return 2
+
+
+def measure(s: RelaySettings, args) -> int:
+    """The probe, gate and cost verbs: each starts named consumer containers,
+    so main() runs them under stop_signals_raise()."""
     if args.verb == "probe":
         result = probe(s, args.seconds)
         reasons = probe_verdict(result, s)
@@ -914,8 +979,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.verb == "gate":
         return gate(s, args.seconds, args.progress_seconds)
     if args.verb == "cost":
-        decoder = start_grey_decoder(s, args.decode_grey_fps) if args.decode_grey_fps else None
+        decoder = None
         try:
+            # Started inside the try, so a signal arriving as it starts still
+            # reaches the removal below.
+            decoder = start_grey_decoder(s, args.decode_grey_fps) if args.decode_grey_fps else None
             if decoder:
                 time.sleep(5)
                 args.container.append(GREY_DECODER)
@@ -927,12 +995,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 result["decoder_still_running"] = decoder.poll() is None
             emit(result)
         finally:
-            if decoder:
+            if args.decode_grey_fps:
                 subprocess.run(["docker", "rm", "-f", GREY_DECODER], stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, timeout=60)
         return 0
-    p.print_help()
-    return 2
+    raise ValueError(args.verb)
 
 
 if __name__ == "__main__":

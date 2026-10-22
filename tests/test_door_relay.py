@@ -9,7 +9,7 @@ on synthetic TS packets built below.
 
 What does not: the real relay, ffmpeg and a camera-like source. That is
 stack/door/tests/door-relay-lab.sh (root + docker; TC-1385..TC-1392).
-Implements: TC-1377..TC-1384, TC-1393..TC-1398.
+Implements: TC-1377..TC-1384, TC-1393..TC-1399.
 """
 
 from __future__ import annotations
@@ -978,3 +978,249 @@ def test_tc1399_a_gate_interrupted_in_its_probe_removes_gate_1(monkeypatch, tmp_
         dr.gate(s, 1)
     assert docker.removed("homehub-door-gate-1") and docker.running == set()
     assert started == []  # nothing else was started to be left behind
+
+
+# ── TC-1399 a SIGTERM or SIGHUP still removes the consumers (review round 4 F8) ─
+#
+# Python's default SIGTERM/SIGHUP action ends the process without unwinding, so
+# neither probe()'s except nor gate()'s and cost's finally ran: Sol reproduced
+# `python_rc=-15 container_running=true` for probe and gate. These run the REAL
+# CLI as a child process, against a silent TCP fixture standing in for the
+# relay, with a stub docker on PATH whose containers - like the real ones -
+# outlive their killed client and hold their session until `docker rm -f`.
+
+STUB_DOCKER = r'''#!{python}
+import json, os, re, subprocess, sys, time
+state = os.environ["FAKE_DOCKER_STATE"]
+argv = sys.argv[1:]
+with open(os.path.join(state, "calls.log"), "a") as log:
+    log.write(json.dumps(argv) + "\n")
+def box(name):
+    return os.path.join(state, "c-" + name)
+if argv[:2] == ["rm", "-f"]:
+    for name in argv[2:]:
+        try:
+            pid = int(open(box(name)).read())
+            os.kill(pid, 9)
+        except (OSError, ValueError):
+            pass
+        try:
+            os.unlink(box(name))
+        except OSError:
+            pass
+    sys.exit(0)
+if argv[:1] == ["inspect"]:
+    sys.exit(1)
+assert argv[0] == "run", argv
+name = argv[argv.index("--name") + 1]
+if os.path.exists(box(name)):
+    sys.stderr.write('docker: Error response from daemon: Conflict. The container name "/%s" is already in use\n' % name)
+    sys.exit(125)
+document = sys.stdin.buffer.read().decode()  # the consumer's input document; stdin is closed after it
+host, port = re.search(r"@([0-9.]+):([0-9]+)/", document).groups()
+if name in os.environ.get("FAKE_DOCKER_FINISH", "").split(","):
+    # ffprobe read its seconds and exited; --rm removed the container.
+    print(json.dumps({{"streams": [{{"codec_name": "h264", "width": 1536, "height": 1536,
+                                    "nb_read_packets": "51", "avg_frame_rate": "10/1"}}]}}))
+    sys.exit(0)
+# The container: its own session, so killing this client leaves it holding
+# its connection to the relay - which never answers - until `docker rm -f`.
+holder = (
+    "import os, socket, sys, time\n"
+    "s = socket.create_connection((sys.argv[1], int(sys.argv[2])))\n"
+    "open(sys.argv[3] + '.tmp', 'w').write(str(os.getpid()))\n"
+    "os.rename(sys.argv[3] + '.tmp', sys.argv[3])\n"
+    "time.sleep(3600)\n")
+subprocess.Popen([sys.executable, "-c", holder, host, port, box(name)], start_new_session=True,
+                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+t0 = time.monotonic()
+while not os.path.exists(box(name)) and time.monotonic() - t0 < 10:
+    time.sleep(0.05)
+while os.path.exists(box(name)):  # attached, as `docker run` is, until the container goes
+    time.sleep(0.05)
+sys.exit(137)
+'''
+
+
+class SilentRelay:
+    """A TCP listener that accepts and never answers (a relay or camera that
+    took the connection and says nothing). `sessions_open()` counts accepted
+    connections the far side has not closed."""
+
+    def __init__(self):
+        import socket
+        import threading
+        self.server = socket.socket()
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen(16)
+        self.port = self.server.getsockname()[1]
+        self.accepted = []
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                conn, _ = self.server.accept()
+            except OSError:
+                return
+            conn.setblocking(False)
+            self.accepted.append(conn)
+
+    def sessions_open(self):
+        n = 0
+        for conn in self.accepted:
+            try:
+                if conn.recv(1) != b"":
+                    n += 1
+            except BlockingIOError:
+                n += 1
+            except OSError:
+                pass
+        return n
+
+    def close(self):
+        for conn in self.accepted:
+            conn.close()
+        self.server.close()
+
+
+@pytest.fixture
+def cli_rig(tmp_path):
+    """(run, relay, signal): `run(args, wait_for, sig, finish)` starts the real
+    door_relay.py CLI against the stub docker and the silent relay, waits until
+    every `wait_for` container holds its session, sends `sig` (None: none),
+    and returns the CLI's exit status and output."""
+    import signal as sg
+    import subprocess as sp
+    import time as tm
+    relay = SilentRelay()
+    state = tmp_path / "docker-state"
+    state.mkdir()
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    stub = bindir / "docker"
+    stub.write_text(STUB_DOCKER.format(python=sys.executable))
+    stub.chmod(0o755)
+    env_file = write_env(tmp_path, LAN_IP="127.0.0.1", DOOR_RELAY_RTSP_PORT=str(relay.port))
+    procs = []
+
+    def run(args, wait_for, sig, finish=()):
+        env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ.get("PATH", ""),
+                   FAKE_DOCKER_STATE=str(state), FAKE_DOCKER_FINISH=",".join(finish),
+                   HOMEHUB_MONITOR_OVERRIDE_FILE=str(tmp_path / "no-override"))
+        proc = sp.Popen([sys.executable, str(STACK / "door" / "door_relay.py"), "--env-file", env_file] + list(args),
+                        stdout=sp.PIPE, stderr=sp.STDOUT, env=env)
+        procs.append(proc)
+        if sig is not None:
+            deadline = tm.monotonic() + 30
+            while not all((state / ("c-" + n)).exists() for n in wait_for):
+                assert proc.poll() is None, proc.stdout.read().decode()
+                assert tm.monotonic() < deadline, "the consumers never started"
+                tm.sleep(0.05)
+            tm.sleep(0.3)  # into the wait the verb is making, not the instant of the start
+            proc.send_signal(sig)
+        out = proc.communicate(timeout=90)[0].decode()
+        return proc.returncode, out
+
+    def calls():
+        log = state / "calls.log"
+        return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def sessions_closed():
+        deadline = tm.monotonic() + 5
+        while relay.sessions_open() and tm.monotonic() < deadline:
+            tm.sleep(0.05)
+        return relay.sessions_open() == 0
+
+    run.calls = calls
+    run.containers = lambda: sorted(p.name[2:] for p in state.glob("c-*") if not p.name.endswith(".tmp"))
+    run.sessions_closed = sessions_closed
+    try:
+        yield run, relay, sg
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+        for box in state.glob("c-*"):  # a failing case must not leave holders running
+            try:
+                os.kill(int(box.read_text()), sg.SIGKILL)
+            except (OSError, ValueError):
+                pass
+        relay.close()
+
+
+def removed(calls, name):
+    return any(c[:2] == ["rm", "-f"] and name in c[2:] for c in calls)
+
+
+posix_signals = pytest.mark.skipif(sys.platform.startswith("win"),
+                                   reason="SIGTERM/SIGHUP to a child process and a stub docker are POSIX")
+
+
+@posix_signals
+@pytest.mark.parametrize("signame,code", [("SIGTERM", 143), ("SIGHUP", 129)])
+def test_tc1399_a_signalled_probe_removes_its_container_and_a_retry_passes(cli_rig, signame, code):
+    run, relay, sg = cli_rig
+    rc, out = run(["probe", "--seconds", "30"], ["homehub-door-probe"], getattr(sg, signame))
+    assert rc == code, out
+    assert removed(run.calls(), "homehub-door-probe"), run.calls()
+    assert run.containers() == [] and relay.accepted and run.sessions_closed()
+    assert "stopped by signal %d" % getattr(sg, signame) in out
+    # The fixed name is free again: the retry is not refused.
+    rc, out = run(["probe", "--seconds", "1"], [], None, finish=["homehub-door-probe"])
+    assert rc == 0, out
+    assert json.loads(out.strip().splitlines()[-1])["pass"] is True
+
+
+@posix_signals
+def test_tc1399_a_gate_signalled_in_its_probe_removes_gate_1(cli_rig):
+    run, relay, sg = cli_rig
+    rc, out = run(["gate", "--seconds", "30"], ["homehub-door-gate-1"], sg.SIGTERM)
+    assert rc == 143, out
+    assert removed(run.calls(), "homehub-door-gate-1")
+    assert run.containers() == [] and relay.accepted and run.sessions_closed()
+
+
+@posix_signals
+def test_tc1399_a_gate_signalled_with_two_consumers_removes_both(cli_rig):
+    run, relay, sg = cli_rig
+    rc, out = run(["gate", "--seconds", "30"], ["homehub-door-gate-2", "homehub-door-gate-3"], sg.SIGTERM,
+                  finish=["homehub-door-gate-1"])
+    assert rc == 143, out
+    calls = run.calls()
+    assert removed(calls, "homehub-door-gate-2") and removed(calls, "homehub-door-gate-3")
+    assert run.containers() == [] and len(relay.accepted) == 2 and run.sessions_closed()
+    assert '"gate-hub-half"' not in out  # a stopped gate reports no verdict
+
+
+@posix_signals
+def test_tc1399_a_signalled_cost_run_removes_its_grey_decoder(cli_rig):
+    run, relay, sg = cli_rig
+    rc, out = run(["cost", "--seconds", "60", "--decode-grey-fps", "5"], [dr.GREY_DECODER], sg.SIGTERM)
+    assert rc == 143, out
+    assert removed(run.calls(), dr.GREY_DECODER)
+    assert run.containers() == [] and relay.accepted and run.sessions_closed()
+
+
+@posix_signals
+def test_tc1399_the_verbs_restore_the_signal_handlers_they_found(monkeypatch, tmp_path, capsys):
+    import signal as sg
+
+    def mine(*_a):
+        pass
+    before = {sig: sg.signal(sig, mine) for sig in (sg.SIGTERM, sg.SIGHUP)}
+    try:
+        monkeypatch.setattr(dr.subprocess, "run", FakeDocker().run)
+        monkeypatch.setattr(dr, "image_ref", lambda: "example/go2rtc:1@sha256:0")
+        assert dr.main(["--env-file", write_env(tmp_path), "probe", "--seconds", "1"]) == 0
+        assert sg.getsignal(sg.SIGTERM) is mine and sg.getsignal(sg.SIGHUP) is mine
+        with dr.stop_signals_raise():
+            with pytest.raises(dr.Stopped) as stopped:
+                os.kill(os.getpid(), sg.SIGTERM)
+            assert stopped.value.code == 143
+            # The cleanup the first signal started is not cut short by a second.
+            os.kill(os.getpid(), sg.SIGHUP)
+        assert sg.getsignal(sg.SIGTERM) is mine and sg.getsignal(sg.SIGHUP) is mine
+    finally:
+        for sig, handler in before.items():
+            sg.signal(sig, handler)

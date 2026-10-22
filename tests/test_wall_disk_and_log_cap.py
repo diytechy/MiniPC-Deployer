@@ -33,6 +33,8 @@ from pathlib import Path
 
 import pytest
 
+from git_retry import run_git  # transient shared-.git faults: see tests/git_retry.py
+
 WALL = Path(__file__).resolve().parents[1] / "stack" / "autoinstall" / "wall"
 BASH = shutil.which("bash")
 needs_bash = pytest.mark.skipif(BASH is None, reason="needs bash")
@@ -230,8 +232,7 @@ def test_tc1263_new_files_are_lf_and_the_script_is_executable_in_git():
     for name in ("wall-disk-check.py", "wall-disk-check.service", "wall-disk-check.timer",
                  "wall-journald.conf", "wall-journald-no-syslog.conf"):
         assert b"\r" not in (WALL / name).read_bytes(), name
-    out = subprocess.run(["git", "-C", str(WALL), "ls-files", "-s", "wall-disk-check.py"],
-                         capture_output=True, text=True, check=True).stdout
+    out = run_git(["git", "-C", str(WALL), "ls-files", "-s", "wall-disk-check.py"]).stdout
     assert out.startswith("100755"), out
 
 

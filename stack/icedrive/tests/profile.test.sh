@@ -36,6 +36,8 @@
 #   I15 the last good archive survives a capture that fails late
 #   I10 "no profile" and "no archive" exit 3, distinct from failure: a box with
 #       IceDrive off must never look like a broken recovery
+#   I18 under systemd the restarted client leaves the unit's cgroup, and one
+#       that did not is a FAILED capture (found on the hub 2026-10-19)
 #
 # Usage: bash profile.test.sh [--keep-tmp]
 set -uo pipefail
@@ -415,6 +417,64 @@ else
 fi
 pkill -u "$ME" -f '/opt/icedrive/Icedrive\.AppImage' 2>/dev/null || true
 kill "$FAKE_SESSION2" 2>/dev/null || true
+echo
+
+# ── I18: under systemd the restart must LEAVE the unit's cgroup ─────────────
+# THE DEFECT, measured on the hub 2026-10-19 and 2026-10-05: the capture ran as
+# a Type=oneshot unit, restarted the client with setsid+nohup, watched it for
+# 15s, reported "back and WORKING" and exited 0 - and systemd then killed the
+# client along with everything else in the unit's cgroup. Nothing in I16/I17 can
+# see that, because the kill comes after the script has finished.
+#
+# The fixture sets INVOCATION_ID (what systemd sets for every unit) and puts a
+# stand-in systemd-run on PATH that RECORDS its arguments and then runs the
+# command WITHOUT moving it - i.e. a launcher that failed to escape. Two things
+# must hold: the launcher is used with --scope, and the cgroup check notices the
+# client never left and fails the capture instead of calling it good.
+echo "== I18: under systemd the restarted client must leave the unit's cgroup =="
+make_profile
+
+cp /bin/sleep "$TMP/xfce4-session"
+env DISPLAY=:99 "$TMP/xfce4-session" 180 &
+FAKE_SESSION3=$!
+sleep 1
+
+mkdir -p "$TMP/fakebin"
+cat >"$TMP/fakebin/systemd-run" <<EOS
+#!/bin/bash
+printf '%s\n' "\$*" >>"$TMP/systemd-run.args"
+while [ "\$#" -gt 0 ] && [ "\$1" != "--" ]; do shift; done
+shift
+exec "\$@"
+EOS
+chmod +x "$TMP/fakebin/systemd-run"
+rm -f "$TMP/systemd-run.args"
+
+cat >"$TMP/stays-up.sh" <<'EOS'
+#!/bin/bash
+exec -a "/opt/icedrive/Icedrive.AppImage" sleep 60
+EOS
+chmod +x "$TMP/stays-up.sh"
+printf '[Desktop Entry]\nType=Application\nExec=%s\n' "$TMP/stays-up.sh" \
+    >"$REALHOME/.config/autostart/icedrive.desktop"
+
+setsid bash -c 'exec -a "/opt/icedrive/Icedrive.AppImage" sleep 120' &
+sleep 1
+
+rc="$(PATH="$TMP/fakebin:$PATH" INVOCATION_ID=test-i18 sut --capture)"
+if grep -q -- '--scope' "$TMP/systemd-run.args" 2>/dev/null; then
+    pass "I18 under a unit the restart goes through systemd-run --scope"
+else
+    fail "I18 systemd-run --scope was not used: $(cat "$TMP/systemd-run.args" 2>/dev/null || echo 'never called')"
+fi
+if [ "$rc" = 1 ] && grep -q "still in this unit's cgroup" "$TMP/out.txt"; then
+    pass "I18 a client that never left the unit's cgroup FAILS the capture, and says why"
+else
+    fail "I18 exit=$rc - a client that will die with the unit was reported as fine"
+    sed -n '1,40p' "$TMP/out.txt"
+fi
+pkill -u "$ME" -f '/opt/icedrive/Icedrive\.AppImage' 2>/dev/null || true
+kill "$FAKE_SESSION3" 2>/dev/null || true
 echo "──────────────────────────────────────────────────────────────"
 printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 if [ "$FAIL" -eq 0 ]; then exit 0; fi

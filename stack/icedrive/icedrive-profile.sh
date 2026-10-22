@@ -476,8 +476,35 @@ start_client() {
         log_inode="$(stat -c %d:%i "$applog" 2>/dev/null || echo '')"
     fi
 
+    # ── LEAVE THIS UNIT'S CGROUP, OR THE CLIENT DIES WHEN THE CAPTURE ENDS ────
+    # Measured on the hub 2026-10-19 (and 2026-10-05 before it): the restart
+    # came up, was watched for 15s, was reported "back and WORKING" - and was
+    # gone two seconds later, for good. The nightly unit is Type=oneshot with
+    # the default KillMode=control-group, so when this script exits systemd
+    # kills EVERY process left in the unit's cgroup, and `setsid`, `nohup` and
+    # `disown` change the session and the signal disposition but not the
+    # cgroup. The offsite sync then stayed down until someone opened a new
+    # desktop session. Every check above passes in that case, because the kill
+    # happens after the last of them has run.
+    #
+    # `systemd-run --scope` moves the client into a transient scope of its own
+    # before it execs, so the unit's teardown no longer reaches it. Only when
+    # we ARE a unit (INVOCATION_ID is set by systemd for every service it
+    # starts): run from a shell, there is no unit cgroup to escape.
+    local -a launcher=()
+    if [ -n "${INVOCATION_ID:-}" ]; then
+        if command -v systemd-run >/dev/null 2>&1; then
+            launcher=(systemd-run --scope --quiet --collect
+                      --unit="homehub-icedrive-client-$(date +%Y%m%d%H%M%S)-$$" --)
+        else
+            warn "running as a systemd unit but systemd-run is missing: the client"
+            warn "  will be killed when this unit exits. Not starting it here."
+            return 1
+        fi
+    fi
+
     log "restarting the client into the live session ($(printf '%s\n' ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} | grep '^DISPLAY=' || echo 'DISPLAY=?'))"
-    setsid runuser -u "$PROF_USER" -- env ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} nohup sh -c "$exec_line" >/dev/null 2>&1 &
+    setsid ${launcher[@]+"${launcher[@]}"} runuser -u "$PROF_USER" -- env ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} nohup sh -c "$exec_line" </dev/null >/dev/null 2>&1 &
     disown 2>/dev/null || true
 
     # Phase 1 — a process appears at all.
@@ -485,6 +512,23 @@ start_client() {
     if [ -z "$(app_pids)" ]; then
         warn "the client did NOT come back after ${w}s (the gate may have refused — check: journalctl -t icedrive-gate)"
         return 1
+    fi
+
+    # Phase 1b — it is NOT in our cgroup. This is the check that would have
+    # caught 2026-10-19: it asks where the client lives, not whether it is up,
+    # and a client still sharing this unit's cgroup is a client that dies with
+    # it. Under a unit only, for the same reason as the launcher.
+    if [ -n "${INVOCATION_ID:-}" ]; then
+        local own_cg pid_cg p
+        own_cg="$(cat "/proc/$$/cgroup" 2>/dev/null || true)"
+        for p in $(app_pids); do
+            pid_cg="$(cat "/proc/$p/cgroup" 2>/dev/null || true)"
+            if [ -n "$own_cg" ] && [ "$pid_cg" = "$own_cg" ]; then
+                warn "the restarted client (pid $p) is still in this unit's cgroup"
+                warn "  ($own_cg): systemd will kill it the moment this capture exits."
+                return 1
+            fi
+        done
     fi
 
     # Phase 2 — it stays up AND reaches a working state, and then KEEPS being up.

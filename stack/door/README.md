@@ -24,6 +24,17 @@ and the API reports the camera URL); WebRTC, SRTP and RTMP disabled. Host
 networking, so those binds are the host's. **No Caddy route, no DNS name.**
 Video only (`#media=video`, `default_query: video`).
 
+**The relay's output never carries the credential.** go2rtc's producer warns
+with the whole camera URL - credential and camera address included - every time
+the camera drops, and `info` is kept because those warnings are the record of a
+dropout. So the unit runs the attached `compose up` under `door_relay.py
+redact-run`, which merges stdout and stderr and removes, line by line, every
+spelling of the password (raw, percent-encoded, the API's Basic token) and the
+camera's host:port before anything reaches the journal; and the compose service
+has `logging: driver: none`, so docker keeps no second copy (`docker logs
+homehub-door-relay` answers "configured logging driver does not support
+reading" - that is the design, not a fault; read the journal).
+
 **Credentials on the hub** are `DOOR_RELAY_UPSTREAM_HOST/PORT/PATH/USERNAME/
 PASSWORD` — deliberately not the panel's `DOORBELL_RTSP_*` names, because after
 the cutover the panel's `DOORBELL_RTSP_HOST` is the relay. The password is the
@@ -43,13 +54,17 @@ frame, so every file decodes.
 ## Tests
 
 * `tests/test_door_relay.py` (pytest): config, validation, import, pin, units,
-  the TS cutter, pruning, guard and quota stops, continuity (TC-1377..TC-1397).
+  redaction, the TS cutter, pruning, guard and quota stops, continuity over a
+  window, the gate's verdicts (TC-1377..TC-1399).
 * `tests/door-relay-lab.sh` (root + docker; TC-1385..TC-1392): the real relay
   against a fake single-session camera — listeners, auth, geometry, the gate,
   the panel broker's own input path, decodable video-only segments across a
-  relay restart, no secret in any log, the cost tool.
+  relay restart, no secret in any log, the cost tool, and (check 10) the relay
+  run from its unit file's own Exec lines with the camera killed under a
+  consumer: the dropout warning arrives redacted and docker holds nothing.
 * `tests/door-cutover-panel.test.sh` (hermetic; TC-1398): the panel script's
-  file verbs on a fake tree.
+  file verbs on a fake tree, and the probe and compat verdicts (their own Python
+  bodies, extracted from the script) against a fake broker, `ss` and decoder.
 
 ---
 
@@ -114,19 +129,26 @@ sudo bash /tmp/w4/door/door-cutover-panel.sh suppress
 # hub: relay up; the readiness gate, then the hub half of the gate
 sudo systemctl start homehub-door-relay
 sudo python3 /opt/homehub/stack/door/door_relay.py probe --seconds 10
-#   {"codec": "h264"|"hevc", "width": 1536, "height": 1536, "packets": > 0}   (geometry unchanged, raw fisheye)
+#   {"codec": "h264", "width": 1536, "height": 1536, "packets": > 0, "rc": 0, "pass": true, "reasons": []}
+#   exit 0 ONLY on rc 0, packets > 0 and exactly DOOR_RELAY_EXPECT_CODEC / _SIZE (h264, 1536x1536:
+#   the raw fisheye, unchanged). A camera that really sends hevc: set DOOR_RELAY_EXPECT_CODEC=hevc first.
 sudo python3 /opt/homehub/stack/door/door_relay.py gate --seconds 15
-#   readiness+geometry; two-consumers {upstream_connections: 1, producers: 1, consumers >= 2};
-#   one-consumer-left {upstream_connections: 1, survivor_running: true}; {"check": "gate-hub-half", "pass": true}
+#   readiness+geometry {"pass": true}; two-consumers {upstream_connections: 1, producers: 1, consumers >= 2};
+#   one-consumer-left {upstream_connections: 1, survivor_running: true, survivor_progressing: true,
+#   survivor_sent_bytes: [a, b] with b > a}; {"check": "gate-hub-half", "pass": true}
 # panel: the broker's OWN input path against the relay (the broker stays suppressed)
-sudo bash /tmp/w4/door/door-cutover-panel.sh compat <hub> 8554 /door 20      # frames > 0, decoder counts
+sudo bash /tmp/w4/door/door-cutover-panel.sh compat <hub> 8554 /door 20
+#   {"frames": > 0, "stalled": false, "ended_early": false, ...}; it always ends within 20 s (+5 s to
+#   kill the decoder) even against a silent session, and exit 1 = no frames, a stall or an early end.
 # hub: segments, a relay restart and a camera dropout, with 60 s segments for the window
 printf 'DOOR_RECORDER_SEGMENT_SEC=60\n' | sudo tee -a /etc/homehub-monitor/override.env
 sudo sed -i 's/^DOOR_RECORDER_ENABLED=.*/DOOR_RECORDER_ENABLED=true/' /opt/homehub/stack/.env
-sudo systemctl start homehub-door-recorder; sleep 200
+T0="$(date +%s)"; sudo systemctl start homehub-door-recorder; sleep 200
 sudo systemctl restart homehub-door-relay; sleep 120          # relay restart: the recorder is back within ~30 s
 sudo ss -K dst <cam> dport = :554; sleep 120                   # camera dropout: go2rtc reconnects
-sudo python3 /opt/homehub/stack/door/door_recorder.py continuity --hours 1   # gaps = the two events, each < 60 s
+sudo journalctl -u homehub-door-relay --since "@$T0" | grep -c 'url=rtsp://\*\*\*@<camera>'   # >= 1: the dropout, redacted (`<camera>` is literal)
+sudo journalctl -u homehub-door-relay --since "@$T0" | grep -cF '<cam>'                        # 0: no camera address
+sudo python3 /opt/homehub/stack/door/door_recorder.py continuity --since "$T0"   # "between" gaps = the two events, each < 60 s
 sudo python3 /opt/homehub/stack/door/door_recorder.py verify /srv/scratch/door/*/door-*.ts   # every line OK
 sudo python3 /opt/homehub/stack/door/door_relay.py upstream-count             # 1
 ```
@@ -134,7 +156,9 @@ sudo python3 /opt/homehub/stack/door/door_relay.py upstream-count             # 
 End of the window (the rollback transaction, step 5, without the wall.env part):
 `sudo systemctl stop homehub-door-recorder homehub-door-relay`;
 `door_relay.py upstream-count` → 0; on the panel `release`, then
-`probe <cam> 554` → `"on_target": true`. Remove the override line. Record the
+`probe <cam> 554` → `"live": true, "on_target": true`, exit 0 (both are
+required: a peer that was already there before the view was asked for, or a
+connection with a dead decoder behind it, is not a pass). Remove the override line. Record the
 window's duration. **Stop if** the relay drops the camera for more than a minute
 or the panel's view or motion degrade.
 
@@ -159,6 +183,15 @@ panel `ss -tn` shows none to `<cam>` and one to `<hub>:8554` while the view is
 live; the kiosk journal `[door] ... state=live`; the panel's motion detector
 still raises the door view (a real visitor within 24 h, else an open-items C
 row). `wall-firstboot.sh` restarts the kiosk; expect the screen to blank once.
+
+**The recorder's 24 h acceptance** (at most 3 gaps, 5 minutes in all):
+`door_recorder.py continuity --hours 24`. It counts the gaps between segments
+**and** both uncovered edges of the window (the open `.part` is the recording in
+progress), and no segment at all is a fail. It reads the tree, so the window must
+lie inside what the cap retains: if 7.5 GiB holds less than a day at the camera's
+bitrate (the oldest day directory says), the leading edge is pruning, not
+downtime - run `continuity --hours 6` every 6 hours instead and add the four
+results' `gaps` and `downtime_seconds`. Record which.
 
 **At the same time, in HomeHub** `config.wall.psd1`: `DOORBELL_RTSP_HOST` to the
 hub's identity reference, `DOORBELL_RTSP_PORT = '8554'`, `DOORBELL_RTSP_PATH =

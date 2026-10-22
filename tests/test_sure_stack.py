@@ -31,7 +31,10 @@ def test_sure_profile_and_storage_sr060():
         assert "ports" not in service
         assert service["healthcheck"]["test"]
         assert service["volumes"]
-    assert "sure" in env()["COMPOSE_PROFILES"].split(",")
+    # On by default (Owner, 2026-10-09) through its knob and unit, never the
+    # profile list (SR-100): tests/test_sure_unit.py covers the unit.
+    assert "sure" not in env()["COMPOSE_PROFILES"].split(",")
+    assert env()["SURE_ENABLED"] == "true"
     assert config["networks"]["sure"]["internal"] is True
     for name in ("sure-web", "sure-worker"):
         assert config["services"][name]["depends_on"] == {

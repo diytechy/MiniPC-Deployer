@@ -191,10 +191,17 @@ ensure_image "filebackup:${FILEBACKUP_IMAGE_TAG:-local}" "FileBackup" ""
 # Sure - the Owner's FORK (SURE_IMAGE, default sure-auroleap:local), built from the
 # sibling ../sure by its own script because it builds a NAMED ref via `git archive`
 # rather than the working tree (the checkout is often detached or on a feature
-# branch). Guarded on the `sure` profile, like the relay is on its knob: a clone
-# without ../sure must not die on a service it does not run. No public fallback.
+# branch). Guarded on SURE_ENABLED (exactly `true`), like the relay is on its
+# knob: a clone without ../sure must not die on a service it does not run. No
+# public fallback. THE KNOB, NOT THE PROFILE, SINCE 2026-10-22 (SR-100): `sure`
+# left COMPOSE_PROFILES on 2026-10-18 and this guard then skipped the fork on
+# every build; vmtest/export-images.sh moved in the same commit, so the two still
+# ask the same question of the same file. A `sure` profile is refused here too.
 case ",$(env_get COMPOSE_PROFILES | tr -d '[:space:]')," in
-    *,sure,*)
+    *,sure,*) die "COMPOSE_PROFILES in ${ENV_FILE##*/} contains 'sure'. Remove it and set SURE_ENABLED=true: homehub-sure.service starts Sure, and a profile named there makes firstboot's every-boot 'docker compose up -d' wait on Sure's database and cache." ;;
+esac
+case "$(env_get SURE_ENABLED | tr -d '[:space:]')" in
+    true)
         SURE_IMAGE="$(env_get SURE_IMAGE)"; SURE_IMAGE="${SURE_IMAGE:-sure-auroleap:local}"
         # Omit --ref when the knob is empty so build-sure-image.sh's own clear
         # "no source ref" error fires rather than a bare argument-parse failure.
@@ -209,7 +216,7 @@ case ",$(env_get COMPOSE_PROFILES | tr -d '[:space:]')," in
         fi
         ;;
     *)
-        log "skip: $(env_get SURE_IMAGE) (the sure profile is not in COMPOSE_PROFILES of ${ENV_FILE##*/})"
+        log "skip: $(env_get SURE_IMAGE) (SURE_ENABLED is not true in ${ENV_FILE##*/})"
         ;;
 esac
 

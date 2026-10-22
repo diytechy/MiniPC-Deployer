@@ -713,7 +713,8 @@ is never involved in validation.** Checked against Caddy's docs and source
   the caddy service's environment; all files referenced by compose/autoinstall
   exist. See `../docs/status.md` for the full validation ledger.
 
-Sure is selected in the default template by Owner direction 2026-10-09.
+Sure is on in the default template by Owner direction 2026-10-09, through
+`SURE_ENABLED=true` and `homehub-sure.service`, never `COMPOSE_PROFILES` (SR-100).
 HomeHub also selects it during materialization. Prepare its secrets before
 build/deploy; Actual and the bridge Actual data source remain available.
 See [Sure deployment prerequisites](sure/README.md).

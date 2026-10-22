@@ -1414,6 +1414,52 @@ else
     log "rustdesk: no payload at $STACK_DIR/rustdesk - skipping (correct for a build without it)"
 fi
 
+# ── 4-pre-a2b. SURE: ITS OWN UNIT, NEVER COMPOSE_PROFILES (SR-100, LLR-1211) ──
+# The household ledger is started by homehub-sure.service and switched by
+# SURE_ENABLED. It is NOT a profile in COMPOSE_PROFILES, because the bulk
+# `docker compose up -d` below is all-or-nothing and would wait on Sure's
+# database and cache before DNS, Samba and the recovery supervisor (the
+# 2026-10-18 Sure deploy review; stack/sure/sure-unit.sh carries the long form).
+#
+# START IS QUEUED, NEVER WAITED FOR. The unit is After=homehub-firstboot.service,
+# so a blocking `systemctl start` from in here would wait for this very script to
+# finish - the AI CLI's start found the same trap (TC-1259). --no-block hands
+# the job to systemd, which runs it the moment firstboot exits.
+#
+# THE OFF BRANCH STOPS ONLY WHAT THIS UNIT OWNED. A box whose .env predates the
+# knob (the live hub on 2026-10-22 carries no SURE_ENABLED line, and Sure runs
+# there from its first start, `restart: unless-stopped`) must not lose its
+# finance database to an upgrade of this script: with the unit never enabled
+# there, nothing is stopped and the log says so. A unit that WAS enabled and is
+# now switched off is disabled and stopped, so the knob means what it says.
+if [ -f "$STACK_DIR/sure/homehub-sure.service" ]; then
+    install -m 0644 "$STACK_DIR/sure/homehub-sure.service" /etc/systemd/system/ 2>/dev/null || log "WARN: could not install homehub-sure.service"
+    systemctl daemon-reload 2>/dev/null || log "WARN: systemctl daemon-reload failed"
+    # Same .env reading as the RustDesk knob above, for the same reason: this
+    # script never sources .env, so the knob must be read out of the file.
+    _sure_enabled="$(sed -n 's/^SURE_ENABLED=//p' "$STACK_DIR/.env" 2>/dev/null | tail -n1 | tr -d '\015' | tr -d '"')" || _sure_enabled=""
+    _sure_profiles="$(sed -n 's/^COMPOSE_PROFILES=//p' "$STACK_DIR/.env" 2>/dev/null | tail -n1 | tr -d '\015' | tr -d '"' | tr -d '[:space:]')" || _sure_profiles=""
+    case ",$_sure_profiles," in
+        *,sure,*) log "WARN: COMPOSE_PROFILES names 'sure'. Remove it: the bulk 'docker compose up -d' now waits on Sure's database and cache, and homehub-sure.service (SURE_ENABLED) is what starts Sure." ;;
+    esac
+    if [ "$_sure_enabled" = "true" ]; then
+        systemctl enable homehub-sure.service >/dev/null 2>&1 || log "WARN: could not enable homehub-sure.service - Sure would not come back after a reboot"
+        if systemctl start --no-block homehub-sure.service >/dev/null 2>&1; then
+            log "sure: homehub-sure.service enabled and its start queued (SURE_ENABLED=true)"
+        else
+            log "WARN: could not queue the start of homehub-sure.service; start it by hand: systemctl start homehub-sure"
+        fi
+    elif systemctl is-enabled homehub-sure.service >/dev/null 2>&1; then
+        systemctl disable homehub-sure.service >/dev/null 2>&1 || log "WARN: could not disable homehub-sure.service"
+        systemctl stop --no-block homehub-sure.service >/dev/null 2>&1 || log "WARN: could not queue the stop of homehub-sure.service"
+        log "sure: homehub-sure.service DISABLED and its stop queued (SURE_ENABLED='$_sure_enabled')"
+    else
+        log "sure: homehub-sure.service left disabled; no Sure container was touched (SURE_ENABLED='$_sure_enabled')"
+    fi
+else
+    log "sure: no payload at $STACK_DIR/sure - skipping (correct for a build without it)"
+fi
+
 # ── 4-pre-a3. DNS CONSOLE FENCE (ADMIN_PORTAL_PLAN_2026-09-22 §4.5, D-A5) ──
 # Technitium's console (tcp/5380) fenced to loopback and the pinned admin
 # network, ABOVE Tailscale's ts-input jump - see dns-console-fence.sh for why

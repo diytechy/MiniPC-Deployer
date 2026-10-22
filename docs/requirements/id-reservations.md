@@ -12,7 +12,7 @@ truth for what each id means.
 | 2026-10-22 | Plan W5 (panel power button: press twice) | SN-049; SR-093..094; LLR-1180..1189; TC-1315..1329; IF-067 |
 | 2026-10-22 | Plan W11 (usage gauges every minute) | SR-095..096; LLR-1190..1199; TC-1330..1344 |
 | 2026-10-22 | Plan W12 (finance on Sure; tracker feed token) | SR-097..099; LLR-1200..1209; TC-1345..1359; IF-068..069 |
-| 2026-10-22 | Plan W10 (gate health) | SR-100..101; LLR-1210..1214; TC-1360..1369 |
+| 2026-10-22 | Plan W10 (gate health; used by lane W10-sA, the backlog shortlist) | SR-100..101; LLR-1210..1214; TC-1360..1369 |
 | 2026-10-22 | Plan W4 (scratch volume, door relay, recorder) | SN-050; SR-102..107; LLR-1215..1239; TC-1370..1399; IF-070..071 |
 | 2026-10-22 | Plan W6 (meeting recording, system half) | SR-108..111; LLR-1240..1254; TC-1400..1419 |
 

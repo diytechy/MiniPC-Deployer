@@ -1,9 +1,27 @@
 # Sure preparation (SR-060..SR-065)
 
 The `sure` profile defines web, Sidekiq, Postgres and Redis beside Actual.
-Owner direction 2026-10-09 includes it in shipped `COMPOSE_PROFILES` and
-HomeHub materialization defaults. Remove `sure` from the profile list to opt
-out. This config change does not start an installed hub. Sure owns household logins.
+Owner direction 2026-10-09 keeps Sure ON by default, and **since 2026-10-22 the
+switch is `SURE_ENABLED`, not `COMPOSE_PROFILES`** (SR-100):
+
+- `homehub-sure.service` (this directory, with `sure-unit.sh`) is the only thing
+  that passes `--profile sure`. firstboot installs it on every boot, enables it
+  and queues its start when `SURE_ENABLED=true`, and disables and stops it when
+  the knob is switched off after it had been enabled.
+- `sure` must never be in `COMPOSE_PROFILES`: firstboot's every-boot bulk
+  `docker compose up -d` is all-or-nothing and would wait on Sure's Postgres and
+  Redis before DNS provisioning, Samba and recovery (the 2026-10-18 Sure deploy
+  review). `vmtest/export-images.sh` and `scripts/ensure-local-images.sh` refuse
+  it and read `SURE_ENABLED` instead; firstboot warns.
+- The four services keep `restart: unless-stopped`, so a crash or a
+  docker.service restart brings them back without the unit; the unit's stop
+  marks them stopped, so after a reboot it is the unit that starts them, and a
+  disabled unit keeps them off.
+- An `.env` with no `SURE_ENABLED` line (the live hub on 2026-10-22) leaves the
+  unit disabled and touches no running Sure container.
+
+Turn it off: set `SURE_ENABLED=false` in `.env`, then `systemctl disable --now
+homehub-sure`. Sure owns household logins.
 Caddy accepts `LAN_CIDR` only, proxies to `sure-web:3000`, and injects no hub
 identity. Technitium provisions `SURE_SUBDOMAIN`. No service publishes a port.
 
@@ -23,7 +41,7 @@ current bridge rejects the former even on the Actual path. Its fix must cover
 `TRACKER_FEED_USER`, `SURE_API_KEY`, `SURE_URL` and `DATA_SOURCE`. Static tests
 prove mappings and defaults only, not that the current FA accepts them.
 
-## What changes with the profile off
+## What changes with Sure off (`SURE_ENABLED` not `true`)
 
 Sure containers stay off. The Caddy site and Technitium DNS provisioning remain
 active, following the repo's current household-site convention (Caddyfile's

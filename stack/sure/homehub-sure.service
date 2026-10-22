@@ -1,0 +1,42 @@
+[Unit]
+# The owner of the Sure household ledger (SR-100, LLR-1210). The ONLY thing on
+# the box that passes `--profile sure`: `sure` is never in COMPOSE_PROFILES,
+# because firstboot's every-boot bulk `docker compose up -d` would then wait on
+# Sure's database and cache before DNS, Samba and recovery (sure-unit.sh says
+# why at length).
+Description=Sure household ledger (web, worker, Postgres, Redis)
+Documentation=file:///opt/homehub/stack/sure/README.md
+
+# WANTS, NOT REQUIRES, docker.service. Requires= would propagate a docker
+# restart (needrestart restarts docker.service after a containerd upgrade) into
+# a STOP of this unit - ExecStop marks the containers user-stopped, so docker
+# would not bring them back and nothing would restart this oneshot: Sure would
+# stay down until the next boot. With Wants= the unit stays active and the
+# containers' own `restart: unless-stopped` brings them back with the daemon.
+Wants=docker.service network-online.target
+# After firstboot, which loads the image payload on a fresh install and writes
+# the compose inputs. Ordering only: a red firstboot must not take Sure with it,
+# and firstboot itself queues this start with --no-block so it never waits here.
+After=docker.service network-online.target homehub-firstboot.service
+AssertPathExists=/opt/homehub/stack/sure/sure-unit.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/homehub/stack
+# Exit 1 = SURE_ENABLED is not exactly `true`: a clean skip, never red.
+ExecCondition=/bin/bash /opt/homehub/stack/sure/sure-unit.sh condition
+ExecStart=/bin/bash /opt/homehub/stack/sure/sure-unit.sh start
+ExecStop=/bin/bash /opt/homehub/stack/sure/sure-unit.sh stop
+# `up -d` waits for Postgres and Redis to report healthy before it starts web
+# and worker (depends_on: service_healthy); Postgres's probe runs every 5 s.
+# The first start after an image change also runs Rails migrations inside
+# sure-web, but `up -d` returns when the container starts, not when Rails is
+# ready, so this does not need to cover them.
+TimeoutStartSec=300
+# The script gives each container 60 s to stop (Postgres flushing); four in
+# order, plus compose's own overhead.
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

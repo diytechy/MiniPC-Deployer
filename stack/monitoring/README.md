@@ -89,7 +89,9 @@ panel's rule, SR-083). Add `/srv/scratch` here when the scratch volume exists.
 profile capture (no success for 26 h), any container `unhealthy` for 10 min,
 any container restarted 3 or more times within 30 min (`restart-loops`,
 LLR-1211: a crash loop reads `starting`, never `unhealthy`, and `docker ps`
-still says Up - open-items C58 ran to 2,327 restarts that way), and the
+still says Up - open-items C58 ran to 2,327 restarts that way; the count is
+taken from the newest sample at least 30 min old, so the whole window is always
+measured, and the alert clears only after a whole 30 min with fewer), and the
 drill-only synthetic watch. `HOMEHUB_WATCH_DISABLE="row ..."` switches
 rows off without editing the table.
 

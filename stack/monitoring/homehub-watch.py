@@ -24,7 +24,10 @@ THE KINDS (watch.table header has the row syntax):
                  "docker is not answering").
   docker-restarts each container whose RestartCount rose by RESTART_LOOP_MIN or
                  more within THRESHOLD, one alert each; clear once a whole
-                 THRESHOLD passes with fewer. A crash-looping container is
+                 THRESHOLD passes with fewer. The rise is measured from the
+                 newest sample at or before now - THRESHOLD, so the span is the
+                 whole window plus at most one poll (judge_restarts has the
+                 boundary rule). A crash-looping container is
                  INVISIBLE to docker-health: between deaths it is "starting",
                  never "unhealthy", and `docker ps` says "Up". Immich ran like
                  that for 2,327 restarts in 2026-08 (open-items C58) and only
@@ -261,30 +264,53 @@ def judge_restarts(
     """Per-container verdicts {name: looping}; None when docker could not answer.
 
     `counts` is {container: RestartCount} for the containers docker lists now.
-    Each container keeps the (monotonic time, count) samples of the last window;
-    it is looping when the count rose by RESTART_LOOP_MIN or more since the
-    oldest sample in that window. A count that went DOWN is a recreated
-    container (a fresh container starts at 0), so its history restarts; a new
-    boot restarts every history. A container no longer listed is cleared.
-    Pure: no I/O.
+    Each container keeps (monotonic time, count) samples, and the RISE is the
+    count now minus the count of its BASELINE: the newest sample taken at or
+    before `mono - THRESHOLD`. The measured span therefore always covers the
+    whole window, and by at most one poll interval more - a restart inside the
+    window is never lost to pruning (dropping every sample older than the window
+    threw that baseline away, and three restarts at 100, 800 and 1700 s, polled
+    every 301 s, never fired; W10-sA review F3). Until a container has a sample
+    that old, the baseline is its oldest sample.
+
+    Looping FIRES when the rise reaches RESTART_LOOP_MIN, over whatever span the
+    samples cover. It CLEARS only when a whole THRESHOLD has passed with fewer:
+    a rise below RESTART_LOOP_MIN measured from a baseline at least THRESHOLD
+    old. A shorter history keeps the verdict it had, so a steady loop at the
+    threshold rate stays fired instead of flapping fire/clear every poll.
+
+    A count that went DOWN is a recreated container (a fresh one starts at 0),
+    so its history restarts; a new boot restarts every history (the monotonic
+    clock restarts). Either way a container that was looping stays looping
+    until a whole THRESHOLD of the new history has passed with fewer. A
+    container no longer listed is cleared. Pure: no I/O.
     Implements: SR-088, LLR-1211
     """
     st = dict(st)
     if counts is None:
         return None, st, "docker did not answer"
     if st.get("boot_id") != boot:
-        st = {"boot_id": boot, "samples": {}}
+        st = {"boot_id": boot, "samples": {}, "looping": list(st.get("looping", []))}
     window = row["threshold_s"]
+    cutoff = mono - window
     samples = {k: [list(x) for x in v] for k, v in st.get("samples", {}).items()}
+    was_looping = set(st.get("looping", []))
     verdicts, rising = {}, []
     for name, count in counts.items():
-        history = [x for x in samples.get(name, []) if 0 <= mono - x[0] <= window]
-        if history and count < history[-1][1]:
-            history = []
+        kept = [x for x in samples.get(name, []) if x[0] <= mono]
+        if kept and count < kept[-1][1]:
+            kept = []
+        older = [x for x in kept if x[0] <= cutoff]
+        history = older[-1:] + [x for x in kept if x[0] > cutoff]
         history.append([mono, count])
         samples[name] = history
         rise = count - history[0][1]
-        verdicts[name] = rise >= RESTART_LOOP_MIN
+        if rise >= RESTART_LOOP_MIN:
+            verdicts[name] = True
+        elif history[0][0] <= cutoff:
+            verdicts[name] = False
+        else:
+            verdicts[name] = name in was_looping
         if rise > 0:
             rising.append("%s +%d" % (name, rise))
     for name in list(samples):
@@ -292,6 +318,7 @@ def judge_restarts(
             del samples[name]
             verdicts[name] = False
     st["samples"] = samples
+    st["looping"] = sorted(n for n, bad in verdicts.items() if bad)
     return (
         verdicts,
         st,

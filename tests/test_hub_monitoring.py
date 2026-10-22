@@ -834,9 +834,84 @@ def test_tc1368_a_recreated_container_a_new_boot_and_a_hung_docker_llr1211():
     v, st2, _ = watch.judge_restarts(row, st, None, 700.0, "b")
     assert v is None and st2 == st, "docker not answering changes nothing"
     v, st, _ = watch.judge_restarts(row, st, {"x": 9}, 5.0, "b2")
-    assert v == {"x": False}, "a new boot restarts every history"
-    v, st, _ = watch.judge_restarts(row, st, {}, 10.0, "b2")
-    assert v == {"x": False} and st["samples"] == {}, "a container that is gone is cleared"
+    # A new boot restarts every history, but a loop that was alerting is not
+    # declared over by a reboot: it clears only after a whole window of the new
+    # boot with fewer than three restarts (W10-sA review F3).
+    assert v == {"x": True} and st["samples"] == {"x": [[5.0, 9]]}
+    v, st, _ = watch.judge_restarts(row, st, {"x": 10}, 1000.0, "b2")
+    assert v == {"x": True}, "less than a whole window of the new boot: no clear yet"
+    v, st, _ = watch.judge_restarts(row, st, {"x": 10}, 1805.0, "b2")
+    assert v == {"x": False}, "a whole window with one restart clears"
+    v, st, _ = watch.judge_restarts(row, st, {}, 1810.0, "b2")
+    assert v == {"x": False} and st["samples"] == {} and st["looping"] == [], "a container that is gone is cleared"
+
+
+def test_tc1368_the_baseline_brackets_the_window_so_no_restart_inside_it_is_lost_llr1211():
+    """The review's sequence (poll second, count), restarts really at 100, 800
+    and 1700 s, polled about every 301 s (the timer's AccuracySec=30s allows the
+    drift). All three lie inside the 30-minute window ending at 1806; pruning
+    every sample older than the window threw away the zero baseline and the
+    watch reported +2 and never fired."""
+    row = {"name": "r", "kind": "docker-restarts", "target": "*", "threshold_s": 1800}
+    st, seen = {}, []
+    for mono, count in ((0, 0), (301, 1), (602, 1), (903, 2), (1204, 2), (1505, 2), (1806, 3)):
+        v, st, what = watch.judge_restarts(row, st, {"immich-server": count}, float(mono), "b")
+        seen.append(v["immich-server"])
+    assert seen == [False] * 6 + [True], seen
+    assert "immich-server +3" in what
+    # The baseline kept is the newest sample at or before 1806 - 1800 = 6: (0, 0).
+    assert st["samples"]["immich-server"][0] == [0.0, 0]
+    # 2107: the window (307, 2107] holds 800 and 1700 only, from the baseline
+    # (301, 1), a whole window old: fewer than three, so it clears.
+    v, st, _ = watch.judge_restarts(row, st, {"immich-server": 3}, 2107.0, "b")
+    assert v == {"immich-server": False}
+
+
+def _restart_loop_verdicts(period, poll, until, stop_at=None, jitter=()):
+    """Drive judge_restarts with a container that restarts every `period`
+    seconds (until `stop_at`), polled every `poll` seconds (plus `jitter`)."""
+    row = {"name": "r", "kind": "docker-restarts", "target": "*", "threshold_s": 1800}
+    st, out, t, i = {}, [], 0.0, 0
+    while t <= until:
+        last = t if stop_at is None else min(t, stop_at)
+        count = int(last // period)
+        v, st, _ = watch.judge_restarts(row, st, {"c": count}, t, "b")
+        out.append((t, v["c"]))
+        t += poll + (jitter[i % len(jitter)] if jitter else 0.0)
+        i += 1
+    return out
+
+
+def test_tc1368_a_steady_loop_at_the_threshold_rate_fires_and_stays_fired_llr1211():
+    """Restarts every 600 s, polled every 301 s: exactly three per window. The
+    old pruning flapped fire/clear on every poll from 1505 s on, sending
+    'stopped restarting' while the loop ran."""
+    verdicts = _restart_loop_verdicts(period=600.0, poll=301.0, until=4 * 3600.0)
+    flips = [(a[0], b[0]) for a, b in zip(verdicts, verdicts[1:]) if a[1] and not b[1]]
+    assert flips == [], "cleared while the loop ran: %r" % flips[:5]
+    first = next(t for t, bad in verdicts if bad)
+    assert first <= 1800.0 + 301.0, first
+    assert all(bad for t, bad in verdicts if t >= first)
+    # the same loop with the timer's +-30 s drift
+    drift = _restart_loop_verdicts(period=600.0, poll=301.0, until=4 * 3600.0, jitter=(25.0, -20.0, 29.0, -30.0))
+    first = next(t for t, bad in drift if bad)
+    assert all(bad for t, bad in drift if t >= first), drift
+
+
+def test_tc1368_a_loop_clears_only_after_a_whole_window_with_fewer_llr1211():
+    """The loop stops at 7200 s (last restart there). While any whole 30-minute
+    window ending at the poll still holds three restarts the verdict stays
+    fired; it clears once one does not."""
+    verdicts = _restart_loop_verdicts(period=600.0, poll=301.0, until=4 * 3600.0, stop_at=7200.0)
+    restarts = [600.0 * k for k in range(1, 13)]
+    for t, bad in verdicts:
+        inside = sum(1 for r in restarts if t - 1800.0 < r <= t)
+        if t > 1800.0 + 301.0 and inside >= 3:
+            assert bad, (t, inside)
+    cleared = [t for t, bad in verdicts if t > 7200.0 and not bad]
+    assert cleared, "never cleared after the loop stopped"
+    assert cleared[0] >= 7200.0 - 1200.0 + 1800.0, cleared[0]   # 6000 s restart left the window
+    assert all(not bad for t, bad in verdicts if t >= cleared[0])
 
 
 def test_tc1369_the_watch_alerts_a_loop_once_and_clears_it_once_llr1211(tmp_path, monkeypatch):

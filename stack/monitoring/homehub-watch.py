@@ -419,7 +419,9 @@ def judge_newest_file(row: dict, st: dict, found: dict, now: float) -> Tuple[boo
     recorder that has not written since before a reboot is still not writing);
     and at once when the walk hit a limit, because a partial walk cannot vouch
     for the newest file. `now` must be read AFTER the walk, or the segment being
-    written can carry an mtime later than `now`. Never unknown: a tree that
+    written can carry an mtime later than `now`. A newest mtime more than 60 s
+    after `now` means the clock went back: that reading keeps the firing state
+    as it was, so an unchanged stale file never reads as a recovery. Never unknown: a tree that
     cannot be read is a recorder that is not recording there. Pure.
     Implements: LLR-1290
     """
@@ -432,6 +434,14 @@ def judge_newest_file(row: dict, st: dict, found: dict, now: float) -> Tuple[boo
     newest = found.get("newest")
     if newest is not None:
         st.pop("empty_since", None)
+        if newest[0] > now + 60:  # the same slack as empty_since: the clock went back past the file
+            # An unchanged stale file read through a rolled-back clock looks
+            # fresh. That is no evidence of recovery, so a firing incident
+            # stays firing and nothing is cleared (Sol W3b review round 1, F2).
+            st["firing"] = bool(st.get("firing"))
+            return (st["firing"], st, "newest %s has an mtime %ds in the future (clock went back?) - "
+                    "not judged as recovery (%d matching)%s"
+                    % (newest[1], int(newest[0] - now), found.get("files", 0), problem))  # fmt: skip
         st["firing"] = now - newest[0] >= limit
         return (st["firing"], st, "newest %s written %ds ago (%d matching)%s"
                 % (newest[1], int(now - newest[0]), found.get("files", 0), problem))  # fmt: skip

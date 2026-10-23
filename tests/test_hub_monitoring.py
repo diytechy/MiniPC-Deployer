@@ -1146,6 +1146,44 @@ def test_tc1461_stale_segments_deleted_while_firing_send_no_false_clear_llr1290(
     assert watch.main(args) == 0 and sent == ["watch-door-segments", "watch-door-segments.clear"]
 
 
+def test_tc1461_a_clock_that_went_back_does_not_clear_a_stale_recorder_llr1290(tmp_path, monkeypatch):
+    """main(): a segment last written 1200 s ago fires -> the clock goes back an hour with the
+    file untouched (its mtime now 2400 s in the future) -> still firing, no 'being written
+    again' -> a genuinely fresh segment is the only clear (Sol W3b review round 1, F2)."""
+    sent = []
+    monkeypatch.setattr(watch.mc, "send_alert", lambda key, prio, title, *a, **k: sent.append(key)
+                        or mc.ALERT_DELIVERED)  # fmt: skip
+    clock = {"t": T0}
+    monkeypatch.setattr(watch.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(watch.time, "time", lambda: clock["t"])
+    monkeypatch.setenv("HOMEHUB_MONITOR_OVERRIDE_FILE", str(tmp_path / "no-override"))
+    row = [line for line in TABLE.splitlines() if line.startswith("door-segments ")]
+    door = (tmp_path / "door").as_posix()
+    table = _w(tmp_path / "watch.table", "\n".join(row).replace("/srv/scratch/door", door) + "\n")
+    _w(tmp_path / "env", "DOOR_RECORDER_ENABLED=true\n")
+    _w(tmp_path / "proc/sys/kernel/random/boot_id", "b1\n")
+    args = ["--table", str(table), "--state-dir", str(tmp_path / "st"), "--env-file", str(tmp_path / "env"),
+            "--proc-root", str(tmp_path / "proc")]  # fmt: skip
+    day = tmp_path / "door" / "2026-10-22"
+    _seg(day / "door-20261022T200000Z.ts", T0 - 1200)
+    assert watch.main(args) == 0 and sent == ["watch-door-segments"]
+    for back in (3600, 3300, 3000):  # the clock went back an hour and runs on from there
+        clock["t"] = T0 - back
+        assert watch.main(args) == 0
+    assert sent == ["watch-door-segments"], "an unchanged stale file is no recovery"
+    # held, not judged, until the clock passes the file again: then a fresh segment is the clear
+    clock["t"] = T0 + 300
+    assert watch.main(args) == 0 and sent == ["watch-door-segments"], "the file is 1500 s old again"
+    _seg(day / "door-20261022T210000Z.ts.part", T0 + 590)
+    clock["t"] = T0 + 600
+    assert watch.main(args) == 0 and sent == ["watch-door-segments", "watch-door-segments.clear"]
+    # the pure judgement: a row that was not firing stays ok, and says why it did not judge
+    bad, st, what = _judge_door(_door_row(tmp_path), {}, T0 - 7200)
+    assert bad is False and st["firing"] is False and "in the future (clock went back?)" in what
+    bad, st, what = _judge_door(_door_row(tmp_path), {"firing": True}, T0 - 7200)
+    assert bad is True and st["firing"] is True and "not judged as recovery" in what
+
+
 def _can_symlink(tmp_path):
     try:
         os.symlink(str(tmp_path), str(tmp_path / "probe-link"))

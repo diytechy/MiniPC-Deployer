@@ -95,6 +95,34 @@ measured, and the alert clears only after a whole 30 min with fewer), and the
 drill-only synthetic watch. `HOMEHUB_WATCH_DISABLE="row ..."` switches
 rows off without editing the table.
 
+Plan W3b added two kinds and three rows, each row on only when its component
+is (LLR-1290..LLR-1292):
+
+| Row | Kind | Fires when | Knob for the threshold | On with |
+|---|---|---|---|---|
+| `door-segments` | `newest-file` | the newest `/srv/scratch/door/*/door-*.ts*` (the open `.ts.part` is the recording in progress and counts) was last written 15 min ago or more, or nothing has matched for 15 min | `HOMEHUB_WATCH_DOOR_FRESH_MIN` | `DOOR_RECORDER_ENABLED=true` |
+| `scratch-mount` | `scratch-identity` | `homehub_scratch.py status` has not said `mounted`, `identity_ok` and `prjquota` on two runs in a row (5 min), or cannot run | `HOMEHUB_WATCH_SCRATCH_MIN` | `HOMEHUB_SCRATCH_ENABLED=true` |
+| `meeting-pull` | `unit-success` | `homehub-meeting-pull.service` (every 2 min) has not succeeded for 30 min - which includes the panel being unreachable for that long | `HOMEHUB_WATCH_MEETING_PULL_MIN` | `MEETING_PULL_ENABLED=true` |
+
+- **`newest-file` never follows a symlink** - not the root, not a directory,
+  not a file - so a link cannot pull a fresh file from elsewhere into the
+  judgement. It looks at no more than 10 000 entries (the door tree holds about
+  150 at its cap) and gives the walk 10 s; hitting either bound **fires**, because
+  a walk that saw part of the tree cannot vouch for its newest file. A missing
+  or unreadable tree is "nothing matched", never "unknown". Point it at NVMe
+  paths only: a directory walk would wake a spun-down disk.
+- **`scratch-identity` re-implements nothing.** It runs the guard's own module
+  (`--env-file <stack .env> status`, 10 s) and reads back its three keys, so
+  the watch and the writers' mount guard cannot disagree about which volume is
+  the right one. A status that crashes, times out or prints no JSON fires with
+  the reason; it never crashes the watch.
+- A threshold of `0m` fires at the next run on a healthy job: the drill value,
+  only ever set in the override file.
+
+`Get-DeploymentState` (HomeHub `scripts/verify/deployment-state.psd1`) already
+measures the same two facts from the outside (`scratch-identity`,
+`door-segment-fresh`); these rows are the alert, that is the audit.
+
 ### Liveness and evidence (SR-089)
 
 After `HOMEHUB_LIVENESS_FAILURES` (3) consecutive failed runs: **one** bundle
@@ -161,9 +189,71 @@ sudo rm /etc/homehub-monitor/override.env
 # next run: ntfy "HomeHub: liveness restored"
 ```
 
+### The W3b drills: (d) door segments, (e) scratch identity, (f) meeting pull
+
+Each one fires a watch on a **healthy** job by overriding only that row's
+threshold (or, for (e), the status tool's path), and is restored by deleting the
+override. Nothing is stopped: the recorder keeps recording, the pull keeps
+pulling, the volume stays mounted.
+
+Two rules before starting:
+
+- **Look first, and never leave a scratch knob in the override.** The scratch
+  writers' mount guard (`homehub_scratch.py guard`, run before every door
+  segment) reads `/etc/homehub-monitor/override.env` too, so a `HOMEHUB_SCRATCH_*`
+  line there would stop the recorder. The drills below write `HOMEHUB_WATCH_*`
+  only, which the guard ignores. `sudo cat /etc/homehub-monitor/override.env`
+  first; if it exists and is not yours, stop and ask.
+- **One fire per row per 30 min.** A delivered alert stamps its key for
+  `HOMEHUB_ALERT_REPEAT_SEC` (1800 s); a repeat inside that window is journaled
+  `alert suppressed` and stays pending. The `.clear` has its own key.
+
+Subscribe, then run each drill as one block (a timer run landing between the
+`tee` and the `rm` is harmless: it sends the same one alert):
+
+```sh
+curl -s "http://<lan-ip>:<NTFY_PORT>/homehub-alerts/json?poll=1&since=2h"
+
+# (d) door segments: 0m fires on the segment being written right now
+sudo install -d -m 0755 /etc/homehub-monitor
+printf 'HOMEHUB_WATCH_DOOR_FRESH_MIN=0\n' | sudo tee /etc/homehub-monitor/override.env
+sudo systemctl start homehub-watch.service
+journalctl -u homehub-watch -n 20 --no-pager
+#   watch: door-segments     FIRING   newest door-<UTC>.ts.part written 2s ago (N matching)
+#   alert delivered to http://... [watch-door-segments]: HomeHub: nothing new matching /srv/scratch/door/*/door-*.ts* in 0m (watch door-segments)
+#   ntfy: "HomeHub: nothing new matching /srv/scratch/door/*/door-*.ts* in 0m (watch door-segments)"
+sudo rm /etc/homehub-monitor/override.env
+sudo systemctl start homehub-watch.service
+#   watch: door-segments     ok       newest door-<UTC>.ts.part written 1s ago (N matching)
+#   ntfy: "HomeHub: /srv/scratch/door/*/door-*.ts* is being written again (watch door-segments)"
+
+# (e) scratch identity: a status tool that does not exist must alert, at 0m
+printf 'HOMEHUB_WATCH_SCRATCH_TOOL=/nonexistent/homehub_scratch.py\nHOMEHUB_WATCH_SCRATCH_MIN=0\n' \
+    | sudo tee /etc/homehub-monitor/override.env
+sudo systemctl start homehub-watch.service
+#   watch: scratch-mount     FIRING   scratch status did not run: /nonexistent/homehub_scratch.py status exited 2: ... (bad for 0s)
+#   ntfy: "HomeHub: the scratch volume is not mounted as expected (watch scratch-mount)"
+sudo rm /etc/homehub-monitor/override.env
+sudo systemctl start homehub-watch.service
+#   watch: scratch-mount     ok       /srv/scratch mounted from /dev/mapper/...-hub--scratch, identity and prjquota ok
+#   ntfy: "HomeHub: the scratch volume is mounted as expected again (watch scratch-mount)"
+
+# (f) meeting pull: 0m fires on any last success older than now
+printf 'HOMEHUB_WATCH_MEETING_PULL_MIN=0\n' | sudo tee /etc/homehub-monitor/override.env
+sudo systemctl start homehub-watch.service
+#   watch: meeting-pull      FIRING   last success Ns ago
+#   ntfy: "HomeHub: homehub-meeting-pull.service has not succeeded in 0m (watch meeting-pull)"
+sudo rm /etc/homehub-monitor/override.env
+sudo systemctl start homehub-watch.service
+#   watch: meeting-pull      ok       last success Ns ago     (needs a success within 30 min)
+#   ntfy: "HomeHub: homehub-meeting-pull.service succeeded again (watch meeting-pull)"
+```
+
+Afterwards `sudo test ! -e /etc/homehub-monitor/override.env && echo restored`,
+and `sudo cat /var/lib/homehub-monitor/watch-status.json` shows all three `ok`.
+
 ## What is NOT here
 
 - Recovery of any kind (SN-046's opt-in supervisor owns that).
-- The door recorder and scratch-volume identity watches (plan W3b, after W4).
 - An alert route from the panel: the panel's freeze watchdog and disk alarm
   write the panel's journal only.

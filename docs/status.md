@@ -12,6 +12,17 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-10-22 — HomeHub plan W3b, on `w3b-recorder-scratch-watches` (not merged, not deployed).**
+- **SR-088 amended / LLR-1290..1292:** `homehub-watch` gains two kinds. `newest-file`: the newest file
+  matching an absolute glob is THRESHOLD old, or nothing has matched for THRESHOLD; never follows a
+  symlink, at most 10 000 entries and 10 s, and a bound hit fires. `scratch-identity`: runs
+  `homehub_scratch.py status` (the guard's own module, never re-implemented) and fires when it has not
+  said mounted + identity_ok + prjquota on two runs in a row, or cannot run. Three rows, each gated by its
+  component's switch: `door-segments` (15 min, the open `.ts.part` counts), `scratch-mount` (5 min),
+  `meeting-pull` (`unit-success`, 30 min). Thresholds take `0m` from the override file for live drills
+  that stop nothing (README "The W3b drills"). TC-1460..1466.
+- Not proven: any of it on the hub (deploy and drills are the coordinator's; steps in HomeHub FOLLOWUPS).
+
 **2026-10-22 — HomeHub plan W10, lane W10-timer, on `w10-frame-timer-cadence` (not merged, not deployed).**
 - **SR-112 / LLR-1255:** `wall-sync-frame.timer` carries the Owner's 30-minute cadence itself
   (`OnUnitInactiveSec=30min`) plus `OnActiveSec=3min`, which arms from the timer's own start. The panel's

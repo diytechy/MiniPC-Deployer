@@ -15,7 +15,18 @@
 #                  THRESHOLD (TARGET is `*`; one alert per container). A crash
 #                  loop never reads `unhealthy` - between deaths it is
 #                  `starting` and `docker ps` says Up (open-items C58).
-# threshold: Nm (minutes) or Nh (hours).
+#   newest-file    the newest regular file matching TARGET (an absolute glob
+#                  with a fixed root; `*` per level, no `**`) is THRESHOLD old,
+#                  or nothing has matched for THRESHOLD. Never follows a
+#                  symlink; bounded in entries and time. Point it only at NVMe
+#                  paths: the walk reads directories, which would wake a
+#                  spun-down disk.
+#   scratch-identity
+#                  TARGET is homehub_scratch.py; its `status` says the scratch
+#                  volume is not mounted, not the expected filesystem, or
+#                  without prjquota - or the status cannot run - for THRESHOLD.
+# threshold: Nm (minutes) or Nh (hours). 0m fires at the first run that sees
+#   the condition: a drill value, set in the override file, never here.
 # when: comma-separated conditions on stack .env knobs, ALL of which must hold:
 #   KEY=VALUE, KEY!=VALUE, or KEY (set and not empty). Omitted or `-` = always.
 # ${KEY:-default} in target or threshold is replaced from the stack .env.
@@ -33,3 +44,10 @@ restart-loops      docker-restarts *                                          30
 # The drill target. Off unless HOMEHUB_WATCH_SYNTHETIC_PROCESS names a process;
 # used only to prove the alert path end to end (stack/monitoring/README.md).
 synthetic          process        ${HOMEHUB_WATCH_SYNTHETIC_PROCESS:-}        ${HOMEHUB_WATCH_SYNTHETIC_ABSENT_MIN:-10}m  HOMEHUB_WATCH_SYNTHETIC_PROCESS
+# Plan W3b (after W4/W6): the door recorder's newest segment (the open .ts.part
+# is the recording in progress), the scratch volume's identity, and the meeting
+# pull. Each threshold has a knob so a drill can set it to 0m in
+# /etc/homehub-monitor/override.env without stopping anything (README "Drills").
+door-segments      newest-file    /srv/scratch/door/*/door-*.ts*              ${HOMEHUB_WATCH_DOOR_FRESH_MIN:-15}m        DOOR_RECORDER_ENABLED=true
+scratch-mount      scratch-identity ${HOMEHUB_WATCH_SCRATCH_TOOL:-/opt/homehub/stack/scratch/homehub_scratch.py} ${HOMEHUB_WATCH_SCRATCH_MIN:-5}m HOMEHUB_SCRATCH_ENABLED=true
+meeting-pull       unit-success   homehub-meeting-pull.service                ${HOMEHUB_WATCH_MEETING_PULL_MIN:-30}m      MEETING_PULL_ENABLED=true

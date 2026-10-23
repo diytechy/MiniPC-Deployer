@@ -11,7 +11,10 @@
 #     their whole process group at the evidence item's timeout and cap
 #     (TC-1309, TC-1310), and a descendant that escapes the group (TC-1312);
 #   * four simultaneous alarms against a hung ntfy, through the real helper
-#     and the shipped delivery deadline (TC-1314).
+#     and the shipped delivery deadline (TC-1314);
+#   * the W3b watches over a real tree with symlinks pointing out of it, and
+#     the REAL homehub_scratch.py status on a box with no scratch volume
+#     (TC-1466).
 # Nothing here needs root, a network, docker or a real disk.
 #
 # Run by stack/run-hermetic-tests.sh.
@@ -232,6 +235,42 @@ else
     fail "TC-1314 rc=$rc took=${took}s limit=$limit leftover=$leftover verdict=$verdict out=$out"
 fi
 pkill -f "sleep $NAP" 2>/dev/null
+
+# ── plan W3b: the real watch over a real tree and the REAL scratch status ──
+# The real homehub-watch.py main(), the shipped W3b rows (the door tree moved
+# into $TMP), real symlinks pointing out of the tree, and the real
+# stack/scratch/homehub_scratch.py status on a box with no scratch volume: the
+# door row judges only the file inside the tree, and the scratch row fires
+# "not mounted" from the tool's own JSON (TC-1466).
+W="$TMP/w3b"; D="$W/door"
+mkdir -p "$D/2026-10-22" "$W/outside" "$W/proc/sys/kernel/random"
+echo w3bboot >"$W/proc/sys/kernel/random/boot_id"
+: >"$W/outside/door-20261022T235900Z.ts"                       # fresh, but outside
+ln -s "$W/outside" "$D/2026-10-23"                             # a day that is a link out
+ln -s "$W/outside/door-20261022T235900Z.ts" "$D/2026-10-22/door-20261022T235959Z.ts"
+: >"$D/2026-10-22/door-20261022T200000Z.ts"
+touch -d '-2 hours' "$D/2026-10-22/door-20261022T200000Z.ts"   # the only real segment: stale
+grep -E '^(door-segments|scratch-mount) ' "$MON/watch.table" | sed "s#/srv/scratch/door#$D#" >"$W/watch.table"
+printf 'DOOR_RECORDER_ENABLED=true\nHOMEHUB_SCRATCH_ENABLED=true\nHOMEHUB_WATCH_SCRATCH_MIN=0\nHOMEHUB_WATCH_SCRATCH_TOOL=%s\n' \
+    "$MON/../scratch/homehub_scratch.py" >"$W/env"
+: >"$W/alerts.log"
+out="$(ALERTS="$W/alerts.log" python3 "$MON/homehub-watch.py" --table "$W/watch.table" --state-dir "$W/st" \
+        --env-file "$W/env" --alert-helper "$TMP/alert.sh" --proc-root "$W/proc" 2>&1)"; rc=$?
+verdict="$(python3 -c '
+import json, sys
+rows = {r["name"]: r for r in json.load(open(sys.argv[1]))["rows"]}
+print("%s|%s|%s|%s" % (rows["door-segments"]["verdict"], rows["door-segments"]["detail"],
+                       rows["scratch-mount"]["verdict"], rows["scratch-mount"]["detail"]))' "$W/st/watch-status.json" 2>&1)"
+alerts="$(sort "$W/alerts.log" | tr '\n' ' ')"
+case "$verdict" in
+    "FIRING|newest door-20261022T200000Z.ts written "*"s ago (1 matching)|FIRING|/srv/scratch is not mounted (bad for 0s)")
+        if [ "$rc" = 0 ] && [ "$alerts" = "watch-door-segments watch-scratch-mount " ]; then
+            pass "TC-1466 real tree: links out are not followed; the real scratch status says not mounted; one alert each"
+        else
+            fail "TC-1466 rc=$rc alerts=$alerts out=$out"
+        fi ;;
+    *) fail "TC-1466 verdict=$verdict rc=$rc out=$out" ;;
+esac
 
 mode="$(stat -c %a "$TMP/ev")"
 if [ "$mode" = 700 ]; then pass "TC-1310 the evidence root is 0700"; else fail "TC-1310 evidence root mode $mode"; fi

@@ -167,14 +167,16 @@ if [ "$rc2" = 76 ] && ! grep -q ' run ' "$FAKE_LOG" && [ -z "$leaked" ]; then
 else bad "2 unmounted: rc=$rc2 leaked=[$leaked] $(echo "$out2" | tail -2)"; fi
 mount -T "$R/etc/fstab" "$MP"
 
-# 3 the volume goes away mid-run: the next item's guard refuses (exit 76) and
-#   nothing is written under the bare mount point
+# 3 the volume goes away while an item's container runs: the next guard (before
+#   that item's metadata, or - when the lazily unmounted item is no longer
+#   visible - before the next item) refuses with exit 76, the next item's
+#   container never starts, and nothing is written under the bare mount point
 rm -f "$MP/ottertube/lib/video/test/"*; : >"$FAKE_LOG"
 export FAKE_SIZE_huge_item=5 FAKE_UNMOUNT_AFTER=small-item
 out3="$(otrun)"; rc3=$?
 leaked="$(find "$MP" -mindepth 1 2>/dev/null | head -3)"
-if [ "$rc3" = 76 ] && [[ "$out3" == *"before item huge-item"* ]] && [ -z "$leaked" ]; then
-    ok "3 unmounted mid-run: the next item refused (exit 76), nothing under the bare mount point"
+if [ "$rc3" = 76 ] && [[ "$out3" == *"before item small-item metadata"* || "$out3" == *"before item huge-item:"* ]] && ! grep -q 'huge-item' "$FAKE_LOG" && [ -z "$leaked" ]; then
+    ok "3 unmounted mid-run: refused at the next guard (exit 76: $(echo "$out3" | grep -o 'before item [a-z-]*\( metadata\)\?' | head -1)), the next item never started, nothing under the bare mount point"
 else bad "3 mid-run: rc=$rc3 leaked=[$leaked] $(echo "$out3" | tail -3)"; fi
 unset FAKE_UNMOUNT_AFTER
 mount -T "$R/etc/fstab" "$MP"

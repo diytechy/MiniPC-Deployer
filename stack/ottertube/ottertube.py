@@ -644,6 +644,9 @@ class Runner:
             for line in out.splitlines()[-12:]:
                 mc.log("ottertube: item %s: %s" % (stem, line[:400]), warning=True)
             return "failed"
+        # The container ran for minutes; the probe, the title and the thumbnail
+        # are new files on the volume, so the guard runs again before them.
+        self.check_guard("item %s metadata" % stem)
         if kind == "video":
             height = self.probe_height(col, folder, stem)
             if height is None or height > MAX_HEIGHT:

@@ -274,8 +274,8 @@ class Rig:
 def test_tc1435_the_guard_runs_before_the_run_every_item_and_the_indexer(tmp_path):
     rig = Rig(tmp_path, a_list(item(1), item(2)))
     assert rig.runner.run() == 0
-    # run, item-1, item-2, approved.json, the indexer
-    assert rig.guard_calls == 5
+    # run, item-1 and its metadata, item-2 and its metadata, approved.json, the indexer
+    assert rig.guard_calls == 7
     assert len(rig.downloads()) == 2 and any("ottertube-indexer" in c for c in rig.calls)
 
 
@@ -287,10 +287,19 @@ def test_tc1435_a_refusal_before_the_run_starts_nothing(tmp_path):
 
 
 def test_tc1435_a_refusal_before_the_second_item_stops_there(tmp_path):
-    rig = Rig(tmp_path, a_list(item(1), item(2)), guard_results=[(True, "ok"), (True, "ok"), (False, "wrong device")])
+    rig = Rig(tmp_path, a_list(item(1), item(2)), guard_results=[(True, "ok"), (True, "ok"), (True, "ok"), (False, "wrong device")])
     assert rig.runner.run() == ot.EXIT_GUARD
     assert len(rig.downloads()) == 1 and not any("ottertube-indexer" in c for c in rig.calls)
     assert os.listdir(rig.paths.work) == []
+
+
+def test_tc1435_a_refusal_after_the_container_writes_no_metadata(tmp_path):
+    rig = Rig(tmp_path, a_list(item(1, thumb="https://images-assets.nasa.gov/video/a/a~thumb.jpg")),
+              guard_results=[(True, "ok"), (True, "ok"), (False, "not a mount point")])
+    assert rig.runner.run() == ot.EXIT_GUARD
+    assert rig.fetches == [] and not any("--entrypoint" in c for c in rig.calls)
+    info = json.load(open(os.path.join(rig.paths.kind_root("video"), "space", "item-1.info.json")))
+    assert info["title"] == "item-1~small"
 
 
 def test_tc1436_edquot_in_the_output_stops_the_run_empties_work_and_alerts(tmp_path):

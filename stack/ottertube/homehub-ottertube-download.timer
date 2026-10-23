@@ -1,0 +1,18 @@
+[Unit]
+# Once a day, off-peak (SR-113): 01:20, before the IceDrive profile (02:10) and
+# the backups (03:00), so the run's network and disk use meet neither. A run
+# downloads only items not yet on the volume, so an unchanged list costs a few
+# container starts and no transfer. The service's ExecCondition reads
+# OTTERTUBE_ENABLED: with it off the timer fires into a clean skip.
+Description=OtterTube: daily download of the curated list
+
+[Timer]
+OnCalendar=*-*-* 01:20:00
+RandomizedDelaySec=10min
+# Not Persistent: a run missed while the hub was off waits for the next night
+# rather than starting at boot, in the daytime.
+Persistent=false
+Unit=homehub-ottertube-download.service
+
+[Install]
+WantedBy=timers.target

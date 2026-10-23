@@ -238,6 +238,28 @@ case "$DOOR_RELAY_ENABLED" in
         ;;
 esac
 
+# ── OTTERTUBE: THE SAME SHAPE AS THE DOOR RELAY (SN-051, SR-113) ─────────────
+# `ottertube` is a compose profile only to keep its three services out of
+# firstboot's bulk `up -d`; the homehub-ottertube-* units own them and
+# OTTERTUBE_ENABLED is the switch. So the bake follows the knob: the two pinned
+# images (stack/ottertube/ottertube-images.pin). The media server is the local
+# caddy-cloudflare image, baked with Caddy whatever the knob says.
+case " $ENV_PROFILES " in
+    *" ottertube "*)
+        die "COMPOSE_PROFILES in $ENV_FILE contains 'ottertube'. That is a DEFECT, not an enable switch: its services belong to the homehub-ottertube-* units, which run the scratch guard first. Remove ottertube from COMPOSE_PROFILES and set OTTERTUBE_ENABLED=true instead."
+        ;;
+esac
+OTTERTUBE_ENABLED="$(env_file_value "$ENV_FILE" OTTERTUBE_ENABLED | tr -d '[:space:]')"
+case "$OTTERTUBE_ENABLED" in
+    true)
+        PROFILE_ARGS+=(--profile ottertube)
+        log "OTTERTUBE_ENABLED=true in ${ENV_FILE##*/} — baking the OtterTube downloader and indexer images (--profile ottertube)"
+        ;;
+    *)
+        log "OTTERTUBE_ENABLED is not true in ${ENV_FILE##*/} — the OtterTube images are NOT baked"
+        ;;
+esac
+
 for p in $ENV_PROFILES ${EXTRA_PROFILES:-}; do
     case " ${PROFILE_ARGS[*]} " in *" $p "*) continue ;; esac
     PROFILE_ARGS+=(--profile "$p")

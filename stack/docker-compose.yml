@@ -170,6 +170,10 @@ services:
       # the Caddyfile. The relay unit's failure message says so.
       GAME_HOST: ${GAME_HOST}
       GAME_WS_SECRET: ${GAME_WS_SECRET}
+      # The OtterTube site (SN-051): LAN-only, one name, the web build plus the
+      # catalogue and media proxied to homehub-ottertube-media. A Technitium
+      # pinpoint record exists for it only while OTTERTUBE_ENABLED=true.
+      OTTERTUBE_HOST: ${OTTERTUBE_SUBDOMAIN:-ottertube}.${DOMAIN}
     # THREE NETWORKS, and ALL must be named explicitly. Naming any network at
     # all opts a service OUT of the implicit `default`, so omitting `default`
     # here would cut Caddy off from tracker, actual and oauth2-proxy in one edit
@@ -190,6 +194,10 @@ services:
       # it, nothing writes it — the IMAGE populates the directory. Ships empty
       # (README only) until the OfficeWallNaglight artifact contract lands.
       - ./wall-shell:/srv/wall-shell:ro
+      # OtterTube's web build (npm run build -> dist/web), read-only. Ships with
+      # a README only; the coordinator fills it with `rsync --delete` INTO the
+      # directory (replacing the directory itself would detach this mount).
+      - ./ottertube/web:/srv/ottertube/web:ro
       # THE ACCESS LOG fail2ban READS, and it is a BIND MOUNT rather than a
       # named volume on purpose: fail2ban runs on the HOST and has to be able to
       # tail the file. Only the admin sign-in host and the LLM gateway log here
@@ -1606,6 +1614,173 @@ services:
       # Pinned by digest; a digest pin has nothing for diun to watch.
       - "diun.enable=false"
 
+  # ── OtterTube: the curated kids' video downloader, catalogue and media (SN-051) ──
+  #
+  # Three services, ONE profile, and the profile is NOT an enable switch: it keeps
+  # them out of firstboot's bulk `up -d`. Their units own them (stack/ottertube/):
+  #   * homehub-ottertube-download.service (a daily timer) runs ottertube.py,
+  #     which starts ottertube-ytdl-sub ONCE PER ITEM and then ottertube-indexer,
+  #     each with `docker compose run --rm`, after the scratch guard;
+  #   * homehub-ottertube-media.service holds ottertube-media up, read-only.
+  # The knob is OTTERTUBE_ENABLED. NEVER add `ottertube` to COMPOSE_PROFILES.
+  #
+  # THE SCRATCH WRITER RULES (SR-103, IF-071) for every one of them:
+  # `restart: "no"` (a docker restart or a reboot cannot start one ahead of the
+  # mount; its unit does, behind RequiresMountsFor=/BindsTo=), long-syntax binds
+  # with create_host_path: false (a missing /srv/scratch fails the start instead
+  # of docker creating the path on /), no CAP_SYS_RESOURCE (cap_drop: ALL - the
+  # quota is only a wall without it), and nothing written outside
+  # /srv/scratch/ottertube: read-only root filesystems, tmpfs /tmp, no log driver
+  # (the attached `run` hands the output to ottertube.py and the journal).
+  #
+  # PINNED BY VERSION AND DIGEST (stack/ottertube/ottertube-images.pin; the media
+  # server is the hub's own caddy-cloudflare image, built locally).
+  ottertube-ytdl-sub:
+    image: ${OTTERTUBE_YTDL_SUB_IMAGE}
+    profiles: ["ottertube"]
+    # ytdl-sub itself, not the image's s6 init: no cron, no PUID/PGID chown of
+    # /config, no default files written into it. ottertube.py passes the verb.
+    entrypoint: ["ytdl-sub"]
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 1.0
+    # Its own network: egress for the download, no route to the stack's other
+    # containers by name.
+    networks: [ottertube]
+    volumes:
+      - type: bind
+        source: ./ottertube/ytdl-sub
+        target: /config
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/scratch/ottertube/lib/video
+        target: /library/video
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/scratch/ottertube/lib/music
+        target: /library/music
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/scratch/ottertube/work
+        target: /work
+        bind:
+          create_host_path: false
+    logging:
+      driver: none
+    labels:
+      - "diun.enable=false"
+
+  # OtterTube's own indexer (tools/catalog/build-catalog.mjs, from the OtterTube
+  # commit the served build came from; stack/ottertube/README.md "Indexer").
+  # No network at all. Downloads and publication share ONE bind (/library) so
+  # the publication can be hard links (--require-hardlink): no second copy
+  # against the quota. NOT /lib: that would shadow the image's own /lib (musl's
+  # loader lives there) and nothing in the container could start - measured.
+  ottertube-indexer:
+    image: ${OTTERTUBE_INDEXER_IMAGE}
+    profiles: ["ottertube"]
+    entrypoint: []
+    working_dir: /ottertube
+    restart: "no"
+    read_only: true
+    network_mode: none
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    mem_limit: 512m
+    cpus: 1.0
+    volumes:
+      - type: bind
+        source: ./ottertube/indexer
+        target: /ottertube
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/scratch/ottertube/lib
+        target: /library
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/scratch/ottertube/catalog
+        target: /catalog
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/scratch/ottertube/work
+        target: /work
+        read_only: true
+        bind:
+          create_host_path: false
+    logging:
+      driver: none
+    labels:
+      - "diun.enable=false"
+
+  # The publication and the catalogue, read-only, for Caddy's OtterTube site
+  # (reverse_proxy homehub-ottertube-media:8080). A separate server so the main
+  # Caddy never binds the scratch volume: a missing volume stops THIS container
+  # (its unit is BindsTo=srv-scratch.mount), never every site, and the door's
+  # recordings are never inside the internet-facing proxy's view.
+  ottertube-media:
+    image: caddy-cloudflare:${CADDY_IMAGE_TAG}
+    container_name: homehub-ottertube-media
+    profiles: ["ottertube"]
+    command: ["caddy", "file-server", "--root", "/srv/ottertube", "--listen", ":8080"]
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /config
+      - /data
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # ...and back the ONE capability the image's caddy binary carries as a file
+    # capability (cap_net_bind_service=ep): without it in the bounding set the
+    # kernel refuses to exec the binary at all (measured: exit 255, no output).
+    # It listens on 8080 and never uses it.
+    cap_add:
+      - NET_BIND_SERVICE
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.5
+    networks: [default]
+    volumes:
+      - type: bind
+        source: /srv/scratch/ottertube/lib/publish
+        target: /srv/ottertube/media
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/scratch/ottertube/catalog
+        target: /srv/ottertube/catalog
+        read_only: true
+        bind:
+          create_host_path: false
+    logging:
+      driver: none
+    labels:
+      - "diun.enable=false"
+
   # ── centralised LLM gateway: FreeLLMAPI (SR-043, SN-043) ─────────────────────
   #
   # ONE endpoint every LLM consumer points at — hub services, the Owner over the
@@ -2035,6 +2210,12 @@ networks:
         - subnet: 172.28.92.0/24
           gateway: 172.28.92.1
           ip_range: 172.28.92.128/25
+
+  # The OtterTube downloader's network (SN-051): egress for ytdl-sub and nothing
+  # else on it, so the downloader cannot reach the stack's containers by name.
+  # Not `internal`: it must reach the reviewed hosts. Not a LAN fence either (a
+  # bridge still NATs to the LAN); the sources are reviewed hosts, not hostile.
+  ottertube:
 
 volumes:
   # Sure ledger and attachments: private, LAN backup drive only.

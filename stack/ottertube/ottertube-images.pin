@@ -1,0 +1,47 @@
+# ottertube-images.pin - the OtterTube downloader's images, by version AND digest.
+#
+# Implements: SR-113, LLR-1264
+#
+# docker-compose.yml references ${OTTERTUBE_YTDL_SUB_IMAGE} and
+# ${OTTERTUBE_INDEXER_IMAGE}, whose values in stack/.env.example are
+# IMAGE:VERSION@DIGEST built from the lines below; tests/test_ottertube.py fails
+# if they ever differ. The media server is the hub's own caddy-cloudflare image
+# (stack/caddy/Dockerfile, built locally), so it has no line here.
+#
+# PROVENANCE, 2026-10-22:
+#   ytdl-sub (https://github.com/jmbannon/ytdl-sub), the HEADLESS image:
+#   * GitHub release 2026.08.26.post1, published 2026-08-26T03:04:20Z, not a
+#     pre-release - the newest release (api.github.com/repos/jmbannon/ytdl-sub/releases).
+#   * The registry itself: HEAD ghcr.io/v2/jmbannon/ytdl-sub/manifests/2026.08.26.post1
+#     answered 200, docker-content-digest sha256:f96bcf1d...e278, an OCI image
+#     INDEX whose linux/amd64 manifest is
+#     sha256:29f27bc2b405b303d9da07f11f53ba39f7575efb94f98fe4c2c65d40a3e83bdd.
+#     The OtterTube kit's tag (deploy/hub/docker-compose.example.yml) EXISTS.
+#   * `docker pull` by that digest verified it; inside, `ytdl-sub --version`
+#     reports 2026.08.26+4ab55f1, yt-dlp 2026.08.19, ffmpeg 8.1.2, Python 3.14.7.
+#   * `latest` resolved to the same index digest on that date. Tags move; this
+#     file is the record.
+#   node (the indexer's runtime; OtterTube's indexer needs Node >= 24, which
+#   runs its one .ts import by type stripping):
+#   * Docker Hub library/node 24.22.0-alpine3.24, pushed 2026-10-14 (24.22.1 was
+#     a day old on the pin date and was passed over). HEAD
+#     registry-1.docker.io/v2/library/node/manifests/24.22.0-alpine3.24 answered
+#     docker-content-digest sha256:44fce696...937f, an OCI index whose
+#     linux/amd64 manifest is
+#     sha256:429bdfbc204b4eabc6438e6d34e4e9d8dd2ca1df8289bcd78cdd3c5db387b7a5.
+#   * `docker pull` by that digest verified it; `node --version` is v24.22.0.
+#
+# TO ROTATE: yt-dlp breaks routinely, so ytdl-sub is the one that will move.
+# Pick the release, resolve its index digest against the registry, update the
+# three lines and PINNED together with the .env.example line, dry-run one list
+# item (README "Rotating the image"), and commit them in one change.
+
+YTDL_SUB_IMAGE=ghcr.io/jmbannon/ytdl-sub
+YTDL_SUB_VERSION=2026.08.26.post1
+YTDL_SUB_DIGEST=sha256:f96bcf1d2896da0177f9c7964407c27830571d1eb96a5886abd605140c69e278
+YTDL_SUB_AMD64_MANIFEST=sha256:29f27bc2b405b303d9da07f11f53ba39f7575efb94f98fe4c2c65d40a3e83bdd
+INDEXER_IMAGE=node
+INDEXER_VERSION=24.22.0-alpine3.24
+INDEXER_DIGEST=sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f
+INDEXER_AMD64_MANIFEST=sha256:429bdfbc204b4eabc6438e6d34e4e9d8dd2ca1df8289bcd78cdd3c5db387b7a5
+PINNED=2026-10-22

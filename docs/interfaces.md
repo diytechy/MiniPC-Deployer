@@ -58,6 +58,8 @@ only the Contract cell's opening words; the CSV holds the contract.
 | **IF-069** | Consumes | NagLight | Draft | v1 | SR-097 | v1 tracker bearer contract (NagLight SR-030/LLR-020, internal/web/auth.go): with TRACKER_API_TOKEN set every … |
 | **IF-070** | Provides | OfficeWallNaglight (the door broker) | Implemented | v1 | SR-105, SR-106 | v1 door relay RTSP endpoint (SR-105). rtsp://&lt;hub LAN_IP>:&lt;DOOR_RELAY_RTSP_PORT, default … |
 | **IF-071** | Provides | scratch-volume writers (the door recorder; meetings, plan W6; OtterTube, plan W8) | Implemented | v1 | SR-103, SR-104 | v1 scratch writer contract (SR-103, SR-104). A writer owns /srv/scratch/&lt;name>/ (door, meetings or … |
+| **IF-072** | Consumes | HomeHub (private deploy config) | Implemented | v1 | SR-114, SR-115 | v1 OtterTube curated list (SR-114). One JSON file, HomeHub scripts/deploy/ottertube/list.json, installed as … |
+| **IF-073** | Provides | OtterTube (browser build and desktop app) | Implemented | v1 | SR-117 | v1 OtterTube site (SR-117). https://&lt;OTTERTUBE_SUBDOMAIN>.&lt;DOMAIN>/ottertube/ on the LAN only (403 elsewhere … |
 <!-- END GENERATED IF INDEX -->
 
 ## Notes on selected interfaces (hand-written)

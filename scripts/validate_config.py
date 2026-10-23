@@ -755,6 +755,10 @@ def main():
         # BindsTo=srv-scratch.mount, which firstboot never stops.
         ("door/homehub-door-relay.service", "autoinstall/firstboot.sh"),
         ("door/homehub-door-recorder.service", "autoinstall/firstboot.sh"),
+        # Enrolled 2026-10-22 with the OtterTube downloader (SN-051): both are
+        # Wants=+After= docker; their one hard binding is BindsTo=srv-scratch.mount.
+        ("ottertube/homehub-ottertube-download.service", "autoinstall/firstboot.sh"),
+        ("ottertube/homehub-ottertube-media.service", "autoinstall/firstboot.sh"),
     ):
         unit_text, script_text = load(stack / unit_rel), load(stack / script_rel)
         if not unit_text or not script_text:

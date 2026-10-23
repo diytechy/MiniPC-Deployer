@@ -177,6 +177,7 @@ graph LR
 | `stack/monitoring/` | SN-048: the hub's record-and-alert monitors (telemetry, low-disk alarm, watched jobs, liveness with evidence) and the one alert helper (SR-085..SR-091) |
 | [`stack/scratch/`](../stack/scratch/README.md) | SN-050: the NVMe scratch volume (18 GiB ext4 LV with one hard project quota per writer), its non-destructive provisioner and the mount guard every writer runs before each new file (SR-102..SR-104, IF-071) |
 | [`stack/door/`](../stack/door/README.md) | SN-050: the door relay (go2rtc pinned by digest; the doorbell's one RTSP session re-served on the LAN), the copy-only recorder onto `/srv/scratch/door`, and the gate/cutover/cost tooling (SR-105..SR-107, IF-070) |
+| [`stack/ottertube/`](../stack/ottertube/README.md) | SN-051: OtterTube on the hub - the daily per-item ytdl-sub run of the private curated list onto `/srv/scratch/ottertube`, OtterTube's own indexer (hard-linked publication), the read-only media server and Caddy's LAN-only OtterTube site (SR-113..SR-117, IF-072, IF-073) |
 | `sim/` | V1 homehub-sim — the full stack vs fictional stand-ins (Dex, Samba, mock shims) |
 | `vmtest/` | V3 — the real autoinstall ISO booted in Hyper-V (SIM secrets only) |
 | `scripts/validate_config.py` | config-coverage validation (the product-layer check here) |
@@ -1017,6 +1018,57 @@ sequenceDiagram
         H->>S: report ok, or full (no room / EDQUOT): the kiosk can then say both are full
     end
     Note over V: hourly retention: older than 14 days, then the oldest above 90 % of the 2 GiB quota (LLR-1252)
+```
+
+### One OtterTube download run, guarded before every container (SR-113, SR-114, SR-116, LLR-1269, LLR-1270, LLR-1268, LLR-1273, LLR-1280, LLR-1281, LLR-1282, LLR-1283)
+
+The daily timer starts the oneshot unit; systemd will not start it without the
+scratch mount, and stops it the moment the mount goes. Each list item is its
+own container, so the scratch guard runs before every download, and a present
+item (one with its completion marker) costs nothing. The first EDQUOT or ENOSPC
+ends the run where it stands. A container that outlives its client is removed
+before anything else runs. A refusal ends all work on the volume, work/'s
+cleanup included, and every later cleanup of work/ first checks the volume is
+still ours (a write probe failing only because the budget is full does not
+count: freeing space is the point of the quota stop).
+
+```mermaid
+sequenceDiagram
+    participant T as homehub-ottertube-download.timer
+    participant U as download unit (no CAP_SYS_RESOURCE)
+    participant R as ottertube.py run
+    participant G as scratch guard
+    participant Y as ottertube-ytdl-sub (one per item)
+    participant I as ottertube-indexer
+    T->>U: 01:20 (BindsTo srv-scratch.mount)
+    U->>G: ExecStartPre guard --writer ottertube
+    U->>R: run
+    R->>G: before the run
+    R->>R: validate list (SR-114) - refuse: alert, exit 2
+    loop every item without its completion marker
+        R->>G: before this item (skipped for media left unchecked: checked in place)
+        alt guard refuses
+            R-->>U: alert ottertube-guard, exit 76 (work/ left as it is: nothing more on a refused volume)
+        end
+        R->>Y: compose run --rm (one-item subscription)
+        Y-->>R: output, exit
+        alt client exit not 0 (timeout among them)
+            R->>R: docker rm -f, inspect until gone - not gone: alert ottertube-container, exit 1
+        end
+        alt EDQUOT / ENOSPC in output
+            R->>G: identity before emptying work/ (a full budget passes; refuses: work/ and last-run left as they are)
+            R->>R: empty work/, last-run quota
+            R-->>U: alert ottertube-quota, exit 75
+        end
+        R->>Y: ffprobe height (over 480p: discard)
+        R->>R: title and thumbnail from the list, then the .ok marker
+    end
+    R->>R: prune what the list no longer names
+    R->>G: before approved.json and the indexer
+    R->>I: build-catalog --require-hardlink (--allow-shrink only when the list shrank)
+    I-->>R: catalog.json + hard-linked publication
+    R->>R: logs/last-run.json
+    R->>G: identity before emptying work/ (refuses: left for the next run, after its guard)
 ```
 
 ### One memory episode on the hub: kill, reboot, hand-off (SR-050, SR-051, LLR-999, LLR-1000, LLR-1002)

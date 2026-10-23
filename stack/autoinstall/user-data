@@ -863,7 +863,8 @@ autoinstall:
       "samba-users.creds:/target/etc/homehub-samba/samba-users.creds:optional"
       "smb.conf.fragment:/target/etc/homehub-samba/smb.conf.fragment:required"
       "library-mounts.fstab:/target/etc/homehub-samba/library-mounts.fstab:required"
-      "drive-identity.conf:/target/etc/homehub-samba/drive-identity.conf:optional"; do
+      "drive-identity.conf:/target/etc/homehub-samba/drive-identity.conf:optional"
+      "ottertube-list.json:/target/opt/homehub/stack/ottertube/config/list.json:optional"; do
       f=${spec%%:*}; rest=${spec#*:}; d=${rest%:*}; kind=${rest##*:};
       if [ ! -f "$S/$f" ]; then
       if [ "$kind" = required ]; then

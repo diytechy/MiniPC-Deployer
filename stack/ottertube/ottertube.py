@@ -32,12 +32,15 @@ allow-list only after its terms were reviewed (HomeHub's starter-list record).
 THE SCRATCH RULES (SR-103, IF-071). Every write lands under
 /srv/scratch/ottertube/, in the ottertube quota project. The guard runs before
 the run, before EVERY item's container and before the indexer; a refusal stops
-the run (exit 76) with an alert. EDQUOT or ENOSPC, seen in a container's output
-or raised here, stops the run cleanly (exit 75): the work directory (its own
-temporary files, a partial download among them) is emptied, an alert is sent,
-nothing is written anywhere else, and the unit does not retry.
+the run (exit 76) with an alert, and nothing further is done on the volume:
+not even work/ is emptied. Every cleanup of work/ after the start of the run
+asks the guard again first and leaves work/ as it is when the guard refuses.
+EDQUOT or ENOSPC, seen in a container's output or raised here, stops the run
+cleanly (exit 75): the work directory (its own temporary files, a partial
+download among them) is emptied, an alert is sent, nothing is written anywhere
+else, and the unit does not retry.
 
-Python 3.8-compatible. Implements: SR-113..SR-117, LLR-1260..LLR-1279.
+Python 3.8-compatible. Implements: SR-113..SR-117, LLR-1260..LLR-1283.
 """
 
 from __future__ import annotations
@@ -615,6 +618,10 @@ class Runner:
         self.sleep, self.fetch, self.clock = sleep, fetch, clock
         self.counts = {"present": 0, "downloaded": 0, "failed": 0, "pruned": 0}
         self.current: Optional[str] = None
+        # A guard refusal anywhere in the run: nothing further touches the
+        # volume, the cleanup of work/ included (LLR-1269, LLR-1283).
+        self.refused = False
+        self.work_cleaned = False
         self.docker_bin: List[str] = ["docker"]  # tests point it at a fake client
 
     # side effects ------------------------------------------------------------
@@ -634,7 +641,27 @@ class Runner:
     def check_guard(self, before: str) -> None:
         ok, reason = self.guard()
         if not ok:
+            self.refused = True
             raise GuardStop("before %s: %s" % (before, reason))
+
+    def clean_work(self, when: str) -> bool:
+        """Empty work/, but only on the volume the guard accepts NOW: never after
+        any refusal in this run, and not when the guard refuses here. True when
+        work/ was emptied.
+
+        Implements: LLR-1283.
+        """
+        if self.refused:
+            mc.log("ottertube: work/ left as it is (%s): the scratch guard refused the volume" % when, warning=True)
+            return False
+        ok, reason = self.guard()
+        if not ok:
+            self.refused = True
+            mc.log("ottertube: work/ left as it is (%s): the scratch guard refused: %s" % (when, reason), warning=True)
+            return False
+        empty_dir(self.p.work)
+        self.work_cleaned = True
+        return True
 
     def compose(self, *args: str) -> List[str]:
         # Explicit file and project directory: the stack .env interpolates the
@@ -823,6 +850,9 @@ class Runner:
         return rc
 
     def record(self, started: float, result: str, **extra) -> None:
+        if self.refused:  # logs/ is on the volume the guard refused (LLR-1283)
+            mc.log("ottertube: logs/last-run.json not written: the scratch guard refused the volume", warning=True)
+            return
         try:
             write_json_atomic(os.path.join(self.p.logs, "last-run.json"),
                               run_summary(started, self.clock(), result, self.counts, **extra))
@@ -884,9 +914,10 @@ class Runner:
         except (QuotaStop, OSError) as exc:
             if isinstance(exc, OSError) and not is_quota_error(exc):
                 raise
-            # Our own temporary files go (a partial download among them); nothing
-            # is written anywhere else, and the unit does not retry (exit 75).
-            empty_dir(self.p.work)
+            # Our own temporary files go (a partial download among them), on the
+            # volume the guard still accepts; nothing is written anywhere else,
+            # and the unit does not retry (exit 75).
+            self.clean_work("after the quota stop")
             what = str(exc) if isinstance(exc, QuotaStop) else "%s writing on the volume" % errno.errorcode.get(exc.errno, exc.errno)
             mc.log("ottertube: STOPPED - %s; the ottertube budget on /srv/scratch is full" % what, warning=True)
             self.alert("ottertube-quota", "HomeHub: OtterTube downloads stopped (budget full)",
@@ -894,10 +925,11 @@ class Runner:
             self.record(started, "quota", reason=what)
             return EXIT_QUOTA
         finally:
-            # Never under a container that may still be writing (ContainerStop):
-            # the next run empties work/ before it starts anything.
-            if self.current is None:
-                empty_dir(self.p.work)
+            # Never under a container that may still be writing (ContainerStop),
+            # never after a guard refusal, and only on the volume the guard
+            # accepts now: the next run empties work/ before it starts anything.
+            if self.current is None and not self.work_cleaned:
+                self.clean_work("after the run")
 
 
 def serve_check(paths: Paths, guard: Callable[[], Tuple[bool, str]]) -> Tuple[bool, str]:

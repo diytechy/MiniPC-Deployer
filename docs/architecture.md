@@ -1020,14 +1020,15 @@ sequenceDiagram
     Note over V: hourly retention: older than 14 days, then the oldest above 90 % of the 2 GiB quota (LLR-1252)
 ```
 
-### One OtterTube download run, guarded before every container (SR-113, SR-114, SR-116, LLR-1269, LLR-1270, LLR-1268, LLR-1273, LLR-1280, LLR-1281, LLR-1282)
+### One OtterTube download run, guarded before every container (SR-113, SR-114, SR-116, LLR-1269, LLR-1270, LLR-1268, LLR-1273, LLR-1280, LLR-1281, LLR-1282, LLR-1283)
 
 The daily timer starts the oneshot unit; systemd will not start it without the
 scratch mount, and stops it the moment the mount goes. Each list item is its
 own container, so the scratch guard runs before every download, and a present
 item (one with its completion marker) costs nothing. The first EDQUOT or ENOSPC
 ends the run where it stands. A container that outlives its client is removed
-before anything else runs.
+before anything else runs. A refusal ends all work on the volume, work/'s
+cleanup included, and every later cleanup of work/ asks the guard first.
 
 ```mermaid
 sequenceDiagram
@@ -1045,7 +1046,7 @@ sequenceDiagram
     loop every item without its completion marker
         R->>G: before this item (skipped for media left unchecked: checked in place)
         alt guard refuses
-            R-->>U: alert ottertube-guard, exit 76
+            R-->>U: alert ottertube-guard, exit 76 (work/ left as it is: nothing more on a refused volume)
         end
         R->>Y: compose run --rm (one-item subscription)
         Y-->>R: output, exit
@@ -1053,6 +1054,7 @@ sequenceDiagram
             R->>R: docker rm -f, inspect until gone - not gone: alert ottertube-container, exit 1
         end
         alt EDQUOT / ENOSPC in output
+            R->>G: before emptying work/ (refuses: work/ and last-run left as they are)
             R->>R: empty work/, last-run quota
             R-->>U: alert ottertube-quota, exit 75
         end
@@ -1064,6 +1066,7 @@ sequenceDiagram
     R->>I: build-catalog --require-hardlink (--allow-shrink only when the list shrank)
     I-->>R: catalog.json + hard-linked publication
     R->>R: logs/last-run.json
+    R->>G: before emptying work/ (refuses: left for the next run, after its guard)
 ```
 
 ### One memory episode on the hub: kill, reboot, hand-off (SR-050, SR-051, LLR-999, LLR-1000, LLR-1002)

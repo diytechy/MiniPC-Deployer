@@ -3,7 +3,7 @@
 What runs here, on the dev PC: the curated list's finite-by-construction rules,
 the one-item subscription and approved.json it generates, the run's guard
 before every item and the indexer, the EDQUOT/ENOSPC stop, the 480p cap, the
-titles, thumbnails and pruning, the completion marker, a list reduction
+titles, thumbnails and pruning, the completion marker, no cleanup of a refused volume, a list reduction
 through OtterTube's real indexer and a container outliving its client - with
 fake docker, guard and alert - and the
 compose/unit/firstboot/bake/Caddy/DNS contract, read from the files.
@@ -12,7 +12,7 @@ What does not: the real kernel quota (stack/ottertube/tests/
 ottertube-quota.root-test.sh under the hub's kernel in QEMU, TC-1440) and the
 real images, clip and site (stack/ottertube/tests/ottertube-lab.sh,
 TC-1441..TC-1443).
-Implements: TC-1430..TC-1439, TC-1444..TC-1453.
+Implements: TC-1430..TC-1439, TC-1444..TC-1454.
 """
 
 from __future__ import annotations
@@ -309,8 +309,9 @@ class Rig:
 def test_tc1435_the_guard_runs_before_the_run_every_item_and_the_indexer(tmp_path):
     rig = Rig(tmp_path, a_list(item(1), item(2)))
     assert rig.runner.run() == 0
-    # run, item-1 and its metadata, item-2 and its metadata, approved.json, the indexer
-    assert rig.guard_calls == 7
+    # run, item-1 and its metadata, item-2 and its metadata, approved.json, the
+    # indexer, and the cleanup of work/ after the run (LLR-1283)
+    assert rig.guard_calls == 8
     assert len(rig.downloads()) == 2 and any("ottertube-indexer" in c for c in rig.calls)
 
 
@@ -325,7 +326,9 @@ def test_tc1435_a_refusal_before_the_second_item_stops_there(tmp_path):
     rig = Rig(tmp_path, a_list(item(1), item(2)), guard_results=[(True, "ok"), (True, "ok"), (True, "ok"), (False, "wrong device")])
     assert rig.runner.run() == ot.EXIT_GUARD
     assert len(rig.downloads()) == 1 and not any("ottertube-indexer" in c for c in rig.calls)
-    assert os.listdir(rig.paths.work) == []
+    # The refused volume is not touched again: item-1's subscription stays in
+    # work/ until the next run's guard has passed (LLR-1283).
+    assert os.listdir(rig.paths.work) == ["sub.json"]
 
 
 def test_tc1435_a_refusal_after_the_container_writes_no_metadata(tmp_path):
@@ -473,6 +476,67 @@ def test_tc1435_the_indexer_publishes_by_hard_link_from_the_generated_approved_j
     assert tail[tail.index("--approved") + 1] == "/work/approved.json"
     assert tail[tail.index("--publish") + 1] == "/library/publish"
     assert "--project-directory" in idx and idx[idx.index("--profile") + 1] == "ottertube"
+
+
+# ── TC-1454 a refused volume is never cleaned up (LLR-1283) ─────────────────
+
+
+SENTINEL = "sentinel.part"
+
+
+def test_tc1454_a_refusal_at_the_start_leaves_an_existing_work_tree_alone(tmp_path):
+    rig = Rig(tmp_path, a_list(item(1)), guard_results=[(False, "wrong device")])
+    os.makedirs(os.path.join(rig.paths.work, "ytdl"))
+    open(os.path.join(rig.paths.work, SENTINEL), "w").write("x")
+    open(os.path.join(rig.paths.work, "ytdl", "frag.part"), "w").write("x")
+    assert rig.runner.run() == ot.EXIT_GUARD
+    assert rig.calls == [] and rig.alerts == ["ottertube-guard"]
+    assert os.path.exists(os.path.join(rig.paths.work, SENTINEL))
+    assert os.path.exists(os.path.join(rig.paths.work, "ytdl", "frag.part"))
+    assert rig.guard_calls == 1 and not os.path.exists(os.path.join(rig.paths.logs, "last-run.json"))
+
+
+def test_tc1454_a_refusal_mid_run_before_an_item_leaves_work_alone(tmp_path):
+    # The start-of-run cleanup passed its guard; then the volume changes under
+    # the run (a remount, a different device) and the guard before item-1
+    # refuses. What is in work/ now is on the refused filesystem.
+    rig = Rig(tmp_path, a_list(item(1)))
+    calls = []
+
+    def guard():
+        calls.append(1)
+        if len(calls) == 1:
+            return True, "ok"
+        open(os.path.join(rig.paths.work, SENTINEL), "w").write("x")
+        return False, "wrong device"
+    rig.runner.guard = guard
+    assert rig.runner.run() == ot.EXIT_GUARD
+    assert rig.calls == [] and rig.alerts == ["ottertube-guard"]  # no container started
+    assert os.path.exists(os.path.join(rig.paths.work, SENTINEL))
+    assert len(calls) == 2  # nothing asks the refused volume again
+
+
+def test_tc1454_the_cleanup_after_a_good_run_asks_the_guard_first(tmp_path):
+    rig = Rig(tmp_path, a_list(item(1)), guard_results=[(True, "ok")] * 5 + [(False, "not a mount point")])
+    assert rig.runner.run() == 0
+    assert rig.guard_calls == 6 and sorted(os.listdir(rig.paths.work)) == ["approved.json", "sub.json"]
+
+
+def test_tc1454_the_quota_stop_cleans_only_where_the_guard_still_agrees(tmp_path):
+    out = (1, "[ytdl-sub:yt-dlp] ERROR: unable to write data: [Errno 122] Disk quota exceeded")
+    rig = Rig(tmp_path, a_list(item(1)), outputs={"item-1": out},
+              guard_results=[(True, "ok"), (True, "ok"), (False, "wrong device")])
+    assert rig.runner.run() == ot.EXIT_QUOTA and rig.alerts == ["ottertube-quota"]
+    assert os.listdir(rig.paths.work) == ["sub.json"] and rig.guard_calls == 3
+    assert not os.path.exists(os.path.join(rig.paths.logs, "last-run.json"))  # logs/ is on that volume too
+
+
+def test_tc1454_the_quota_stop_still_empties_work_when_the_guard_agrees(tmp_path):
+    out = (1, "[ytdl-sub:yt-dlp] ERROR: unable to write data: [Errno 122] Disk quota exceeded")
+    rig = Rig(tmp_path, a_list(item(1)), outputs={"item-1": out})
+    assert rig.runner.run() == ot.EXIT_QUOTA
+    assert os.listdir(rig.paths.work) == [] and rig.guard_calls == 3  # run, item-1, the quota cleanup; not again
+    assert rig.last_run()["result"] == "quota"
 
 
 # ── TC-1451 an item is complete only with its marker (LLR-1280) ─────────────

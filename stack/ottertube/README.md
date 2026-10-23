@@ -49,7 +49,7 @@ enables the timer and media server only while the knob is `true`.
 | `/srv/scratch/ottertube/lib/{video,music}/<collection>/` | downloads: `<item id>.<ext>`, `.info.json`, thumbnail, and `<item id>.ok`, the completion marker written only after the 480p probe, the title and the thumbnail step (without it the next run checks the item again) | ytdl-sub, `ottertube.py` |
 | `/srv/scratch/ottertube/lib/publish/` | the publication: hard links of what the catalogue references | the indexer |
 | `/srv/scratch/ottertube/catalog/catalog.json` | the catalogue | the indexer |
-| `/srv/scratch/ottertube/work/` | the run's temporary files (subscription, approved.json, ytdl-sub's working dir); emptied before and after every run | ottertube.py |
+| `/srv/scratch/ottertube/work/` | the run's temporary files (subscription, approved.json, ytdl-sub's working dir); emptied before and after every run, the cleanup after asking the guard first and never after a refusal (LLR-1283) | ottertube.py |
 | `/srv/scratch/ottertube/logs/last-run.json` | the last run's result and counts (deployment-state reads it) | ottertube.py |
 
 Scratch: never backed up, never shared (HomeHub `scripts/deploy/storage-map.md`
@@ -121,7 +121,7 @@ release's index digest against ghcr.io, update `ottertube-images.pin` and the
 
 ## Tests
 
-* `tests/test_ottertube.py` (pytest, dev PC; TC-1430..TC-1439, TC-1444..TC-1453; the
+* `tests/test_ottertube.py` (pytest, dev PC; TC-1430..TC-1439, TC-1444..TC-1454; the
   TC-1452 cases run OtterTube's real indexer from the sibling checkout, or `OTTERTUBE_CHECKOUT`).
 * `tests/ottertube-quota.root-test.sh` (root; TC-1440): the real scratch volume
   and EDQUOT under the hub's own kernel —

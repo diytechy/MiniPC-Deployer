@@ -3,14 +3,16 @@
 What runs here, on the dev PC: the curated list's finite-by-construction rules,
 the one-item subscription and approved.json it generates, the run's guard
 before every item and the indexer, the EDQUOT/ENOSPC stop, the 480p cap, the
-titles, thumbnails and pruning - with fake docker, guard and alert - and the
+titles, thumbnails and pruning, the completion marker, a list reduction
+through OtterTube's real indexer and a container outliving its client - with
+fake docker, guard and alert - and the
 compose/unit/firstboot/bake/Caddy/DNS contract, read from the files.
 
 What does not: the real kernel quota (stack/ottertube/tests/
 ottertube-quota.root-test.sh under the hub's kernel in QEMU, TC-1440) and the
 real images, clip and site (stack/ottertube/tests/ottertube-lab.sh,
 TC-1441..TC-1443).
-Implements: TC-1430..TC-1439, TC-1444..TC-1450.
+Implements: TC-1430..TC-1439, TC-1444..TC-1453.
 """
 
 from __future__ import annotations
@@ -188,7 +190,7 @@ def test_tc1434_approved_json_is_one_entry_per_collection_with_the_lists_bands()
         "music": [{"folder": "songs", "id": "songs", "title": "Songs", "bands": ["toddler"], "order": "title"}]}
 
 
-OTTERTUBE = ROOT.parent / "OtterTube"
+OTTERTUBE = Path(os.environ.get("OTTERTUBE_CHECKOUT") or ROOT.parent / "OtterTube")
 
 
 @pytest.mark.skipif(not (OTTERTUBE / "tools" / "catalog" / "lib.mjs").exists() or not shutil.which("node"),
@@ -216,10 +218,11 @@ def test_tc1436_output_classification():
 class Rig:
     """A Runner over a temp tree with fake guard, docker, alert, sleep and fetch."""
 
-    def __init__(self, tmp_path, data, guard_results=None, env=None, sizes=None, heights=None, outputs=None):
+    def __init__(self, tmp_path, data, guard_results=None, env=None, sizes=None, heights=None, outputs=None,
+                 orphans=(), stuck=False, indexer=None):
         self.tmp = tmp_path
         self.paths = ot.Paths(str(tmp_path / "root"), str(tmp_path / "stack"))
-        os.makedirs(os.path.dirname(self.paths.list_file))
+        os.makedirs(os.path.dirname(self.paths.list_file), exist_ok=True)  # a second Rig reuses the tree
         with open(self.paths.list_file, "w") as handle:
             json.dump(data, handle)
         self.guard_results = list(guard_results or [])
@@ -227,6 +230,11 @@ class Rig:
         self.calls, self.alerts, self.sleeps, self.fetches = [], [], [], []
         self.heights = heights or {}
         self.outputs = outputs or {}
+        # The daemon's side: containers that exist. `orphans` are items whose
+        # client times out (124) while their container keeps running; `stuck`
+        # makes `docker rm -f` leave every container in place.
+        self.containers, self.orphans, self.stuck = set(), set(orphans), stuck
+        self.indexer = indexer  # None: a fake success; "real": OtterTube's own build-catalog.mjs
         env = dict({"OTTERTUBE_ENABLED": "true", "OTTERTUBE_PAUSE_SEC": "10"}, **(env or {}))
         self.runner = ot.Runner(ot.Settings(env), self.paths, None, "/nonexistent",
                                 guard=self.guard, docker=self.docker,
@@ -245,8 +253,17 @@ class Rig:
 
     def docker(self, argv, timeout):
         self.calls.append(argv)
+        if argv[1] == "rm":
+            if not self.stuck:
+                self.containers.discard(argv[-1])
+            return 0, ""
+        if argv[1] == "inspect":
+            return (0, "running") if argv[-1] in self.containers else (1, "Error: No such object: %s" % argv[-1])
+        name = argv[argv.index("--name") + 1]
+        if name in self.containers:
+            return 125, 'docker: Error response from daemon: Conflict. The container name "/%s" is already in use.' % name
         if "ottertube-indexer" in argv:
-            return 0, "written: /catalog/catalog.json"
+            return self.real_indexer(argv) if self.indexer == "real" else (0, "written: /catalog/catalog.json")
         if "--entrypoint" in argv:
             stem = os.path.basename(argv[-1]).split(".")[0]
             return 0, "%d\n" % self.heights.get(stem, 360)
@@ -262,7 +279,25 @@ class Rig:
         open(os.path.join(folder, stem + (".m4a" if kind == "music" else ".mp4")), "wb").write(b"x")
         json.dump({"id": stem + "~small", "title": stem + "~small"}, open(os.path.join(folder, stem + ".info.json"), "w"))
         open(os.path.join(folder, ".ytdl-sub-%s-download-archive.json" % stem), "w").write("{}")
+        if stem in self.orphans:
+            self.containers.add(ot.DL_CONTAINER)  # the client gave up; the daemon's container did not
+            return 124, "(stopped after %ds)" % timeout
         return 0, "[ytdl-sub] Download Summary: +1"
+
+    def real_indexer(self, argv):
+        """OtterTube's own indexer on the host, its container paths mapped onto the temp tree."""
+        tail = argv[argv.index("ottertube-indexer") + 1:]
+        assert tail[:2] == ["node", "tools/catalog/build-catalog.mjs"]
+        where = {"/work": self.paths.work, "/library": self.paths.lib, "/catalog": self.paths.catalog}
+
+        def host(arg):
+            for prefix, real in where.items():
+                if arg == prefix or arg.startswith(prefix + "/"):
+                    return real + arg[len(prefix):].replace("/", os.sep)
+            return arg
+        cmd = ["node", str(OTTERTUBE / "tools" / "catalog" / "build-catalog.mjs")] + [host(a) for a in tail[2:]]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        return res.returncode, res.stdout + res.stderr
 
     def downloads(self):
         return [c for c in self.calls if "ottertube-ytdl-sub" in c and "--entrypoint" not in c]
@@ -362,7 +397,7 @@ def test_tc1438_a_video_over_480p_is_discarded(tmp_path):
     rig = Rig(tmp_path, a_list(item(1), item(2)), heights={"item-1": 720})
     assert rig.runner.run() == ot.EXIT_FAILED
     folder = os.path.join(rig.paths.kind_root("video"), "space")
-    assert sorted(os.listdir(folder)) == [".ytdl-sub-item-2-download-archive.json", "item-2.info.json", "item-2.mp4"]
+    assert sorted(os.listdir(folder)) == [".ytdl-sub-item-2-download-archive.json", "item-2.info.json", "item-2.mp4", "item-2.ok"]
 
 
 def test_tc1438_an_unreadable_height_is_discarded_too(tmp_path):
@@ -396,8 +431,8 @@ def test_tc1439_what_the_list_no_longer_names_is_pruned(tmp_path):
     open(os.path.join(gone, "x.mp4"), "w").write("x")
     assert shrunk.runner.run() == 0
     folder = os.path.join(shrunk.paths.kind_root("video"), "space")
-    assert sorted(os.listdir(folder)) == [".ytdl-sub-item-2-download-archive.json", "item-2.info.json", "item-2.mp4"]
-    assert not os.path.exists(gone) and shrunk.runner.counts["pruned"] == 4
+    assert sorted(os.listdir(folder)) == [".ytdl-sub-item-2-download-archive.json", "item-2.info.json", "item-2.mp4", "item-2.ok"]
+    assert not os.path.exists(gone) and shrunk.runner.counts["pruned"] == 5  # 4 files of item-1 (its .ok too) + the folder
 
 
 def test_tc1439_prune_never_follows_a_link(tmp_path):
@@ -438,6 +473,290 @@ def test_tc1435_the_indexer_publishes_by_hard_link_from_the_generated_approved_j
     assert tail[tail.index("--approved") + 1] == "/work/approved.json"
     assert tail[tail.index("--publish") + 1] == "/library/publish"
     assert "--project-directory" in idx and idx[idx.index("--profile") + 1] == "ottertube"
+
+
+# ── TC-1451 an item is complete only with its marker (LLR-1280) ─────────────
+
+THUMB = "https://images-assets.nasa.gov/video/a/a~thumb.jpg"
+
+
+def interrupted(tmp_path):
+    """A first run whose guard refuses after item-1's container wrote its files:
+    exit 76, the media and info.json on the volume, no probe, no marker."""
+    rig = Rig(tmp_path / "first", a_list(item(1, title="Moon Phases", thumb=THUMB)),
+              guard_results=[(True, "ok"), (True, "ok"), (False, "not a mount point")])
+    assert rig.runner.run() == ot.EXIT_GUARD
+    folder = os.path.join(rig.paths.kind_root("video"), "space")
+    assert sorted(os.listdir(folder)) == [".ytdl-sub-item-1-download-archive.json", "item-1.info.json", "item-1.mp4"]
+    return rig
+
+
+def test_tc1451_files_left_by_an_interrupted_run_are_checked_before_they_count(tmp_path):
+    first = interrupted(tmp_path)
+    again = Rig(tmp_path / "again", a_list(item(1, title="Moon Phases", thumb=THUMB)))
+    shutil.copytree(first.paths.base, again.paths.base)
+    assert again.runner.run() == 0
+    probes = [c for c in again.calls if "--entrypoint" in c]
+    assert len(probes) == 1 and probes[0][-1] == "/library/video/space/item-1.mp4"
+    assert again.downloads() == [] and again.runner.counts["present"] == 0  # checked in place, not counted present
+    folder = os.path.join(again.paths.kind_root("video"), "space")
+    assert json.load(open(os.path.join(folder, "item-1.info.json")))["title"] == "Moon Phases"
+    assert again.fetches == [THUMB]
+    assert json.load(open(os.path.join(folder, "item-1.ok"))) == {"schema": 1, "height": 360}
+    third = Rig(tmp_path / "third", a_list(item(1, title="Moon Phases", thumb=THUMB)))
+    shutil.copytree(again.paths.base, third.paths.base)
+    assert third.runner.run() == 0 and third.runner.counts["present"] == 1
+    assert not any("ottertube-ytdl-sub" in c for c in third.calls)
+
+
+def test_tc1451_an_interrupted_item_over_480p_is_discarded_on_the_next_run(tmp_path):
+    first = interrupted(tmp_path)
+    again = Rig(tmp_path / "again", a_list(item(1, title="Moon Phases", thumb=THUMB)), heights={"item-1": 720})
+    shutil.copytree(first.paths.base, again.paths.base)
+    assert again.runner.run() == ot.EXIT_FAILED
+    assert again.runner.counts == {"present": 0, "downloaded": 0, "failed": 1, "pruned": 0}
+    assert os.listdir(os.path.join(again.paths.kind_root("video"), "space")) == []
+
+
+def test_tc1451_a_partial_leftover_is_removed_and_fetched_afresh(tmp_path):
+    rig = Rig(tmp_path, a_list(item(1)))
+    folder = os.path.join(rig.paths.kind_root("video"), "space")
+    os.makedirs(folder)
+    # A download archive alone would make ytdl-sub skip the item; media without info.json is not an item.
+    for name in (".ytdl-sub-item-1-download-archive.json", "item-1.mp4"):
+        open(os.path.join(folder, name), "w").write("{}")
+    seen = []
+    real = rig.docker
+
+    def docker(argv, timeout):
+        if "sub" in argv and "--entrypoint" not in argv:
+            seen.append(sorted(os.listdir(folder)))
+        return real(argv, timeout)
+    rig.runner.docker = docker
+    assert rig.runner.run() == 0
+    assert seen == [[]] and os.path.exists(os.path.join(folder, "item-1.ok"))
+
+
+def test_tc1451_a_failed_container_leaves_nothing_for_the_indexer(tmp_path):
+    rig = Rig(tmp_path, a_list(item(1)))
+    real = rig.docker
+
+    def docker(argv, timeout):
+        rc, out = real(argv, timeout)
+        if "sub" in argv and "--entrypoint" not in argv:
+            return 1, "ERROR: postprocessing failed"  # the files were written, the exit says otherwise
+        return rc, out
+    rig.runner.docker = docker
+    assert rig.runner.run() == ot.EXIT_FAILED
+    assert os.listdir(os.path.join(rig.paths.kind_root("video"), "space")) == []
+
+
+def test_tc1451_the_marker_is_kept_with_its_item_and_pruned_with_it():
+    assert ot.file_stem("item-1" + ot.DONE_EXT) == "item-1"
+
+
+# ── TC-1452 a list reduction reaches the catalogue (LLR-1281) ────────────────
+
+
+def write_catalog(paths, n):
+    os.makedirs(paths.catalog, exist_ok=True)
+    ot.write_json_atomic(os.path.join(paths.catalog, "catalog.json"),
+                         {"videos": [{"id": "space", "items": [{"id": "v%d" % i} for i in range(n)]}],
+                          "music": [{"id": "songs", "tracks": []}]})
+
+
+@pytest.mark.parametrize("before, listed, complete, allow", [
+    (0, 1, 1, False),    # no catalogue yet
+    (3, 3, 0, False),    # the list did not shrink: downloads went missing, protection stays
+    (3, 4, 4, False),    # the list grew
+    (3, 1, 1, True),     # the Owner cut 3 to 1
+    (10, 6, 3, True),    # cut to 6, half of them complete: within the indexer's own rule
+    (10, 6, 2, False),   # cut to 6 but most of them missing: protection stays
+])
+def test_tc1452_allow_shrink_only_when_the_list_explains_it(tmp_path, before, listed, complete, allow):
+    rig = Rig(tmp_path, a_list(item(1)))
+    if before:
+        write_catalog(rig.paths, before)
+    assert rig.runner.shrink_explained(listed, complete) is allow
+
+
+def test_tc1452_catalog_items_counts_as_the_indexer_does(tmp_path):
+    paths = ot.Paths(str(tmp_path), str(tmp_path / "stack"))
+    write_catalog(paths, 4)
+    assert ot.catalog_items(os.path.join(paths.catalog, "catalog.json")) == 4
+    assert ot.catalog_items(os.path.join(paths.catalog, "absent.json")) == 0
+    (Path(paths.catalog) / "bad.json").write_text("{")
+    assert ot.catalog_items(os.path.join(paths.catalog, "bad.json")) == 0
+
+
+needs_indexer = pytest.mark.skipif(
+    not (OTTERTUBE / "tools" / "catalog" / "build-catalog.mjs").exists() or not shutil.which("node"),
+    reason="needs the sibling OtterTube checkout and node (the other side of the contract)")
+
+
+def published_state(rig):
+    return json.load(open(os.path.join(rig.paths.publish, ".publish-state.json")))["files"]
+
+
+@needs_indexer
+def test_tc1452_the_real_indexer_takes_a_list_cut_from_3_to_1(tmp_path):
+    rig = Rig(tmp_path, a_list(item(1), item(2), item(3)), indexer="real")
+    assert rig.runner.run() == 0, rig.calls[-1]
+    catalog = os.path.join(rig.paths.catalog, "catalog.json")
+    assert ot.catalog_items(catalog) == 3
+    assert len([k for k in published_state(rig) if not k.endswith("-thumb.jpg")]) == 3
+    cut = Rig(tmp_path, a_list(item(2)), indexer="real")
+    assert cut.runner.run() == 0
+    assert "--allow-shrink" in next(c for c in cut.calls if "ottertube-indexer" in c)
+    assert ot.catalog_items(catalog) == 1
+    state = published_state(cut)
+    kept = [k for k, e in state.items() if "unreferencedSince" not in e]
+    marked = [k for k, e in state.items() if "unreferencedSince" in e]
+    assert len(kept) == 1 and len(marked) == 2  # the two removed items wait out the grace period, unreferenced
+    assert json.load(open(catalog))["videos"][0]["items"][0]["file"].endswith(kept[0].split("/")[1])
+
+
+@needs_indexer
+def test_tc1452_the_real_indexer_still_refuses_downloads_that_went_missing(tmp_path, capsys):
+    rig = Rig(tmp_path, a_list(item(1), item(2), item(3), item(4)), indexer="real")
+    assert rig.runner.run() == 0
+    catalog = os.path.join(rig.paths.catalog, "catalog.json")
+    # The list is cut to 2, and both of those vanish and fail to download again.
+    for name in os.listdir(os.path.join(rig.paths.kind_root("video"), "space")):
+        os.unlink(os.path.join(rig.paths.kind_root("video"), "space", name))
+    fail = (1, "ERROR: unable to download")
+    cut = Rig(tmp_path, a_list(item(1), item(2)), indexer="real", outputs={"item-1": fail, "item-2": fail})
+    assert cut.runner.run() == ot.EXIT_FAILED
+    assert "--allow-shrink" not in next(c for c in cut.calls if "ottertube-indexer" in c)
+    assert cut.last_run()["indexer_exit"] == 1 and ot.catalog_items(catalog) == 4
+    assert "the catalogue would shrink from 4 to 0 videos and songs: nothing written" in capsys.readouterr().out
+
+
+# ── TC-1453 a container outliving its client (LLR-1282) ──────────────────────
+
+
+def test_tc1453_a_timed_out_client_s_container_is_removed_before_the_next_item(tmp_path):
+    rig = Rig(tmp_path, a_list(item(1), item(2)), orphans={"item-1"})
+    assert rig.runner.run() == ot.EXIT_FAILED
+    assert rig.runner.counts == {"present": 0, "downloaded": 1, "failed": 1, "pruned": 0}
+    i_rm = next(i for i, c in enumerate(rig.calls) if c[1:3] == ["rm", "-f"])
+    i_next = [i for i, c in enumerate(rig.calls) if "sub" in c and "--entrypoint" not in c][1]
+    assert rig.calls[i_rm][-1] == ot.DL_CONTAINER and i_rm < i_next
+    assert rig.containers == set()
+    folder = os.path.join(rig.paths.kind_root("video"), "space")
+    assert not any(n.startswith("item-1") for n in os.listdir(folder))  # the timed-out item's files went too
+
+
+def test_tc1453_a_container_that_will_not_go_stops_the_run(tmp_path):
+    rig = Rig(tmp_path, a_list(item(1), item(2)), orphans={"item-1"}, stuck=True)
+    os.makedirs(rig.paths.work)
+    assert rig.runner.run() == ot.EXIT_FAILED
+    assert len(rig.downloads()) == 1 and not any("ottertube-indexer" in c for c in rig.calls)
+    assert len([c for c in rig.calls if c[1:3] == ["rm", "-f"]]) == 3
+    assert rig.alerts == ["ottertube-container"] and rig.last_run()["result"] == "failed"
+    assert "could not be confirmed gone" in rig.last_run()["reason"]
+    assert os.listdir(rig.paths.work) != []  # never emptied under a container that may still write
+
+
+def test_tc1453_the_indexer_and_the_probe_are_reaped_too(tmp_path):
+    rig = Rig(tmp_path, a_list(item(1)))
+    real = rig.docker
+
+    def docker(argv, timeout):
+        if ("ottertube-indexer" in argv or "--entrypoint" in argv) and "--name" in argv:
+            rig.calls.append(argv)
+            rig.containers.add(argv[argv.index("--name") + 1])
+            return 124, "(stopped)"
+        return real(argv, timeout)
+    rig.runner.docker = docker
+    assert rig.runner.run() == ot.EXIT_FAILED
+    removed = [c[-1] for c in rig.calls if c[1:3] == ["rm", "-f"]]
+    assert removed == [ot.DL_CONTAINER, ot.INDEX_CONTAINER] and rig.containers == set()
+
+
+FAKE_CLIENT = r'''
+import json, os, subprocess, sys, time
+state, args = os.environ["FAKE_DOCKER_STATE"], sys.argv[1:]
+beat = os.path.join(state, "heartbeat")
+pidfile = lambda name: os.path.join(state, name + ".pid")
+def log(line):
+    with open(os.path.join(state, "client.log"), "a") as h:
+        h.write(line + "\n")
+if args[0] == "rm":
+    p = pidfile(args[-1])
+    if os.path.exists(p):
+        alive = os.path.exists(beat) and time.time() - os.path.getmtime(beat) < 1.0
+        log("rm %s alive=%s" % (args[-1], alive))
+        try:
+            os.kill(int(open(p).read()), 15)
+        except OSError:
+            pass
+        time.sleep(0.3)
+        os.unlink(p)
+    sys.exit(0)
+if args[0] == "inspect":
+    if os.path.exists(pidfile(args[-1])):
+        print("running"); sys.exit(0)
+    print("Error: No such object: " + args[-1]); sys.exit(1)
+name = args[args.index("--name") + 1]
+if os.path.exists(pidfile(name)):
+    print('Conflict. The container name "/%s" is already in use' % name); sys.exit(125)
+if "ottertube-indexer" in args:
+    sys.exit(0)
+if "--entrypoint" in args:
+    print("360"); sys.exit(0)
+sub = json.load(open(os.path.join(os.environ["FAKE_DOCKER_WORK"], "sub.json")))
+body = list(list(sub.values())[0].values())[0]["overrides"]
+folder = os.path.join(os.environ["FAKE_DOCKER_LIB"], "video", body["ottertube_folder"])
+os.makedirs(folder, exist_ok=True)
+stem = body["ottertube_stem"]
+open(os.path.join(folder, stem + ".mp4"), "wb").write(b"x")
+json.dump({"id": stem, "title": stem}, open(os.path.join(folder, stem + ".info.json"), "w"))
+log("run " + stem)
+if stem == "item-1":
+    # The "container": a process of its own, outside the client's process group,
+    # as a daemon-owned container is. It keeps writing after the client dies.
+    flags = {"start_new_session": True} if os.name != "nt" else {"creationflags": 0x00000008 | 0x00000200}
+    code = "import time\nwhile True:\n    open(%r, 'a').write('.')\n    time.sleep(0.1)\n" % beat
+    child = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, close_fds=True, **flags)
+    open(pidfile(name), "w").write(str(child.pid))
+    time.sleep(120)
+sys.exit(0)
+'''
+
+
+def test_tc1453_a_real_container_process_outlives_its_killed_client_and_is_reaped(tmp_path, monkeypatch):
+    """Through the real run_bounded: the client is killed at the timeout, the
+    separate 'container' process keeps writing, and the runner removes it before
+    item-2 starts (which would otherwise hit the fixed --name)."""
+    rig = Rig(tmp_path, a_list(item(1), item(2)))
+    state = tmp_path / "daemon"
+    state.mkdir()
+    client = tmp_path / "fake_docker.py"
+    client.write_text(FAKE_CLIENT)
+    monkeypatch.setenv("FAKE_DOCKER_STATE", str(state))
+    monkeypatch.setenv("FAKE_DOCKER_WORK", rig.paths.work)
+    monkeypatch.setenv("FAKE_DOCKER_LIB", rig.paths.lib)
+    rig.runner.docker = rig.runner._docker
+    rig.runner.docker_bin = [sys.executable, str(client)]
+    rig.runner.s.item_timeout = 3
+    try:
+        assert rig.runner.run() == ot.EXIT_FAILED
+        log = (state / "client.log").read_text().splitlines()
+        assert log == ["run item-1", "rm %s alive=True" % ot.DL_CONTAINER, "run item-2"], log
+        assert rig.runner.counts["downloaded"] == 1 and rig.runner.counts["failed"] == 1
+        size = (state / "heartbeat").stat().st_size
+        import time
+        time.sleep(0.6)
+        assert (state / "heartbeat").stat().st_size == size, "the container process is still writing"
+    finally:
+        pid = state / (ot.DL_CONTAINER + ".pid")
+        if pid.exists():
+            try:
+                os.kill(int(pid.read_text()), 15)
+            except OSError:
+                pass
 
 
 # ── TC-1449, TC-1450 serve-check, status, docker, the CLI ────────────────────

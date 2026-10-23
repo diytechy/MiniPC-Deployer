@@ -103,6 +103,13 @@ SPACE_PATTERNS = (re.compile(r"Errno 28\b"), re.compile(r"No space left on devic
 
 DL_CONTAINER = "homehub-ottertube-dl"
 INDEX_CONTAINER = "homehub-ottertube-index"
+# What `docker inspect` says about a container that does not exist.
+NO_SUCH_CONTAINER = re.compile(r"No such (object|container)", re.IGNORECASE)
+
+# An item is COMPLETE only with <stem><DONE_EXT>, written (atomically) after its
+# 480p probe, its title and its thumbnail step all succeeded. Media without it
+# was left by a run that stopped in between, and is checked again (LLR-1280).
+DONE_EXT = ".ok"
 
 
 class Invalid(Exception):
@@ -115,6 +122,12 @@ class QuotaStop(Exception):
 
 class GuardStop(Exception):
     """The scratch guard refused: the volume is not the one we may write to."""
+
+
+class ContainerStop(Exception):
+    """A run container could not be confirmed gone after its client stopped
+    (a timeout, a missing binary or any other non-zero exit): it may still be
+    writing, so the run stops rather than start the next container beside it."""
 
 
 # ── knobs ────────────────────────────────────────────────────────────────────
@@ -384,13 +397,48 @@ def media_exts(kind: str) -> Tuple[str, ...]:
     return AUDIO_EXT if kind == "music" else VIDEO_EXT
 
 
-def present(folder: str, stem: str, kind: str) -> bool:
-    """True when the item's media file and info.json are already on the volume."""
+def _names(folder: str) -> set:
     try:
-        names = set(os.listdir(folder))
+        return set(os.listdir(folder))
     except OSError:
-        return False
+        return set()
+
+
+def downloaded(folder: str, stem: str, kind: str) -> bool:
+    """True when the item's media file and info.json are on the volume (checked or not)."""
+    names = _names(folder)
     return (stem + ".info.json") in names and any((stem + ext) in names for ext in media_exts(kind))
+
+
+def present(folder: str, stem: str, kind: str) -> bool:
+    """True when the item is COMPLETE: its media file, its info.json and its
+    completion marker, which only a run whose checks all passed writes.
+
+    Implements: SR-113, SR-114, LLR-1270, LLR-1280.
+    """
+    return (stem + DONE_EXT) in _names(folder) and downloaded(folder, stem, kind)
+
+
+def catalog_items(path: str) -> int:
+    """Items (videos + tracks) in a catalogue file, as OtterTube's indexer counts
+    them for its shrink guard (tools/catalog/lib.mjs itemCount); 0 when unreadable.
+
+    Implements: LLR-1281.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            c = json.load(handle)
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(c, dict):
+        return 0
+
+    def count(key: str, inner: str) -> int:
+        rows = c.get(key)
+        if not isinstance(rows, list):
+            return 0
+        return sum(len(x[inner]) for x in rows if isinstance(x, dict) and isinstance(x.get(inner), list))
+    return count("videos", "items") + count("music", "tracks")
 
 
 def file_stem(name: str) -> str:
@@ -567,6 +615,7 @@ class Runner:
         self.sleep, self.fetch, self.clock = sleep, fetch, clock
         self.counts = {"present": 0, "downloaded": 0, "failed": 0, "pruned": 0}
         self.current: Optional[str] = None
+        self.docker_bin: List[str] = ["docker"]  # tests point it at a fake client
 
     # side effects ------------------------------------------------------------
 
@@ -590,8 +639,39 @@ class Runner:
     def compose(self, *args: str) -> List[str]:
         # Explicit file and project directory: the stack .env interpolates the
         # compose file whatever the caller's working directory is.
-        return ["docker", "compose", "--project-directory", self.p.stack,
+        return self.docker_bin + ["compose", "--project-directory", self.p.stack,
                 "-f", os.path.join(self.p.stack, "docker-compose.yml"), "--profile", "ottertube"] + list(args)
+
+    def run_container(self, name: str, argv: List[str], timeout: float) -> Tuple[int, str]:
+        """One `docker compose run --rm --name NAME`. The container belongs to the
+        daemon, not to the client run_bounded kills, so after ANY non-zero exit
+        (124 timeout, 127 no client, the container's own failure) it is removed
+        and confirmed gone before the run goes on; ContainerStop when it cannot be.
+
+        Implements: SR-116, LLR-1282.
+        """
+        self.current = name
+        rc, out = self.docker(argv, timeout)
+        if rc != 0:
+            self.reap(name)
+        self.current = None
+        return rc, out
+
+    def reap(self, name: str) -> None:
+        """`docker rm -f NAME` until `docker inspect NAME` says there is no such container."""
+        rc, out = 0, ""
+        for _attempt in range(3):
+            self.docker(self.docker_bin + ["rm", "-f", name], 60)
+            rc, out = self.docker(self.docker_bin + ["inspect", "--format", "{{.State.Status}}", name], 30)
+            if rc != 0 and NO_SUCH_CONTAINER.search(out):
+                return
+        raise ContainerStop("the container %s could not be confirmed gone (docker inspect: exit %d, %s)"
+                            % (name, rc, (out.strip().splitlines() or ["no output"])[-1][:200]))
+
+    def discard(self, folder: str, stem: str) -> None:
+        """Every file of one item: an incomplete item never reaches the indexer."""
+        for path in item_files(folder, stem):
+            os.unlink(path)
 
     # steps -------------------------------------------------------------------
 
@@ -623,46 +703,67 @@ class Runner:
         return present(folder, stem, kind)
 
     def download(self, col: Dict[str, object], item: Dict[str, object]) -> str:
-        """One item: 'present', 'downloaded' or 'failed'. Raises QuotaStop/GuardStop."""
+        """One item: 'present', 'downloaded' or 'failed'. Raises QuotaStop/GuardStop/ContainerStop.
+
+        Media and info.json without the completion marker (a run stopped after the
+        container and before the checks) are checked in place; any other leftover
+        (a partial, a download archive alone) is removed and fetched afresh.
+        Implements: SR-114, LLR-1263, LLR-1271, LLR-1280.
+        """
         kind, folder, stem = self.item_place(col, item)
         if present(folder, stem, kind):
             return "present"
-        self.check_guard("item %s" % stem)
-        write_json_atomic(os.path.join(self.p.work, "sub.json"), subscription_for(col, item, self.s))
-        self.current = DL_CONTAINER
-        rc, out = self.docker(self.compose("run", "--rm", "--no-deps", "-T", "--name", DL_CONTAINER,
-                                           "ottertube-ytdl-sub", "--config", "/config/config.yaml",
-                                           "sub", "/work/sub.json"), self.s.item_timeout)
-        self.current = None
-        what = classify_output(out)
-        if what:
-            raise QuotaStop("%s while downloading %s" % ("EDQUOT" if what == "quota" else "ENOSPC", stem))
-        if rc != 0 or not present(folder, stem, kind):
-            mc.log("ottertube: item %s FAILED (exit %d); the run continues with the next item" % (stem, rc), warning=True)
-            # The tail of ytdl-sub's own account (no credential is ever on its
-            # command line or in its config), so the journal says why.
-            for line in out.splitlines()[-12:]:
-                mc.log("ottertube: item %s: %s" % (stem, line[:400]), warning=True)
-            return "failed"
+        in_place = downloaded(folder, stem, kind)
+        if in_place:
+            mc.log("ottertube: item %s is on the volume without its completion marker (an earlier run stopped "
+                   "before its checks); checking it in place" % stem, warning=True)
+        else:
+            self.check_guard("item %s" % stem)
+            # A leftover download archive would make ytdl-sub skip the item.
+            self.discard(folder, stem)
+            write_json_atomic(os.path.join(self.p.work, "sub.json"), subscription_for(col, item, self.s))
+            rc, out = self.run_container(DL_CONTAINER, self.compose(
+                "run", "--rm", "--no-deps", "-T", "--name", DL_CONTAINER, "ottertube-ytdl-sub",
+                "--config", "/config/config.yaml", "sub", "/work/sub.json"), self.s.item_timeout)
+            what = classify_output(out)
+            if what:
+                raise QuotaStop("%s while downloading %s" % ("EDQUOT" if what == "quota" else "ENOSPC", stem))
+            if rc != 0 or not downloaded(folder, stem, kind):
+                mc.log("ottertube: item %s FAILED (exit %d); the run continues with the next item" % (stem, rc), warning=True)
+                # The tail of ytdl-sub's own account (no credential is ever on its
+                # command line or in its config), so the journal says why.
+                for line in out.splitlines()[-12:]:
+                    mc.log("ottertube: item %s: %s" % (stem, line[:400]), warning=True)
+                self.discard(folder, stem)
+                return "failed"
         # The container ran for minutes; the probe, the title and the thumbnail
         # are new files on the volume, so the guard runs again before them.
         self.check_guard("item %s metadata" % stem)
+        height = None
         if kind == "video":
             height = self.probe_height(col, folder, stem)
             if height is None or height > MAX_HEIGHT:
-                for path in item_files(folder, stem):
-                    os.unlink(path)
+                self.discard(folder, stem)
                 mc.log("ottertube: item %s DISCARDED - %s, the cap is %dp; the run continues"
                        % (stem, "its height could not be read" if height is None else "%dp" % height, MAX_HEIGHT),
                        warning=True)
                 return "failed"
         info = os.path.join(folder, stem + ".info.json")
-        if retitle(info, str(item["title"]).strip()):
+        try:
+            changed = retitle(info, str(item["title"]).strip())
+        except ValueError:
+            self.discard(folder, stem)
+            mc.log("ottertube: item %s DISCARDED - its info.json could not be read; the run continues" % stem,
+                   warning=True)
+            return "failed"
+        if changed:
             mc.log("ottertube: item %s: title set from the list" % stem)
         if item.get("thumb") and not any(os.path.exists(os.path.join(folder, stem + e)) for e in THUMB_EXT):
             if self.fetch(str(item["thumb"]), os.path.join(folder, stem)) is None:
                 mc.log("ottertube: item %s: the list's thumbnail could not be fetched" % stem, warning=True)
-        mc.log("ottertube: item %s downloaded" % stem)
+        # Last, and atomically: from here on the item counts as present.
+        write_json_atomic(os.path.join(folder, stem + DONE_EXT), {"schema": 1, "height": height})
+        mc.log("ottertube: item %s %s" % (stem, "checked in place" if in_place else "downloaded"))
         return "downloaded"
 
     def probe_height(self, col: Dict[str, object], folder: str, stem: str) -> Optional[int]:
@@ -672,12 +773,10 @@ class Runner:
         media = next((stem + e for e in VIDEO_EXT if os.path.exists(os.path.join(folder, stem + e))), None)
         if media is None:
             return None
-        self.current = DL_CONTAINER
-        rc, out = self.docker(self.compose("run", "--rm", "--no-deps", "-T", "--name", DL_CONTAINER,
-                                           "--entrypoint", "ffprobe", "ottertube-ytdl-sub",
-                                           "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height",
-                                           "-of", "csv=p=0", "/library/video/%s/%s" % (col["id"], media)), 120)
-        self.current = None
+        rc, out = self.run_container(DL_CONTAINER, self.compose(
+            "run", "--rm", "--no-deps", "-T", "--name", DL_CONTAINER, "--entrypoint", "ffprobe", "ottertube-ytdl-sub",
+            "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height",
+            "-of", "csv=p=0", "/library/video/%s/%s" % (col["id"], media)), 120)
         return parse_height(out) if rc == 0 else None
 
     def prune(self, data: Dict[str, object]) -> None:
@@ -690,16 +789,33 @@ class Runner:
             self.counts["pruned"] += 1
             mc.log("ottertube: removed %s (no longer in the list)" % os.path.relpath(path, self.p.lib))
 
-    def index(self) -> int:
+    def shrink_explained(self, listed: int, complete: int) -> bool:
+        """True when the indexer may cut the catalogue by more than half because
+        the LIST shrank: it names fewer items than the served catalogue holds, and
+        at least half of what it names is complete on the volume. Downloads that
+        went missing unexpectedly keep the indexer's protection (SR-115).
+
+        Implements: SR-115, LLR-1281.
+        """
+        before = catalog_items(os.path.join(self.p.catalog, "catalog.json"))
+        if before <= 0 or listed >= before:
+            return False
+        if 2 * complete < listed:
+            mc.log("ottertube: the list names %d items (the catalogue holds %d) but only %d are complete: "
+                   "the indexer's shrink protection stays on" % (listed, before, complete), warning=True)
+            return False
+        mc.log("ottertube: the list names %d items, the catalogue holds %d: the indexer may shrink it (--allow-shrink)"
+               % (listed, before))
+        return True
+
+    def index(self, allow_shrink: bool = False) -> int:
         self.check_guard("the indexer")
         args = ["node", "tools/catalog/build-catalog.mjs", "--approved", "/work/approved.json",
                 "--video-root", "/library/video", "--music-root", "/library/music", "--publish", "/library/publish",
                 "--out", "/catalog/catalog.json", "--require-hardlink", "--allow-missing",
-                "--grace-days", str(self.s.grace_days)]
-        self.current = INDEX_CONTAINER
-        rc, out = self.docker(self.compose("run", "--rm", "--no-deps", "-T", "--name", INDEX_CONTAINER,
-                                           "ottertube-indexer") + args, 900)
-        self.current = None
+                "--grace-days", str(self.s.grace_days)] + (["--allow-shrink"] if allow_shrink else [])
+        rc, out = self.run_container(INDEX_CONTAINER, self.compose(
+            "run", "--rm", "--no-deps", "-T", "--name", INDEX_CONTAINER, "ottertube-indexer") + args, 900)
         for line in out.splitlines()[-30:]:
             mc.log("ottertube indexer: %s" % line)
         if classify_output(out):
@@ -732,9 +848,14 @@ class Runner:
                 self.counts[state] += 1
                 fetched = fetched or state != "present"
             self.prune(data)
+            listed = complete = 0
+            for col, item in iter_items(data):
+                listed += 1
+                complete += int(self.is_present(col, item))
+            allow_shrink = self.shrink_explained(listed, complete)
             self.check_guard("approved.json")
             write_json_atomic(os.path.join(self.p.work, "approved.json"), approved_for(data))
-            rc = self.index()
+            rc = self.index(allow_shrink)
             result = "ok" if rc == 0 and self.counts["failed"] == 0 else "failed"
             if rc != 0:
                 self.alert("ottertube-index", "HomeHub: OtterTube catalogue not rebuilt",
@@ -754,6 +875,12 @@ class Runner:
             mc.log("ottertube: STOPPED - the scratch guard refused %s" % exc, warning=True)
             self.alert("ottertube-guard", "HomeHub: OtterTube downloads stopped (scratch volume)", str(exc))
             return EXIT_GUARD
+        except ContainerStop as exc:
+            mc.log("ottertube: STOPPED - %s; no further container is started" % exc, warning=True)
+            self.alert("ottertube-container", "HomeHub: OtterTube run stopped (a container would not go)",
+                       "%s. The unit's ExecStopPost removes it; check docker ps." % exc)
+            self.record(started, "failed", reason=str(exc))
+            return EXIT_FAILED
         except (QuotaStop, OSError) as exc:
             if isinstance(exc, OSError) and not is_quota_error(exc):
                 raise
@@ -767,7 +894,10 @@ class Runner:
             self.record(started, "quota", reason=what)
             return EXIT_QUOTA
         finally:
-            empty_dir(self.p.work)
+            # Never under a container that may still be writing (ContainerStop):
+            # the next run empties work/ before it starts anything.
+            if self.current is None:
+                empty_dir(self.p.work)
 
 
 def serve_check(paths: Paths, guard: Callable[[], Tuple[bool, str]]) -> Tuple[bool, str]:

@@ -127,6 +127,8 @@ case " $* " in
     echo "[ytdl-sub] Download Summary: +1"; exit 0 ;;
   *" ottertube-indexer "*) echo "indexed"; exit 0 ;;
   *" rm "*) exit 0 ;;
+  # the runner confirms a container gone after any non-zero client exit (LLR-1282)
+  *" inspect "*) echo "Error: No such object: ${!#}"; exit 1 ;;
 esac
 exit 0
 EOF

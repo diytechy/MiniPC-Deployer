@@ -24,6 +24,15 @@ the mechanism. Default **off** (`OTTERTUBE_ENABLED=false`).
 | compose `ottertube-indexer` | node, pinned; runs OtterTube's `tools/catalog/build-catalog.mjs` from `indexer/`, no network |
 | Caddy `{$OTTERTUBE_HOST}` | the site: `/ottertube/` the web build (`web/`), `/ottertube/catalog.json`, `/ottertube/media/...` proxied to the media server |
 
+Every run container has a fixed `--name`, and it belongs to the docker daemon,
+not to the client the runner bounds: after any non-zero client exit (a timeout
+among them) the runner removes it and confirms it gone before anything else
+runs, or stops the run (alert `ottertube-container`). When the list itself
+shrinks below half of the served catalogue, the runner passes the indexer
+`--allow-shrink` (only if at least half of what the list names is complete), so
+a deliberate removal reaches the catalogue; the removed files stay published,
+unreferenced, for `OTTERTUBE_GRACE_DAYS`.
+
 All three compose services sit behind `profiles: ["ottertube"]` only to stay out
 of firstboot's bulk `up -d`; **never** put `ottertube` in `COMPOSE_PROFILES`
 (export-images refuses it). Firstboot (step 6j) installs the units always and
@@ -37,7 +46,7 @@ enables the timer and media server only while the knob is `true`.
 | `…/ottertube/config/list.json` | the curated list (IF-072), 0600 root | HomeHub `scripts/deploy/ottertube/list.json`: the image's site/ payload (`ottertube-list.json`), or the coordinator's copy |
 | `…/ottertube/indexer/` | `tools/catalog/` + `app/src/catalog/` of ONE OtterTube commit | the coordinator's copy (below); **a reimage does not carry it** |
 | `…/ottertube/web/` | OtterTube's `dist/web` of the same commit (`build-info.json` names it) | the coordinator's copy; **a reimage does not carry it** |
-| `/srv/scratch/ottertube/lib/{video,music}/<collection>/` | downloads: `<item id>.<ext>`, `.info.json`, thumbnail | ytdl-sub |
+| `/srv/scratch/ottertube/lib/{video,music}/<collection>/` | downloads: `<item id>.<ext>`, `.info.json`, thumbnail, and `<item id>.ok`, the completion marker written only after the 480p probe, the title and the thumbnail step (without it the next run checks the item again) | ytdl-sub, `ottertube.py` |
 | `/srv/scratch/ottertube/lib/publish/` | the publication: hard links of what the catalogue references | the indexer |
 | `/srv/scratch/ottertube/catalog/catalog.json` | the catalogue | the indexer |
 | `/srv/scratch/ottertube/work/` | the run's temporary files (subscription, approved.json, ytdl-sub's working dir); emptied before and after every run | ottertube.py |
@@ -112,7 +121,8 @@ release's index digest against ghcr.io, update `ottertube-images.pin` and the
 
 ## Tests
 
-* `tests/test_ottertube.py` (pytest, dev PC; TC-1430..TC-1439, TC-1444..TC-1450).
+* `tests/test_ottertube.py` (pytest, dev PC; TC-1430..TC-1439, TC-1444..TC-1453; the
+  TC-1452 cases run OtterTube's real indexer from the sibling checkout, or `OTTERTUBE_CHECKOUT`).
 * `tests/ottertube-quota.root-test.sh` (root; TC-1440): the real scratch volume
   and EDQUOT under the hub's own kernel —
   `bash stack/scratch/tests/run-root-suite-in-qemu.sh <vmlinuz> <quota modules> ottertube/tests/ottertube-quota.root-test.sh`.

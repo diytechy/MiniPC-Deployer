@@ -1020,12 +1020,14 @@ sequenceDiagram
     Note over V: hourly retention: older than 14 days, then the oldest above 90 % of the 2 GiB quota (LLR-1252)
 ```
 
-### One OtterTube download run, guarded before every container (SR-113, SR-114, SR-116, LLR-1269, LLR-1270, LLR-1268, LLR-1273)
+### One OtterTube download run, guarded before every container (SR-113, SR-114, SR-116, LLR-1269, LLR-1270, LLR-1268, LLR-1273, LLR-1280, LLR-1281, LLR-1282)
 
 The daily timer starts the oneshot unit; systemd will not start it without the
 scratch mount, and stops it the moment the mount goes. Each list item is its
 own container, so the scratch guard runs before every download, and a present
-item costs nothing. The first EDQUOT or ENOSPC ends the run where it stands.
+item (one with its completion marker) costs nothing. The first EDQUOT or ENOSPC
+ends the run where it stands. A container that outlives its client is removed
+before anything else runs.
 
 ```mermaid
 sequenceDiagram
@@ -1040,23 +1042,26 @@ sequenceDiagram
     U->>R: run
     R->>G: before the run
     R->>R: validate list (SR-114) - refuse: alert, exit 2
-    loop every item not present
-        R->>G: before this item
+    loop every item without its completion marker
+        R->>G: before this item (skipped for media left unchecked: checked in place)
         alt guard refuses
             R-->>U: alert ottertube-guard, exit 76
         end
         R->>Y: compose run --rm (one-item subscription)
         Y-->>R: output, exit
+        alt client exit not 0 (timeout among them)
+            R->>R: docker rm -f, inspect until gone - not gone: alert ottertube-container, exit 1
+        end
         alt EDQUOT / ENOSPC in output
             R->>R: empty work/, last-run quota
             R-->>U: alert ottertube-quota, exit 75
         end
         R->>Y: ffprobe height (over 480p: discard)
-        R->>R: title and thumbnail from the list
+        R->>R: title and thumbnail from the list, then the .ok marker
     end
     R->>R: prune what the list no longer names
     R->>G: before approved.json and the indexer
-    R->>I: build-catalog --require-hardlink
+    R->>I: build-catalog --require-hardlink (--allow-shrink only when the list shrank)
     I-->>R: catalog.json + hard-linked publication
     R->>R: logs/last-run.json
 ```

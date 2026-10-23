@@ -35,6 +35,7 @@
 #   {$WALL_HOST} {$WALL_PORT} {$PANEL_IP} {$PANEL_USER_SUB} {$PANEL_ACCESS_ENABLED}
 #   {$GAME_HOST} {$GAME_WS_SECRET}
 #   {$LLM_GATEWAY_HOST}
+#   {$OTTERTUBE_HOST}
 
 {
     # WHERE rate_limit SITS IN THE CHAIN, and it is the whole point of the
@@ -869,6 +870,85 @@ ntfy.{$DOMAIN} {
     }
     handle {
         respond "ntfy: LAN only" 403
+    }
+}
+
+# ── {$OTTERTUBE_HOST} — OtterTube, the kids' app (SN-051, SR-117) ─────────────
+# ONE LAN-only name for the web build, its catalogue and its media, so the
+# browser build is same-origin and the desktop app (origin app://ottertube)
+# reads them with CORS. NO admin login: children's devices cannot complete one,
+# and nothing here is writable; the @lan gate is what keeps it off the
+# internet, exactly as for photos./music. above.
+#
+#   /ottertube/                 the web build (npm run build -> dist/web),
+#                               /opt/homehub/stack/ottertube/web, read-only
+#   /ottertube/catalog.json     the catalogue the indexer last wrote
+#   /ottertube/media/<kind>/<id>.<ext>
+#                               the PUBLICATION only (hard links the indexer made
+#                               of exactly the files the validated catalogue
+#                               references): media and image types by name, all
+#                               else 404, so the download tree, info.json files and
+#                               the indexer's dot files are unreachable by URL.
+# Catalogue and media come from homehub-ottertube-media, which is down whenever
+# the scratch volume is (502 then; the web build still loads and says "No
+# videos yet"). Range requests pass through reverse_proxy to its file_server,
+# which answers them (206), so a <video> seeks.
+#
+# The Technitium record exists only while OTTERTUBE_ENABLED=true
+# (provision-technitium.sh); with it off this site still holds its certificate
+# and answers nothing useful, like every other site whose service is off.
+{$OTTERTUBE_HOST} {
+    import acme_cloudflare
+    @lan remote_ip {$LAN_CIDR}
+    handle @lan {
+        # CORS for the two origins the app runs from, on every response (the
+        # app routes media through Web Audio for the parent's volume cap, which
+        # needs CORS for cross-origin media). Exact values, no pattern; two
+        # values of one field are OR'ed.
+        @ot_cors {
+            header Origin https://{$OTTERTUBE_HOST}
+            header Origin app://ottertube
+        }
+        header @ot_cors {
+            Access-Control-Allow-Origin "{http.request.header.Origin}"
+            Access-Control-Expose-Headers "Content-Length, Content-Range, Accept-Ranges"
+            Vary Origin
+        }
+        # The catalogue: always revalidated.
+        handle /ottertube/catalog.json {
+            header >Cache-Control "no-cache"
+            rewrite * /catalog/catalog.json
+            reverse_proxy homehub-ottertube-media:8080
+        }
+        # Media: the publication only, media and image types only. A name never
+        # changes between runs and a changed download is replaced by rename, so
+        # clients revalidate (ETag / Last-Modified) rather than cache for good.
+        handle_path /ottertube/media/* {
+            @media path_regexp ^/(video|music)/[a-z0-9-]+\.(mp4|m4v|webm|mkv|mov|m4a|mp3|ogg|opus|oga|flac|wav|aac|jpg|jpeg|png|webp)$
+            handle @media {
+                header >Cache-Control "no-cache"
+                rewrite * /media{path}
+                reverse_proxy homehub-ottertube-media:8080
+            }
+            handle {
+                respond 404
+            }
+        }
+        # The web build, relative base.
+        handle_path /ottertube/* {
+            root * /srv/ottertube/web
+            encode zstd gzip
+            file_server
+        }
+        handle / {
+            redir * /ottertube/ 302
+        }
+        handle {
+            respond 404
+        }
+    }
+    handle {
+        respond "ottertube: LAN only" 403
     }
 }
 

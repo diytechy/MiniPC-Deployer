@@ -1,0 +1,72 @@
+# ytdl-sub configuration for the hub's OtterTube downloader (SR-113; stack/ottertube/README.md).
+#
+# PUBLIC: presets only, no content. The curated list (which videos, for which age
+# bands) is private HomeHub config; ottertube.py turns each list item into a
+# ONE-ITEM subscription file under /work and runs ytdl-sub once per item, so the
+# scratch mount guard runs before every download (SR-103).
+#
+# Verified against the pinned image (ytdl-sub 2026.08.26.post1, yt-dlp 2026.08.19)
+# with `ytdl-sub --dry-run` and one real download, 2026-10-22.
+#
+# What each item run writes, for the OtterTube indexer (tools/catalog):
+#   /library/<kind>/<collection>/<item id>.<ext>        the media file
+#   /library/<kind>/<collection>/<item id>.info.json    metadata (id, title, duration)
+#   /library/<kind>/<collection>/<item id>.<thumb ext>  thumbnail, when the source has one
+# (/library, never /lib: a bind there would shadow the image's own libraries.)
+# The stem is the LIST's item id (an override set per subscription), so a file
+# name never depends on a title the source can change.
+
+configuration:
+  # On the scratch volume (/work is /srv/scratch/ottertube/work), wiped by
+  # ottertube.py before and after every run. A different bind mount from /library,
+  # so the finished file is copied, not renamed: one item's size, transiently,
+  # inside the ottertube quota.
+  working_directory: /work/ytdl-sub-working
+  # Its single-instance lock: the container's tmpfs, never /config.
+  lock_directory: /tmp
+  # Never write logs under /config (read-only, on the root filesystem).
+  persist_logs:
+    logs_directory: /work/logs
+    keep_successful_logs: false
+
+presets:
+  # Video for the Watch section: at most 480p (the plan's cap), H.264 preferred
+  # (the weakest kids target decodes it in hardware), one file with audio.
+  # `<=?` and `^=?` also admit a format whose height or codec the source does not
+  # declare (a bare file URL declares neither, measured); ottertube.py then reads
+  # the downloaded file's real height with ffprobe and discards anything over 480.
+  ottertube_video:
+    download: "{ottertube_url}"
+    output_options:
+      output_directory: "/library/video/{ottertube_folder}"
+      file_name: "{ottertube_stem}.{ext}"
+      thumbnail_name: "{ottertube_stem}.{thumbnail_ext}"
+      info_json_name: "{ottertube_stem}.{info_json_ext}"
+      maintain_download_archive: true
+    format: "b[height<=?480][vcodec^=?avc1]/bv*[height<=?480][vcodec^=?avc1]+ba[ext=m4a]/b[height<=?480]/bv*[height<=?480]+ba"
+    ytdl_options:
+      merge_output_format: mp4
+      writesubtitles: false
+      # no cache directory under HOME (/config is read-only)
+      cachedir: false
+    overrides:
+      ottertube_url: ""
+      ottertube_folder: ""
+      ottertube_stem: ""
+
+  # Audio for the Listen section.
+  ottertube_music:
+    download: "{ottertube_url}"
+    output_options:
+      output_directory: "/library/music/{ottertube_folder}"
+      file_name: "{ottertube_stem}.{ext}"
+      thumbnail_name: "{ottertube_stem}.{thumbnail_ext}"
+      info_json_name: "{ottertube_stem}.{info_json_ext}"
+      maintain_download_archive: true
+    format: "ba[ext=m4a]/ba"
+    ytdl_options:
+      cachedir: false
+    overrides:
+      ottertube_url: ""
+      ottertube_folder: ""
+      ottertube_stem: ""

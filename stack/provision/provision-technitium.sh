@@ -26,7 +26,8 @@
 # Env/.env keys consumed: DOMAIN, LAN_IP, TECHNITIUM_ADMIN_PASSWORD,
 #   TECHNITIUM_API_TOKEN_NAME, TECHNITIUM_FORWARDERS, TECHNITIUM_BLOCKLISTS,
 #   TRACKER_SUBDOMAIN, ACTUAL_SUBDOMAIN, MAIN_BOX_IP, EXTRA_SUBDOMAINS (SR-012),
-#   WALL_HOST (the kiosk site — the panel resolves it through this box).
+#   WALL_HOST (the kiosk site — the panel resolves it through this box),
+#   OTTERTUBE_ENABLED + OTTERTUBE_SUBDOMAIN (the OtterTube site, SN-051).
 #
 # Exit codes: 0 success; nonzero (with a message) on any API failure — so the
 # first-boot unit is marked failed and the operator can see it, rather than the
@@ -378,6 +379,14 @@ main() {
     # record rather than one pointing at a service that is not there.
     if [ -n "${LLM_GATEWAY_SUBDOMAIN:-}" ]; then
         add_a "$TOKEN" "${LLM_GATEWAY_SUBDOMAIN}.${DOMAIN}" "$LAN_IP"
+    fi
+
+    # OTTERTUBE (SN-051, SR-117): Caddy serves {$OTTERTUBE_HOST} always, but the
+    # name answers on the LAN only while the downloader is on - a hub with it
+    # off gets no record rather than one for a site with nothing behind it.
+    # Exactly `true`, the same reading as the units' ExecCondition.
+    if [ "${OTTERTUBE_ENABLED:-}" = true ]; then
+        add_a "$TOKEN" "${OTTERTUBE_SUBDOMAIN:-ottertube}.${DOMAIN}" "$LAN_IP"
     fi
 
     # Tier-2 opt-in subdomains (SR-012): bare labels from EXTRA_SUBDOMAINS in

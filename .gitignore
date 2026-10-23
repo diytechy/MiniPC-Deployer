@@ -80,3 +80,12 @@ vmtest/.cache/
 # merely careless.
 .pytest-review/
 build/
+
+# ── OtterTube on the hub (SN-051, stack/ottertube/README.md) ─────────────────
+# The curated list is PRIVATE (HomeHub config, installed by the image's site/
+# payload); the indexer and the web build are copied from an OtterTube commit by
+# the coordinator. None of them is this repository's content.
+stack/ottertube/config/
+stack/ottertube/indexer/
+stack/ottertube/web/*
+!stack/ottertube/web/README.md

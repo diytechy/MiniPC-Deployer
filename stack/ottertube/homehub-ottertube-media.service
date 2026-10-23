@@ -1,0 +1,40 @@
+[Unit]
+# OtterTube's media server (SN-051, SR-117): the publication and the catalogue
+# from /srv/scratch/ottertube, READ-ONLY, for Caddy's OtterTube site. SYSTEMD
+# OWNS ITS LIFECYCLE, NOT DOCKER: the compose service is `restart: "no"` behind
+# `profiles: ["ottertube"]`, which keeps firstboot's bulk `up -d` from starting
+# it, and its binds are long-syntax with create_host_path: false.
+# Bound to the volume like a writer (RequiresMountsFor=, BindsTo=): when the
+# mount goes, the server stops and the site's media answer 502; the web build
+# itself is served by Caddy from the root filesystem and keeps loading.
+# The knob is OTTERTUBE_ENABLED, read by ExecCondition.
+Description=OtterTube: media and catalogue server for the OtterTube site (read-only)
+Documentation=file:///opt/homehub/stack/ottertube/README.md
+RequiresMountsFor=/srv/scratch
+BindsTo=srv-scratch.mount
+# Wants=+After= docker, deliberately NOT Requires= (validate_config check 5b).
+After=srv-scratch.mount docker.service network-online.target homehub-firstboot.service
+Wants=docker.service network-online.target
+AssertPathExists=/opt/homehub/stack/ottertube/ottertube.py
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/homehub/stack
+ExecCondition=/usr/bin/python3 /opt/homehub/stack/ottertube/ottertube.py condition
+# The guard (the volume is the scratch filesystem, ottertube/ in its project)
+# and the two read-only sources exist.
+ExecStartPre=/usr/bin/python3 /opt/homehub/stack/ottertube/ottertube.py serve-check
+ExecStartPre=-/usr/bin/docker rm -f homehub-ottertube-media
+# Attached, so the container's life IS this unit's life.
+ExecStart=/usr/bin/docker compose --profile ottertube up --no-deps --no-log-prefix --exit-code-from ottertube-media ottertube-media
+ExecStop=/usr/bin/docker compose --profile ottertube stop --timeout 10 ottertube-media
+ExecStopPost=-/usr/bin/docker rm -f homehub-ottertube-media
+CapabilityBoundingSet=~CAP_SYS_RESOURCE
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+[Install]
+# srv-scratch.mount as well: when the volume comes back, so does the server.
+WantedBy=multi-user.target srv-scratch.mount

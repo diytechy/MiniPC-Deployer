@@ -3030,6 +3030,44 @@ else
     log "WARN: no $STACK_DIR/door on the payload - no door relay or recorder"
 fi
 
+# ── 6j. OtterTube downloader, catalogue and media server (SN-051; stack/ottertube) ──
+# Installed always; ENABLED ONLY WHILE OTTERTUBE_ENABLED=true, and disabled again
+# when it is not (this step runs on every boot). Unlike the door units these
+# cannot sit "enabled, inert and green" on a box without the knob: they are
+# BindsTo=srv-scratch.mount, and on a hub with no scratch volume that mount unit
+# does not exist, so systemd refuses to queue them at all ("Unit
+# srv-scratch.mount not found", measured 2026-10-22) and the timer would fail
+# every night. The ExecCondition still reads the knob, for a hand-run start.
+# The media server is WantedBy the scratch mount, so it returns with the volume;
+# the download service runs only from its timer. Started with --no-block (the
+# 2026-08-27 deadlock: they are ordered After= this unit).
+# The two pinned images are baked by vmtest/export-images.sh when the knob is
+# true. The private list arrives through the site/ payload (user-data step 4);
+# the web build and the indexer are copied from an OtterTube commit
+# (stack/ottertube/README.md) and a reimage does NOT carry them: until they are
+# copied again the run refuses with an alert and the site serves no app.
+if [ -d "$STACK_DIR/ottertube" ]; then
+    for __u in homehub-ottertube-download.service homehub-ottertube-download.timer homehub-ottertube-media.service; do
+        install -m 0644 "$STACK_DIR/ottertube/$__u" "/etc/systemd/system/$__u" || log "WARN: could not install $__u"
+    done
+    systemctl daemon-reload || log "WARN: systemctl daemon-reload failed"
+    # The same reading as 1b-scratch: the LAST assignment wins, quotes dropped.
+    __ot_on="$(sed -n 's/^OTTERTUBE_ENABLED=//p' "$STACK_DIR/.env" 2>/dev/null | tail -n1 \
+            | tr -d "\"'" | tr -d '[:space:]')"
+    if [ "$__ot_on" = true ]; then
+        systemctl enable homehub-ottertube-download.timer homehub-ottertube-media.service >/dev/null 2>&1 \
+            || log "WARN: could not enable the OtterTube timer/media server"
+        systemctl start --no-block homehub-ottertube-download.timer homehub-ottertube-media.service >/dev/null 2>&1 \
+            || log "WARN: could not queue the OtterTube timer/media server start"
+        log "OtterTube units installed and enabled (list $( [ -f "$STACK_DIR/ottertube/config/list.json" ] && echo present || echo ABSENT ), indexer $( [ -f "$STACK_DIR/ottertube/indexer/tools/catalog/build-catalog.mjs" ] && echo present || echo ABSENT ), web build $( [ -f "$STACK_DIR/ottertube/web/index.html" ] && echo present || echo ABSENT ))"
+    else
+        systemctl disable --now homehub-ottertube-download.timer homehub-ottertube-media.service >/dev/null 2>&1 || true
+        log "OtterTube units installed, not enabled (OTTERTUBE_ENABLED=${__ot_on:-unset})"
+    fi
+else
+    log "WARN: no $STACK_DIR/ottertube on the payload - no OtterTube downloader"
+fi
+
 # ── 7. done ──────────────────────────────────────────────────────────────────
 date > "$MARKER"
 # A defect found in step 4b is reported HERE, at the end, and as a NON-ZERO

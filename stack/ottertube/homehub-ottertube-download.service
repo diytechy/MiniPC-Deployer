@@ -1,0 +1,43 @@
+[Unit]
+# OtterTube's daily download and catalogue run (SN-051, SR-113..SR-116).
+# ottertube.py downloads each item of the private curated list that is not yet
+# on the volume (one ytdl-sub container per item), then rebuilds the catalogue
+# with OtterTube's indexer. A SCRATCH WRITER, so it carries the writer pattern
+# (SR-103, stack/scratch/README.md):
+#   * RequiresMountsFor= and BindsTo=srv-scratch.mount: it does not start
+#     without the volume and is stopped the moment the mount goes away (its
+#     ExecStopPost removes any container still running);
+#   * ExecStartPre runs the mount guard, and ottertube.py runs it again before
+#     EVERY item's container and before the indexer;
+#   * it drops CAP_SYS_RESOURCE, without which the kernel ignores quota hard
+#     limits for it; its containers run with cap_drop: ALL.
+# Started only by homehub-ottertube-download.timer (and by hand: systemctl
+# start). Never restarted: a failed run waits for the next day.
+Description=OtterTube: download the curated list and rebuild the catalogue (scratch volume)
+Documentation=file:///opt/homehub/stack/ottertube/README.md
+RequiresMountsFor=/srv/scratch
+BindsTo=srv-scratch.mount
+After=srv-scratch.mount docker.service network-online.target homehub-firstboot.service
+Wants=docker.service network-online.target
+AssertPathExists=/opt/homehub/stack/ottertube/ottertube.py
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/homehub/stack
+ExecCondition=/usr/bin/python3 /opt/homehub/stack/ottertube/ottertube.py condition
+ExecStartPre=/usr/bin/python3 /opt/homehub/stack/scratch/homehub_scratch.py guard --writer ottertube
+ExecStart=/usr/bin/python3 /opt/homehub/stack/ottertube/ottertube.py run
+ExecStopPost=-/usr/bin/docker rm -f homehub-ottertube-dl homehub-ottertube-index
+# THE QUOTA IS ONLY A WALL WITHOUT THIS (fs/quota/dquot.c ignore_hardlimit).
+CapabilityBoundingSet=~CAP_SYS_RESOURCE
+NoNewPrivileges=true
+# Off-peak and in the background: it must never compete with the hub's
+# interactive work. The downloads themselves are bounded per item
+# (OTTERTUBE_ITEM_TIMEOUT_SEC); this bounds the whole run.
+Nice=10
+IOSchedulingClass=idle
+CPUAccounting=true
+MemoryAccounting=true
+MemoryMax=256M
+TimeoutStartSec=6h
+TimeoutStopSec=60

@@ -531,6 +531,45 @@ def test_tc1454_the_quota_stop_cleans_only_where_the_guard_still_agrees(tmp_path
     assert not os.path.exists(os.path.join(rig.paths.logs, "last-run.json"))  # logs/ is on that volume too
 
 
+def scratch_facts(**over):
+    facts = dict(writer="ottertube", known_writer=True, expected_uuid="0f0e0d0c-0b0a-4908-8706-050403020100",
+                 uuid_malformed=False, mounted=True, mount_majmin="253:3", uuid_majmin="253:3", fstype="ext4",
+                 superopts="rw,prjquota", read_only=False, has_cap_sys_resource=False, dir_kind="dir",
+                 dir_dev_ok=True, project_id=ot.scratch.PROJECT_ID["ottertube"], project_inherit=True, probe_error=None)
+    facts.update(over)
+    return facts
+
+
+@pytest.mark.parametrize("over, ok, words", [
+    ({}, True, "ok"),
+    # The budget is full: the guard refuses a writer, but the volume is still ours to clean.
+    ({"probe_error": "EDQUOT"}, True, "ok"),
+    ({"probe_error": "ENOSPC"}, True, "ok"),
+    ({"probe_error": "EIO"}, False, "not writable (EIO)"),
+    ({"uuid_majmin": "8:1"}, False, "wrong device"),
+    ({"mounted": False}, False, "not a mount point"),
+    ({"dir_dev_ok": False}, False, "not on the scratch filesystem"),
+    ({"project_id": 7101}, False, "quota project"),
+])
+def test_tc1454_the_cleanup_asks_identity_not_writability(monkeypatch, over, ok, words):
+    monkeypatch.setattr(ot.scratch, "gather_guard_facts", lambda writer, s, paths: scratch_facts(**over))
+    got = ot.scratch_identity(None, "/")
+    assert got[0] is ok and words in got[1]
+    # ... while the writer guard itself still refuses a full budget
+    if over.get("probe_error") in ("EDQUOT", "ENOSPC"):
+        assert ot.scratch.judge_guard(scratch_facts(**over))[0] is False
+
+
+def test_tc1454_a_full_budget_still_frees_work(tmp_path):
+    # The real guard's write probe fails at the quota; the cleanup's identity check passes.
+    out = (1, "[ytdl-sub:yt-dlp] ERROR: unable to write data: [Errno 122] Disk quota exceeded")
+    rig = Rig(tmp_path, a_list(item(1)), outputs={"item-1": out},
+              guard_results=[(True, "ok"), (True, "ok"), (False, "/srv/scratch/ottertube is not writable (EDQUOT)")])
+    rig.runner.identity = lambda: (True, "ok")
+    assert rig.runner.run() == ot.EXIT_QUOTA
+    assert os.listdir(rig.paths.work) == [] and rig.last_run()["result"] == "quota"
+
+
 def test_tc1454_the_quota_stop_still_empties_work_when_the_guard_agrees(tmp_path):
     out = (1, "[ytdl-sub:yt-dlp] ERROR: unable to write data: [Errno 122] Disk quota exceeded")
     rig = Rig(tmp_path, a_list(item(1)), outputs={"item-1": out})

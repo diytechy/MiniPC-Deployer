@@ -49,7 +49,7 @@ enables the timer and media server only while the knob is `true`.
 | `/srv/scratch/ottertube/lib/{video,music}/<collection>/` | downloads: `<item id>.<ext>`, `.info.json`, thumbnail, and `<item id>.ok`, the completion marker written only after the 480p probe, the title and the thumbnail step (without it the next run checks the item again) | ytdl-sub, `ottertube.py` |
 | `/srv/scratch/ottertube/lib/publish/` | the publication: hard links of what the catalogue references | the indexer |
 | `/srv/scratch/ottertube/catalog/catalog.json` | the catalogue | the indexer |
-| `/srv/scratch/ottertube/work/` | the run's temporary files (subscription, approved.json, ytdl-sub's working dir); emptied before and after every run, the cleanup after asking the guard first and never after a refusal (LLR-1283) | ottertube.py |
+| `/srv/scratch/ottertube/work/` | the run's temporary files (subscription, approved.json, ytdl-sub's working dir); emptied before and after every run, the cleanup after checking the volume is still ours (scratch_identity: the guard's checks, a full-budget probe excepted) and never after a refusal (LLR-1283) | ottertube.py |
 | `/srv/scratch/ottertube/logs/last-run.json` | the last run's result and counts (deployment-state reads it) | ottertube.py |
 
 Scratch: never backed up, never shared (HomeHub `scripts/deploy/storage-map.md`

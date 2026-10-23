@@ -1028,7 +1028,9 @@ own container, so the scratch guard runs before every download, and a present
 item (one with its completion marker) costs nothing. The first EDQUOT or ENOSPC
 ends the run where it stands. A container that outlives its client is removed
 before anything else runs. A refusal ends all work on the volume, work/'s
-cleanup included, and every later cleanup of work/ asks the guard first.
+cleanup included, and every later cleanup of work/ first checks the volume is
+still ours (a write probe failing only because the budget is full does not
+count: freeing space is the point of the quota stop).
 
 ```mermaid
 sequenceDiagram
@@ -1054,7 +1056,7 @@ sequenceDiagram
             R->>R: docker rm -f, inspect until gone - not gone: alert ottertube-container, exit 1
         end
         alt EDQUOT / ENOSPC in output
-            R->>G: before emptying work/ (refuses: work/ and last-run left as they are)
+            R->>G: identity before emptying work/ (a full budget passes; refuses: work/ and last-run left as they are)
             R->>R: empty work/, last-run quota
             R-->>U: alert ottertube-quota, exit 75
         end
@@ -1066,7 +1068,7 @@ sequenceDiagram
     R->>I: build-catalog --require-hardlink (--allow-shrink only when the list shrank)
     I-->>R: catalog.json + hard-linked publication
     R->>R: logs/last-run.json
-    R->>G: before emptying work/ (refuses: left for the next run, after its guard)
+    R->>G: identity before emptying work/ (refuses: left for the next run, after its guard)
 ```
 
 ### One memory episode on the hub: kill, reboot, hand-off (SR-050, SR-051, LLR-999, LLR-1000, LLR-1002)

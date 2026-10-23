@@ -600,12 +600,28 @@ def fetch_thumb(url: str, dest_stem: str, timeout: float = 30.0) -> Optional[str
             os.unlink(tmp)
 
 
+def scratch_identity(scratch_settings, root: Optional[str] = None) -> Tuple[bool, str]:
+    """Is the mounted volume still OUR scratch volume (the guard's identity and
+    placement checks)? The question before a cleanup, which frees space rather
+    than taking it: a write probe that fails because the ottertube budget is
+    full (EDQUOT, ENOSPC) does not make it someone else's volume. Any other
+    refusal stands, a failed probe for another reason among them.
+
+    Implements: LLR-1283.
+    """
+    facts = scratch.gather_guard_facts(WRITER, scratch_settings, scratch.Paths(root) if root else scratch.Paths())
+    if facts.get("probe_error") in ("EDQUOT", "ENOSPC"):
+        facts["probe_error"] = None
+    return scratch.judge_guard(facts)
+
+
 class Runner:
     """One download-and-index run. Every side effect goes through an injectable
     callable so tests drive it with fakes: guard, docker, alert, sleep, fetch."""
 
     def __init__(self, settings: Settings, paths: Paths, scratch_settings, env_file: str,
                  guard: Optional[Callable[[], Tuple[bool, str]]] = None,
+                 identity: Optional[Callable[[], Tuple[bool, str]]] = None,
                  docker: Optional[Callable[[List[str], float], Tuple[int, str]]] = None,
                  alert: Optional[Callable[[str, str, str], None]] = None,
                  sleep: Callable[[float], None] = time.sleep,
@@ -613,6 +629,9 @@ class Runner:
                  clock: Callable[[], float] = time.time):
         self.s, self.p, self.env_file = settings, paths, env_file
         self.guard = guard or (lambda: scratch.guard(WRITER, scratch_settings))
+        # The cleanup's question (scratch_identity). An injected guard answers
+        # it too unless an identity is injected as well (main injects both).
+        self.identity = identity or (guard if guard else (lambda: scratch_identity(scratch_settings)))
         self.docker = docker or self._docker
         self.alert = alert or self._alert
         self.sleep, self.fetch, self.clock = sleep, fetch, clock
@@ -645,19 +664,19 @@ class Runner:
             raise GuardStop("before %s: %s" % (before, reason))
 
     def clean_work(self, when: str) -> bool:
-        """Empty work/, but only on the volume the guard accepts NOW: never after
-        any refusal in this run, and not when the guard refuses here. True when
-        work/ was emptied.
+        """Empty work/, but only on the volume that is still ours NOW
+        (scratch_identity): never after any guard refusal in this run, and not
+        when the identity check refuses here. True when work/ was emptied.
 
         Implements: LLR-1283.
         """
         if self.refused:
             mc.log("ottertube: work/ left as it is (%s): the scratch guard refused the volume" % when, warning=True)
             return False
-        ok, reason = self.guard()
+        ok, reason = self.identity()
         if not ok:
             self.refused = True
-            mc.log("ottertube: work/ left as it is (%s): the scratch guard refused: %s" % (when, reason), warning=True)
+            mc.log("ottertube: work/ left as it is (%s): the scratch volume check refused: %s" % (when, reason), warning=True)
             return False
         empty_dir(self.p.work)
         self.work_cleaned = True
@@ -1005,7 +1024,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     scratch_settings = scratch.Settings(env)
     guard = lambda: scratch.guard(WRITER, scratch_settings, scratch.Paths(args.root))  # noqa: E731
     if args.verb == "run":
-        runner = Runner(settings, paths, scratch_settings, args.env_file, guard=guard)
+        runner = Runner(settings, paths, scratch_settings, args.env_file, guard=guard,
+                        identity=lambda: scratch_identity(scratch_settings, args.root))
 
         def on_term(signum, _frame):
             # A stop (BindsTo= when the mount goes, or systemctl stop) must not

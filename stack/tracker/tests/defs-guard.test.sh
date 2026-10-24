@@ -42,8 +42,11 @@
 #       only the lost id
 #   D25 an item moved between two existing files (same ids, new per-file counts)
 #       is not red: the baseline refreshes and the move is recorded
-#   D26 the reason in the POST body is <= 500 bytes and valid UTF-8 (NagLight's
-#       maxFeedReasonLen); the state file keeps the full verdict
+#   D26 the reason in the POST body is <= 500 DECODED bytes and valid UTF-8
+#       (NagLight's maxFeedReasonLen); the body is valid JSON even with a
+#       backslash or a tab in the text; the state file keeps the full verdict
+#   D27 a duplicate id across two files, one copy swapped for a NEW id, is red
+#   D28 ... and swapped for ANOTHER EXISTING id is red, not a move/recount
 #   D15 a corrupt baseline is yellow, never green
 #   D16 a state file that cannot be written escalates to RED - the durable
 #       verdict is the whole point, and a stale one reads as current
@@ -630,6 +633,23 @@ if grep -q '^reason=move/recount auto-accepted' "$STATE/tracker-defs-baseline"; 
 rc="$(guard --check)"
 if [ "$rc" = 0 ] && grep -q 'by count AND by inventory' "$TMP/out.txt"; then pass "D25 the baseline was refreshed (next run matches exactly)"; else fail "D25 second run exit=$rc"; cat "$TMP/out.txt"; fi
 
+# D27/D28: DUPLICATE ids across files. The normalised inventories keep
+# multiplicity (plain sort, not sort -u), so a lost copy is still a removal.
+# D27: `dup` lives in alpha and beta; the alpha copy is swapped for a NEW id.
+fresh; write_alpha one dup; write_beta dup two
+guard --baseline >/dev/null
+write_alpha one fresh
+rc="$(guard --check)"
+if [ "$rc" = 1 ] && [ "$(state_of band)" = red ]; then pass "D27 a lost duplicate swapped for a new id is RED (exit 1)"; else fail "D27 band=$(state_of band) exit=$rc"; cat "$TMP/out.txt"; fi
+if [ "$(state_of removed)" = "user-one/dup" ]; then pass "D27 removed names user-one/dup"; else fail "D27 removed='$(state_of removed)'"; fi
+# D28: the lost copy is replaced by ANOTHER EXISTING id (a second `two`).
+fresh; write_alpha one dup; write_beta dup two
+guard --baseline >/dev/null
+write_alpha one two
+rc="$(guard --check)"
+if [ "$rc" = 1 ] && [ "$(state_of band)" = red ]; then pass "D28 a lost duplicate replaced by an existing id is RED, not a move (exit 1)"; else fail "D28 band=$(state_of band) exit=$rc"; cat "$TMP/out.txt"; fi
+if state_of verdict | grep -q 'REMOVED'; then pass "D28 and it is called a removal"; else fail "D28 verdict: $(state_of verdict)"; fi
+
 # D26: the POST body's reason must fit the tracker (500 bytes, valid UTF-8).
 # A recording docker stands in for the container: it saves the --post-data.
 POSTBIN="$TMP/postbin"; mkdir -p "$POSTBIN"
@@ -659,17 +679,55 @@ guard --baseline >/dev/null
 write_beta zzz
 post_reason() { # post_reason [MAXBYTES] -> runs --report, leaves the reason in $TMP/reason.txt
     rm -f "$TMP/post.json"
-    POST_OUT="$TMP/post.json" TRACKER_DEFS_ROOT="$ROOT" TRACKER_DEFS_STATE_DIR="$STATE" \
+    POST_OUT="$TMP/post.json" TRACKER_DEFS_ROOT="${POST_ROOT:-$ROOT}" TRACKER_DEFS_STATE_DIR="$STATE" \
         TRACKER_DEFS_ENV_FILE="$TMP/feed2.env" TRACKER_DEFS_REASON_MAX_BYTES="${1:-500}" \
         PATH="$POSTBIN:$PATH" bash "$GUARD" --report >"$TMP/out.txt" 2>&1
-    sed -e 's/^.*"reason":"//' -e 's/"}$//' "$TMP/post.json" >"$TMP/reason.txt"
+    # DECODE the body as the tracker does (json.loads) and keep the decoded
+    # reason as UTF-8 bytes: the 500 limit is on THAT, not on the escaped text.
+    # A body that is not valid JSON leaves reason.txt empty and fails the checks.
+    : >"$TMP/reason.txt"
+    "$PY" -c 'import json,sys; r=json.load(open(sys.argv[1],encoding="utf-8"))["reason"]; sys.stdout.buffer.write(r.encode("utf-8"))' \
+        "$TMP/post.json" >"$TMP/reason.txt" 2>"$TMP/decode.err"
 }
+PY="$(command -v python3 || command -v python)"
 post_reason
 rlen="$(LC_ALL=C wc -c <"$TMP/reason.txt" | tr -d ' ')"
 if [ -s "$TMP/post.json" ] && [ "$rlen" -le 500 ] && [ "$rlen" -gt 0 ]; then pass "D26 the POSTed reason is $rlen bytes (<= 500)"; else fail "D26 reason is ${rlen:-?} bytes (or no POST was made)"; fi
 if iconv -f UTF-8 -t UTF-8 "$TMP/reason.txt" >/dev/null 2>&1; then pass "D26 and it is valid UTF-8"; else fail "D26 reason is not valid UTF-8"; fi
 if grep -q 'more' "$TMP/reason.txt"; then pass "D26 the long list was shortened ('...and N more')"; else fail "D26 no shortened-list marker"; fi
 if [ "$(state_of band)" = red ] && [ "$(state_of removed | wc -c)" -gt 800 ]; then pass "D26 the state file keeps the FULL verdict"; else fail "D26 state removed is only $(state_of removed | wc -c) bytes"; fi
+# JSON safety: a backslash in an id, and cuts landing right beside backslashes.
+fresh
+bs_ids=(); for n in $(seq 1 40); do bs_ids+=("b"'\'"s"'\'"l"'\'"a"'\'"sh-$n"); done
+write_alpha one two; write_beta "${bs_ids[@]}"
+guard --baseline >/dev/null
+write_beta zzz
+post_reason
+rlen="$(LC_ALL=C wc -c <"$TMP/reason.txt" | tr -d ' ')"
+if [ -s "$TMP/post.json" ] && [ "$rlen" -gt 0 ] && [ "$rlen" -le 500 ]; then pass "D26 ids holding backslashes: the body decodes as JSON, reason $rlen bytes (<= 500)"; else fail "D26 backslash ids: reason ${rlen:-?} bytes or the body is not valid JSON: $(cat "$TMP/decode.err")"; fi
+sweep_ok=1
+# The hard cut can only land beside a backslash in text OUTSIDE the [lists] (those
+# are shortened away first), so use the "NO definition files ... under $ROOT"
+# verdict with backslashes in the path, and cut it at every offset.
+BSROOT="$TMP/ro"'\'"ot"'\'"dir"; rm -rf "$BSROOT"; mkdir -p "$BSROOT/u1"
+for m in $(seq 40 110); do
+    POST_ROOT="$BSROOT" post_reason "$m"
+    l="$(LC_ALL=C wc -c <"$TMP/reason.txt" | tr -d ' ')"
+    if [ "$l" -eq 0 ] || [ "$l" -gt "$m" ] || ! iconv -f UTF-8 -t UTF-8 "$TMP/reason.txt" >/dev/null 2>&1; then
+        sweep_ok=0; echo "  cap $m -> $l bytes ($(head -c 200 "$TMP/decode.err"))"
+    fi
+done
+if [ "$sweep_ok" = 1 ]; then pass "D26 caps 40-110 cutting beside backslashes: always valid JSON, decoded <= cap, valid UTF-8"; else fail "D26 a cut beside a backslash broke the body or the bound"; fi
+# A control character (a tab in a user directory name reaches the verdict).
+fresh; write_alpha one two; write_beta three
+mkdir -p "$ROOT/tab"$'\t'"user/definitions"
+cp "$DEFS/beta.md" "$ROOT/tab"$'\t'"user/definitions/gamma.md"
+guard --baseline >/dev/null
+write_alpha one
+post_reason
+rlen="$(LC_ALL=C wc -c <"$TMP/reason.txt" | tr -d ' ')"
+if [ "$(state_of band)" = red ] && grep -q "$(printf 'tab\tuser')" "$STATE/tracker-defs.state"; then pass "D26 setup: the verdict really carries a tab"; else fail "D26 tab setup: band=$(state_of band)"; fi
+if [ "$rlen" -gt 0 ] && [ "$rlen" -le 500 ] && ! grep -q "$(printf '\t')" "$TMP/reason.txt"; then pass "D26 a tab in the verdict gives a valid body (control char neutralised)"; else fail "D26 tab: reason ${rlen:-?} bytes: $(cat "$TMP/decode.err")"; fi
 # The backstop, called directly: lift the bounding functions out of the guard and
 # cut a string full of 2-, 3- and 4-byte characters at every cap from 1 to 60.
 eval "$(sed -n '/^REASON_MAX_BYTES=/,/^# .* baseline mode/p' "$GUARD" | sed '$d')"

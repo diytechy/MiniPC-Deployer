@@ -282,6 +282,9 @@ shorten_lists() { # shorten_lists K TEXT
         printf "%s", out rest
     }'
 }
+# json_escape: the inside of a JSON string. Control characters are first made
+# spaces (they are not legal raw in JSON), then \ and " are escaped.
+json_escape() { printf '%s' "$1" | tr '\000-\037\177' ' ' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 bound_reason() {
     local text="$1" k cand="$1" max="$REASON_MAX_BYTES"
     if [ "$(bytelen "$text")" -le "$max" ]; then printf '%s' "$text"; return 0; fi
@@ -434,8 +437,8 @@ if [ -n "$_inv_owner" ] && [ "$_inv_owner" = "${B_HASH:-}" ] && [ -n "$INV_HASH"
             # rewrite, under the same collation (nothing in this script sets LC_ALL).
             _now_norm="$(mktemp 2>/dev/null)"; _base_norm="$(mktemp 2>/dev/null)"
             if [ -n "$_now_norm" ] && [ -n "$_base_norm" ] \
-               && sed -E 's/\.md:[0-9]+$/.md/' "$_now_inv" | sort -u >"$_now_norm" 2>/dev/null \
-               && sed -E 's/\.md:[0-9]+$/.md/' "$_base_inv" | sort -u >"$_base_norm" 2>/dev/null; then
+               && sed -E 's/\.md:[0-9]+$/.md/' "$_now_inv" | sort >"$_now_norm" 2>/dev/null \
+               && sed -E 's/\.md:[0-9]+$/.md/' "$_base_inv" | sort >"$_base_norm" 2>/dev/null; then
                 INV_DIFFABLE=1
                 INV_ADDED="$(comm -13 "$_base_norm" "$_now_norm" 2>/dev/null | tr "\n" " " | sed "s/ *$//")"
                 INV_REMOVED="$(comm -23 "$_base_norm" "$_now_norm" 2>/dev/null | tr "\n" " " | sed "s/ *$//")"
@@ -505,7 +508,7 @@ if [ -z "$band" ]; then
         fi
     elif [ "$FILES" -gt "$B_FILES" ] || [ "$ITEMS" -gt "$B_ITEMS" ]; then
         band=yellow
-        verdict="definitions GREW:$FILES file(s)/$ITEMS item(s) now, baseline had $B_FILES/$B_ITEMS — but this baseline carries no inventory record, so the guard cannot prove nothing was removed alongside and will not self-accept it. Re-run '$TAG --baseline' to accept; that also records the inventory, after which the next addition accepts itself. Newest change $NEWEST_HUMAN (${AGE_DAYS}d ago)."
+        verdict="definitions GREW: $FILES file(s)/$ITEMS item(s) now, baseline had $B_FILES/$B_ITEMS — but this baseline carries no inventory record, so the guard cannot prove nothing was removed alongside and will not self-accept it. Re-run '$TAG --baseline' to accept; that also records the inventory, after which the next addition accepts itself. Newest change $NEWEST_HUMAN (${AGE_DAYS}d ago)."
     elif [ -n "$B_USERS" ] && [ "$USERS" -ne "$B_USERS" ]; then
         band=yellow
         verdict="the FILE and ITEM counts match the baseline but the number of user directories changed ($USERS now, $B_USERS at baseline) — someone was added or removed. [$DETAIL]"
@@ -607,8 +610,13 @@ if [ "$MODE" = report ]; then
         # still read off the volume; the state file already holds the answer.
         log "feed: NOT SENT — container '$NAGLIGHT_FEED_CONTAINER' is not running. The verdict above stands: it was read from the volume, not from the tracker."
     else
-        note="$(bound_reason "${verdict//\"/\'}")"
-        body="$(printf '{"check":"%s","color":"%s","reason":"%s"}' "$CHECK_ID" "$band" "$note")"
+        # BOUND THE RAW TEXT FIRST (the tracker counts the DECODED string), then
+        # escape it: control characters become spaces (same byte length, so the
+        # bound still holds), and backslash and double quote are escaped last, so
+        # a cut next to a backslash can never swallow the closing quote.
+        note="$(bound_reason "$(printf '%s' "$verdict" | tr '\000-\037\177' ' ')")"
+        body="$(printf '{"check":"%s","color":"%s","reason":"%s"}' \
+                "$(json_escape "$CHECK_ID")" "$(json_escape "$band")" "$(json_escape "$note")")"
         hdr=(--header "Content-Type: application/json")
         [ -n "${NAGLIGHT_TOKEN:-}" ] && hdr+=(--header "Authorization: Bearer ${NAGLIGHT_TOKEN}")
         [ -n "${NAGLIGHT_USER:-}" ]  && hdr+=(--header "X-Forwarded-User: ${NAGLIGHT_USER}")

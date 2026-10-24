@@ -251,6 +251,72 @@ NEWEST_HUMAN="never"
 AGE_DAYS=-1
 if [ "$NEWEST" -gt 0 ]; then AGE_DAYS=$(( ( $(date -u +%s) - NEWEST ) / 86400 )); fi
 
+# ── the POST body must fit the tracker ───────────────────────────────────────
+# NagLight rejects a feed post whose `reason` is longer than maxFeedReasonLen =
+# 500 BYTES (Go len() on the decoded string; internal/web/handlers.go). Long id
+# lists made 1,537 posts fail with HTTP 400. Only the POST is bounded - the
+# state file and the journal keep the full verdict.
+#   1. shorten each [ ... ] list to its first K tokens + "...and N more",
+#      K = 8, 4, 2, 1, 0, stopping at the first that fits;
+#   2. backstop: hard byte cap, then drop any UTF-8 sequence the cut split.
+REASON_MAX_BYTES="${TRACKER_DEFS_REASON_MAX_BYTES:-500}"
+bytelen() { local LC_ALL=C; local s="$1"; printf '%s' "${#s}"; }
+shorten_lists() { # shorten_lists K TEXT
+    printf '%s' "$2" | awk -v k="$1" '{
+        out = ""; rest = $0
+        while ((i = index(rest, "[")) > 0) {
+            out = out substr(rest, 1, i)
+            rest = substr(rest, i + 1)
+            j = index(rest, "]")
+            if (j == 0) break
+            body = substr(rest, 1, j - 1)
+            n = split(body, t, " ")
+            if (n > k) {
+                body = ""
+                for (x = 1; x <= k; x++) body = body (x > 1 ? " " : "") t[x]
+                body = body (k > 0 ? " " : "") "...and " (n - k) " more"
+            }
+            out = out body "]"
+            rest = substr(rest, j + 1)
+        }
+        printf "%s", out rest
+    }'
+}
+# json_escape: the inside of a JSON string. Control characters are first made
+# spaces (they are not legal raw in JSON), then \ and " are escaped.
+json_escape() { printf '%s' "$1" | tr '\000-\037\177' ' ' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+bound_reason() {
+    local text="$1" k cand="$1" max="$REASON_MAX_BYTES"
+    if [ "$(bytelen "$text")" -le "$max" ]; then printf '%s' "$text"; return 0; fi
+    for k in 8 4 2 1 0; do
+        cand="$(shorten_lists "$k" "$text")"
+        if [ "$(bytelen "$cand")" -le "$max" ]; then printf '%s' "$cand"; return 0; fi
+    done
+    (
+        LC_ALL=C
+        s="${cand:0:$max}"
+        n=${#s}; j=$((n - 1)); back=0
+        # walk back over continuation bytes (0x80-0xBF) to the lead byte
+        while [ "$j" -ge 0 ] && [ "$back" -lt 4 ]; do
+            b=$(printf '%d' "'${s:$j:1}")
+            [ "$b" -lt 0 ] && b=$((b + 256))
+            if [ "$b" -ge 128 ] && [ "$b" -lt 192 ]; then j=$((j - 1)); back=$((back + 1)); continue; fi
+            break
+        done
+        if [ "$j" -ge 0 ]; then
+            b=$(printf '%d' "'${s:$j:1}")
+            [ "$b" -lt 0 ] && b=$((b + 256))
+            need=1
+            [ "$b" -ge 192 ] && need=2
+            [ "$b" -ge 224 ] && need=3
+            [ "$b" -ge 240 ] && need=4
+            have=$((n - j))
+            if [ "$need" -gt "$have" ]; then s="${s:0:$j}"; fi
+        fi
+        printf '%s' "$s"
+    )
+}
+
 # ── baseline mode ────────────────────────────────────────────────────────────
 write_baseline() {
     local tmp
@@ -361,12 +427,23 @@ if [ -n "$_inv_owner" ] && [ "$_inv_owner" = "${B_HASH:-}" ] && [ -n "$INV_HASH"
     if [ -n "$_now_inv" ] && [ -n "$_base_inv" ]; then
         if printf '%s' "$INV" | grep -v '^$' | sort >"$_now_inv" 2>/dev/null \
            && tail -n +2 "$BASELINE_INV_FILE" >"$_base_inv" 2>/dev/null; then
-            INV_DIFFABLE=1
-            # comm needs both sides sorted, and both are: the baseline copy was
-            # sorted when written and this one just now, under the same collation
-            # (nothing in this script sets LC_ALL).
-            INV_ADDED="$(comm -13 "$_base_inv" "$_now_inv" 2>/dev/null | tr "\n" " " | sed "s/ *$//")"
-            INV_REMOVED="$(comm -23 "$_base_inv" "$_now_inv" 2>/dev/null | tr "\n" " " | sed "s/ *$//")"
+            # A `user/file.md:N` line is a QUANTITY, not an identity: one row added
+            # to an existing file turns `u/f.md:4` into `u/f.md:5`, and diffing the
+            # raw lines reports the old count as REMOVED (measured on the hub,
+            # 2026-09-14 and 2026-10-23). Both sides are normalised to `user/file.md`
+            # BEFORE comm, so only an id or a file can be added or removed. The
+            # counts stay in INV_HASH, which is how a pure recount is still noticed.
+            # comm needs both sides sorted: they are re-sorted here after the
+            # rewrite, under the same collation (nothing in this script sets LC_ALL).
+            _now_norm="$(mktemp 2>/dev/null)"; _base_norm="$(mktemp 2>/dev/null)"
+            if [ -n "$_now_norm" ] && [ -n "$_base_norm" ] \
+               && sed -E 's/\.md:[0-9]+$/.md/' "$_now_inv" | sort >"$_now_norm" 2>/dev/null \
+               && sed -E 's/\.md:[0-9]+$/.md/' "$_base_inv" | sort >"$_base_norm" 2>/dev/null; then
+                INV_DIFFABLE=1
+                INV_ADDED="$(comm -13 "$_base_norm" "$_now_norm" 2>/dev/null | tr "\n" " " | sed "s/ *$//")"
+                INV_REMOVED="$(comm -23 "$_base_norm" "$_now_norm" 2>/dev/null | tr "\n" " " | sed "s/ *$//")"
+            fi
+            rm -f "$_now_norm" "$_base_norm" 2>/dev/null
         fi
     fi
     rm -f "$_now_inv" "$_base_inv" 2>/dev/null
@@ -409,6 +486,25 @@ if [ -z "$band" ]; then
         else
             band=yellow
             verdict="definitions GREW (added [$INV_ADDED]) but the baseline could NOT be refreshed — $BASELINE_FILE is not writable. The addition is unaccepted and this lane stays yellow until it can be written."
+        fi
+    elif [ "$INV_DIFFABLE" = 1 ] && [ -z "$INV_ADDED" ] && [ -z "$INV_REMOVED" ] \
+         && [ -n "$B_HASH" ] && [ "$B_HASH" != "unavailable" ] && [ "$INV_HASH" != "$B_HASH" ] \
+         && [ "$USERS" -eq "${B_USERS:-$USERS}" ]; then
+        # SAME IDS, SAME FILES, DIFFERENT PER-FILE COUNTS: an item changed
+        # category (moved between two existing files). Nothing stopped being
+        # tracked, so there is nothing to launder - treated like growth, refreshed
+        # automatically and put on the record. Without this branch the run falls
+        # through to the "INVENTORY does not match" yellow below, which is for
+        # the case the inventory diff could NOT explain.
+        BASELINE_REASON="move/recount auto-accepted: same ids and files, per-file counts changed"
+        if write_baseline; then
+            band=green
+            verdict="definitions MOVED or were RECOUNTED between existing files (no id or file added or removed) and the baseline was refreshed automatically. Now $FILES file(s)/$ITEMS item(s)/$USERS user(s). A REMOVAL still reads RED and still needs '$TAG --baseline' from a human. Newest change $NEWEST_HUMAN (${AGE_DAYS}d ago). [$DETAIL]"
+            log "INVENTORY MOVED/RECOUNTED - baseline refreshed automatically. no ids added or removed; per-file counts changed"
+            B_FILES="$FILES"; B_ITEMS="$ITEMS"; B_USERS="$USERS"; B_HASH="$INV_HASH"
+        else
+            band=yellow
+            verdict="definitions MOVED or were RECOUNTED between existing files (no id or file added or removed) but the baseline could NOT be refreshed - $BASELINE_FILE is not writable. The change is unaccepted and this lane stays yellow until it can be written."
         fi
     elif [ "$FILES" -gt "$B_FILES" ] || [ "$ITEMS" -gt "$B_ITEMS" ]; then
         band=yellow
@@ -514,8 +610,13 @@ if [ "$MODE" = report ]; then
         # still read off the volume; the state file already holds the answer.
         log "feed: NOT SENT — container '$NAGLIGHT_FEED_CONTAINER' is not running. The verdict above stands: it was read from the volume, not from the tracker."
     else
-        note="${verdict//\"/\'}"
-        body="$(printf '{"check":"%s","color":"%s","reason":"%s"}' "$CHECK_ID" "$band" "$note")"
+        # BOUND THE RAW TEXT FIRST (the tracker counts the DECODED string), then
+        # escape it: control characters become spaces (same byte length, so the
+        # bound still holds), and backslash and double quote are escaped last, so
+        # a cut next to a backslash can never swallow the closing quote.
+        note="$(bound_reason "$(printf '%s' "$verdict" | tr '\000-\037\177' ' ')")"
+        body="$(printf '{"check":"%s","color":"%s","reason":"%s"}' \
+                "$(json_escape "$CHECK_ID")" "$(json_escape "$band")" "$(json_escape "$note")")"
         hdr=(--header "Content-Type: application/json")
         [ -n "${NAGLIGHT_TOKEN:-}" ] && hdr+=(--header "Authorization: Bearer ${NAGLIGHT_TOKEN}")
         [ -n "${NAGLIGHT_USER:-}" ]  && hdr+=(--header "X-Forwarded-User: ${NAGLIGHT_USER}")

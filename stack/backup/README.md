@@ -796,8 +796,10 @@ cd /opt/homehub/stack
 # 1. list what exists. The output is line-framed JSON: take exactly the [ .. ]
 #    block by line — never a greedy regex. Empty is `[]`.
 docker compose --profile filebackup run --rm -T filebackup snapshots
-# 2. DRY RUN the removal first.
-FILEBACKUP_DRY_RUN=1 docker compose --profile filebackup run --rm -T filebackup \
+# 2. DRY RUN the removal first. `-e` is what makes it a dry run: a variable set
+#    on the host shell (FILEBACKUP_DRY_RUN=1 docker compose …) is NOT passed into
+#    the container, so that form silently runs the REAL prune.
+docker compose --profile filebackup run --rm -T -e FILEBACKUP_DRY_RUN=1 filebackup \
     prune -Snapshot Snapshot_2026-08-23
 # 3. then for real.
 docker compose --profile filebackup run --rm -T filebackup prune -Snapshot Snapshot_2026-08-23

@@ -526,7 +526,7 @@ if [ "$_avail" -lt $(( MIN_FREE_GB * 1000000000 )) ]; then
         "THERE IS NO AUTOMATIC RETENTION (Q-FB2) — nothing here deletes a snapshot, so this will not clear itself." \
         "The manual relief valve, in this order:" \
         "  cd $STACK_DIR && docker compose --profile filebackup run --rm -T filebackup snapshots" \
-        "  FILEBACKUP_DRY_RUN=1 docker compose --profile filebackup run --rm -T filebackup prune -Snapshot <name>   # dry run first" \
+        "  docker compose --profile filebackup run --rm -T -e FILEBACKUP_DRY_RUN=1 filebackup prune -Snapshot <name>   # dry run first (-e, not a host variable)" \
         "NEVER delete a Snapshot_* folder by hand — it is the only copy of the states it holds." \
         "Or lower BACKUP_LIBRARY_MIN_FREE_GB in backup.env if this floor is simply too high for this drive."
 fi

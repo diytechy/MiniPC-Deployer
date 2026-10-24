@@ -547,6 +547,22 @@ else
 fi
 rm -f "$TMP/state/MANIFEST.csv"
 
+# ── a documented dry run must really be one (TC-1067) ────────────────────────
+# `FILEBACKUP_DRY_RUN=1 docker compose … run` sets the variable on the HOST and
+# compose does not pass it into the container (measured in WSL, docker compose
+# v5.3.0: the container saw it unset), so that form runs the REAL prune. Every
+# FILEBACKUP_* switch the operator is told to use must go through `-e`.
+# Comment lines are skipped: the README's own warning quotes the bad form.
+_bad_forms="$(grep -n 'FILEBACKUP_[A-Z_]*=[^ ]* *docker compose' "$WRAPPER" "$ROOT/stack/backup/README.md" 2>/dev/null \
+              | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)"
+if [ -z "$_bad_forms" ] \
+   && grep -qF -- '-e FILEBACKUP_DRY_RUN=1 filebackup' "$ROOT/stack/backup/README.md" \
+   && grep -qF -- '-e FILEBACKUP_DRY_RUN=1 filebackup' "$WRAPPER"; then
+    pass "TC-1067 every documented FILEBACKUP_* switch reaches the container through -e"
+else
+    fail "TC-1067 a host-variable form that never reaches the container is documented: $_bad_forms"
+fi
+
 # ── the system-disk manifest copy for frame-freshness (TC-1070) ──────────────
 # Refreshed after a COMPLETED run (exit 0 or 1), whole (published by rename);
 # left as it was after a run that did not complete; a copy that cannot be made

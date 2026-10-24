@@ -29,9 +29,9 @@
 #    and the code DELETED on 2026-08-09: the IceDrive client on the box is
 #    pointed at library paths in its own GUI, and this service stages nothing.
 #    Any surviving OFFSITE_* knob is REFUSED at run start rather than ignored.)
-#   6. report         — POST NagLight /api/feed; NEVER-SILENT-GREEN: any failure
-#                        posts nothing (the nightlySuccess age grows) and exits nonzero — the ERR trap AND
-#                        every `die` path (OI-9)
+#   6. report         — POSTs nightlySuccess to /api/backup-state, on the verified-success
+#                        path only; any failure posts nothing (the nightlySuccess age
+#                        grows) and exits nonzero — the ERR trap AND every `die` path (OI-9)
 #
 # Usage: backup.sh [--config PATH] [--plan]
 #   --config  path to backup.env (default: /etc/homehub-backup/backup.env, else the
@@ -352,7 +352,7 @@ STANDBY_VALUE="${BACKUP_DRIVE_STANDBY:-241}"
 # that with the drive unplugged, $BACKUP_TARGET is still a perfectly good empty
 # DIRECTORY on the system disk. `mkdir -p "$RUN_DIR"` then succeeds, rsync
 # copies into it, verification passes (the files really are there), retention
-# prunes happily, and step 6 posts **ok=true**. A green backup lane, onto the
+# prunes happily, and step 6 posts **nightlySuccess**. A green backup lane, onto the
 # 119 GB system disk, until it fills.
 #
 # That is the same silent-green shape samba/library-guard.sh was written to

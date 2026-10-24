@@ -12,6 +12,8 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-10-23 — nightly backup into the unified lane (`nightly-backup-feed`).** `sim/mini-serv-sim/run-ingest-sim.sh`, `run-volume-sim.sh` and `run-drivepower-sim.sh` were retargeted from the retired `/api/feed` `ok` bodies to `nightlySuccess` (success: a post; failure: none; each has a positive success scenario) but were never executed, only `bash -n`-checked. The hermetic `stack/backup/tests/nightly-success-feed.test.sh` is what proves the behaviour.
+
 **2026-10-22 — HomeHub plan W3b, on `w3b-recorder-scratch-watches` (not merged, not deployed).**
 - **SR-088 amended / LLR-1290..1292:** `homehub-watch` gains two kinds. `newest-file`: the newest file
   matching an absolute glob is THRESHOLD old, or nothing has matched for THRESHOLD; never follows a

@@ -1,7 +1,7 @@
 # AWOW bash backup service (WI-10.10). Oneshot invoked by homehub-backup.timer.
 # Runs as root: mount.cifs (source pulls + offsite push) needs it, and the timer
 # makes it periodic. Never-silent-green: a nonzero exit here is visible in
-# `systemctl status` / journal AND already reported to NagLight (ok=false).
+# `systemctl status` / journal; nothing is posted to NagLight, so the nightlySuccess age grows.
 [Unit]
 Description=AWOW bash backup (cifs pull -> tar/zstd -> verify -> offsite -> NagLight)
 Wants=network-online.target

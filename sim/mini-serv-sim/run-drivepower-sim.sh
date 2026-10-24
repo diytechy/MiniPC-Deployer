@@ -11,7 +11,7 @@
 #   (a) `-S 0` (standby DISABLED) issued to EACH configured device at run start;
 #   (b) the configured timeout value re-issued to EACH device on NORMAL exit;
 #   (c) on a FORCED mid-run failure (mock rsync exits 1), the restore STILL fires
-#       via the EXIT trap AND the run STILL posts ok=false (never-silent-green);
+#       via the EXIT trap AND the run posts no nightlySuccess (the age grows);
 #   (d) with NO devices configured, ZERO hdparm calls and an unchanged green run.
 #
 # Prereqs (same as run-backup-sim.sh): the homehub-sim stack up (sim/run-sim.sh) for

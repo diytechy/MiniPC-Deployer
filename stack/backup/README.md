@@ -10,8 +10,8 @@ a question about which of the two you are looking at.
 | **What it protects** | cifs **ingest** from Mini-serv, the five `volume:` sets (Actual, Technitium, Caddy, tracker, finance), the Mini-serv `path:` set | the **nine library `path:` sets** — the ~4 TB tree that had no archive at all |
 | **How** | `tar` + `zstd` per set into `/mnt/backup-drive/config-history` — one dated copy per night plus a Fibonacci ladder of older samples (`BACKUP_LAYOUT=fib`, 2026-09-08; `flat` on the library drive before that, and a dated `run_<UTC>` on the archive drive root before that) | **FileBackup** in a container: per-file dedup, a browsable **mirror**, `Snapshot_<date>` history |
 | **Storage cost** | 7 dailies + 7 ladder rungs = **14 copies**, ~34 MB in total at the current 2.4 MB per run. Self-contained: the column to the right no longer versions it | one mirror + deltas; growth is bounded by **change rate**, not run count |
-| **Runs** | `homehub-backup.timer`, 03:30 | `homehub-library-backup.timer`, 21:30 (**Q-FB6**, the Owner may move it) |
-| **Panel health** | no separate visible feed | sole writer of verified `lastSuccess` for `file-share-backup-health` |
+| **Runs** | `homehub-backup.timer`, 03:00 box-local | `homehub-library-backup.timer`, also 03:00 box-local, in the same systemd transaction and ordered `After=homehub-backup.service` (so it follows the nightly run; **Q-FB6**, the Owner may move it) |
+| **Panel health** | posts only `nightlySuccess` (verified, promoted run) to the one File Backups row; a failure posts nothing, so the age grows | sole writer of verified `lastSuccess` for `file-share-backup-health` |
 | **Retention** | `BACKUP_FIB_DAILY_KEEP` (7) rolling dailies, plus a **cascading** Fibonacci ladder: rung F(n) is refilled from F(n-1) every F(n-2) days, up to 233. `BACKUP_KEEP` is not read. | **none — nothing prunes.** See below |
 | **Entry point** | `backup.sh` | `library-backup.sh` (host) → one `docker compose run` |
 | **Wake-on-LAN, drive power, ingest** | yes | reuses the same `common.sh` drive-power helpers; no WoL, no ingest |
@@ -70,8 +70,10 @@ leg added 2026-08-09 covers what only exists across runs.
 | 3 | **hash + verify + manifest** — per-file sha256 table + archive sha256 + integrity test; a recovery MANIFEST | `backup.sh` |
 | 4 | **target** — `BACKUP_LAYOUT=flat`: the archives land in `BACKUP_TARGET` itself, one current copy, no retention (a `--plan` run gets one `plan_latest` slot). `BACKUP_LAYOUT=dated`: a `run_<UTC>` snapshot with `BACKUP_KEEP` retention, and `plan_<UTC>` on its own `BACKUP_PLAN_KEEP` budget. See [Layout](#layout--dated-vs-flat-2026-09-01) | `backup.sh` |
 | ~~5~~ | **offsite — DELETED 2026-08-09.** The service stages nothing offsite; the IceDrive client syncs library paths directly. `OFFSITE_PATH` / `OFFSITE_UNC` / `OFFSITE_SETS` are still recognised and now **refuse the run** rather than being ignored | — |
-| 0 | **target preflight** — refuse to run unless a real mount *carries* `BACKUP_TARGET` (and is not `ro`); posts `ok=false` and exits 1 if not. The target may be the mountpoint itself or a folder on it, so the check walks up; landing on `/` means no data drive is there. Zero disk I/O, so it never wakes a parked drive | `backup.sh` + `common.sh` `enclosing_mountpoint` |
-| 6 | **report** — ~~POST NagLight `/api/feed`; **never-silent-green** (failure → `ok=false` + nonzero exit) — the ERR trap **and** every `die` path (OI-9)~~ **Now a no-op (corrected 2026-10-09):** `feed_naglight` only logs "legacy config-backup feed suppressed" and returns 0; this config-archive service now posts nothing to the panel. File-share/backup state (IF-006, `/api/backup-state`) is posted by `library-backup.sh`, not by this service | `common.sh` `feed_naglight` |
+| 0 | **target preflight** — refuse to run unless a real mount *carries* `BACKUP_TARGET` (and is not `ro`); logs the refusal, posts nothing (the `nightlySuccess` age grows) and exits non-zero if not. The target may be the mountpoint itself or a folder on it, so the check walks up; landing on `/` means no data drive is there. Zero disk I/O, so it never wakes a parked drive | `backup.sh` + `common.sh` `enclosing_mountpoint` |
+| 6 | **report** — on the `backup ok` path (after verify, promotion, RUN.json and retention) `feed_naglight true` POSTs `nightlySuccess=<UTC now>` to `/api/backup-state` through `post_file_share_backup_state` (SR-121, 2026-10-23). **Every failure path posts nothing** — the ERR trap, `die`, refusals and the fib-ladder failure still exit non-zero — so the age of the last `nightlySuccess` grows and the wall turns the File Backups row yellow/orange/red by itself. A lost post is a WARNING and the run still exits 0 (deliberately unlike `library-backup.sh`: the archives are complete, and the age shows it). `/api/feed` is not used; `lastSuccess`, `shareHealth` and `runState` belong to other producers | `common.sh` `feed_naglight` |
+
+**Rollout and rollback (nightlySuccess).** Deploy order: the tracker that understands `nightlySuccess` first, then this producer. There is no backfill; the File Backups row stays red until the first post, which it already is while FileBackup has no success. **Do not roll the tracker back to a version without the field once this producer is live:** the old writer drops the unknown key when it saves `state/file-share-backup.json`, silently erasing the nightly timestamp. Roll the producer back first if the tracker must go back. No new knob: the nightly run reads the same `FILE_SHARE_BACKUP_*` / `NAGLIGHT_*` settings from `/etc/homehub-backup/backup.env`; the sim gate `backup.env` (`vmtest/lib/common.sh`, installed by `firstboot.sh`) already carries them, so a sim hub posts it too.
 
 ## Layout — `dated` vs `flat` (2026-09-01)
 
@@ -220,8 +222,9 @@ the packet every 15 s.
 - **The packet is best-effort; the wait is the truth.** The run proceeds only
   once the port answers. If the box was never asleep the probe short-circuits
   and no packet is sent.
-- **A wake timeout FAILS THE RUN, loudly** — `ok=false` to the feed and a
-  nonzero exit. Never-silent-green means a source that failed to *wake* must
+- **A wake timeout FAILS THE RUN, loudly** — the failure is logged, nothing is
+  posted (the `nightlySuccess` age grows) and the exit is
+  nonzero. Never-silent-green means a source that failed to *wake* must
   never be mistaken for a source with nothing new to copy.
 - **No new dependency:** the packet goes out over bash's own `/dev/udp`.
   Bash cannot set `SO_BROADCAST` on that socket, so some kernels refuse a
@@ -433,7 +436,7 @@ what now means "no data drive is here", and it is refused exactly as an
 unmounted drive always was — which matters more in the folder case, not less,
 because a missing drive leaves a *plausible-looking* path behind either way.
 
-Step 0 refuses instead, and reports `ok=false`. Deliberately NOT done as
+Step 0 refuses instead, logs the refusal, posts nothing (the `nightlySuccess` age grows) and exits non-zero. Deliberately NOT done as
 `RequiresMountsFor=` on the unit: systemd would refuse to *start* the service, so
 **nothing** would reach NagLight — an unreported non-run, which is worse than a
 red one. Escape hatch for a target that is legitimately a plain directory:
@@ -475,7 +478,7 @@ set names to `OFFSITE_SETS`.
 - Call contract + failure paths proven in `sim/mini-serv-sim/run-volume-sim.sh`
   (mock-`docker` shim, same pattern as the drive-power leg): volume set archives
   + restores byte-equal, stop-before-copy/start-after ordering, mid-copy failure
-  still restarts + posts `ok=false`, cifs-only config makes zero docker calls.
+  still restarts + posts nothing (nonzero exit), cifs-only config makes zero docker calls.
 
 ## Recovery MANIFEST / state format
 
@@ -535,7 +538,7 @@ call contract (disable-at-start, restore-on-exit including the failure path, and
 the empty-device no-op) with a mock-`hdparm` shim.
 `sim/mini-serv-sim/run-volume-sim.sh` proves the SR-013 volume-source contract
 (archive/restore byte-equality, quiesce ordering, failure-path restart +
-`ok=false`, cifs-only zero-docker no-op) with a mock-`docker` shim.
+no post, cifs-only zero-docker no-op) with a mock-`docker` shim.
 `sim/mini-serv-sim/run-ingest-sim.sh` proves the **ingest** and **exclusion**
 steps against the real Samba fixtures (mirror byte-equality + restore,
 deletion propagation, global/per-set exclusions and their visibility, the
@@ -563,7 +566,7 @@ library-backup.sh                        the host side (bash, root, one-shot)
 filebackup.json                          the container's config — TRACKED, installed
                                          to /etc/homehub-backup/filebackup.json 0644
 systemd/homehub-library-backup.service   Type=oneshot, TimeoutStartSec=infinity
-systemd/homehub-library-backup.timer     21:30 (Q-FB6 default), Persistent=true
+systemd/homehub-library-backup.timer     03:00 box-local (same transaction as the nightly, After= orders it), Persistent=true
 ```
 
 The image is `filebackup:${FILEBACKUP_IMAGE_TAG}`, built from a sibling

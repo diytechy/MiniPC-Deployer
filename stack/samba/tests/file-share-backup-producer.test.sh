@@ -78,8 +78,8 @@ PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo-ro" \
         echo "FAIL: Samba preexec must still reject a read-only library" >&2; exit 1; }
 
 # The FileBackup-only helper has a distinct payload. A monitor cannot call this
-# path, and the legacy config backup is retained as a no-op to prevent deleted
-# check ids from breaking archival work.
+# path, and the config backup posts only nightlySuccess (see
+# stack/backup/tests/nightly-success-feed.test.sh).
 CAPTURE="$CAPTURE" PATH="$TMP/bin:$PATH" FILE_SHARE_BACKUP_STATE_URL=http://mock.invalid/api/backup-state \
     FILE_SHARE_BACKUP_FEED_ID=file-share-backup-health bash -c '
         log() { :; }; warn() { :; }; . "$1"; post_file_share_backup_state lastSuccess 2026-09-08T03:04:05Z

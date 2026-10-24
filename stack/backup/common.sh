@@ -771,12 +771,13 @@ fstab_mount_for() {
     done
 }
 
-# ── NagLight /api/feed reporting (step 6) — never-silent-green ────────────────
-# feed_naglight OK NOTE : POST {check,ok,note}. ok=false on ANY failure so a
-# broken backup is never a silent green. Uses the multi-user trust model (direct
-# to the tracker with X-Forwarded-User) when NAGLIGHT_USER is set; single-user
-# otherwise. A reporting failure is logged but does not mask the backup's own
-# exit status.
+# ── NagLight /api/backup-state reporting (step 6): nightlySuccess ─────────────
+# feed_naglight OK NOTE (defined below) posts the nightly run's verified success
+# as `nightlySuccess` through post_file_share_backup_state; a failure posts
+# nothing, so the age grows (never a silent green, never a fake fresh one). Uses
+# the multi-user trust model (direct to the tracker with X-Forwarded-User) when
+# NAGLIGHT_USER is set; single-user otherwise. A reporting failure is logged but
+# does not mask the backup's own exit status.
 #
 # Transport: the tracker is BRIDGE-ONLY by design (D2/WI-10.5 — no host
 # publish, or the trusted headers would be forgeable from the LAN). A host-side
@@ -827,6 +828,13 @@ post_file_share_backup_state() {
             # local clock/config regression cannot manufacture a fresh backup.
             case "$value" in *T*Z) ;; *) warn "file-share/backup state: lastSuccess must be RFC3339 UTC, got '$value'"; return 0;; esac
             body="$(printf '{"id":"%s","lastSuccess":"%s"}' "$id" "$value")"
+            ;;
+        nightlySuccess)
+            # The hub's NIGHTLY config/database backup (backup.sh), a field of its
+            # own: FileBackup alone advances lastSuccess, this run alone advances
+            # nightlySuccess.  Same strict shape check as lastSuccess.
+            case "$value" in *T*Z) ;; *) warn "file-share/backup state: nightlySuccess must be RFC3339 UTC, got '$value'"; return 0;; esac
+            body="$(printf '{"id":"%s","nightlySuccess":"%s"}' "$id" "$value")"
             ;;
         runState)
             # A PHASE, NOT A VERDICT.  It says where the run is, never that one
@@ -890,11 +898,30 @@ post_file_share_backup_state() {
     if [ "$code" = "200" ]; then log "file-share/backup state: reported $field=$value (HTTP 200)"; else warn "file-share/backup state: $field=$value got HTTP $code"; fi
 }
 
-# The bash config-archive service still calls this through its existing refusal
-# and ERR paths.  Keep that service operational, but make the retired visible
-# lane an intentional no-op: it is neither share health nor a whole-library
-# FileBackup success, so posting it could only corrupt the unified clock.
+# The nightly config-archive service (backup.sh) calls this on every outcome.
+# SUCCESS posts `nightlySuccess=<now, UTC>` to the unified backup lane through
+# the poster above (one field per body, never lastSuccess/shareHealth/runState).
+# FAILURE posts NOTHING: the age of the last nightlySuccess simply keeps growing
+# and the wall turns it yellow/orange/red by itself.  A lost post is only a
+# WARNING and returns 0: the backup itself succeeded, and the age shows it anyway.
+# Missing config (no URL) is logged by the poster and also returns 0.
+# DELIBERATE DIVERGENCE from library-backup.sh, which fails its unit when its
+# post is lost: here the archives are already complete and verified, and a lost
+# post is visible on the wall within a day by age alone.  The poster's allowlist
+# includes nightlySuccess, so the post really happens.
 feed_naglight() {
-    log "legacy config-backup feed suppressed: $2"
+    local ok="$1" note="${2:-}"
+    if [ "$ok" != "true" ]; then
+        log "nightly backup did not succeed ($note) - nightlySuccess NOT posted; its age keeps growing"
+        return 0
+    fi
+    local now
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    post_file_share_backup_state nightlySuccess "$now"
+    case "$FILE_SHARE_BACKUP_STATE_LAST_CODE" in
+        200) log "nightly backup reported: nightlySuccess=$now (HTTP 200)" ;;
+        skipped) ;;  # the poster already said why
+        *) warn "nightly backup succeeded but nightlySuccess=$now did not post (HTTP $FILE_SHARE_BACKUP_STATE_LAST_CODE); the lane will show its age" ;;
+    esac
     return 0
 }

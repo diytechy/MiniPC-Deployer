@@ -16,7 +16,7 @@
 #   (b) `volume:VOL@CONTAINER` quiesces: `docker stop C` BEFORE the copy and
 #       `docker start C` after, exactly once each, on a green run;
 #   (c) a FORCED mid-copy failure (mock rsync exits 1) STILL restarts the
-#       container (EXIT trap) AND still posts ok=false + nonzero (never-silent-
+#       container (EXIT trap) AND posts no nightlySuccess + nonzero (never-silent-
 #       green; a failed backup must never leave a service down);
 #   (d) a cifs-only config makes ZERO docker calls (backward compatible).
 #
@@ -122,6 +122,8 @@ chmod +x /tmp/vp/rsync.mock
 
 # (a) cifs set + live volume set + a comment line that must be SKIPPED.
 cat > /tmp/vp/backup.env.a <<'ENV'
+FILE_SHARE_BACKUP_STATE_URL=http://mock.invalid/api/backup-state
+FILE_SHARE_BACKUP_FEED_ID=file-share-backup-health
 BACKUP_TARGET=/backup
 BACKUP_STAGING=/var/tmp/homehub-backup/staging
 BACKUP_KEEP=3
@@ -140,6 +142,8 @@ ENV
 
 # Shared tail for the b/c/d configs (everything but BACKUP_SOURCES).
 cat > /tmp/vp/env.tail <<'ENV'
+FILE_SHARE_BACKUP_STATE_URL=http://mock.invalid/api/backup-state
+FILE_SHARE_BACKUP_FEED_ID=file-share-backup-health
 BACKUP_CIFS_USER=homehub
 BACKUP_CIFS_PASS=simpass
 BACKUP_CIFS_EXTRA=vers=3.0
@@ -194,7 +198,7 @@ if ! has "$manifest" 'commented'; then
 else
     fail "(a) comment line was treated as a set"
 fi
-if printf '%s\n' "$ccalls" | grep -Fq '"ok":true'; then pass "(a) NagLight report posted ok=true"; else fail "(a) no ok=true feed captured"; fi
+if printf '%s\n' "$ccalls" | grep -Fq '"nightlySuccess":'; then pass "(a) NagLight report posted nightlySuccess"; else fail "(a) no nightlySuccess feed captured"; fi
 
 echo "  -- restore drill: reconstruct 'actual' and byte-diff vs the fixture volume --"
 if rex "rm -rf /tmp/vp/restore && mkdir -p /tmp/vp/restore && bash $RESTORE --run '$RUN_DIR' --set actual --target /tmp/vp/restore >/tmp/vp/restore_a.log 2>&1 && diff -r /tmp/vp/restore /tmp/vp/vol_actual"; then
@@ -222,11 +226,11 @@ else
     fail "(b) quiesce ordering/count wrong (stops=$stops starts=$starts stop@$stop_ln start@$start_ln)"
     printf '%s\n' "$dcalls" | sed 's/^/      docker> /'
 fi
-if printf '%s\n' "$ccalls" | grep -Fq '"ok":true'; then pass "(b) NagLight report posted ok=true"; else fail "(b) no ok=true feed captured"; fi
+if printf '%s\n' "$ccalls" | grep -Fq '"nightlySuccess":'; then pass "(b) NagLight report posted nightlySuccess"; else fail "(b) no nightlySuccess feed captured"; fi
 
 # ══ scenario (c): forced mid-copy failure while quiesced ══════════════════════
 echo
-echo "== scenario (c): FORCED mid-copy failure — container STILL restarted + ok=false =="
+echo "== scenario (c): FORCED mid-copy failure — container STILL restarted + no nightlySuccess =="
 rex 'cp /tmp/vp/rsync.mock /usr/local/bin/rsync; : > /tmp/vp/docker.calls; : > /tmp/vp/curl.calls'
 rex "bash $BACKUP --config /tmp/vp/backup.env.c >/tmp/vp/run_c.log 2>&1"; rc=$?
 dcalls="$(rex 'cat /tmp/vp/docker.calls 2>/dev/null')"
@@ -239,10 +243,10 @@ if has "$dcalls" 'stop tracker' && has "$dcalls" 'start tracker'; then
 else
     fail "(c) stop/start pair not observed on failure"; printf '%s\n' "$dcalls" | sed 's/^/      docker> /'
 fi
-if printf '%s\n' "$ccalls" | grep -Fq '"ok":false'; then
-    pass "(c) run still posted ok=false (never-silent-green)"
+if ! printf '%s\n' "$ccalls" | grep -Fq '"nightlySuccess":'; then
+    pass "(c) failed run posted no nightlySuccess (the age grows)"
 else
-    fail "(c) no ok=false feed captured"; printf '%s\n' "$ccalls" | sed 's/^/      curl> /'
+    fail "(c) a nightlySuccess was posted after a failure"; printf '%s\n' "$ccalls" | sed 's/^/      curl> /'
 fi
 if rex 'grep -q "BACKUP FAILED" /tmp/vp/run_c.log'; then pass "(c) on_err ran (BACKUP FAILED logged)"; else fail "(c) on_err path not observed"; fi
 

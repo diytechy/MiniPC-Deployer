@@ -12,6 +12,34 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-10-24 — the library backup on FileBackup's bounded-run-loop contract (`filebackup-bounded-contract`, not merged, not deployed).**
+**Requires a FileBackup image built from FileBackup's `BoundedRebuild` work, which is not in a released image yet.**
+- **SR-128 / LLR-1357..1360:** one writable `/store` bind holding `backup/` and `changes/` replaces `/state`,
+  `/backup` and `/changes`; `filebackup.json` drops `SourceStatePath`. The wrapper refuses while backup/ or changes/
+  is a separate mount, or while the old three-mount store still holds data (step 2b). `library-store-migrate.sh`
+  is the explicit migration: two `rename(2)` calls, never a copy or a delete, refusing other filesystems or
+  mounts, two stores, symlinks, the root filesystem, a held lock or a running container; idempotent. After every
+  completed run the wrapper publishes a system-disk copy of the latest manifest, which `frame-freshness.sh` (IF-035)
+  now reads instead of the retired `/state` record. TC-1542..1545.
+- **SR-018 amended / LLR-1356:** backup exits 0/1/2/4 and verify 0/1/2. **Only backup exit 0 plus a passing
+  verify advances `lastSuccess`;** exit 1 ("completed, files not captured") still runs the verify gate, then fails
+  the unit. A 3 is reported as an older image. TC-1541.
+- **SR-049 amended / LLR-1004, TC-1065:** an old engine's `Temp` is a note naming the recovery event, not a
+  refusal (the bounded engine never stages in Temp; refusing would block every backup).
+- **Fixed in passing:** the documented prune dry run (`FILEBACKUP_DRY_RUN=1 docker compose run …`) ran the real
+  prune — compose does not pass a host variable into the container (measured). It is `-e` now (TC-1542 guard).
+- **Assumptions to confirm (decided unattended):** (a) branch cut from `IceDrive-DesktopDirection`, the
+  integration branch, not `main` (803 commits behind, no FileBackup integration); (b) exit 1 is not a verified
+  success, and the verify gate still runs after it; (c) exit 4 is retried by the next timer run, no extra
+  retry; (d) the weekly verify stays report-only, so `DuplicateObject` findings left by the old engine fail
+  verify nights until someone runs the one-time `-e FILEBACKUP_REPAIR=1 … verify` (README "Verify findings");
+  (e) store default `/mnt/backup-drive/library-store`; (f) SR-128 is traced to SN-014 for want of an SN for the
+  library backup itself; (g) IF-006 cannot show warn vs error for the library lane, so 1, 2 and 4 all show as the
+  age growing; (h) comment-only drift in `autoinstall/user-data` (5c, "/state, /backup, /changes") and
+  `firstboot.sh` (C61, "stale Temp refuses later backups") left alone, per the 2026-10-19 no-drift precedent.
+- **Not proven:** the image, a migration on the hub, frame-freshness on the hub. Cross-repo: HomeHub's
+  materialiser/FieldSchema should emit `FILEBACKUP_STORE` and drop the three retired keys (the defaults match).
+
 **2026-10-23 — nightly backup into the unified lane (`nightly-backup-feed`).** `sim/mini-serv-sim/run-ingest-sim.sh`, `run-volume-sim.sh` and `run-drivepower-sim.sh` were retargeted from the retired `/api/feed` `ok` bodies to `nightlySuccess` (success: a post; failure: none; each has a positive success scenario) but were never executed, only `bash -n`-checked. The hermetic `stack/backup/tests/nightly-success-feed.test.sh` is what proves the behaviour.
 
 **2026-10-22 — HomeHub plan W3b, on `w3b-recorder-scratch-watches` (not merged, not deployed).**
@@ -77,7 +105,7 @@ shuts down. Branch `w5-power-button`, NOT merged, NOT deployed.**
   dark screen and a real press are the installed checks and the Owner's acceptance.
 
 **2026-10-22 — SN-048 specified and built on `w3a-hub-monitoring` (HomeHub plan W3a); NOT deployed.**
-SR-085..SR-091: the shared alert helper (`stack/monitoring/homehub-alert.sh`, now also rustdesk-check's
+SR-085..SR-91: the shared alert helper (`stack/monitoring/homehub-alert.sh`, now also rustdesk-check's
 transport), the 30 s telemetry record with thermal/throttle/frequency alarms, the 15 min NVMe-only
 low-disk alarm, the 5 min watch table, the 60 s liveness probe with one evidence bundle per incident,
 firstboot step 6h with one knob per component (unset = on), and the panel's freeze watchdog taken into
@@ -166,7 +194,7 @@ sh body for bus/trigger/panel/absent. BUILT, NOT DEPLOYED: reaches the panel onl
 release. NOT PROVEN: never run on the panel; FOLLOWUPS B3's "enabled" claim is unverified against
 the live panel (`systemctl is-enabled wall-line-in` is the next read).
 
-**2026-10-05 — Draft, built and hermetically tested, NOTHING deployed or enabled: the hub recovery capability (SN-046, SR-049..SR-051; LLR-994..1018; TC-1048..1086), branch `hub-recovery-watchdog`. Owner D11 (quarantine) ACCEPTED. Updated 2026-10-10 for a second review round (three MAJORs, below) and merged up to `IceDrive-DesktopDirection`; still NOT merged into it (Owner decision 4 gates that).** Implements HomeHub `docs/design/HUB_HANG_WATCHDOG_DESIGN_2026-10-05.md` rev 3 in [stack/recovery/](../stack/recovery/README.md). Branched after merging GitHub's admin-portal and exit-node work into the base (7fc16ca).
+**2026-10-05 — Draft, built and hermetically tested, NOTHING deployed or enabled: the hub recovery capability (SN-046, SR-049..SR-51; LLR-994..1018; TC-1048..1086), branch `hub-recovery-watchdog`. Owner D11 (quarantine) ACCEPTED. Updated 2026-10-10 for a second review round (three MAJORs, below) and merged up to `IceDrive-DesktopDirection`; still NOT merged into it (Owner decision 4 gates that).** Implements HomeHub `docs/design/HUB_HANG_WATCHDOG_DESIGN_2026-10-05.md` rev 3 in [stack/recovery/](../stack/recovery/README.md). Branched after merging GitHub's admin-portal and exit-node work into the base (7fc16ca).
 
 * **Always on, record-only:** the 30 s `hub-pressure` sample (C1), the late-shutdown stamp and the five-class boot classifier with atomic commits and the brake (C5), a persistent journal pinned at 4G and `hung_task_warnings=-1` (C6), and the library backup in its own `homehub-filebackup.slice` with its `memory.peak` logged after every run (C4). firstboot step 6g installs them every boot.
 * **Opt-in, OFF:** `HUB_WATCHDOG_ENABLED=false`. `HUB_WD_TIERS=contain` (P3) gives the measured-pressure early kill, Docker reconciliation, quarantine and the sshd restart; `full` (P4) adds the graceful reboot, the hardware watchdog with its 300 s shutdown hand-off and `kernel.panic=10`. `setup-recovery.sh` converges on or off; any change to a running supervisor (off, full -> contain, a different device) goes through the VERIFIED disarm first, and a disarm that cannot be proven changes nothing.
@@ -328,7 +356,7 @@ also means history is not frozen; same-day daily replacement/ordinary retention
 can remove prior ledger archives. Preserve a verified archive/key before long
 term disablement. Running dump or Docker query failures remain fatal.
 
-Spine stays Draft: SR-060..066, LLR-1040..1046, TC-1100..1117, IF-030..034;
+Spine stays Draft: SR-060..66, LLR-1040..1046, TC-1100..1117, IF-030..034;
 review adds TC-1115..1117 for missing/stopped/query-failure boundaries. CSV
 prose corrected line by line; TC-1114 placed in order and edited rows re-read.
 Original full WSL hermetic attempts were NOT green (unrelated unchanged suites; corrected attempt hit240s). That

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TC-1069 — execute the real library-store-migrate.sh against a temp tree.
+# TC-1544 — execute the real library-store-migrate.sh against a temp tree.
 #
 # The renames are REAL (python3 os.rename on this filesystem) and the folder
 # contents are checked byte for byte afterwards. Only the host's answers are
@@ -92,9 +92,9 @@ if [ "$RUN_RC" = 0 ] && grep -qF "rename $OLD_B -> $STORE/backup" "$TMP/plan.out
    && grep -qF "rename $OLD_C -> $STORE/changes" "$TMP/plan.out" \
    && grep -qF 'nothing was changed' "$TMP/plan.out" \
    && [ ! -e "$STORE" ] && [ "$(tree_sum "$OLD_B")" = "$before_b" ] && [ "$(tree_sum "$OLD_C")" = "$before_c" ]; then
-    pass "TC-1069 without --apply the plan is printed and nothing is created or moved"
+    pass "TC-1544 without --apply the plan is printed and nothing is created or moved"
 else
-    fail "TC-1069 plan rc=$RUN_RC: $(say plan)"
+    fail "TC-1544 plan rc=$RUN_RC: $(say plan)"
 fi
 
 # ── apply: two renames, every byte where it was, nothing else touched ────────
@@ -106,9 +106,9 @@ if [ "$RUN_RC" = 0 ] && [ ! -e "$OLD_B" ] && [ ! -e "$OLD_C" ] \
    && grep -qF 'Nothing was copied or deleted' "$TMP/apply.out" \
    && grep -qF "$STORE/changes/Temp came along" "$TMP/apply.out" \
    && grep -qF "delete the retired source-side record by hand: rm -r $TMP/state" "$TMP/apply.out"; then
-    pass "TC-1069 --apply renames both folders into the store intact; Temp and the old record are kept and named"
+    pass "TC-1544 --apply renames both folders into the store intact; Temp and the old record are kept and named"
 else
-    fail "TC-1069 apply rc=$RUN_RC: $(say apply)"
+    fail "TC-1544 apply rc=$RUN_RC: $(say apply)"
 fi
 
 # ── idempotent ────────────────────────────────────────────────────────────────
@@ -117,9 +117,9 @@ run_migrate again --apply
 if [ "$RUN_RC" = 0 ] && grep -qF 'nothing to do.' "$TMP/again.out" \
    && grep -qF "already at $STORE/backup" "$TMP/again.out" \
    && [ "$(tree_sum "$STORE")" = "$after_store" ]; then
-    pass "TC-1069 a second --apply finds nothing to do and changes nothing"
+    pass "TC-1544 a second --apply finds nothing to do and changes nothing"
 else
-    fail "TC-1069 rerun rc=$RUN_RC: $(say again)"
+    fail "TC-1544 rerun rc=$RUN_RC: $(say again)"
 fi
 
 # ── a migration killed between its two renames carries on ────────────────────
@@ -130,9 +130,9 @@ run_migrate resume --apply
 if [ "$RUN_RC" = 0 ] && [ ! -e "$OLD_C" ] && [ "$(tree_sum "$STORE/changes")" = "$before_c" ] \
    && grep -qF "already at $STORE/backup" "$TMP/resume.out" \
    && grep -qF "renamed $OLD_C -> $STORE/changes" "$TMP/resume.out"; then
-    pass "TC-1069 after a kill between the renames, --apply does only the one that is left"
+    pass "TC-1544 after a kill between the renames, --apply does only the one that is left"
 else
-    fail "TC-1069 resume rc=$RUN_RC: $(say resume)"
+    fail "TC-1544 resume rc=$RUN_RC: $(say resume)"
 fi
 
 # ── two stores: refuse, touch neither ─────────────────────────────────────────
@@ -142,9 +142,9 @@ run_migrate conflict --apply
 if [ "$RUN_RC" = 2 ] && grep -qF "both $OLD_B and $STORE/backup hold data" "$TMP/conflict.out" \
    && [ "$(tree_sum "$OLD_B")" = "$before_b" ] && [ "$(cat "$STORE/backup/MANIFEST.csv")" = other ] \
    && [ -d "$OLD_C" ] && [ ! -e "$STORE/changes" ]; then
-    pass "TC-1069 an old and a new store that both hold data are refused (exit 2) and neither is touched"
+    pass "TC-1544 an old and a new store that both hold data are refused (exit 2) and neither is touched"
 else
-    fail "TC-1069 conflict rc=$RUN_RC: $(say conflict)"
+    fail "TC-1544 conflict rc=$RUN_RC: $(say conflict)"
 fi
 
 # ── a different mount is a copy: refuse before creating anything ─────────────
@@ -154,9 +154,9 @@ MOCK_MOUNTS="$DRIVE $STORE" run_migrate crossmount --apply
 if [ "$RUN_RC" = 2 ] && grep -qF 'this script never copies' "$TMP/crossmount.out" \
    && [ "$(tree_sum "$OLD_B")" = "$before_b" ] && [ "$(tree_sum "$OLD_C")" = "$before_c" ] \
    && [ ! -e "$STORE/backup" ] && [ ! -e "$STORE/changes" ]; then
-    pass "TC-1069 a store on another mount is refused (exit 2): a move there would be a copy"
+    pass "TC-1544 a store on another mount is refused (exit 2): a move there would be a copy"
 else
-    fail "TC-1069 cross-mount rc=$RUN_RC: $(say crossmount)"
+    fail "TC-1544 cross-mount rc=$RUN_RC: $(say crossmount)"
 fi
 rmdir "$STORE" 2>/dev/null || true
 
@@ -176,13 +176,13 @@ EOF
     MOCK_SAME_MOUNT=1 run_migrate crossdev --apply
     if [ "$RUN_RC" = 2 ] && grep -qF 'this script never copies' "$TMP/crossdev.out" \
        && [ "$(cat "$SHM/library/MANIFEST.csv")" = x ] && [ ! -e "$STORE/backup" ] && [ -d "$OLD_C" ]; then
-        pass "TC-1069 a pair on two real filesystems is refused by the device check even when findmnt calls it one mount"
+        pass "TC-1544 a pair on two real filesystems is refused by the device check even when findmnt calls it one mount"
     else
-        fail "TC-1069 cross-device rc=$RUN_RC: $(say crossdev)"
+        fail "TC-1544 cross-device rc=$RUN_RC: $(say crossdev)"
     fi
     write_config
 else
-    skip "TC-1069 cross-device case: no writable second filesystem at /dev/shm on this box"
+    skip "TC-1544 cross-device case: no writable second filesystem at /dev/shm on this box"
 fi
 
 # ── the backup drive not mounted: everything resolves to / ───────────────────
@@ -190,9 +190,9 @@ seed_old_store
 MOCK_MOUNTS="" run_migrate rootfs --apply
 if [ "$RUN_RC" = 2 ] && grep -qF 'ROOT filesystem' "$TMP/rootfs.out" \
    && [ "$(tree_sum "$OLD_B")" = "$before_b" ] && [ ! -e "$STORE" ]; then
-    pass "TC-1069 a store that resolves to the root filesystem is refused"
+    pass "TC-1544 a store that resolves to the root filesystem is refused"
 else
-    fail "TC-1069 rootfs rc=$RUN_RC: $(say rootfs)"
+    fail "TC-1544 rootfs rc=$RUN_RC: $(say rootfs)"
 fi
 
 # ── a running backup, a running container, or no way to tell ─────────────────
@@ -208,9 +208,9 @@ done
 run_migrate locked --apply
 kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
 if [ "$RUN_RC" = 2 ] && grep -qF 'a library backup is running' "$TMP/locked.out" && [ -d "$OLD_B" ] && [ ! -e "$STORE" ]; then
-    pass "TC-1069 a held library-backup lock is refused and nothing moves"
+    pass "TC-1544 a held library-backup lock is refused and nothing moves"
 else
-    fail "TC-1069 locked rc=$RUN_RC: $(say locked)"
+    fail "TC-1544 locked rc=$RUN_RC: $(say locked)"
 fi
 MOCK_FB_RUNNING=abc123 run_migrate container --apply
 CONTAINER_RC=$RUN_RC
@@ -218,26 +218,26 @@ MOCK_DOCKER_PS_RC=1 run_migrate nodocker --apply
 if [ "$CONTAINER_RC" = 2 ] && grep -qF 'a FileBackup container is running (abc123)' "$TMP/container.out" \
    && [ "$RUN_RC" = 2 ] && grep -qF 'cannot ask docker' "$TMP/nodocker.out" \
    && [ -d "$OLD_B" ] && [ ! -e "$STORE" ]; then
-    pass "TC-1069 a running FileBackup container, or not being able to ask, is refused (fail closed)"
+    pass "TC-1544 a running FileBackup container, or not being able to ask, is refused (fail closed)"
 else
-    fail "TC-1069 container rc=$CONTAINER_RC/$RUN_RC: $(say container) $(say nodocker)"
+    fail "TC-1544 container rc=$CONTAINER_RC/$RUN_RC: $(say container) $(say nodocker)"
 fi
 
 # ── nothing to migrate: a fresh box, and an empty leftover ───────────────────
 rm -rf "$DRIVE" "$TMP/state"; mkdir -p "$DRIVE"
 run_migrate fresh --apply
 if [ "$RUN_RC" = 0 ] && grep -qF 'nothing to do.' "$TMP/fresh.out" && [ ! -e "$STORE" ]; then
-    pass "TC-1069 a fresh box has nothing to migrate and nothing is created"
+    pass "TC-1544 a fresh box has nothing to migrate and nothing is created"
 else
-    fail "TC-1069 fresh rc=$RUN_RC: $(say fresh)"
+    fail "TC-1544 fresh rc=$RUN_RC: $(say fresh)"
 fi
 mkdir -p "$OLD_B"
 run_migrate leftover --apply
 if [ "$RUN_RC" = 0 ] && grep -qF "$OLD_B is EMPTY — nothing to move; remove it by hand (rmdir $OLD_B)" "$TMP/leftover.out" \
    && [ -d "$OLD_B" ] && [ ! -e "$STORE" ]; then
-    pass "TC-1069 an empty old folder is named for rmdir, not moved and not deleted"
+    pass "TC-1544 an empty old folder is named for rmdir, not moved and not deleted"
 else
-    fail "TC-1069 leftover rc=$RUN_RC: $(say leftover)"
+    fail "TC-1544 leftover rc=$RUN_RC: $(say leftover)"
 fi
 
 # ── a symlinked old folder: renaming it would move the link, not the store ───
@@ -245,9 +245,9 @@ rm -rf "$DRIVE"; mkdir -p "$DRIVE/elsewhere"; printf 'y\n' >"$DRIVE/elsewhere/MA
 ln -s "$DRIVE/elsewhere" "$OLD_B"
 run_migrate symlink --apply
 if [ "$RUN_RC" = 2 ] && grep -qF "$OLD_B is a symlink" "$TMP/symlink.out" && [ -L "$OLD_B" ] && [ ! -e "$STORE" ]; then
-    pass "TC-1069 a symlinked old folder is refused"
+    pass "TC-1544 a symlinked old folder is refused"
 else
-    fail "TC-1069 symlink rc=$RUN_RC: $(say symlink)"
+    fail "TC-1544 symlink rc=$RUN_RC: $(say symlink)"
 fi
 
 printf '%s PASS  %s FAIL  %s SKIP\n' "$PASS" "$FAIL" "$SKIP"

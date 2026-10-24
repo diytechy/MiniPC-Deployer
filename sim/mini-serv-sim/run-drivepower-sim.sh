@@ -4,7 +4,7 @@
 #
 # Platters can't spin in a container, but the *contract* can: we put a MOCK
 # `hdparm` on PATH inside the backup-runner (it logs every invocation and exits
-# 0), a MOCK `curl` (captures each NagLight POST body so ok=true/false is
+# 0), a MOCK `curl` (captures each NagLight POST body so nightlySuccess is
 # assertable without the tracker), and run REAL backup cycles against the Samba
 # fixtures. Then we assert the exact sequence the design requires:
 #
@@ -73,7 +73,7 @@ exit 0
 SH
 chmod +x /usr/local/bin/hdparm
 
-# Mock curl: capture the POST body (the -d value) so the NagLight ok=true/false
+# Mock curl: capture the POST body (the -d value) so the NagLight nightlySuccess
 # report is assertable with no tracker, and echo the http code feed_naglight
 # expects (it reads stdout via -w '%{http_code}').
 cat > /usr/local/bin/curl <<'SH'
@@ -98,6 +98,8 @@ chmod +x /tmp/dp/rsync.mock
 
 # Test config WITH devices (offsite disabled — this leg tests power, not push).
 cat > /tmp/dp/backup.env <<'ENV'
+FILE_SHARE_BACKUP_STATE_URL=http://mock.invalid/api/backup-state
+FILE_SHARE_BACKUP_FEED_ID=file-share-backup-health
 BACKUP_TARGET=/backup
 BACKUP_STAGING=/var/tmp/homehub-backup/staging
 BACKUP_KEEP=3
@@ -148,12 +150,12 @@ if [ "$nlines" -eq 4 ] && [ "${first#*-S 0}" != "$first" ] && [ "${last#*-S 241}
 else
     fail "ordering/count wrong (lines=$nlines first='$first' last='$last')"
 fi
-# feed posted ok=true on the green run
-if printf '%s\n' "$ccalls" | grep -Fq '"ok":true'; then pass "NagLight report posted ok=true"; else fail "no ok=true feed captured"; fi
+# feed posted nightlySuccess on the green run
+if printf '%s\n' "$ccalls" | grep -Fq '"nightlySuccess":'; then pass "NagLight report posted nightlySuccess"; else fail "no nightlySuccess feed captured"; fi
 
 # ══ scenario (c): forced mid-run failure ═════════════════════════════════════
 echo
-echo "== scenario (c): FORCED mid-run failure (mock rsync exit 1) — restore still fires + ok=false =="
+echo "== scenario (c): FORCED mid-run failure (mock rsync exit 1) — restore still fires + no nightlySuccess =="
 rex 'cp /tmp/dp/rsync.mock /usr/local/bin/rsync; : > /tmp/dp/hdparm.calls; : > /tmp/dp/curl.calls'
 rex "bash $BACKUP --config /tmp/dp/backup.env >/tmp/dp/run_c.log 2>&1"; rc=$?
 hcalls="$(rex 'cat /tmp/dp/hdparm.calls 2>/dev/null')"
@@ -167,10 +169,10 @@ if has "$hcalls" '-S 241 /tmp/dp/dev1' && has "$hcalls" '-S 241 /tmp/dp/dev2'; t
 else
     fail "(c) restore did NOT fire after failure"; printf '%s\n' "$hcalls" | sed 's/^/      hdparm> /'
 fi
-if printf '%s\n' "$ccalls" | grep -Fq '"ok":false'; then
-    pass "(c) run still posted ok=false (never-silent-green)"
+if ! printf '%s\n' "$ccalls" | grep -Fq '"nightlySuccess":'; then
+    pass "(c) failed run posted no nightlySuccess (the age grows)"
 else
-    fail "(c) no ok=false feed captured"; printf '%s\n' "$ccalls" | sed 's/^/      curl> /'
+    fail "(c) a nightlySuccess was posted after a failure"; printf '%s\n' "$ccalls" | sed 's/^/      curl> /'
 fi
 if rex 'grep -q "BACKUP FAILED" /tmp/dp/run_c.log'; then pass "(c) on_err ran (BACKUP FAILED logged, RUN.json=failed)"; else fail "(c) on_err path not observed"; fi
 

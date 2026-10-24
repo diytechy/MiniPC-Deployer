@@ -25,12 +25,12 @@
 #       the patterns, restore.sh says out loud that the copy is FILTERED, and a
 #       set with no per-set line still gets the global patterns;
 #   (d) MIRROR SAFETY: a share that mounts but is EMPTY does NOT get to
-#       mirror-delete a good library copy — the run dies loudly with ok=false
+#       mirror-delete a good library copy — the run dies loudly and posts nothing
 #       and the library survives untouched; INGEST_ALLOW_EMPTY=true is the
 #       explicit override;
 #   (e) loud config failures: a malformed INGEST_SOURCES line, and a
 #       `name.exclude=` line naming a set that does not exist, each die with
-#       ok=false (never-silent-green).
+#       no nightlySuccess (the age grows).
 #
 # Scenario (d) needs a share that really is empty, so the compose file grows one:
 # `//mini-serv/empty`, backed by a named volume nothing ever writes to. No other
@@ -115,6 +115,8 @@ echo 'second big file'        > /srv/library/Docs/Downloads/huge2.bin
 # Shared config tail (everything but the sources/exclude knobs).
 cat > /tmp/ing/env.tail <<'ENV'
 BACKUP_TARGET=/backup
+FILE_SHARE_BACKUP_STATE_URL=http://mock.invalid/api/backup-state
+FILE_SHARE_BACKUP_FEED_ID=file-share-backup-health
 BACKUP_STAGING=/var/tmp/homehub-backup/staging
 BACKUP_KEEP=3
 BACKUP_CIFS_USER=homehub
@@ -193,7 +195,7 @@ if rex "rm -rf /tmp/ing/restore && mkdir -p /tmp/ing/restore && bash $RESTORE --
 else
     fail "(a) restore drill diff failed"; rex 'tail -n 12 /tmp/ing/restore_a.log' || true
 fi
-if printf '%s\n' "$ccalls" | grep -Fq '"ok":true'; then pass "(a) NagLight report posted ok=true"; else fail "(a) no ok=true feed captured"; fi
+if printf '%s\n' "$ccalls" | grep -Fq '"nightlySuccess":'; then pass "(a) NagLight report posted nightlySuccess"; else fail "(a) no nightlySuccess feed captured"; fi
 
 # ══ scenario (b): mirror semantics — library-only files are deleted ════════════
 echo
@@ -288,7 +290,7 @@ else
     fail "(d) library file count changed: $n_before -> $n_after"
 fi
 if has "$logd" 'REFUSING to mirror-delete'; then pass "(d) the refusal names the reason + the override knob"; else fail "(d) no refusal message"; fi
-if printf '%s\n' "$ccalls" | grep -Fq '"ok":false'; then pass "(d) posted ok=false (never-silent-green)"; else fail "(d) no ok=false feed captured"; fi
+if ! printf '%s\n' "$ccalls" | grep -Fq '"nightlySuccess":'; then pass "(d) posted no nightlySuccess (the age grows)"; else fail "(d) a nightlySuccess was posted after a failure"; fi
 
 echo "  -- INGEST_ALLOW_EMPTY=true is the explicit override (the library IS cleared) --"
 rex ': > /tmp/ing/curl.calls'
@@ -314,10 +316,10 @@ for case in e1 e2 e3; do
         e2) want='no source set named' ;;
         e3) want="library destination's parent does not exist" ;;
     esac
-    if [ "$rc" -ne 0 ] && has "$loge" "$want" && printf '%s\n' "$ccalls" | grep -Fq '"ok":false'; then
-        pass "($case) died nonzero with '$want' AND posted ok=false"
+    if [ "$rc" -ne 0 ] && has "$loge" "$want" && ! printf '%s\n' "$ccalls" | grep -Fq '"nightlySuccess":'; then
+        pass "($case) died nonzero with '$want' AND posted no nightlySuccess"
     else
-        fail "($case) rc=$rc, expected message '$want' + ok=false"
+        fail "($case) rc=$rc, expected message '$want' + no nightlySuccess"
         printf '%s\n' "$loge"   | tail -n 5 | sed 's/^/      log> /'
         printf '%s\n' "$ccalls" | sed 's/^/      feed> /'
     fi

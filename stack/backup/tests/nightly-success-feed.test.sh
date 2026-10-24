@@ -106,5 +106,75 @@ if grep -nE 'feed_naglight true' "$BACKUP" | grep -qE 'backup ok'; then
     pass "TC-1471 the single success report is the 'backup ok' path"
 else fail "TC-1471 success report is not the 'backup ok' path"; fi
 
+
+# -- EXECUTION: the real backup.sh, stubbed host tools, a stubbed curl ---------
+# (the postgres-source / fib-ladder pattern).  The grep checks above prove the
+# call-site SHAPE; these prove reachability: a failed run never reaches a post.
+HAVE_TOOLS=1
+for tool in rsync tar zstd sha256sum; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "SKIP  execution tests: '$tool' missing"; HAVE_TOOLS=0; break; }
+done
+if [ "$HAVE_TOOLS" = 1 ]; then
+    X="$TMP/exec"; SRC="$X/src"; TARGET="$X/drive/config-history"
+    mkdir -p "$SRC/svc"; printf 'alpha\n' >"$SRC/svc/a.txt"
+    D0=2026-01-01
+    # A curl that records whether tonight's daily was already promoted when called.
+    cat >"$TMP/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+{ printf 'CALL\n'; for a in "$@"; do printf 'ARG %s\n' "$a"; done
+  [ -f "$PROMOTED_PROBE" ] && printf 'PROMOTED\n'; } >>"$CAPTURE"
+printf '200'
+STUB
+    chmod +x "$TMP/bin/curl"
+    write_exec_env() {   # $1 = require_mount, $2 = source path
+        {
+            echo "BACKUP_TARGET=$TARGET"; echo "BACKUP_LAYOUT=fib"
+            echo "BACKUP_FIB_DAILY_KEEP=7"; echo 'BACKUP_FIB_SLOTS="13 21 34 55 89 144 233"'
+            echo "BACKUP_STAGING=$X/staging"
+            echo "BACKUP_TARGET_REQUIRE_MOUNT=${1:-false}"
+            echo 'BACKUP_DRIVE_DEVICES=""'; echo 'NAGLIGHT_FEED_URL=""'
+            echo 'BACKUP_WAKE_MAC=""'; echo 'INGEST_SOURCES=""'
+            echo "BACKUP_SOURCES=\"svc=path:${2:-$SRC/svc}\""
+            echo "FILE_SHARE_BACKUP_STATE_URL=http://mock.invalid/api/backup-state"
+            echo "FILE_SHARE_BACKUP_FEED_ID=file-share-backup-health"
+            echo "NAGLIGHT_TOKEN=tok-test"
+        } >"$X/backup.env"
+    }
+    run_night() {   # $1 = faked date; prints rc; posts land in $TMP/capture
+        : >"$TMP/capture"
+        PROMOTED_PROBE="$TARGET/daily/$1/svc.tar.zst" CAPTURE="$TMP/capture" PATH="$TMP/bin:$PATH" \
+            BACKUP_FIB_TODAY="$1" bash "$BACKUP" --config "$X/backup.env" >"$X/out.txt" 2>&1
+        echo $?
+    }
+    posts() { grep -c '^CALL$' "$TMP/capture" || true; }
+
+    # E1: a verified night posts exactly one nightlySuccess, after promotion.
+    write_exec_env; rc="$(run_night $D0)"
+    if [ "$rc" = 0 ] && [ "$(posts)" = 1 ] && grep -q '"nightlySuccess":"' "$TMP/capture" \
+       && grep -qx 'PROMOTED' "$TMP/capture" && ! grep -qE 'lastSuccess|shareHealth|runState' "$TMP/capture"; then
+        pass "TC-1475 a verified, promoted night posts exactly one nightlySuccess (after promotion)"
+    else fail "TC-1475 verified night: rc=$rc posts=$(posts)"; sed -n 1,15p "$X/out.txt"; fi
+
+    # E2: the fib ladder cannot be maintained (clock moved back, as fib-ladder B13): zero posts, red exit.
+    rm -rf "$TARGET"; write_exec_env; d="$D0"
+    for (( i = 0; i < 10; i++ )); do run_night "$d" >/dev/null; d="$(date -u -d "$d + 1 day" +%F)"; done
+    rc="$(run_night $D0)"
+    if [ "$rc" != 0 ] && [ "$(posts)" = 0 ] && grep -q 'refusing to prune daily' "$X/out.txt"; then
+        pass "TC-1475 a fib-ladder failure exits non-zero and posts nothing"
+    else fail "TC-1475 fib-ladder failure: rc=$rc posts=$(posts)"; sed -n 1,12p "$X/out.txt"; fi
+
+    # E3: a report_failure path (a source that cannot be archived): zero posts, red exit.
+    rm -rf "$TARGET"; write_exec_env false "$X/no-such-source"; rc="$(run_night $D0)"
+    if [ "$rc" != 0 ] && [ "$(posts)" = 0 ] && grep -q 'nightlySuccess NOT posted' "$X/out.txt"; then
+        pass "TC-1475 a report_failure path exits non-zero and posts nothing"
+    else fail "TC-1475 report_failure path: rc=$rc posts=$(posts)"; sed -n 1,12p "$X/out.txt"; fi
+
+    # E4: a target refusal (not a mountpoint): zero posts, red exit.
+    rm -rf "$TARGET"; write_exec_env true; rc="$(run_night $D0)"
+    if [ "$rc" != 0 ] && [ "$(posts)" = 0 ] && grep -q 'NOT MOUNTED' "$X/out.txt"; then
+        pass "TC-1475 a target refusal exits non-zero and posts nothing"
+    else fail "TC-1475 target refusal: rc=$rc posts=$(posts)"; sed -n 1,12p "$X/out.txt"; fi
+fi
+
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

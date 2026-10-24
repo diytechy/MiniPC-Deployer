@@ -30,7 +30,7 @@
 #    pointed at library paths in its own GUI, and this service stages nothing.
 #    Any surviving OFFSITE_* knob is REFUSED at run start rather than ignored.)
 #   6. report         — POST NagLight /api/feed; NEVER-SILENT-GREEN: any failure
-#                        posts ok=false and exits nonzero — the ERR trap AND
+#                        posts nothing (the nightlySuccess age grows) and exits nonzero — the ERR trap AND
 #                        every `die` path (OI-9)
 #
 # Usage: backup.sh [--config PATH] [--plan]
@@ -361,7 +361,7 @@ STANDBY_VALUE="${BACKUP_DRIVE_STANDBY:-241}"
 # NOT done as `RequiresMountsFor=` on the unit, deliberately: systemd would
 # refuse to START the service, which means NO report reaches NagLight at all —
 # an unreported non-run, which is the failure mode this project cares most about.
-# Failing HERE posts ok=false through the normal never-silent-green path.
+# Failing HERE posts nothing (the nightlySuccess age grows) through the normal never-silent-green path.
 #
 # Zero disk I/O (mount_options_for reads /proc/self/mountinfo), so this is safe
 # against a spun-down drive and never wakes it just to check.
@@ -689,7 +689,7 @@ write_run_json() {
 JSON
 }
 
-# never-silent-green: any error past this point reports ok=false and exits 1.
+# never-silent-green: any error past this point reports the failure (no post) and exits 1.
 FAIL_NOTE=""
 REPORTED_FAILURE=0
 
@@ -699,7 +699,7 @@ REPORTED_FAILURE=0
 # Empty is the only green state — a partial backup NEVER reports ok.
 MISSING_SETS=""
 
-# report_failure NOTE : the ONE failure path — unmount, post ok=false, write the
+# report_failure NOTE : the ONE failure path — unmount, log the failure (no post), write the
 # failed RUN.json, log. Idempotent: whichever of the ERR trap and `die` gets
 # there first owns the verdict, so a die raised inside the trap (or vice versa)
 # cannot double-post or overwrite it. Always returns 0 — reporting must not
@@ -751,7 +751,7 @@ set -o errtrace
 # OI-9: route `die` through the SAME report. Before this line a die has no feed
 # to post to (no config loaded / no run dir yet) and common.sh's no-op default
 # applies; after it, EVERY failure path — bad config, a refused cifs mount, a
-# wake timeout — posts ok=false before exiting 1.
+# wake timeout — posts nothing (the nightlySuccess age grows) before exiting 1.
 DIE_REPORTER=report_failure
 
 # ── the offsite step is GONE (removed 2026-08-09, Owner) ─────────────────────
@@ -785,7 +785,7 @@ fi
 # ── drive-power RESTORE on exit (WI-10.10) ───────────────────────────────────
 # Re-arm the configured spin-down timeout on ANY exit — normal success, the ERR
 # trap's `exit 1`, an interrupt, or a `die`. The EXIT trap fires AFTER the ERR
-# trap, so it never disturbs the never-silent-green ok=false reporting path; it
+# trap, so it never disturbs the never-silent-green no-post reporting path; it
 # only restores the drives' at-rest standby (the "restore on exit" half of the
 # dynamic-standby policy). No-op when no drives are configured. Never fails
 # (drive_standby_set always returns 0).
@@ -829,7 +829,7 @@ fi
 # mount. Empty BACKUP_WAKE_MAC = the whole feature is off (a box that never
 # sleeps needs none of this). A timeout is FATAL on purpose: a source that
 # failed to wake must never be mistaken for a source with nothing new — and
-# thanks to OI-9 this `die` posts ok=false to the feed before exiting.
+# thanks to OI-9 this `die` posts nothing (the nightlySuccess age grows) to the feed before exiting.
 if [ -n "${BACKUP_WAKE_MAC:-}" ]; then
     [ -n "${BACKUP_WAKE_HOST:-}" ] \
         || die "config: BACKUP_WAKE_MAC is set but BACKUP_WAKE_HOST is not — the wake needs a host/IP to probe"
@@ -1072,7 +1072,7 @@ for line in "${SOURCE_LINES[@]}"; do
             # nothing creates — backed up NOTHING AT ALL. Thirteen healthy sets,
             # including every Private tree, were lost to the absence of one.
             # "Never silently skip" is the rule, and it does NOT require aborting:
-            # the run is still red, still posts ok=false, still exits non-zero and
+            # the run is still red, still posts nothing, still exits non-zero and
             # still names the set — it just does so AFTER protecting the data it
             # could reach. Losing tonight's backup of everything is the worse
             # failure, and it is the one that used to happen.
@@ -1635,9 +1635,10 @@ fi
 #   RUN.json  is what retention reads to decide this run is worth keeping, and
 #             what the capacity preflight reads to size the next one. A run with
 #             no RUN.json is classified `bad` by its own next sibling.
-#   the feed  is the ONLY thing that tells anybody the backup happened. A silent
-#             failure here is the exact never-silent-green shape this service is
-#             built around.
+#   the feed  is the nightlySuccess post (feed_naglight). It is best-effort BY
+#             DESIGN: a lost post only warns and the run still exits 0, because
+#             the archives are complete and a missing post shows on the wall as
+#             a growing age. A FAILED run posts nothing at all.
 # (Adversarial review, 2026-08-29.)
 if ! write_run_json "ok" "sets: ${SET_SUMMARY:-none}"; then
     report_failure "the archives are complete and verified, but RUN.json could not be written to $RUN_DIR — retention will class this run as failed and the next run cannot size itself from it"
@@ -1673,13 +1674,8 @@ elif [ "$LAYOUT" = fib ]; then
         exit 1
     fi
 fi
-if ! feed_naglight true "backup ok $RUN_TS — ${SET_SUMMARY:-no sets}"; then
-    log "ERROR: the backup succeeded but the report did NOT reach NagLight."
-    log "  The archives in $RUN_DIR are complete and verified; what failed is the"
-    log "  telling. Exiting non-zero so the unit shows as failed, because a backup"
-    log "  nobody is told about is the failure mode this service exists to refuse."
-    exit 1
-fi
+# Posts nightlySuccess; a failed post warns and returns 0 (see feed_naglight).
+feed_naglight true "backup ok $RUN_TS — ${SET_SUMMARY:-no sets}"
 log "== backup OK: $TOTAL_FILES file(s), $TOTAL_BYTES byte(s) across sets =="
 log "manifest: $MANIFEST"
 exit 0

@@ -3,6 +3,11 @@
 # boundary.  Mocks replace only host tools (mount topology, docker and curl); the
 # script under test remains library-backup.sh, so the order after preflight,
 # backup and optional restore verification cannot drift unobserved.
+#
+# The wrapper is written for a FileBackup image built from its bounded-run-loop
+# work (BoundedRebuild): one /store mount, backup exits 0/1/2/4, verify exits
+# 0/1/2. The cases below pin that contract (TC-1066..TC-1069) as well as the
+# state-update boundary.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,19 +22,25 @@ TMP="$(mktemp -d)"
 KEEP_TMP="${KEEP_TMP:-0}"
 cleanup() { [ "$KEEP_TMP" = 1 ] && { printf 'tmp kept: %s\n' "$TMP"; return; }; rm -rf "$TMP"; }
 trap cleanup EXIT
-mkdir -p "$TMP/bin" "$TMP/src" "$TMP/backup" "$TMP/changes" "$TMP/state" "$TMP/logs"
+# store/ is the ONE writable bind (holding backup/ and changes/); old-backup,
+# old-changes and state are where an unmigrated hub's three-mount store lived.
+mkdir -p "$TMP/bin" "$TMP/src" "$TMP/store/backup" "$TMP/store/changes" "$TMP/state" "$TMP/logs"
 : >"$TMP/filebackup.json"
 
 # The actual wrapper asks findmnt two subtly different questions: the exact
-# source mount must remain its own mountpoint, while the changes path must be on
-# the same enclosing mount as the backup store.  This mock models both facts.
+# source mount must remain its own mountpoint, while backup/ and changes/ must
+# be on the same enclosing mount as the store.  This mock models both facts.
+# MOCK_SPLIT_CHANGES=1 models a second mount under the store at changes/.
 cat >"$TMP/bin/findmnt" <<'EOF'
 #!/usr/bin/env bash
 last=""; for arg in "$@"; do last="$arg"; done
 if [[ " $* " == *" --target "* ]]; then
     case "$last" in
         "$FILEBACKUP_SOURCE") printf '%s\n' "$FILEBACKUP_SOURCE" ;;
-        "$FILEBACKUP_BACKUP"|"$FILEBACKUP_CHANGES") printf '%s\n' "$FILEBACKUP_BACKUP" ;;
+        "$FILEBACKUP_STORE/changes")
+            if [ "${MOCK_SPLIT_CHANGES:-0}" = 1 ]; then printf '%s\n' "$FILEBACKUP_STORE/changes"
+            else printf '%s\n' "$FILEBACKUP_STORE"; fi ;;
+        "$FILEBACKUP_STORE"|"$FILEBACKUP_STORE"/*) printf '%s\n' "$FILEBACKUP_STORE" ;;
         *) printf '%s\n' "$last" ;;
     esac
 elif [[ " $* " == *" -o SOURCE,FSTYPE "* ]]; then
@@ -96,11 +107,11 @@ chmod +x "$TMP/bin"/*
 
 cat >"$TMP/fstab" <<EOF
 mock $TMP/src ext4 defaults 0 0
-mock $TMP/backup ext4 defaults 0 0
+mock $TMP/store ext4 defaults 0 0
 EOF
 cat >"$TMP/mountinfo" <<EOF
 24 22 0:31 / $TMP/src rw,relatime - tmpfs tmpfs rw
-25 22 0:32 / $TMP/backup rw,relatime - tmpfs tmpfs rw
+25 22 0:32 / $TMP/store rw,relatime - tmpfs tmpfs rw
 EOF
 # The guard also asks the kernel whether each mounted device still EXISTS
 # (e32a1b4: a vanished device is a stale mount). 0:31 and 0:32 are fictional, so
@@ -109,14 +120,18 @@ EOF
 mkdir -p "$TMP/sys-dev-block"
 : >"$TMP/sys-dev-block/0:31"; : >"$TMP/sys-dev-block/0:32"
 
+# The retired three-mount keys are set the way an unmigrated hub's .env still
+# carries them, pointed at temp paths, so the store-layout guard reads only this
+# tree and never the real /mnt/backup-drive.
 write_config() {
     local target="$1"
     cat >"$target" <<EOF
 FILEBACKUP_CONFIG=$TMP/filebackup.json
 FILEBACKUP_SOURCE=$TMP/src
+FILEBACKUP_STORE=$TMP/store
 FILEBACKUP_STATE=$TMP/state
-FILEBACKUP_BACKUP=$TMP/backup
-FILEBACKUP_CHANGES=$TMP/changes
+FILEBACKUP_BACKUP=$TMP/old-backup
+FILEBACKUP_CHANGES=$TMP/old-changes
 FILEBACKUP_LOGS=$TMP/logs
 FILEBACKUP_USER_NAME=root
 LIBRARY_MOUNTS_FSTAB=$TMP/fstab
@@ -132,9 +147,10 @@ write_config "$TMP/good.env"
 cat >"$TMP/preflight-failure.env" <<EOF
 FILEBACKUP_CONFIG=$TMP/missing-filebackup.json
 FILEBACKUP_SOURCE=$TMP/src
+FILEBACKUP_STORE=$TMP/store
 FILEBACKUP_STATE=$TMP/state
-FILEBACKUP_BACKUP=$TMP/backup
-FILEBACKUP_CHANGES=$TMP/changes
+FILEBACKUP_BACKUP=$TMP/old-backup
+FILEBACKUP_CHANGES=$TMP/old-changes
 FILEBACKUP_LOGS=$TMP/logs
 FILEBACKUP_USER_NAME=root
 LIBRARY_MOUNTS_FSTAB=$TMP/fstab
@@ -219,17 +235,97 @@ fi
 run_wrapper container-failure "$TMP/good.env" none 1 0 200
 if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/container-failure.capture")" = 0 ] \
    && [ "$(phases "$TMP/container-failure.capture")" = 'starting backing-up idle ' ]; then
-    pass "TC-001 SR-018 failed container posts no lastSuccess and ends idle"
+    pass "TC-001 SR-018 a backup that is not complete posts no lastSuccess and ends idle"
 else
     fail "TC-001 container failure rc=$RUN_RC lastSuccess=$(success_count "$TMP/container-failure.capture") phases='$(phases "$TMP/container-failure.capture")'"
 fi
 
-run_wrapper verify-failure "$TMP/good.env" shallow 0 3 200
+run_wrapper verify-failure "$TMP/good.env" shallow 0 1 200
 if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/verify-failure.capture")" = 0 ] \
-   && [ "$(phases "$TMP/verify-failure.capture")" = 'starting backing-up verifying idle ' ]; then
-    pass "TC-001 SR-018 failed verification posts no lastSuccess and ends idle"
+   && [ "$(phases "$TMP/verify-failure.capture")" = 'starting backing-up verifying idle ' ] \
+   && grep -qF 'verify exit 1 — FINDINGS' "$TMP/verify-failure.out"; then
+    pass "TC-001 SR-018 verification findings post no lastSuccess and end idle"
 else
     fail "TC-001 verify failure rc=$RUN_RC lastSuccess=$(success_count "$TMP/verify-failure.capture") phases='$(phases "$TMP/verify-failure.capture")'"
+fi
+
+# ── the bounded-run-loop backup exit table (TC-1066) ─────────────────────────
+# Exit 1 = the run COMPLETED but some files were not captured. Not a verified
+# success: no lastSuccess, non-zero exit. But the verify gate still runs, so a
+# file that stays locked cannot also starve the weekly proof.
+run_wrapper partial "$TMP/good.env" shallow 1 0 200
+if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/partial.capture")" = 0 ] \
+   && [ "$(tr '\n' ' ' <"$TMP/partial.events")" = 'state state docker:backup state docker:verify state ' ] \
+   && [ "$(phases "$TMP/partial.capture")" = 'starting backing-up verifying idle ' ] \
+   && grep -qF 'COMPLETED WITH FILES NOT CAPTURED (container exit 1; verify=shallow ok)' "$TMP/partial.out" \
+   && grep -qF 'lastSuccess is NOT advanced' "$TMP/partial.out"; then
+    pass "TC-1066 backup exit 1 runs the verify gate, advances no lastSuccess, and fails the unit naming the set log"
+else
+    fail "TC-1066 partial rc=$RUN_RC lastSuccess=$(success_count "$TMP/partial.capture") events=$(tr '\n' ' ' <"$TMP/partial.events")"
+fi
+
+# Exit 2 = refused before changing anything; exit 4 = host problem, retry later.
+# Neither reaches the verify gate, and each has its own message.
+run_wrapper refused "$TMP/good.env" shallow 2 0 200
+if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/refused.capture")" = 0 ] \
+   && ! grep -q 'docker:verify' "$TMP/refused.events" \
+   && grep -qF 'REFUSED the run before changing anything (exit 2)' "$TMP/refused.out" \
+   && grep -qF 'retrying will not help' "$TMP/refused.out"; then
+    pass "TC-1066 backup exit 2 is a do-not-retry refusal: no verify, no lastSuccess"
+else
+    fail "TC-1066 exit 2 rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/refused.events"): $(grep 'ERROR' "$TMP/refused.out" | head -1)"
+fi
+run_wrapper host-stop "$TMP/good.env" shallow 4 0 200
+if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/host-stop.capture")" = 0 ] \
+   && ! grep -q 'docker:verify' "$TMP/host-stop.events" \
+   && grep -qF 'STOPPED for a host problem (exit 4)' "$TMP/host-stop.out" \
+   && grep -qF 'Retry later' "$TMP/host-stop.out"; then
+    pass "TC-1066 backup exit 4 is a retry-later host stop: no verify, no lastSuccess"
+else
+    fail "TC-1066 exit 4 rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/host-stop.events"): $(grep 'ERROR' "$TMP/host-stop.out" | head -1)"
+fi
+
+# A bounded-run-loop image never returns 3 (no witness), from backup or verify.
+# A 3 is an OLDER image, and the message must say so rather than "witness".
+run_wrapper old-image "$TMP/good.env" none 3 0 200
+OLD_IMAGE_RC=$RUN_RC
+run_wrapper old-image-verify "$TMP/good.env" shallow 0 3 200
+if [ "$OLD_IMAGE_RC" != 0 ] && [ "$RUN_RC" != 0 ] && grep -qF 'OLDER image' "$TMP/old-image.out" \
+   && grep -qF 'OLDER image' "$TMP/old-image-verify.out" \
+   && [ "$(success_count "$TMP/old-image.capture")" = 0 ] \
+   && [ "$(success_count "$TMP/old-image-verify.capture")" = 0 ]; then
+    pass "TC-1066 an exit 3 from backup or verify is reported as an older FileBackup image, with no lastSuccess"
+else
+    fail "TC-1066 exit 3: $(grep 'ERROR' "$TMP/old-image.out" | head -1) | $(grep 'ERROR' "$TMP/old-image-verify.out" | head -1)"
+fi
+
+# ── the one-mount store (TC-1067) ────────────────────────────────────────────
+# A second mount under the store at changes/ would make FileBackup's rename test
+# fail inside the container (exit 2). The wrapper refuses first, before docker.
+MOCK_SPLIT_CHANGES=1 run_wrapper split-mount "$TMP/good.env" none 0 0 200
+if [ "$RUN_RC" != 0 ] && ! grep -q '^docker:' "$TMP/split-mount.events" \
+   && [ "$(success_count "$TMP/split-mount.capture")" = 0 ] \
+   && grep -qF "backup/ and changes/ must be ONE mount" "$TMP/split-mount.out"; then
+    pass "TC-1067 a store whose changes/ is a separate mount is refused before the container"
+else
+    fail "TC-1067 split mount rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/split-mount.events")"
+fi
+
+# The compose binding and the container config that go with the wrapper: ONE
+# writable /store, no /state, BackupPath/ChangePath under /store, and no
+# SourceStatePath (the bounded engine ignores it with a warning every run).
+COMPOSE="$ROOT/stack/docker-compose.yml"
+FBJSON="$ROOT/stack/backup/filebackup.json"
+fb_block="$(awk '/^  filebackup:/{on=1; next} on && /^  [a-z]/{exit} on' "$COMPOSE")"
+# shellcheck disable=SC2016  # the ${...} is compose's own interpolation, matched literally
+if printf '%s\n' "$fb_block" | grep -qF -- '- ${FILEBACKUP_STORE:-/mnt/backup-drive/library-store}:/store' \
+   && ! printf '%s\n' "$fb_block" | grep -Eq -- '^ *- .*:/(state|backup|changes)$' \
+   && grep -qF '"BackupPath": "/store/backup"' "$FBJSON" \
+   && grep -qF '"ChangePath": "/store/changes"' "$FBJSON" \
+   && ! grep -q 'SourceStatePath' "$FBJSON"; then
+    pass "TC-1067 compose binds one /store and no /state; filebackup.json keeps both roots under /store"
+else
+    fail "TC-1067 the compose/config contract drifted: $(printf '%s\n' "$fb_block" | grep -E ':/' | tr '\n' '|')"
 fi
 
 run_wrapper rejected-state "$TMP/good.env" shallow 0 0 500
@@ -364,35 +460,88 @@ else
     fail "TC-1064 an unreadable slice changed the run (rc=$RUN_RC)"
 fi
 
-# ── hub recovery §8: staging left by an interrupted run refuses, NAMED ────────
-# Temp predates two recovery events; the one that names the backup is chosen
-# over the later one that does not, and an event older than Temp is ignored by
-# its MTIME even though its name sorts last.
-mkdir -p "$TMP/changes/Temp" "$TMP/events"
-printf 'staged\n' >"$TMP/changes/Temp/only-copy"
-touch -d '2026-10-01 00:00:00' "$TMP/changes/Temp"
+# ── hub recovery §8: an old engine's staging is a NAMED note, not a refusal ───
+# The bounded engine never uses Temp and leaves an old one alone, so refusing
+# here would block every backup forever. The note still names the recovery
+# event: Temp predates two recovery events; the one that names the backup is
+# chosen over the later one that does not, and an event older than Temp is
+# ignored by its MTIME even though its name sorts last.
+mkdir -p "$TMP/store/changes/Temp" "$TMP/events"
+printf 'staged\n' >"$TMP/store/changes/Temp/only-copy"
+touch -d '2026-10-01 00:00:00' "$TMP/store/changes/Temp"
 printf '{"action": "kill", "details": {"interrupts_backup": true}}\n' >"$TMP/events/20261005T010203Z-bbbbbbbb-kill.json"
 printf '{"action": "restart-ssh", "details": {}}\n' >"$TMP/events/20261005T020000Z-bbbbbbbb-restart-ssh.json"
 printf '{"action": "reboot", "details": {"interrupts_backup": true}}\n' >"$TMP/events/20261009T000000Z-aaaaaaaa-reboot.json"
 touch -d '2026-09-01 00:00:00' "$TMP/events/20261009T000000Z-aaaaaaaa-reboot.json"
 RECOVERY_EVENTS_DIR="$TMP/events" run_wrapper staging "$TMP/good.env" shallow 0 0 200
-if [ "$RUN_RC" != 0 ] \
-   && grep -qF 'LIBRARY BACKUP REFUSED: staging needs recovery (interrupted by recovery event 20261005T010203Z-bbbbbbbb-kill)' "$TMP/staging.out" \
-   && ! grep -q '^docker:' "$TMP/staging.events" \
-   && [ "$(success_count "$TMP/staging.capture")" = 0 ] \
-   && [ "$(cat "$TMP/changes/Temp/only-copy")" = staged ]; then
-    pass "TC-1065 staging left by an interrupted run refuses with the recovery event that named the backup, and Temp is untouched"
+if [ "$RUN_RC" = 0 ] \
+   && grep -qF 'LIBRARY BACKUP NOTE: old staging needs recovery by hand (interrupted by recovery event 20261005T010203Z-bbbbbbbb-kill); the backup runs anyway' "$TMP/staging.out" \
+   && grep -q '^docker:backup$' "$TMP/staging.events" \
+   && [ "$(success_count "$TMP/staging.capture")" = 1 ] \
+   && grep -qF 'DEGRADED: old staging' "$TMP/staging.out" \
+   && [ "$(cat "$TMP/store/changes/Temp/only-copy")" = staged ]; then
+    pass "TC-1065 an old Temp is a note naming the recovery event that named the backup; the run goes on and Temp is untouched"
 else
-    fail "TC-1065 staging refusal rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/staging.events"): $(grep 'REFUSED' "$TMP/staging.out" | head -2 | tr '\n' '|')"
+    fail "TC-1065 staging note rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/staging.events"): $(grep 'staging' "$TMP/staging.out" | head -2 | tr '\n' '|')"
 fi
 RECOVERY_EVENTS_DIR="$TMP/no-events" run_wrapper staging2 "$TMP/good.env" shallow 0 0 200
-if [ "$RUN_RC" != 0 ] \
-   && grep -qF 'LIBRARY BACKUP REFUSED: staging needs recovery (interrupted by recovery event none recorded)' "$TMP/staging2.out"; then
-    pass "TC-1065 with no recovery event recorded the refusal says so rather than inventing one"
+if [ "$RUN_RC" = 0 ] \
+   && grep -qF 'LIBRARY BACKUP NOTE: old staging needs recovery by hand (interrupted by recovery event none recorded)' "$TMP/staging2.out"; then
+    pass "TC-1065 with no recovery event recorded the note says so rather than inventing one"
 else
-    fail "TC-1065 no-event refusal rc=$RUN_RC: $(grep 'REFUSED' "$TMP/staging2.out" | head -1)"
+    fail "TC-1065 no-event note rc=$RUN_RC: $(grep 'staging' "$TMP/staging2.out" | head -1)"
 fi
-rm -rf "$TMP/changes/Temp"
+rm -rf "$TMP/store/changes/Temp"
+
+# ── the store-layout guard (TC-1068) ─────────────────────────────────────────
+# An unmigrated three-mount store that still holds data refuses before anything
+# is created or started, names the migration step, and is left exactly as it is.
+mkdir -p "$TMP/old-backup" "$TMP/old-changes/Snapshot_2026_10_01_03_00_00"
+printf 'row\n' >"$TMP/old-backup/MANIFEST.csv"
+run_wrapper unmigrated "$TMP/good.env" none 0 0 200
+if [ "$RUN_RC" != 0 ] && ! grep -q '^docker:' "$TMP/unmigrated.events" \
+   && [ "$(success_count "$TMP/unmigrated.capture")" = 0 ] \
+   && [ "$(phases "$TMP/unmigrated.capture")" = 'starting idle ' ] \
+   && grep -qF 'has NOT been migrated to the one-mount layout' "$TMP/unmigrated.out" \
+   && grep -qF 'library-store-migrate.sh --apply' "$TMP/unmigrated.out" \
+   && [ "$(cat "$TMP/old-backup/MANIFEST.csv")" = row ] \
+   && [ -d "$TMP/old-changes/Snapshot_2026_10_01_03_00_00" ]; then
+    pass "TC-1068 an unmigrated store refuses before docker, names the migration step, and is untouched"
+else
+    fail "TC-1068 unmigrated rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/unmigrated.events"): $(grep 'migrated' "$TMP/unmigrated.out" | head -1)"
+fi
+# The same guard with only the old CHANGES folder left (a migration stopped
+# between its two renames) still refuses.
+rm -rf "$TMP/old-backup"
+run_wrapper half-migrated "$TMP/good.env" none 0 0 200
+if [ "$RUN_RC" != 0 ] && ! grep -q '^docker:' "$TMP/half-migrated.events" \
+   && grep -qF "$TMP/old-changes still holds" "$TMP/half-migrated.out"; then
+    pass "TC-1068 a half-migrated store (old changes/ left) still refuses"
+else
+    fail "TC-1068 half-migrated rc=$RUN_RC: $(grep 'migrated' "$TMP/half-migrated.out" | head -1)"
+fi
+# EMPTY old folders hold nothing to migrate: a note, and the run goes on.
+rm -rf "$TMP/old-changes"; mkdir -p "$TMP/old-backup"
+run_wrapper empty-legacy "$TMP/good.env" none 0 0 200
+if [ "$RUN_RC" = 0 ] && [ "$(success_count "$TMP/empty-legacy.capture")" = 1 ] \
+   && grep -qF "an EMPTY folder from the old store layout is still at $TMP/old-backup" "$TMP/empty-legacy.out"; then
+    pass "TC-1068 an empty old folder is a note and the run goes on"
+else
+    fail "TC-1068 empty legacy rc=$RUN_RC: $(grep -i 'old store\|migrated' "$TMP/empty-legacy.out" | head -1)"
+fi
+rmdir "$TMP/old-backup"
+
+# The retired source-side record: a verified run says once that it can be
+# deleted by hand, and deletes nothing itself.
+printf 'old\n' >"$TMP/state/MANIFEST.csv"
+run_wrapper retired-state "$TMP/good.env" none 0 0 200
+if [ "$RUN_RC" = 0 ] && grep -qF "$TMP/state/MANIFEST.csv is the retired source-side record" "$TMP/retired-state.out" \
+   && [ "$(cat "$TMP/state/MANIFEST.csv")" = old ]; then
+    pass "TC-1068 a verified run names the retired source-side record for deletion by hand and keeps it"
+else
+    fail "TC-1068 retired state rc=$RUN_RC: $(grep 'retired' "$TMP/retired-state.out" | head -1)"
+fi
+rm -f "$TMP/state/MANIFEST.csv"
 
 printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -4,9 +4,8 @@
     {
       "Name": "library",
       "SourcePath": "/source",
-      "SourceStatePath": "/state",
-      "BackupPath": "/backup",
-      "ChangePath": "/changes",
+      "BackupPath": "/store/backup",
+      "ChangePath": "/store/changes",
       "HashRecalcFreq": "W",
       "CompressEnabled": true
     }

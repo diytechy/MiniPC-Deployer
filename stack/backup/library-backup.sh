@@ -11,22 +11,33 @@
 # every preflight, every refusal and the whole NagLight report live out here. It
 # is one `docker compose run` in the middle of a lot of proof.
 #
+# REQUIRES a FileBackup image built from its bounded-run-loop work (FileBackup
+# branch BoundedRebuild): ONE writable /store mount holding backup/ and
+# changes/, no /state mount, and the backup exit table 0/1/2/4 below. An older
+# image does not fit this file (README "The one-mount store").
+#
 # Sequence (each step below carries the failure it exists to prevent):
 #   1. single-instance lock          — the first real run is a multi-day job
 #   2. mount-identity preflight      — zero disk I/O; refuses BEFORE creating
 #                                      anything (finding H / E2 cross-check 1)
+#   2b. store-layout guard           — refuses while the old three-mount store
+#                                      still holds data (library-store-migrate.sh)
 #   3. capacity preflight            — a hard floor, posted RED (Q-FB2 carries
 #                                      the whole space burden here)
-#   4. pre-create the six bind paths — docker's chown-on-create is EPERM on the
+#   4. pre-create the bind paths     — docker's chown-on-create is EPERM on the
 #                                      FAT-family drives and kills the compose
-#   5. write-probe /backup + /changes as uid 65532 (Q-FB5's refinement)
+#   5. write-probe the store, backup/, changes/ and /logs as uid 65532 (Q-FB5)
+#   5b. an old engine's Temp folder  — a NOTE naming the recovery event; the
+#                                      bounded engine leaves Temp alone and runs
 #   6. hold the drive awake for the run, restore standby on exit
-#   7. `docker compose run` the backup — exit 0/1/2, three distinct messages
+#   7. `docker compose run` the backup — exit 0/1/2/4, four distinct messages
 #      (NO prune step: Q-FB2 ruled retention NONE. Nothing here deletes.)
-#   8. weekly `verify` gate, monthly `-Deep`  — restore-side codes 0/1/2/3/4
-#   9. NagLight feed, AFTER the container exits. A failed POST fails the run.
+#   8. weekly `verify` gate, monthly `-Deep`  — verify codes 0/1/2
+#   9. NagLight feed, AFTER the container exits. lastSuccess advances ONLY for
+#      backup exit 0 plus a passing verify. A failed POST fails the run.
 #
-# Never-silent-green throughout: every refusal posts ok=false and exits non-zero.
+# Never-silent-green throughout: every refusal and every failure exits non-zero
+# and posts no lastSuccess, so the lane's age grows.
 #
 # Usage: library-backup.sh [--config PATH] [--preflight-only] [--verify MODE]
 #   --config         backup.env (default /etc/homehub-backup/backup.env, else
@@ -49,7 +60,7 @@ while [ $# -gt 0 ]; do
         --preflight-only) PREFLIGHT_ONLY=1; shift ;;
         --verify)         VERIFY_MODE="$2"; shift 2 ;;
         --reconcile-run-state) RECONCILE_RUN_STATE=1; shift ;;
-        -h|--help)        sed -n '2,40p' "$0"; exit 0 ;;
+        -h|--help)        sed -n '2,49p' "$0"; exit 0 ;;
         *) die "unknown arg: $1 (try --help)" ;;
     esac
 done
@@ -88,9 +99,9 @@ export FILE_SHARE_BACKUP_FEED_ID
 
 FB_CONFIG="${FILEBACKUP_CONFIG:-/etc/homehub-backup/filebackup.json}"
 FB_SOURCE="${FILEBACKUP_SOURCE:-/srv/library}"
-FB_STATE="${FILEBACKUP_STATE:-/var/lib/homehub-filebackup/state}"
-FB_BACKUP="${FILEBACKUP_BACKUP:-/mnt/backup-drive/library}"
-FB_CHANGES="${FILEBACKUP_CHANGES:-/mnt/backup-drive/library-changes}"
+# FB_STORE, FB_BACKUP (= store/backup), FB_CHANGES (= store/changes) and the
+# retired three-mount paths, from common.sh so the migration step agrees.
+filebackup_store_layout
 FB_LOGS="${FILEBACKUP_LOGS:-/var/log/homehub-filebackup}"
 
 FB_UID=65532                            # the image's USER, and the fstab's uid=
@@ -100,6 +111,8 @@ FSTAB="${LIBRARY_MOUNTS_FSTAB:-/etc/homehub-samba/library-mounts.fstab}"
 IDENTITY_FILE="${DRIVE_IDENTITY_FILE:-/etc/homehub-samba/drive-identity.conf}"
 
 MIN_FREE_GB="${BACKUP_LIBRARY_MIN_FREE_GB:-100}"
+# The SYSTEM-DISK floor. Named for the retired /state mount and kept under that
+# name so existing backup.env files keep working; it now guards /logs.
 MIN_FREE_STATE_GB="${BACKUP_LIBRARY_MIN_FREE_STATE_GB:-2}"
 case "$MIN_FREE_GB"       in ''|*[!0-9]*) die "config: BACKUP_LIBRARY_MIN_FREE_GB='$MIN_FREE_GB' is not a number (whole GB)" ;; esac
 case "$MIN_FREE_STATE_GB" in ''|*[!0-9]*) die "config: BACKUP_LIBRARY_MIN_FREE_STATE_GB='$MIN_FREE_STATE_GB' is not a number (whole GB)" ;; esac
@@ -150,10 +163,12 @@ refuse() { die "REFUSING TO RUN: $*"; }
 
 # ── 1. SINGLE-INSTANCE LOCK ───────────────────────────────────────────────────
 # The first real backup of a ~2 TiB library over USB is a MULTI-DAY run. The
-# nightly timer will fire again while it is still going, and a second container
-# sharing one /state and one /backup is not a slow backup, it is a corrupted
-# one. systemd's Type=oneshot serialises the UNIT with itself; this also covers
-# a manual `library-backup.sh`, the drill, and a run started from a shell.
+# nightly timer will fire again while it is still going. FileBackup's own lock
+# (<store>/changes/Temp.lock) would stop a second container with exit 4, but
+# only after compose, the drive spin-up and the preflight; this lock answers
+# first and names the run that holds it. systemd's Type=oneshot serialises the
+# UNIT with itself; this also covers a manual `library-backup.sh`, the drill,
+# and a run started from a shell.
 #
 # A HELD LOCK POSTS NOTHING, deliberately, and it is the one refusal here that
 # does not. The lane belongs to the run that is still going: painting it red
@@ -175,7 +190,7 @@ mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
 for _t in flock findmnt; do
     command -v "$_t" >/dev/null 2>&1 \
         || die "$_t is not on this box (it ships in util-linux) — refusing rather than running blind." \
-               "Without flock a second run could share one /state and one /backup with a run that is" \
+               "Without flock a second run could start against the store of a run that is" \
                "still going, and the missing tool would masquerade as a held lock on every run." \
                "Without findmnt every mount check answers 'not mounted', so the refusal would name" \
                "the wrong fault entirely.  Fix:  apt-get install util-linux"
@@ -203,9 +218,9 @@ if ! flock "${FLOCK_WAIT[@]}" 9; then
         exit 0
     fi
     log "ANOTHER LIBRARY BACKUP IS ALREADY RUNNING (lock held: $LOCK_FILE)."
-    log "  Not starting a second one: two containers sharing one /state and one"
-    log "  /backup would corrupt the manifest, and the first real run of a ~2 TiB"
-    log "  library takes DAYS. This is not a failure of that run — it is still going."
+    log "  Not starting a second one: FileBackup runs one at a time per store, and"
+    log "  the first real run of a ~2 TiB library takes DAYS. This is not a failure"
+    log "  of that run — it is still going."
     log "  Watch it:  journalctl -u homehub-library-backup.service -f"
     log "  Nothing was posted to the feed: the running backup owns the lane."
     exit 1
@@ -233,7 +248,7 @@ if [ "$RECONCILE_RUN_STATE" = 1 ]; then
     # `docker compose run`, and that container is owned by the DAEMON: fd 9 is
     # inherited by the compose client, never by the container. A wrapper killed
     # with SIGKILL or by the OOM killer therefore releases this lock while
-    # FileBackup is still writing to /state and /backup. Withdrawing the phase
+    # FileBackup is still writing to the store. Withdrawing the phase
     # on the strength of the lock would then report a live backup as finished.
     #
     # So ask the daemon as well, and FAIL CLOSED: if the container is up, or if
@@ -427,21 +442,59 @@ SOURCE_MOUNT="$(mount_of "$FB_SOURCE")"
 [ "$SOURCE_MOUNT" = "$FB_SOURCE" ] \
     || refuse "the library source $FB_SOURCE is not a mountpoint of its own — it resolves to '${SOURCE_MOUNT:-?}'." \
               "That means the library drive is not mounted and $FB_SOURCE is an empty directory on that filesystem." \
-              "A backup of it would be a backup of nothing, and FileBackup's AllowEmptySource safety net would" \
-              "then refuse to empty an already-populated /backup — but this refusal is the one that costs nothing."
+              "A backup of it would be a backup of nothing. The bounded FileBackup engine only WARNS on an empty" \
+              "source (it moves the whole latest state into a snapshot, and back on the next good run), so this" \
+              "refusal is now the only thing that stops an unmounted library becoming tonight's latest state."
 preflight_mount "$FB_SOURCE" library
 
-BACKUP_MOUNT="$(mount_of "$FB_BACKUP")"
+BACKUP_MOUNT="$(mount_of "$FB_STORE")"
 [ -n "$BACKUP_MOUNT" ] && [ "$BACKUP_MOUNT" != "/" ] \
-    || refuse "the backup destination $FB_BACKUP resolves to the ROOT filesystem ('${BACKUP_MOUNT:-?}') — the backup drive is not mounted." \
+    || refuse "the library store $FB_STORE resolves to the ROOT filesystem ('${BACKUP_MOUNT:-?}') — the backup drive is not mounted." \
               "Writing there would put the library's whole backup store and snapshot history on the system disk."
 preflight_mount "$BACKUP_MOUNT" backup-drive
 
-CHANGES_MOUNT="$(mount_of "$FB_CHANGES")"
-[ "$CHANGES_MOUNT" = "$BACKUP_MOUNT" ] \
-    || refuse "the snapshot tree $FB_CHANGES is on '$CHANGES_MOUNT' but the backup store $FB_BACKUP is on '$BACKUP_MOUNT'." \
-              "They must share one filesystem: a snapshot is made by MOVING superseded objects out of the store, and" \
-              "a cross-filesystem move is a copy — which would silently double the space every run costs."
+# ONE MOUNT FOR backup/ AND changes/. FileBackup moves objects between them by
+# rename only, and refuses (exit 2) a pair a rename cannot cross; inside the
+# container both are under the one /store bind, so the only way to split them is
+# a second mount under the store on the host, which the bind would carry along.
+# Asked here because here it costs nothing and names the host path.
+for _d in "$FB_BACKUP" "$FB_CHANGES"; do
+    _m="$(mount_of "$_d")"
+    [ "$_m" = "$BACKUP_MOUNT" ] \
+        || refuse "$_d is on '$_m' but the library store $FB_STORE is on '$BACKUP_MOUNT'." \
+                  "backup/ and changes/ must be ONE mount: FileBackup moves content between them by rename only, and" \
+                  "refuses (exit 2) a pair a rename cannot cross. Unmount whatever is mounted under $FB_STORE."
+done
+
+# ── 2b. THE STORE LAYOUT: refuse while the OLD three-mount store holds data ───
+# Before the bounded engine, the store was two sibling folders bound as /backup
+# and /changes (plus a source-side record on /state). Starting the new layout
+# beside an unmigrated old store would not lose anything, but it would be the
+# worst kind of silent: a multi-day first backup into an empty store, doubling
+# the space on the drive, while the real history sat unused next to it. So an
+# old folder that still holds anything is a REFUSAL that names the migration
+# step; an EMPTY one is only a note (nothing to migrate, nothing to lose).
+# A path that is both old and new (a store configured onto the old folders) is
+# not "old" at all and is skipped.
+legacy_store_guard() {
+    local old="$1" new="$2"
+    [ "$old" != "$new" ] || return 0
+    [ -e "$old" ] || [ -L "$old" ] || return 0
+    if [ -d "$old" ] && [ ! -L "$old" ] && ! dir_has_entries "$old"; then
+        DEGRADED="${DEGRADED:+$DEGRADED; }an EMPTY folder from the old store layout is still at $old (rmdir it by hand)"
+        warn "store layout: $old is empty and left over from the old three-mount layout — remove it by hand: rmdir $old"
+        return 0
+    fi
+    refuse "the library store has NOT been migrated to the one-mount layout: $old still holds the old engine's store." \
+           "This image needs ONE store, $FB_STORE, holding backup/ and changes/; starting it now would begin a multi-day" \
+           "first backup into an empty store while the real history sat beside it. Nothing was created and no container ran." \
+           "Migrate it (two renames on the backup drive; nothing is copied or deleted):" \
+           "  sudo bash $STACK_DIR/backup/library-store-migrate.sh            # prints the plan" \
+           "  sudo bash $STACK_DIR/backup/library-store-migrate.sh --apply" \
+           "then start the backup again. README: \"The one-mount store\"."
+}
+legacy_store_guard "$FB_LEGACY_BACKUP" "$FB_BACKUP"
+legacy_store_guard "$FB_LEGACY_CHANGES" "$FB_CHANGES"
 
 # ── 3. CAPACITY PREFLIGHT — the whole of Q-FB2's space burden ─────────────────
 # There is NO retention (Q-FB2, ruled 2026-08-23: snapshots are kept
@@ -457,9 +510,9 @@ CHANGES_MOUNT="$(mount_of "$FB_CHANGES")"
 df_field() { df -PB1 "$1" 2>/dev/null | awk -v f="$2" 'NR==2 {print $f}' || true; }
 gb() { printf '%s' "$(( ${1:-0} / 1000000000 ))"; }
 
-_total="$(df_field "$(existing_ancestor "$FB_BACKUP")" 2)"
-_used="$(df_field  "$(existing_ancestor "$FB_BACKUP")" 3)"
-_avail="$(df_field "$(existing_ancestor "$FB_BACKUP")" 4)"
+_total="$(df_field "$(existing_ancestor "$FB_STORE")" 2)"
+_used="$(df_field  "$(existing_ancestor "$FB_STORE")" 3)"
+_avail="$(df_field "$(existing_ancestor "$FB_STORE")" 4)"
 [ -n "${_avail:-}" ] \
     || refuse "cannot read the free space on $BACKUP_MOUNT (df returned nothing) — refusing rather than treating 'could not ask' as 'there is room'"
 [ -n "${_total:-}" ] && [ "$_total" -gt 0 ] && FILL_PCT="$(( _used * 100 / _total ))%"
@@ -474,51 +527,48 @@ if [ "$_avail" -lt $(( MIN_FREE_GB * 1000000000 )) ]; then
 fi
 log "capacity: backup drive $(gb "$_avail") GB free of $(gb "$_total") GB (${FILL_PCT} full, floor ${MIN_FREE_GB} GB)"
 
-for _p in "$FB_STATE" "$FB_LOGS"; do
-    _sa="$(df_field "$(existing_ancestor "$_p")" 4)"
-    [ -n "${_sa:-}" ] \
-        || refuse "cannot read the free space for $_p — refusing rather than guessing"
-    if [ "$_sa" -lt $(( MIN_FREE_STATE_GB * 1000000000 )) ]; then
-        refuse "only $(gb "$_sa") GB free for $_p (floor ${MIN_FREE_STATE_GB} GB)." \
-            "This is usually the SYSTEM DISK — filling it stops Docker and every service on this box," \
-            "so the backup is refused here rather than allowed to take the hub down with it."
-    fi
-done
-log "capacity: state $(gb "$(df_field "$(existing_ancestor "$FB_STATE")" 4)") GB free, logs $(gb "$(df_field "$(existing_ancestor "$FB_LOGS")" 4)") GB free (floor ${MIN_FREE_STATE_GB} GB each)"
+_sa="$(df_field "$(existing_ancestor "$FB_LOGS")" 4)"
+[ -n "${_sa:-}" ] \
+    || refuse "cannot read the free space for $FB_LOGS — refusing rather than guessing"
+if [ "$_sa" -lt $(( MIN_FREE_STATE_GB * 1000000000 )) ]; then
+    refuse "only $(gb "$_sa") GB free for $FB_LOGS (floor ${MIN_FREE_STATE_GB} GB)." \
+        "This is usually the SYSTEM DISK — filling it stops Docker and every service on this box," \
+        "so the backup is refused here rather than allowed to take the hub down with it."
+fi
+log "capacity: logs $(gb "$_sa") GB free (floor ${MIN_FREE_STATE_GB} GB)"
 
-# ── 4. PRE-CREATE THE SIX BIND PATHS ─────────────────────────────────────────
+# ── 4. PRE-CREATE THE BIND PATHS ─────────────────────────────────────────────
 # DOCKER CREATES A MISSING BIND SOURCE AND THEN CHOWNS IT, and the data drives
 # are FAT-family (exfat/ntfs, no native ownership), so that chown returns EPERM
 # and takes the ENTIRE compose command down — not just this service. Already bit
 # this project once on 2026-08-08, on a box that had installed perfectly.
 # Docker leaves a directory that already exists alone, so the fix is ordering.
 #
-# TWO OF THE SIX ARE ASSERTED, NOT CREATED. The config file and the library
-# source: creating either would be manufacturing the thing whose absence is the
-# fault. mkdir'ing a library over an unmounted drive is exactly the silent green
-# step 2 just refused.
+# TWO ARE ASSERTED, NOT CREATED. The config file and the library source:
+# creating either would be manufacturing the thing whose absence is the fault.
+# mkdir'ing a library over an unmounted drive is exactly the silent green step 2
+# just refused. The store's backup/ and changes/ are no bind of their own, but
+# they are created here too so step 5 can probe them before the container runs.
 [ -r "$FB_CONFIG" ] \
     || refuse "the container's config $FB_CONFIG is missing or unreadable." \
               "It is a TRACKED template (stack/backup/filebackup.json) installed by autoinstall late-command 5c." \
               "Without it the container exits 2 having done nothing; refuse here instead, where the message is useful." \
               "By hand:  install -m0644 -o root -g root $STACK_DIR/backup/filebackup.json $FB_CONFIG"
 [ -d "$FB_SOURCE" ] || refuse "the library source $FB_SOURCE is not a directory"
-for _d in "$FB_STATE" "$FB_BACKUP" "$FB_CHANGES" "$FB_LOGS"; do
+for _d in "$FB_STORE" "$FB_BACKUP" "$FB_CHANGES" "$FB_LOGS"; do
     if [ ! -d "$_d" ]; then
         mkdir -p "$_d" || { FAIL_NOTE="cannot create the bind path $_d"; false; }
         log "created bind path $_d"
     fi
 done
-# /state and /logs are on the SYSTEM disk (ext4), where ownership is real and
-# a root-created directory is unwritable to the container — the first lab run
+# /logs is on the SYSTEM disk (ext4), where ownership is real and a
+# root-created directory is unwritable to the container — the first lab run
 # died on exactly that ('/logs/Backup_Global.log' Access denied). chown works
-# there and is the fix. The two drive paths are NOT chowned: NTFS/exFAT
-# ownership comes from the mount options alone (Q-FB5) and chown is a no-op
-# or an error there — the write-probe below is what proves those.
-for _d in "$FB_STATE" "$FB_LOGS"; do
-    chown "$FB_UID:$FB_UID" "$_d" \
-        || refuse "cannot chown $_d to uid $FB_UID — the container cannot write its state/logs without it."
-done
+# there and is the fix. The store paths are NOT chowned: NTFS/exFAT ownership
+# comes from the mount options alone (Q-FB5) and chown is a no-op or an error
+# there — the write-probe below is what proves those.
+chown "$FB_UID:$FB_UID" "$FB_LOGS" \
+    || refuse "cannot chown $FB_LOGS to uid $FB_UID — the container cannot write its logs without it."
 # The wrapper's own log lands beside the container's, now that the directory is
 # known to exist. Everything above this line is journal-only, which is correct:
 # a refusal that could not create a log directory must still be readable.
@@ -564,29 +614,34 @@ probe_write() {
     rm -f "$probe" 2>/dev/null || warn "write-probe: could not remove $probe (harmless, but say so rather than leave it a mystery)"
     log "write-probe: uid $FB_UID can write $dir"
 }
+# The store itself as well as its two children: FileBackup writes its one-mount
+# check directory into both children, and the store is what docker binds.
+probe_write "$FB_STORE"
 probe_write "$FB_BACKUP"
 probe_write "$FB_CHANGES"
-# The ext4 pair too: a probe is cheaper than the container failing on its
-# first log line, and it catches a future provisioner re-owning them.
-probe_write "$FB_STATE"
+# The ext4 log directory too: a probe is cheaper than the container failing on
+# its first log line, and it catches a future provisioner re-owning it.
 probe_write "$FB_LOGS"
 
-# ── 5b. STAGING LEFT BY AN INTERRUPTED RUN (hub recovery §8, D8) ─────────────
-# FileBackup stages a set in <change root>/Temp and removes it as the run ends.
-# A run killed from outside - the recovery supervisor's early kill, a graceful
-# recovery reboot, a power cut - leaves Temp behind, and FileBackup itself then
-# refuses every later run until a person recovers it (its README, "A run
-# refuses because `Temp` exists"). Temp may hold the only copy of superseded
+# ── 5b. AN OLD ENGINE'S STAGING FOLDER (hub recovery §8, D8) ─────────────────
+# The engine before the bounded run loop staged a set in <change root>/Temp, and
+# a run killed from outside - the recovery supervisor's early kill, a graceful
+# recovery reboot, a power cut - left Temp behind and made every later run
+# refuse until a person recovered it. Temp may hold the only copy of superseded
 # data, so NOTHING here touches it.
 #
-# What this adds is the SIGNAL, said here where it is cheap and named: which
-# recovery event interrupted the run, so the Owner is not left reconstructing it
-# from a container log. Until FileBackup can recover killed staging by itself
-# (D8, which gates the reboot tier), this line is the honest alert; the NagLight
-# lane cannot show it yet (design §8, P5). WHEN FileBackup GAINS SELF-RECOVERY
-# THIS REFUSAL MUST GO, or it would block the very recovery it waits for.
+# THE REFUSAL THAT USED TO BE HERE HAS GONE, AS THIS COMMENT SAID IT MUST. The
+# bounded engine (FileBackup BoundedRebuild) never uses Temp: a killed run leaves
+# only Incoming/ and Building_* behind, which hold no only-copy and which the
+# next run deletes itself. An old Temp gets a warning from FileBackup and is left
+# alone while the run goes on, so refusing here would block every backup forever
+# over a folder the engine no longer needs. (An interrupted PRUNE can still leave
+# one; it is handled the same way.)
 #
-# The event is the newest recovery evidence file written after Temp was, and one
+# What stays is the SIGNAL, said here where it is cheap and named: which
+# recovery event interrupted the run, so the Owner is not left reconstructing it
+# from a container log. It goes into the run summary as a DEGRADED note. The
+# event is the newest recovery evidence file written after Temp was, and one
 # that names the backup (`"interrupts_backup": true`) is preferred over one that
 # merely happened since. No event at all says so rather than inventing one.
 RECOVERY_EVENTS_DIR="${RECOVERY_EVENTS_DIR:-/var/lib/homehub-recovery/events}"
@@ -607,11 +662,11 @@ staging_recovery_event() {
 }
 if [ -d "$FB_CHANGES/Temp" ]; then
     _interrupted_by="$(staging_recovery_event "$FB_CHANGES/Temp")"
-    log "LIBRARY BACKUP REFUSED: staging needs recovery (interrupted by recovery event $_interrupted_by)"
-    refuse "FileBackup's staging folder $FB_CHANGES/Temp is still present from an interrupted run." \
-           "FileBackup would refuse this run itself; it may hold the only copy of superseded data, so it is" \
-           "left exactly as it is. Recover it by hand per FileBackup's README, \"A run refuses because \`Temp\` exists\"," \
-           "then start the backup again. Recovery evidence: homehub-recovery events"
+    log "LIBRARY BACKUP NOTE: old staging needs recovery by hand (interrupted by recovery event $_interrupted_by); the backup runs anyway"
+    warn "  $FB_CHANGES/Temp was left by an older FileBackup or an interrupted prune. It may hold the only copy of"
+    warn "  superseded content, so it is left exactly as it is; the bounded engine ignores it. Recover it by hand per"
+    warn "  FileBackup's README, \"A run refuses because \`Temp\` exists\". Recovery evidence: homehub-recovery events"
+    DEGRADED="${DEGRADED:+$DEGRADED; }old staging $FB_CHANGES/Temp needs recovery by hand (recovery event: $_interrupted_by)"
 fi
 
 if [ "$PREFLIGHT_ONLY" = 1 ]; then
@@ -708,26 +763,54 @@ SNAPSHOT_MADE=no
 _total="$(df_field "$FB_BACKUP" 2)"; _used="$(df_field "$FB_BACKUP" 3)"; _avail="$(df_field "$FB_BACKUP" 4)"
 [ -n "${_total:-}" ] && [ "$_total" -gt 0 ] && FILL_PCT="$(( _used * 100 / _total ))%"
 
-# THE BACKUP-ACTION EXIT MAP (SR-043). Three codes, three distinct causes, three
-# messages — one generic "backup failed" would put a human in the container log
-# every time, which is the finding this table exists to close. There is no code 3
-# on the backup path.
+# THE BACKUP-ACTION EXIT MAP (FileBackup's bounded-run-loop plan §6). Four
+# codes, four distinct causes, four messages — one generic "backup failed" would
+# put a human in the container log every time, which is the finding this table
+# exists to close. The set log ($FB_CHANGES/backup.log) names every file.
+#
+#   0  every file captured                       -> on to the verify gate
+#   1  the run COMPLETED, some files were not    -> on to the verify gate, then
+#      captured; what is stored is safe             FAIL: not a verified success
+#   2  refused before changing anything; a       -> FAIL now, "do not retry"
+#      person must fix it
+#   4  stopped by a host problem, or FileBackup's -> FAIL now, "retry later" (the
+#      own lock is held                             next timer run is the retry)
+#
+# ONLY 0 IS A VERIFIED SUCCESS (the Owner's lane, SR-018). An exit 1 is "partial,
+# no data lost", but a file that was never captured is a file the lane would
+# otherwise call backed up, so it advances nothing: the age grows and the unit
+# fails, which is the warning. The verify gate still runs after a 1, because the
+# store is consistent and a file that stays locked for weeks must not also stop
+# the weekly proof from ever running.
+#
+# A backup never returns 3 any more: the manifest witness is gone. A 3 here
+# means an image OLDER than the one this file is written for.
+BACKUP_PARTIAL=0
 case "$BACKUP_RC" in
-    0) log "container: backup COMPLETE (exit 0) — snapshot created: $SNAPSHOT_MADE, drive $FILL_PCT full" ;;
-    1) FAIL_NOTE="the backup set FAILED (container exit 1) — the run reached the set and could not complete it. This is a data/IO problem, not a configuration one: read $FB_LOGS/Backup_Global.log"
+    0) log "container: backup COMPLETE (exit 0) — every file captured; snapshot created: $SNAPSHOT_MADE, drive $FILL_PCT full" ;;
+    1) BACKUP_PARTIAL=1
+       log "container: backup COMPLETED WITH FILES NOT CAPTURED (exit 1) — snapshot created: $SNAPSHOT_MADE, drive $FILL_PCT full."
+       log "  Every file it could read is stored and nothing already stored was lost; each file it could not"
+       log "  capture kept its previous row and is named in $FB_CHANGES/backup.log. Not a verified success." ;;
+    2) FAIL_NOTE="FileBackup REFUSED the run before changing anything (exit 2) — a person must fix it; retrying will not help. The causes are: $FB_CONFIG cannot be loaded or violates the closed schema (FileBackup's container/FileBackup.schema.json), a missing tool, the source root missing, backup/ and changes/ not on one mount (the rename test failed), or a latest manifest that cannot be read (move $FB_BACKUP/MANIFEST.csv aside to rebuild the latest state from the source; the snapshots are untouched). The reason is in $FB_CHANGES/backup.log and $FB_LOGS/Backup_Global.log"
        false ;;
-    2) FAIL_NOTE="the container REFUSED THE CONFIGURATION (exit 2) — $FB_CONFIG could not be loaded, or it violates the config contract. Retrying will not help. Nothing was backed up. Compare it against FileBackup's container/FileBackup.schema.json (closed schema: an extra key is a violation)"
+    3) FAIL_NOTE="the container exited 3, which a bounded-run-loop FileBackup never returns from a backup (the manifest witness is gone). This is almost certainly an OLDER image: this stack needs one built from FileBackup's BoundedRebuild work. Rebuild it (scripts/ensure-local-images.sh --rebuild) and read $FB_LOGS/Backup_Global.log"
+       false ;;
+    4) FAIL_NOTE="FileBackup STOPPED for a host problem (exit 4): the backup drive is full or went away, or another FileBackup run holds its lock ($FB_CHANGES/Temp.lock — a manual verify or prune?). Nothing stored is lost; a stop is no worse than a kill, and the next run keeps the progress. Retry later: the next timer run does that by itself, or fix the host and run systemctl start homehub-library-backup.service. Read $FB_CHANGES/backup.log"
        false ;;
     125|126|127) FAIL_NOTE="docker itself failed (exit $BACKUP_RC) before FileBackup ran — usually a missing image. Is filebackup:\${FILEBACKUP_IMAGE_TAG} loaded? \`docker image ls filebackup\`; it is baked by vmtest/export-images.sh and loaded by firstboot"
        false ;;
-    *) FAIL_NOTE="the container exited $BACKUP_RC, which is outside the documented 0/1/2 table — treat it as a failure and read $FB_LOGS/Backup_Global.log"
+    *) FAIL_NOTE="the container exited $BACKUP_RC, which is outside the documented 0/1/2/4 table — treat it as a failure and read $FB_LOGS/Backup_Global.log"
        false ;;
 esac
 
 # ── 8. THE VERIFY GATE — weekly, deep monthly ────────────────────────────────
-# A backup nobody reads is a hypothesis. `verify` re-proves the stored manifest;
-# -Deep additionally proves payload identity, which costs real time (it reads
-# the data files) and so is monthly rather than weekly.
+# A backup nobody reads is a hypothesis. `verify` re-proves the stored manifest
+# and reports any object stored twice (DuplicateObject); -Deep additionally
+# proves payload identity, hashing every object against its name (a mismatch is
+# DamagedObject), which costs real time and so is monthly rather than weekly.
+# REPORT ONLY: this gate never passes FILEBACKUP_REPAIR. Moving duplicates and
+# damaged objects into $FB_CHANGES/Verify/ is a person's call (README).
 #
 # `auto` = the FIRST occurrence of BACKUP_LIBRARY_VERIFY_DAY each month is deep,
 # every other occurrence is shallow, and every other day skips. Computed from the
@@ -743,6 +826,12 @@ if [ "$VERIFY_MODE" = auto ]; then
     fi
 fi
 VERIFY_NOTE="skipped"
+# A verify failure ends the run before the partial-backup check below, so its
+# message must carry that fact itself.
+PARTIAL_SUFFIX=""
+if [ "$BACKUP_PARTIAL" = 1 ]; then
+    PARTIAL_SUFFIX=". The backup itself also completed with files not captured (exit 1; see $FB_CHANGES/backup.log)"
+fi
 if [ "$VERIFY_RUN" != none ]; then
     VERIFY_ARGS=(verify)
     [ "$VERIFY_RUN" = deep ] && VERIFY_ARGS+=(-Deep)
@@ -753,39 +842,54 @@ if [ "$VERIFY_RUN" != none ]; then
     VERIFY_RC=0
     fb_run "${VERIFY_ARGS[@]}" || VERIFY_RC=$?
     log_slice_peak "after $VERIFY_RUN verify (exit $VERIFY_RC)"
-    # The RESTORE-SIDE code table (SR-040), which is a different table from the
-    # backup one above and is shared with reconstruct.sh:
-    #   0 complete · 1 incomplete/content · 2 usage or precondition ·
-    #   3 manifest-witness verification failed · 4 incomplete/host (retriable)
-    # Precedence when several apply: 2 > 3 > 4 > 1.
+    # The VERIFY table (FileBackup SR-049/SR-040), a different table from the
+    # backup one above: 0 clean · 1 findings · 2 precondition. Verify reads, so
+    # a host problem stops it before it classifies anything and is reported as
+    # 2; it never returns 3 (no witness) or 4. The findings are a JSON document
+    # on the container's stdout (the journal) and one WARN line each in
+    # $FB_LOGS/Backup_Global.log.
     case "$VERIFY_RC" in
         0) VERIFY_NOTE="$VERIFY_RUN ok"
-           log "verify: COMPLETE (exit 0)" ;;
-        1) VERIFY_NOTE="$VERIFY_RUN INCOMPLETE (content)"
-           FAIL_NOTE="verify exit 1 — INCOMPLETE: stored content is missing for at least one manifest row. The backup is not fully restorable. Read $FB_LOGS/Backup_Global.log for the rows"
+           log "verify: CLEAN (exit 0)" ;;
+        1) VERIFY_NOTE="$VERIFY_RUN FINDINGS"
+           FAIL_NOTE="verify exit 1 — FINDINGS: the store disagrees with its manifests somewhere. Read the [Class] lines in $FB_LOGS/Backup_Global.log. PoolUnresolvable is a row with no bytes anywhere (not restorable until the next backup re-stores it from the source); DuplicateObject is a second copy of one object (harmless, costs space — expected once after a store from the old engine); DamagedObject (-Deep) is an object whose bytes do not match its name. Moving duplicates and damaged objects aside into $FB_CHANGES/Verify/ (never deleted) is a person's call: README \"Verify findings\"$PARTIAL_SUFFIX"
            false ;;
-        2) VERIFY_NOTE="$VERIFY_RUN REFUSED (usage/precondition)"
-           FAIL_NOTE="verify exit 2 — usage or precondition failure: the verify was asked for something it cannot do (bad invocation, or a precondition like a missing manifest). Retrying unchanged will not help"
+        2) VERIFY_NOTE="$VERIFY_RUN REFUSED (precondition)"
+           FAIL_NOTE="verify exit 2 — precondition failure: the verify could not run at all (no backup root, no manifest to verify, -Deep without 7-Zip, or a host problem that stopped it). Retrying unchanged will not help. Read $FB_LOGS/Backup_Global.log"
            false ;;
-        3) VERIFY_NOTE="$VERIFY_RUN WITNESS MISMATCH"
-           FAIL_NOTE="verify exit 3 — MANIFEST WITNESS MISMATCH: the manifest does not match its own sidecar digest. Treat the backup index as untrustworthy until this is understood; do NOT restore from it and do NOT let another run overwrite the evidence"
-           false ;;
-        4) VERIFY_NOTE="$VERIFY_RUN incomplete (host, retriable)"
-           FAIL_NOTE="verify exit 4 — incomplete for a HOST reason (a dependency this box lacks, e.g. 7-Zip for an archived row). Retriable once the host is fixed; the stored data is not implicated"
+        3|4) VERIFY_NOTE="$VERIFY_RUN exit $VERIFY_RC"
+           FAIL_NOTE="verify exited $VERIFY_RC, which a bounded-run-loop FileBackup never returns from verify (no witness; host problems are 2). This is almost certainly an OLDER image: rebuild it from FileBackup's BoundedRebuild work"
            false ;;
         *) VERIFY_NOTE="$VERIFY_RUN exit $VERIFY_RC"
-           FAIL_NOTE="verify exited $VERIFY_RC, outside the documented 0/1/2/3/4 table"
+           FAIL_NOTE="verify exited $VERIFY_RC, outside the documented 0/1/2 table"
            false ;;
     esac
 else
     log "verify gate: not today (mode=$VERIFY_MODE, weekday $(date +%u), verify day $VERIFY_DAY)"
 fi
 
+# A backup that completed with files not captured (exit 1) ends HERE, after the
+# verify gate had its turn: not a verified success, so no lastSuccess, and a
+# non-zero exit so the unit and the hub watch (watch.table `library-backup`)
+# show it. The data already stored is safe, and the message says so.
+if [ "$BACKUP_PARTIAL" = 1 ]; then
+    FAIL_NOTE="the backup COMPLETED WITH FILES NOT CAPTURED (container exit 1; verify=$VERIFY_NOTE). Every file it could read is stored and nothing already stored was lost, but at least one file was not captured, so this is not a verified success and lastSuccess is NOT advanced. Each file is named in $FB_CHANGES/backup.log — usually a file in use or unreadable; the next run tries it again"
+    false
+fi
+
 # ── 9. ADVANCE VERIFIED SUCCESS (SR-018 / IF-010) ────────────────────────────
 # AFTER the container and verification exit successfully, and it can only be
 # after: the container has `network_mode: none` and no way to reach the tracker.
-# A failure above deliberately leaves the previous timestamp untouched.
+# A failure above deliberately leaves the previous timestamp untouched. Only a
+# backup exit 0 reaches this line (exit 1 ended above).
 trap - ERR
+# The old engine's source-side record is no longer read or written by anything.
+# Said once per verified run, because only a person may delete it (nothing here
+# deletes), and this is the moment it is known to be unneeded.
+if [ -f "$FB_LEGACY_STATE/MANIFEST.csv" ]; then
+    log "NOTE: $FB_LEGACY_STATE/MANIFEST.csv is the retired source-side record of the old engine; nothing reads it"
+    log "  any more and this verified run did not need it. Delete it by hand when convenient: rm -r $FB_LEGACY_STATE"
+fi
 SUMMARY="exit=$BACKUP_RC snapshot=$SNAPSHOT_MADE drive=$FILL_PCT full; verify=$VERIFY_NOTE"
 [ -n "$DEGRADED" ] && SUMMARY="$SUMMARY; DEGRADED: $DEGRADED"
 SUCCESS_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"

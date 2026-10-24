@@ -922,15 +922,18 @@ services:
       - /etc/homehub-backup/filebackup.json:/config/FileBackup.json:ro
       # The library, READ-ONLY. FileBackup reads the source in place — there is
       # no staging copy for these sets, which is the NVMe staging bomb that this
-      # service's arrival dissolves.
+      # service's arrival dissolves. Nothing is ever written into it.
       - ${FILEBACKUP_SOURCE:-/srv/library}:/source:ro
-      # Manifest/hash cache. On the SYSTEM disk on purpose: it is small, and it
-      # must survive a backup drive being unplugged.
-      - ${FILEBACKUP_STATE:-/var/lib/homehub-filebackup/state}:/state
-      # The mirror (Q-FB1: PreserveFolderTree) and the snapshot history, both on
-      # the backup drive.
-      - ${FILEBACKUP_BACKUP:-/mnt/backup-drive/library}:/backup
-      - ${FILEBACKUP_CHANGES:-/mnt/backup-drive/library-changes}:/changes
+      # THE STORE: ONE writable mount on the backup drive, holding backup/ (the
+      # content-addressed latest state) and changes/ (the Snapshot_<date>
+      # history). ONE, not two, and that is FileBackup's contract, not a style
+      # choice: an image built from its bounded-run-loop work (BoundedRebuild)
+      # moves objects between the two by rename only and refuses (exit 2) a pair
+      # a rename cannot cross — and Linux cannot rename across two bind mounts
+      # even on one filesystem. filebackup.json fixes the children:
+      # BackupPath=/store/backup, ChangePath=/store/changes. There is no /state
+      # mount any more: the latest manifest is FileBackup's only record.
+      - ${FILEBACKUP_STORE:-/mnt/backup-drive/library-store}:/store
       - ${FILEBACKUP_LOGS:-/var/log/homehub-filebackup}:/logs
     tmpfs:
       # read_only: true leaves the process no writable scratch at all; pwsh

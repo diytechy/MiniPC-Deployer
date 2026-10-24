@@ -35,6 +35,15 @@
 #       IGNORED - diffing against a stale one hides the removal in between
 #   D22 and it is VERIFIED, not trusted: a body that does not hash to the
 #       baseline's inv_hash is ignored however correct its own header looks
+#   D23 a row added to an EXISTING file is pure growth - green, baseline
+#       refreshed, `added` names only the new id (a per-file `file.md:N` count
+#       is a quantity, not an identity, and takes no part in the added/removed diff)
+#   D24 one id lost and another gained in the SAME file is red, `removed` naming
+#       only the lost id
+#   D25 an item moved between two existing files (same ids, new per-file counts)
+#       is not red: the baseline refreshes and the move is recorded
+#   D26 the reason in the POST body is <= 500 bytes and valid UTF-8 (NagLight's
+#       maxFeedReasonLen); the state file keeps the full verdict
 #   D15 a corrupt baseline is yellow, never green
 #   D16 a state file that cannot be written escalates to RED - the durable
 #       verdict is the whole point, and a stale one reads as current
@@ -557,6 +566,124 @@ elif [ "$rc" = 1 ]; then
 else
     fail "D16 exit=$rc with an unwritable state dir, want 1"; cat "$TMP/out.txt"
 fi
+
+echo
+echo "== D23-D26: counts are quantities, not identities; and the POST must fit the tracker =="
+# THE DEFECT (measured on the hub, 2026-09-14 and 2026-10-23): the inventory
+# carries a `user/file.md:N` count line per file. Adding one row to an EXISTING
+# file replaced `u/f.md:4` with `u/f.md:5`; the line diff called the old line
+# REMOVED and a pure addition read RED. D7 only ever added a NEW file, which is
+# why nothing caught it.
+write_beta() { # write_beta ID... -> beta.md carrying exactly those ids
+    {
+        printf -- '---\ncategory: Beta\ncolor_weight: 1.0\nitems:\n'
+        for _id in "$@"; do
+            printf '  - id: %s\n    title: T\n    type: habit\n    recur: daily\n    horizon: daily\n' "$_id"
+        done
+        printf -- '---\n\n# Beta\n'
+    } >"$DEFS/beta.md"
+}
+write_alpha() { # write_alpha ID... -> alpha.md carrying exactly those ids
+    {
+        printf -- '---\ncategory: Alpha\ncolor_weight: 1.0\nitems:\n'
+        for _id in "$@"; do
+            printf '  - id: %s\n    title: T\n    type: habit\n    recur: daily\n    horizon: daily\n' "$_id"
+        done
+        printf -- '---\n\n# Alpha\n'
+    } >"$DEFS/alpha.md"
+}
+fresh() { rm -rf "$STATE" "$ROOT"; mkdir -p "$DEFS" "$STATE"; }
+
+# D23: a row added to an EXISTING file is pure growth.
+fresh; write_alpha one two; write_beta three five
+guard --baseline >/dev/null
+write_beta three five four
+rc="$(guard --check)"
+if [ "$rc" = 0 ] && [ "$(state_of band)" = green ]; then pass "D23 a row added to an existing file is green (exit 0)"; else fail "D23 band=$(state_of band) exit=$rc"; cat "$TMP/out.txt"; fi
+if [ "$(state_of added)" = "user-one/four" ]; then pass "D23 added names only the new id"; else fail "D23 added='$(state_of added)'"; fi
+if [ -z "$(state_of removed)" ]; then pass "D23 and nothing is reported removed"; else fail "D23 removed='$(state_of removed)'"; fi
+if ! state_of added | grep -q '\.md'; then pass "D23 no file.md:N count tokens in the added list"; else fail "D23 count noise in added"; fi
+if [ "$(awk -F= '$1=="items"{print $2}' "$STATE/tracker-defs-baseline")" = 5 ]; then pass "D23 the baseline was refreshed (5 items)"; else fail "D23 baseline items=$(awk -F= '$1=="items"{print $2}' "$STATE/tracker-defs-baseline")"; fi
+rc="$(guard --check)"
+if [ "$rc" = 0 ] && grep -q 'by count AND by inventory' "$TMP/out.txt"; then pass "D23 and the next run matches the refreshed baseline exactly"; else fail "D23 second run exit=$rc"; cat "$TMP/out.txt"; fi
+
+# D24: one id lost and another gained in the SAME file is a removal, and only
+# the lost id is named (no count line may stand in for it).
+fresh; write_alpha one two; write_beta three five
+guard --baseline >/dev/null
+write_beta five four six
+rc="$(guard --check)"
+if [ "$rc" = 1 ] && [ "$(state_of band)" = red ]; then pass "D24 a swap inside one file is RED (exit 1)"; else fail "D24 band=$(state_of band) exit=$rc"; cat "$TMP/out.txt"; fi
+if [ "$(state_of removed)" = "user-one/three" ]; then pass "D24 removed names only the lost id"; else fail "D24 removed='$(state_of removed)'"; fi
+if [ "$(state_of added)" = "user-one/four user-one/six" ]; then pass "D24 added names only the new ids"; else fail "D24 added='$(state_of added)'"; fi
+
+# D25: an item moved between two EXISTING files. Same ids, same files, new
+# per-file counts: nothing stopped being tracked, so it is not red.
+fresh; write_alpha one two; write_beta three
+guard --baseline >/dev/null
+write_alpha one; write_beta three two
+rc="$(guard --check)"
+if [ "$rc" = 0 ] && [ "$(state_of band)" = green ]; then pass "D25 an item moved between existing files is not red (exit 0)"; else fail "D25 band=$(state_of band) exit=$rc"; cat "$TMP/out.txt"; fi
+if state_of verdict | grep -q 'MOVED or were RECOUNTED'; then pass "D25 the verdict records it as a move/recount"; else fail "D25 verdict: $(state_of verdict)"; fi
+if grep -q 'INVENTORY MOVED/RECOUNTED' "$TMP/out.txt"; then pass "D25 and the journal line names it"; else fail "D25 no journal line"; fi
+if grep -q '^reason=move/recount auto-accepted' "$STATE/tracker-defs-baseline"; then pass "D25 the baseline carries the reason"; else fail "D25 baseline reason: $(grep '^reason=' "$STATE/tracker-defs-baseline")"; fi
+rc="$(guard --check)"
+if [ "$rc" = 0 ] && grep -q 'by count AND by inventory' "$TMP/out.txt"; then pass "D25 the baseline was refreshed (next run matches exactly)"; else fail "D25 second run exit=$rc"; cat "$TMP/out.txt"; fi
+
+# D26: the POST body's reason must fit the tracker (500 bytes, valid UTF-8).
+# A recording docker stands in for the container: it saves the --post-data.
+POSTBIN="$TMP/postbin"; mkdir -p "$POSTBIN"
+cat >"$POSTBIN/docker" <<'MOCK3'
+#!/usr/bin/env bash
+case "$1" in
+  inspect) echo true; exit 0 ;;
+  exec)
+    while [ $# -gt 0 ]; do
+        if [ "$1" = "--post-data" ]; then printf '%s' "$2" >"$POST_OUT"; fi
+        shift
+    done
+    exit 0 ;;
+esac
+exit 0
+MOCK3
+chmod +x "$POSTBIN/docker"
+cat >"$TMP/feed2.env" <<'ENVF2'
+NAGLIGHT_FEED_URL=http://127.0.0.1:8787/api/feed
+NAGLIGHT_FEED_CONTAINER=tracker
+ENVF2
+fresh
+# 60 long ids with multi-byte characters, so the list is far past 500 bytes.
+long_ids=(); for n in $(seq 1 60); do long_ids+=("ünïcode—ïd-number-$n"); done
+write_alpha one two; write_beta "${long_ids[@]}"
+guard --baseline >/dev/null
+write_beta zzz
+post_reason() { # post_reason [MAXBYTES] -> runs --report, leaves the reason in $TMP/reason.txt
+    rm -f "$TMP/post.json"
+    POST_OUT="$TMP/post.json" TRACKER_DEFS_ROOT="$ROOT" TRACKER_DEFS_STATE_DIR="$STATE" \
+        TRACKER_DEFS_ENV_FILE="$TMP/feed2.env" TRACKER_DEFS_REASON_MAX_BYTES="${1:-500}" \
+        PATH="$POSTBIN:$PATH" bash "$GUARD" --report >"$TMP/out.txt" 2>&1
+    sed -e 's/^.*"reason":"//' -e 's/"}$//' "$TMP/post.json" >"$TMP/reason.txt"
+}
+post_reason
+rlen="$(LC_ALL=C wc -c <"$TMP/reason.txt" | tr -d ' ')"
+if [ -s "$TMP/post.json" ] && [ "$rlen" -le 500 ] && [ "$rlen" -gt 0 ]; then pass "D26 the POSTed reason is $rlen bytes (<= 500)"; else fail "D26 reason is ${rlen:-?} bytes (or no POST was made)"; fi
+if iconv -f UTF-8 -t UTF-8 "$TMP/reason.txt" >/dev/null 2>&1; then pass "D26 and it is valid UTF-8"; else fail "D26 reason is not valid UTF-8"; fi
+if grep -q 'more' "$TMP/reason.txt"; then pass "D26 the long list was shortened ('...and N more')"; else fail "D26 no shortened-list marker"; fi
+if [ "$(state_of band)" = red ] && [ "$(state_of removed | wc -c)" -gt 800 ]; then pass "D26 the state file keeps the FULL verdict"; else fail "D26 state removed is only $(state_of removed | wc -c) bytes"; fi
+# The backstop, called directly: lift the bounding functions out of the guard and
+# cut a string full of 2-, 3- and 4-byte characters at every cap from 1 to 60.
+eval "$(sed -n '/^REASON_MAX_BYTES=/,/^# .* baseline mode/p' "$GUARD" | sed '$d')"
+sample="aé—😀b—ééé😀😀x—é"
+allok=1
+for m in $(seq 1 60); do
+    REASON_MAX_BYTES="$m"
+    out="$(bound_reason "$sample")"
+    l="$(printf '%s' "$out" | LC_ALL=C wc -c | tr -d ' ')"
+    if [ "$l" -gt "$m" ] || ! printf '%s' "$out" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+        allok=0; echo "  cap $m -> $l bytes"
+    fi
+done
+if [ "$allok" = 1 ]; then pass "D26 the hard byte cap holds and never splits a character (caps 1-60)"; else fail "D26 hard cap broke the bound or split a character"; fi
 echo
 echo "──────────────────────────────────────────────────────────────"
 printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"

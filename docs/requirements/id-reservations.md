@@ -18,5 +18,6 @@ truth for what each id means.
 | 2026-10-22 | Plan W6 (meeting recording, system half) | SR-108..111; LLR-1240..1254; TC-1400..1419 (used: SR-108..111, LLR-1240..1252, TC-1400..1415) |
 | 2026-10-22 | Plan W3b (watches: door recorder segments, scratch identity, meeting pull) | SR-119..120; LLR-1290..1299; TC-1460..1469 (used: LLR-1290..1292, TC-1460..1466; SR-088 amended, no new SR) |
 | 2026-10-22 | Plan W8c (OtterTube on the hub: downloader, catalogue, site) | SN-051; SR-113..118; LLR-1260..1289; TC-1430..1459; IF-072..073 (used: SN-051, SR-113..117, LLR-1260..1283, TC-1430..1454, IF-072, IF-073) |
+| 2026-10-23 | nightly backup into the unified lane | SR-121; LLR-1300; TC-1470..1474 (used: SR-121, LLR-1300, TC-1470..1474; SR-018, IF-003, IF-006 amended) |
 
 The plan is HomeHub `docs/archive/2026-10-23/IMPLEMENTATION_PLAN_2026-10-22.md`.

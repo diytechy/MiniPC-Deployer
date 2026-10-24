@@ -79,9 +79,10 @@ contracts; matching IF-IDs should be recorded there too:
 - **IF-002** — the trusted-header identity contract: oauth2-proxy →
   `X-Forwarded-Email`/`-User` → NagLight multi-user mode (D3/WI-10.5, SR-003).
 - **IF-003** — `POST /api/feed` `{check,ok,note}` + Bearer token — the backup
-  service's step 6 report. That step is now a no-op: `feed_naglight` in
-  `stack/backup/common.sh` logs that the legacy config-backup feed is suppressed
-  and returns 0 without posting (SR-013).
+  service's step 6 report. RETIRED: `/api/feed` is no longer posted from
+  `stack/backup`. Since 2026-10-23 `feed_naglight` in `stack/backup/common.sh`
+  posts `nightlySuccess` to `/api/backup-state` instead (IF-006, SR-121) on a
+  verified, promoted nightly run, and posts nothing on a failure (SR-013).
 
 **This repo ↔ Finance-Auditor** (`Provides` — FA numbered its registry first,
 so ids are repo-local; each Contract cites the counterpart's id):

@@ -71,8 +71,8 @@ ref="$(rex 'sed "s|^BACKUP_TARGET=|OFFSITE_UNC=//mini-serv/icedrive\nBACKUP_TARG
             bash /opt/homehub/stack/backup/backup.sh --config /tmp/legacy.env 2>&1 | grep -c "was REMOVED on 2026-08-09"' | tr -d "\r")"
 if [ "${ref:-0}" -ge 1 ]; then pass "a config still setting OFFSITE_UNC is refused by name"; else fail "a legacy OFFSITE_UNC config was silently accepted"; fi
 
-echo "== (step 6) config archive has no panel feed =="
-pass "only the FileBackup wrapper may advance the unified lastSuccess timestamp"
+echo "== (step 6) config archive reports only nightlySuccess =="
+pass "only the FileBackup wrapper may advance the unified lastSuccess timestamp (the nightly run advances nightlySuccess; see nightly-success-feed.test.sh)"
 
 echo "== RESTORE DRILL — reconstruct minecraft from archive+manifest, diff byte-equality =="
 docker exec -i backup-runner bash -s "$RUN_DIR" <<'DRILL'

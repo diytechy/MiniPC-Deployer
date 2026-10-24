@@ -26,6 +26,9 @@ trap cleanup EXIT
 # old-changes and state are where an unmigrated hub's three-mount store lived.
 mkdir -p "$TMP/bin" "$TMP/src" "$TMP/store/backup" "$TMP/store/changes" "$TMP/state" "$TMP/logs"
 : >"$TMP/filebackup.json"
+# The latest manifest the (mocked) container leaves behind; the wrapper copies
+# it to the system disk for frame-freshness after every completed run.
+printf 'RelativePath,LastWriteTimeStr\nShared/a.jpg,2026-10-01T00:00:00Z\n' >"$TMP/store/backup/MANIFEST.csv"
 
 # The actual wrapper asks findmnt two subtly different questions: the exact
 # source mount must remain its own mountpoint, while backup/ and changes/ must
@@ -124,7 +127,7 @@ mkdir -p "$TMP/sys-dev-block"
 # carries them, pointed at temp paths, so the store-layout guard reads only this
 # tree and never the real /mnt/backup-drive.
 write_config() {
-    local target="$1"
+    local target="$1" copy="${2:-$TMP/latest/MANIFEST.csv}"
     cat >"$target" <<EOF
 FILEBACKUP_CONFIG=$TMP/filebackup.json
 FILEBACKUP_SOURCE=$TMP/src
@@ -133,6 +136,7 @@ FILEBACKUP_STATE=$TMP/state
 FILEBACKUP_BACKUP=$TMP/old-backup
 FILEBACKUP_CHANGES=$TMP/old-changes
 FILEBACKUP_LOGS=$TMP/logs
+LIBRARY_MANIFEST_COPY=$copy
 FILEBACKUP_USER_NAME=root
 LIBRARY_MOUNTS_FSTAB=$TMP/fstab
 DRIVE_IDENTITY_FILE=$TMP/no-identity
@@ -542,6 +546,37 @@ else
     fail "TC-1068 retired state rc=$RUN_RC: $(grep 'retired' "$TMP/retired-state.out" | head -1)"
 fi
 rm -f "$TMP/state/MANIFEST.csv"
+
+# ── the system-disk manifest copy for frame-freshness (TC-1070) ──────────────
+# Refreshed after a COMPLETED run (exit 0 or 1), whole (published by rename);
+# left as it was after a run that did not complete; a copy that cannot be made
+# is a note, never a backup failure.
+printf 'v-complete\n' >"$TMP/store/backup/MANIFEST.csv"
+run_wrapper copy-complete "$TMP/good.env" none 0 0 200
+c1="$(cat "$TMP/latest/MANIFEST.csv" 2>/dev/null)"
+printf 'v-partial\n' >"$TMP/store/backup/MANIFEST.csv"
+run_wrapper copy-partial "$TMP/good.env" none 1 0 200
+c2="$(cat "$TMP/latest/MANIFEST.csv" 2>/dev/null)"
+printf 'v-refused\n' >"$TMP/store/backup/MANIFEST.csv"
+run_wrapper copy-refused "$TMP/good.env" none 2 0 200
+c3="$(cat "$TMP/latest/MANIFEST.csv" 2>/dev/null)"
+if [ "$c1" = v-complete ] && [ "$c2" = v-partial ] && [ "$c3" = v-partial ] \
+   && ! find "$TMP/latest" -name '.MANIFEST.csv.*' | grep -q .; then
+    pass "TC-1070 the manifest copy is refreshed after exit 0 and 1, kept after exit 2, and leaves no temp file"
+else
+    fail "TC-1070 manifest copy after 0/1/2 was '$c1'/'$c2'/'$c3'"
+fi
+# A copy path whose parent is a FILE cannot be created: a note, and the run
+# still succeeds and still posts its lastSuccess.
+: >"$TMP/not-a-dir"
+write_config "$TMP/badcopy.env" "$TMP/not-a-dir/MANIFEST.csv"
+run_wrapper copy-fails "$TMP/badcopy.env" none 0 0 200
+if [ "$RUN_RC" = 0 ] && [ "$(success_count "$TMP/copy-fails.capture")" = 1 ] \
+   && grep -qF "DEGRADED: could not refresh $TMP/not-a-dir/MANIFEST.csv for frame-freshness" "$TMP/copy-fails.out"; then
+    pass "TC-1070 a manifest copy that cannot be made is a DEGRADED note, not a failed backup"
+else
+    fail "TC-1070 failed copy rc=$RUN_RC: $(grep 'manifest copy' "$TMP/copy-fails.out" | head -1)"
+fi
 
 printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

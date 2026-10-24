@@ -103,6 +103,11 @@ FB_SOURCE="${FILEBACKUP_SOURCE:-/srv/library}"
 # retired three-mount paths, from common.sh so the migration step agrees.
 filebackup_store_layout
 FB_LOGS="${FILEBACKUP_LOGS:-/var/log/homehub-filebackup}"
+# A SYSTEM-DISK copy of the latest manifest, refreshed after every completed
+# run, for stack/tracker/frame-freshness.sh (IF-035), which must never wake the
+# backup drive. It used to read FileBackup's source-side record on /state, which
+# the bounded engine no longer writes. frame-freshness.sh defaults to this path.
+FB_MANIFEST_COPY="${LIBRARY_MANIFEST_COPY:-/var/lib/homehub-filebackup/latest/MANIFEST.csv}"
 
 FB_UID=65532                            # the image's USER, and the fstab's uid=
 FB_USER="${FILEBACKUP_USER_NAME:-filebackup}"
@@ -803,6 +808,36 @@ case "$BACKUP_RC" in
     *) FAIL_NOTE="the container exited $BACKUP_RC, which is outside the documented 0/1/2/4 table — treat it as a failure and read $FB_LOGS/Backup_Global.log"
        false ;;
 esac
+
+# ── 7b. THE SYSTEM-DISK MANIFEST COPY (frame-freshness, IF-035) ──────────────
+# After a COMPLETED run (0 or 1) the latest manifest is final, and the drive is
+# awake anyway, so this is where the copy is cheap. Published by rename on the
+# system disk, so a reader never sees a half-written file (the reason the old
+# reader had to compare row counts against a witness). A failure here is a
+# NOTE, never a backup failure: the copy serves another lane, and that lane
+# reads a stale copy as "not changed since", which is the same answer it gave
+# when a backup failed under the old layout.
+publish_manifest_copy() {
+    local src="$FB_BACKUP/MANIFEST.csv" dir tmp
+    dir="$(dirname "$FB_MANIFEST_COPY")"
+    if [ ! -f "$src" ]; then
+        DEGRADED="${DEGRADED:+$DEGRADED; }no latest manifest at $src to copy for frame-freshness"
+        warn "manifest copy: $src does not exist; $FB_MANIFEST_COPY was not refreshed"
+        return 0
+    fi
+    if mkdir -p "$dir" 2>/dev/null \
+       && tmp="$(mktemp "$dir/.MANIFEST.csv.XXXXXX" 2>/dev/null)" \
+       && cp -- "$src" "$tmp" 2>/dev/null \
+       && mv -f -- "$tmp" "$FB_MANIFEST_COPY" 2>/dev/null; then
+        log "manifest copy: $FB_MANIFEST_COPY refreshed from $src (for frame-freshness)"
+    else
+        [ -n "${tmp:-}" ] && rm -f -- "$tmp" 2>/dev/null
+        DEGRADED="${DEGRADED:+$DEGRADED; }could not refresh $FB_MANIFEST_COPY for frame-freshness"
+        warn "manifest copy: could not refresh $FB_MANIFEST_COPY from $src"
+    fi
+    return 0
+}
+publish_manifest_copy
 
 # ── 8. THE VERIFY GATE — weekly, deep monthly ────────────────────────────────
 # A backup nobody reads is a hypothesis. `verify` re-proves the stored manifest

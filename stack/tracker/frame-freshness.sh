@@ -63,10 +63,12 @@
 #
 # ── IT MUST NEVER WAKE THE LIBRARY DRIVE EITHER ──────────────────────────────
 # The "when did the media last change" half does NOT walk /srv/library. It reads
-# the manifest FileBackup already writes to the SYSTEM disk on every nightly
-# library run. That is one pass over a local CSV, so it cannot spin up the
-# parked 4 TB platter — the same contract library-guard.sh and the backup
-# drive-health unit both keep (WI-10.10).
+# the copy of the latest library manifest that library-backup.sh publishes to the
+# SYSTEM disk after every completed nightly run (FileBackup's bounded engine no
+# longer keeps a source-side record there of its own). That is one pass over a
+# local CSV, so it cannot spin up the parked 4 TB platter, nor the backup drive
+# the real manifest lives on — the same contract library-guard.sh and the
+# backup drive-health unit both keep (WI-10.10).
 #
 # ── CREDENTIALS: REUSED, NOT ADDED ───────────────────────────────────────────
 # The mount uses the CIFS credentials the backup already has
@@ -107,7 +109,9 @@ FRAME_WALK_TIMEOUT=60
 # generous. Nothing here does timezone-exact arithmetic on purpose.
 FRAME_PROBE_MAX_AGE_DAYS=7
 FRAME_DRIFT_MAX_DAYS=7
-MANIFEST="/var/lib/homehub-filebackup/state/MANIFEST.csv"
+# library-backup.sh's system-disk copy of the latest manifest (its
+# LIBRARY_MANIFEST_COPY, same default). Overridable as MANIFEST in $FRAME_CONF.
+MANIFEST="/var/lib/homehub-filebackup/latest/MANIFEST.csv"
 # Scope: the WHOLE of Shared, every subtree (plan §7.2). The extension
 # allow-list is the only filter, which is why it is an allow-list and not a
 # deny-list — see the note in the plan §7.1.
@@ -287,16 +291,13 @@ read_shared() {
         shared_err="cannot read $MANIFEST (has the library backup ever run?)"; return 1
     fi
 
-    # The manifest's own sidecar says how many rows a COMPLETE file has. The
-    # nightly rewrites the CSV in place, so a run that opens it mid-rewrite sees
-    # a valid but TRUNCATED file and would compute a max over a prefix — green
-    # from missing rows (review, 2026-09-07). Comparing the parsed row count to
-    # the declared one refuses that.
-    local declared=""
-    [ -r "$MANIFEST.meta" ] && {
-        declared="$(sed -n 's/^Rows=//p' "$MANIFEST.meta" | head -1 | tr -dc '0-9')"
-        MANIFEST_WRITTEN="$(sed -n 's/^Written=//p' "$MANIFEST.meta" | head -1 | cut -c1-19)"
-    }
+    # A TRUNCATED file would compute a max over a prefix — green from missing
+    # rows (review, 2026-09-07). The old reader caught that by comparing the row
+    # count to FileBackup's witness sidecar, which the bounded engine no longer
+    # writes. It cannot happen to this file: library-backup.sh publishes the copy
+    # by rename on one filesystem, so a reader sees the old copy or the new one,
+    # whole. When it was written is the copy's own mtime.
+    MANIFEST_WRITTEN="$(date -u -r "$MANIFEST" +%Y-%m-%dT%H:%M:%S 2>/dev/null || true)"
 
     local out
     out="$(MANIFEST="$MANIFEST" SHARED_PREFIX="$SHARED_PREFIX" python3 - <<'PY' 2>/dev/null
@@ -377,10 +378,9 @@ PY
         *) shared_err="the manifest parser produced no usable answer"; return 1 ;;
     esac
 
-    local total unparsed
+    local unparsed
     SHARED_NEWEST="$(printf '%s\n' "$out" | sed -n 's/^newest=//p' | head -1)"
     SHARED_ROWS="$(printf '%s\n' "$out"   | sed -n 's/^rows=//p'   | head -1)"
-    total="$(printf '%s\n' "$out"         | sed -n 's/^total=//p'  | head -1)"
     unparsed="$(printf '%s\n' "$out"      | sed -n 's/^unparsed=//p' | head -1)"
 
     if ! is_num "$SHARED_NEWEST"; then
@@ -392,10 +392,6 @@ PY
         # bound — but it is named, because a parser quietly skipping rows is how
         # the first cut went wrong.
         shared_err="note: $unparsed timestamp(s) under $SHARED_PREFIX did not parse"
-    fi
-    if is_num "$declared" && is_num "$total" && [ "$declared" -ne "$total" ]; then
-        shared_err="the manifest looks INCOMPLETE: it declares $declared row(s) but $total were read (a rewrite in progress?) — refusing to judge freshness from a partial file"
-        SHARED_NEWEST=""; return 1
     fi
     return 0
 }

@@ -605,6 +605,15 @@ key but ignores it, with a warning every run). The old record at
 `/var/lib/homehub-filebackup/state/MANIFEST.csv` is dead; the wrapper says so
 after each verified run, and you delete it by hand (nothing here deletes it).
 
+**`stack/tracker/frame-freshness.sh` used to read that old record** (it must
+never wake a drive, so it reads a system-disk CSV). The wrapper now publishes a
+copy of the latest manifest to `/var/lib/homehub-filebackup/latest/MANIFEST.csv`
+(`LIBRARY_MANIFEST_COPY`) after every **completed** run, exit 0 or 1, by rename
+so a reader never sees half a file, and frame-freshness reads that. Until the
+first completed run of the new image the copy does not exist and that lane says
+yellow ("cannot read …"); a copy that cannot be made is a `DEGRADED` note, never
+a failed backup.
+
 A hub that ran the old layout has to **migrate once** before the new image runs
 — see [Migrating an existing store](#migrating-an-existing-store). Until then
 the wrapper refuses (step 2b below).

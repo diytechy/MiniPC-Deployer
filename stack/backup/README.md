@@ -583,8 +583,11 @@ unconditionally for the bake.
 > The sibling checkout must be on that work, or on a later commit that contains
 > it, when the image is built. An older image does not fit: it expects a `/state`
 > mount and separate `/backup` and `/changes` mounts, and its exit codes mean
-> different things. Nothing here can tell an old image from a new one before it
-> runs; an exit 3 from the backup is the tell after the fact.
+> different things. Nothing here checks the image before it runs (it carries no
+> contract label). Not verified, but expect an old image to fail for want of a
+> writable place for its source-side record, or to return codes this wrapper
+> reads differently; an exit 3, which the bounded engine never returns from a
+> backup, is reported as "an OLDER image".
 
 ### The one-mount store
 

@@ -592,3 +592,26 @@ def test_the_14_00_rule_uses_the_clock_after_the_fetch(tmp_path):
                                    reader=lambda e: ([], []), poster=poster,
                                    clock=lambda: L(10, 25, 14, 0))
     assert bodies[-1]["value"] == 0 and "observed_at" not in bodies[-1]
+
+
+# ── Review round 2 (2026-10-25) ──────────────────────────────────────────────
+
+def test_an_oversized_stamp_is_refused_not_a_crash_in_any_loader(tmp_path):
+    now = L(10, 25, 9)
+    night = dict(stored_night(70), observed_at=10 ** 401)
+    out = feeder.validate_heart_nights({"2026-10-25": night}, now)
+    assert "observed_at" not in out["2026-10-25"]
+    with pytest.raises(feeder.SourceFailure):
+        feeder.check_observed_at(10 ** 401, now, "x")
+    env = make_env(tmp_path)
+    Path(env["WEIGHT_STATE_FILE"]).write_text(json.dumps(
+        {"heart": {"value": 60, "observed_at": 10 ** 401},
+         feeder.HEART_NIGHTS_KEY: {"2026-10-25": night}}), encoding="utf-8")
+    assert isinstance(feeder.load_state(env["WEIGHT_STATE_FILE"], now), dict)
+
+
+def test_only_the_configured_devices_nights_are_shown(tmp_path):
+    env = make_env(tmp_path, HEART_SAMPLE_DEVICE="Ring")
+    seed_nights(env, {"2026-10-25": stored_night(60, device=WATCH, observed_at=L(10, 25, 7))})
+    _p, _f, body = cycle(env, L(10, 25, 9), (night_samples(), []))   # watch samples only
+    assert body["value"] == 0 and "observed_at" not in body

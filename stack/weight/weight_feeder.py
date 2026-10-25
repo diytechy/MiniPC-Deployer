@@ -757,7 +757,10 @@ def check_observed_at(stamp, now, where):
     Implements: LLR-006
     """
     if isinstance(stamp, bool) or not isinstance(stamp, (int, float)) \
-            or not math.isfinite(stamp):
+            or (isinstance(stamp, float) and not math.isfinite(stamp)):
+        # math.isfinite only for a float: on an int too large for a float it
+        # raises OverflowError, and this runs inside the loader every gauge
+        # shares (an oversized int is then refused below as in the future).
         raise SourceFailure("%s: observed_at is not a number: %r" % (where, stamp))
     value = int(stamp)
     if value < EPOCH_FLOOR:
@@ -6000,7 +6003,11 @@ def run_heart_samples_cycle(env, now=None, reader=None, poster=None, clock=None)
         upsert_heart_nights(nights, figures, config["device"])
     prune_heart_nights(nights, now, zone)
 
-    name, stamp = (None, None) if confirmed else decide_heart_night(nights, now, zone)
+    # ONLY THE CONFIGURED DEVICE'S NIGHTS ARE SHOWN: after HEART_SAMPLE_DEVICE
+    # changes, a stored night from the old device is history, not a reading.
+    mine = {key: night for key, night in nights.items()
+            if night.get("device") == config["device"]}
+    name, stamp = (None, None) if confirmed else decide_heart_night(mine, now, zone)
     fallback = heart_bar(config["target"], config)
     try:
         if name is None:

@@ -4082,6 +4082,22 @@ GOOGLE_HEALTH_HEART_LIST_URL = (
     + HEART_DATA_SEGMENT + "/dataPoints")
 GOOGLE_HEALTH_SCOPE = (
     "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly")
+# THE WATCH'S SLEEP AND STEPS (2026-10-25). The Owner ruled that the hub may
+# read them (plan decision 6.6, re-ruled that day). Each needs its own scope,
+# read off the discovery document (revision 20261021); a probe with the metrics
+# scope alone got HTTP 403 `MISSING_OAUTH_SCOPE` on both routes, which is also
+# how the two segments are known to exist (an unknown type answers 404). NOTHING
+# HERE READS THEM YET: no body has been captured, so there is no parser, and
+# `weight_oauth.py capture --data-type sleep|steps` is how the first one is
+# seen. See HomeHub docs/research/WATCH_DATA_IN_GOOGLE_HEALTH_2026-10-25.md.
+GOOGLE_HEALTH_SLEEP_SCOPE = (
+    "https://www.googleapis.com/auth/googlehealth.sleep.readonly")
+GOOGLE_HEALTH_ACTIVITY_SCOPE = (
+    "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly")
+GOOGLE_HEALTH_SLEEP_LIST_URL = (
+    "https://health.googleapis.com/v4/users/me/dataTypes/sleep/dataPoints")
+GOOGLE_HEALTH_STEPS_LIST_URL = (
+    "https://health.googleapis.com/v4/users/me/dataTypes/steps/dataPoints")
 GOOGLE_HEALTH_FILTER = 'weight.sample_time.physical_time >= "%s"'
 GOOGLE_HEALTH_RPC = (
     "google.devicesandservices.health.v4.DataPointsService.ListDataPoints")

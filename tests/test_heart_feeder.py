@@ -1480,12 +1480,16 @@ def test_the_route_is_the_weight_route_with_one_segment_swapped_same_scope():
     assert heart_url == ("https://health.googleapis.com/v4/users/me/dataTypes/"
                          "daily-resting-heart-rate/dataPoints")
     assert weight_url.replace("/weight/", "/daily-resting-heart-rate/") == heart_url
-    # ONE scope constant in the module, and it is the metrics scope the data
-    # types table lists for this data type: no new consent.
+    # The heart read needs only the metrics scope the data types table lists
+    # for this data type: no new consent. The module names exactly the three
+    # scopes the Owner has ruled on (sleep and activity joined 2026-10-25,
+    # plan decision 6.6), all of them read-only.
     source = MODULE_PATH.read_text(encoding="utf-8")
     scopes = set(re.findall(r"googlehealth\.[a-z_]+\.(?:readonly|writeonly)",
                             source))
-    assert scopes == {"googlehealth.health_metrics_and_measurements.readonly"}
+    assert scopes == {"googlehealth.health_metrics_and_measurements.readonly",
+                      "googlehealth.sleep.readonly",
+                      "googlehealth.activity_and_fitness.readonly"}
     assert feeder.GOOGLE_HEALTH_SCOPE.endswith(
         "googlehealth.health_metrics_and_measurements.readonly")
 
@@ -1500,7 +1504,8 @@ def test_the_oauth_capture_tool_can_fetch_one_heart_body():
     finally:
         sys.path.pop(0)
     assert module.LIST_URLS["heart"] == feeder.GOOGLE_HEALTH_HEART_LIST_URL
-    assert module.SCOPE == feeder.GOOGLE_HEALTH_SCOPE
+    assert module.REQUIRED_SCOPE == feeder.GOOGLE_HEALTH_SCOPE
+    assert module.SCOPES[0] == feeder.GOOGLE_HEALTH_SCOPE
 
 
 def test_the_journal_and_stdout_of_a_whole_cycle_carry_no_health_value(

@@ -3921,12 +3921,19 @@ def test_the_height_route_differs_only_in_the_data_type_segment_ni_a2():
 
 
 def test_the_height_read_uses_the_one_scope_the_weight_read_holds_ni_a2():
-    """There is no height-specific scope, and no second scope constant."""
+    """There is no height-specific scope: height reads under the metrics one.
+
+    The scope constants are pinned as a closed set. Sleep and activity joined
+    on 2026-10-25 (the Owner ruled the hub may read the watch's sleep and
+    steps, plan decision 6.6); they ride the SAME token and the same single
+    consent, and any further scope is a fresh ruling, not a quiet addition.
+    """
     assert "health_metrics_and_measurements.readonly" in feeder.GOOGLE_HEALTH_SCOPE
     scopes = [name for name in dir(feeder)
               if "SCOPE" in name and isinstance(getattr(feeder, name), str)]
-    assert scopes == ["GOOGLE_HEALTH_SCOPE"], (
-        "a second scope constant would be a second consent screen")
+    assert sorted(scopes) == ["GOOGLE_HEALTH_ACTIVITY_SCOPE", "GOOGLE_HEALTH_SCOPE",
+                              "GOOGLE_HEALTH_SLEEP_SCOPE"], (
+        "a scope the Owner has not ruled on is a permission nobody granted")
 
 
 def test_the_height_reader_walks_pages_over_real_sockets_ni_a2(tmp_path):

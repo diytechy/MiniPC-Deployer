@@ -324,12 +324,15 @@ def test_a_quoted_empty_value_is_empty(tmp_path, monkeypatch, capsys, quoted):
     assert rc == 1 and re.search(r"(?m)^MYAIR_PASSWORD\s+empty$", out)
 
 
-@pytest.mark.parametrize("heart", ["HEART_ENABLED=1\n", "HEART_ENABLED=true\n", ""])
-def test_report_fails_unless_heart_is_literally_zero(tmp_path, monkeypatch, capsys, heart):
+@pytest.mark.parametrize("heart", ["HEART_ENABLED=true\n", "HEART_ENABLED=\n", ""])
+def test_report_fails_unless_heart_is_a_literal_zero_or_one(tmp_path, monkeypatch, capsys, heart):
+    """Since 2026-10-25 the heart gauge is ruled on; 0 and 1 are the two literals
+    the feeder and firstboot read the same way."""
     rc, out, _t, _ = run_helper(tmp_path, monkeypatch, capsys, ["--report"], FULL_GOOD + heart)
-    assert rc == 1 and "HEART_ENABLED must be the literal 0" in out
-    rc, out, _t, _ = run_helper(tmp_path, monkeypatch, capsys, ["--report"], FULL_GOOD + "HEART_ENABLED=0\n")
-    assert rc == 0
+    assert rc == 1 and "HEART_ENABLED must be the literal 0 or 1" in out
+    for good in ("HEART_ENABLED=0\n", "HEART_ENABLED=1\n"):
+        rc, out, _t, _ = run_helper(tmp_path, monkeypatch, capsys, ["--report"], FULL_GOOD + good)
+        assert rc == 0
 
 
 def test_report_flags_export_and_indented_forms(tmp_path, monkeypatch, capsys):

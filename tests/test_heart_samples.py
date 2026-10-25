@@ -527,3 +527,68 @@ def test_no_line_and_no_saved_byte_carries_a_bpm_from_a_failure(tmp_path):
     assert not any(n in line for line in failures for n in ("61", "97"))
     text = Path(env["WEIGHT_STATE_FILE"]).read_text(encoding="utf-8")
     assert "refresh_token" not in text and "SENTINEL" not in text
+
+
+# ── Review round 1 (2026-10-25): five should-fix findings, one test each ─────
+
+def test_a_network_failure_after_a_confirmed_sign_in_failure_stays_grey(tmp_path):
+    env = make_env(tmp_path)
+    cycle(env, L(10, 25, 7), (night_samples(), []))
+    dead = feeder.AuthFailure("google-health: the token refresh failed: HTTP 400 "
+                              "invalid_grant", code="invalid_grant")
+    cycle(env, L(10, 25, 7, 15), error=dead)
+    cycle(env, L(10, 25, 7, 30), error=dead)
+    _p, failures, body = cycle(env, L(10, 25, 7, 45),
+                               error=feeder.SourceFailure("google-health: timed out"))
+    assert body["value"] == 0 and "observed_at" not in body
+    _p, failures, body = cycle(env, L(10, 25, 8), (night_samples(), []))
+    assert body["value"] == 60                             # only a success clears it
+
+
+def test_an_oversized_number_in_a_stored_night_is_dropped_not_a_crash():
+    now = L(10, 25, 9)
+    bad = dict(stored_night(70), p25=10 ** 401)
+    assert feeder.validate_heart_nights({"2026-10-25": bad}, now) == {}
+    huge = dict(stored_night(70), rhr=10 ** 401)
+    assert feeder.validate_heart_nights({"2026-10-25": huge}, now) == {}
+
+
+def test_samples_dated_after_now_do_not_set_the_night(tmp_path):
+    env = make_env(tmp_path)
+    now = L(10, 25, 6)
+    real = [(t, 80, WATCH) for t in range(L(10, 25, 0), L(10, 25, 6), 300)]
+    future = [(t, 50, WATCH) for t in range(L(10, 25, 6, 10), L(10, 25, 6, 40), 300)]  # beyond the 5-minute skew allowance
+    _p, _f, body = cycle(env, now, (real + future, []))
+    assert body["value"] == 80
+
+
+def test_a_failed_post_does_not_mark_the_night_published(tmp_path):
+    env = make_env(tmp_path)
+    bodies = []
+
+    def failing(body, url, e, t):
+        bodies.append(body)
+        return False, "HTTP 500 (body not logged)"
+
+    feeder.run_heart_cycle(env, now=L(10, 24, 7), reader=lambda e: (
+        night_samples(day=date(2026, 10, 24)), []), poster=failing)
+    assert bodies[-1]["value"] == 60
+    assert "observed_at" not in state_of(env)[feeder.HEART_NIGHTS_KEY]["2026-10-24"]
+    # Next morning, with no valid night yet, the never-delivered night is not shown.
+    _p, _f, body = cycle(env, L(10, 25, 9))
+    assert body["value"] == 0 and "observed_at" not in body
+
+
+def test_the_14_00_rule_uses_the_clock_after_the_fetch(tmp_path):
+    env = make_env(tmp_path)
+    seed_nights(env, {"2026-10-24": stored_night(66, observed_at=L(10, 24, 7))})
+    bodies = []
+
+    def poster(body, url, e, t):
+        bodies.append(body)
+        return True, "HTTP 200"
+
+    feeder.run_heart_samples_cycle(env, now=L(10, 25, 13, 59),
+                                   reader=lambda e: ([], []), poster=poster,
+                                   clock=lambda: L(10, 25, 14, 0))
+    assert bodies[-1]["value"] == 0 and "observed_at" not in bodies[-1]

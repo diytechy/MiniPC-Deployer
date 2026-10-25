@@ -348,7 +348,8 @@ Nothing here restarts a container; the feeder is a host systemd unit.
    `MYAIR_EMAIL`, `MYAIR_PASSWORD`, `HEART_*`. `SLEEP_ENABLED` and `SLEEP_USER` come
    from HomeHub `config.homehub.psd1`; `MYAIR_EMAIL` from the identity row
    `household.MyAirEmail`; `MYAIR_PASSWORD` from the store key `MyAirPassword`.
-   `HEART_ENABLED` stays `0` (no heart device exists yet).
+   `HEART_ENABLED` is `1` since 2026-10-25 (the heart gauge in samples mode, ruled that
+   day; stack/weight/README.md "Heart"); the helper also carries the samples-mode keys.
 2. **Hub: back the `.env` up.**
    `sudo cp -p /opt/homehub/stack/.env /opt/homehub/stack/.env.bak-$(date +%Y%m%d-%H%M%S)`
 3. **Hub: copy only the sleep tree, after diffing it.** Stage the six files from the
@@ -431,7 +432,7 @@ Nothing here restarts a container; the feeder is a host systemd unit.
    of single or double quotes stripped, so `MYAIR_PASSWORD=''` is *empty*). It exits
    non-zero and says why if a required key is empty, a key is duplicated or written
    as `export` / indented, `SLEEP_ENABLED` is not the literal `true`, or
-   `HEART_ENABLED` is not the literal `0` (the heart gauge stays off in this rollout).
+   `HEART_ENABLED` is not the literal `0` or `1`.
 6. **Hub: check, then install.**
    `sudo bash /opt/homehub/stack/sleep/setup-sleep.sh --check-only` (refuses on a
    blank identity, destination or sign-in, and prints one `clock sync:` line), then

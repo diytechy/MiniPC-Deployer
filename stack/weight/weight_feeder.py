@@ -5768,8 +5768,13 @@ def upsert_heart_nights(nights, figures, device):
 
 
 def _plain_number(value, low, high):
-    return (not isinstance(value, bool) and isinstance(value, (int, float))
-            and math.isfinite(value) and low <= value <= high)
+    # An int is compared directly: math.isfinite raises OverflowError on an int
+    # too large for a float, and this runs inside the loader both gauges share.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, float) and not math.isfinite(value):
+        return False
+    return low <= value <= high
 
 
 def validate_heart_nights(entry, now):
@@ -5903,7 +5908,7 @@ def decide_heart_night(nights, now, zone):
     return None, None
 
 
-def run_heart_samples_cycle(env, now=None, reader=None, poster=None):
+def run_heart_samples_cycle(env, now=None, reader=None, poster=None, clock=None):
     """One heart cycle in samples mode: read, derive, decide, post.
 
     Contract:
@@ -5915,15 +5920,22 @@ def run_heart_samples_cycle(env, now=None, reader=None, poster=None):
     file, its own sign-in count (`heart_count_key`), never the weight gauge.
     ONE DIFFERENCE ON A CONFIRMED SIGN-IN FAILURE: the gauge is posted
     unavailable for as long as the failure stands, but the nightly record is
-    KEPT. It is the baseline, not a reading to forget, and a renewed login
-    resumes it.
+    KEPT. It is the baseline, not a reading to forget, so the grey is held by
+    the count instead: only a SUCCESSFUL read clears it, and a network failure
+    after a confirmed sign-in failure does not bring the old night back.
+
+    THE CLOCK IS RE-READ AFTER THE FETCH (the sleep feeder's rule): a read that
+    starts at 13:59:55 and ends at 14:00:05 decides under 14:00. `clock` is the
+    tests' seam for that second reading; with `now` injected and no `clock`, the
+    injected time stands.
 
     Implements: SR-073, LLR-1314, LLR-1315, LLR-1316, LLR-1317, LLR-1318, LLR-1319
     """
     config = resolve_heart_samples_config(env)
     zone = resolve_heart_zone(env)
     env["_heart_zone"] = zone
-    now = int(now if now is not None else time.time())
+    injected = now is not None
+    now = int(now if injected else time.time())
     state_path = env.get("WEIGHT_STATE_FILE") or "/var/lib/homehub-weight/weight-state.json"
     state_root = resolve_state_root(env)
     feed_url = env["_feed_url"]
@@ -5943,23 +5955,27 @@ def run_heart_samples_cycle(env, now=None, reader=None, poster=None):
         failures.append("%s: %s" % (source, exc))
     except Exception as exc:
         failures.append("%s: unexpected %s" % (source, type(exc).__name__))
+    if clock is not None:
+        now = int(clock())
+    elif not injected:
+        now = int(time.time())
 
     state = load_state(state_path, now)
     before = json.loads(json.dumps(state, sort_keys=True))
     count_key = heart_count_key(source)
     counts = dict(state.get(AUTH_STATE_KEY) or {})
-    confirmed = False
     if auth_failed:
         counts[count_key] = min(counts.get(count_key, 0) + 1, AUTH_CONFIRM_CYCLES)
-        confirmed = counts[count_key] >= AUTH_CONFIRM_CYCLES
+    elif read is not None:
+        counts.pop(count_key, None)          # ONLY a successful read clears it
+    confirmed = counts.get(count_key, 0) >= AUTH_CONFIRM_CYCLES
+    if auth_failed:
         failures.append(
             "%s: sign-in failure %d of %d%s" % (
                 source, counts[count_key], AUTH_CONFIRM_CYCLES,
                 " - confirmed, the gauge is grey until the login is renewed"
                 if confirmed else
                 " - not yet confirmed, the last night is kept"))
-    else:
-        counts.pop(count_key, None)
     if counts:
         state[AUTH_STATE_KEY] = counts
     else:
@@ -5969,6 +5985,12 @@ def run_heart_samples_cycle(env, now=None, reader=None, poster=None):
     check_heart_night_stamps(nights, zone)
     if read is not None:
         samples, sessions = read
+        # NOTHING FROM THE FUTURE: a sample or a session end later than the clock
+        # (beyond the skew allowance) has not happened, and must not set tonight's
+        # figure or pick its window.
+        horizon = now + MAX_CLOCK_SKEW_SECONDS
+        samples = [sample for sample in samples if sample[0] <= horizon]
+        sessions = [session for session in sessions if session[1] <= horizon]
         cleaned = clean_heart_samples(samples, config["device"])
         today = _local_date(now, zone)
         figures = {}
@@ -5984,7 +6006,6 @@ def run_heart_samples_cycle(env, now=None, reader=None, poster=None):
         if name is None:
             body = heart_gauge_body(0, None, fallback)
         else:
-            nights[name].setdefault("observed_at", stamp)      # frozen from here on
             body = heart_gauge_body(nights[name]["rhr"], stamp,
                                     heart_bar(heart_target_for(nights, name, config),
                                               config))
@@ -5997,6 +6018,10 @@ def run_heart_samples_cycle(env, now=None, reader=None, poster=None):
         ok, detail = False, type(exc).__name__
     if not ok:
         failures.append("post %s: %s" % (HEART_GAUGE_ID, detail))
+    elif name is not None:
+        # FROZEN FROM HERE ON, and only now: a stamp is the mark of a night that
+        # REACHED NagLight, which is what lets it stand in for yesterday.
+        nights[name].setdefault("observed_at", stamp)
 
     if nights:
         state[HEART_NIGHTS_KEY] = nights

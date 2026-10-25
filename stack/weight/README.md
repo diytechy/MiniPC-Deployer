@@ -1328,7 +1328,12 @@ posts "unavailable" until a device feeds it.)*
 >   with no valid night, unavailable.
 > - **State:** `heart-nights` in the weight state file, 60 nights, each night
 >   validated on load. A confirmed sign-in failure greys the gauge but KEEPS the
->   record (it is the baseline); the daily mode clears its one reading instead.
+>   record (it is the baseline); the daily mode clears its one reading instead,
+>   so here the grey is held by the count: only a successful read clears it.
+> - **Guards added by review (2026-10-25):** the clock is re-read after the
+>   fetch; samples and session ends after now (+5 min skew) are ignored; a
+>   night's stamp is frozen only after a successful POST; an oversized number in
+>   the state file is refused rather than crashing the loader both gauges share.
 >
 > Observed on the hub 2026-10-25 against live data (read only, nothing posted):
 > the night to 25 Oct gave 72 bpm from the session window, posted against the

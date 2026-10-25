@@ -207,7 +207,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # ── The wire contract (NagLight IF-012 / this repo's IF-014) ─────────────────
 # Not tunables. This is the shape POST /api/feed accepts for a weight gauge,
@@ -757,7 +757,10 @@ def check_observed_at(stamp, now, where):
     Implements: LLR-006
     """
     if isinstance(stamp, bool) or not isinstance(stamp, (int, float)) \
-            or not math.isfinite(stamp):
+            or (isinstance(stamp, float) and not math.isfinite(stamp)):
+        # math.isfinite only for a float: on an int too large for a float it
+        # raises OverflowError, and this runs inside the loader every gauge
+        # shares (an oversized int is then refused below as in the future).
         raise SourceFailure("%s: observed_at is not a number: %r" % (where, stamp))
     value = int(stamp)
     if value < EPOCH_FLOOR:
@@ -3669,6 +3672,13 @@ def load_state(state_path, now):
             if stored is not None:
                 out[key] = stored
             continue
+        # THE NIGHTLY HEART RECORD (samples mode): beats per minute per night,
+        # with its own validator for the same reason.
+        if key == HEART_NIGHTS_KEY:
+            nights = validate_heart_nights(entry, now)
+            if nights:
+                out[key] = nights
+            continue
         if key in (HEIGHT_STATE_KEY, WAIST_STATE_KEY):
             cached = validate_stored_inches(
                 entry, now,
@@ -3689,7 +3699,8 @@ def save_state(state, state_path, state_root):
 
     The state holds A WEIGHT, A TIMESTAMP, AND THE CHECK IDS ALREADY TICKED
     WITH THE SAMPLE TIME EACH WAS TICKED FOR, AND A SMALL INTEGER PER SOURCE
-    COUNTING CONSECUTIVE SIGN-IN FAILURES (AUTH_STATE_KEY) - never a token,
+    COUNTING CONSECUTIVE SIGN-IN FAILURES (AUTH_STATE_KEY), and in heart
+    samples mode one summary per night (HEART_NIGHTS_KEY) - never a token,
     never a header, never a response body. That is asserted by test, because a
     state file that quietly grew a `refresh_token` would turn this feeder into the
     credential-writing thing it promises not to be.
@@ -4080,6 +4091,11 @@ GOOGLE_HEALTH_HEIGHT_LIST_URL = (
 GOOGLE_HEALTH_HEART_LIST_URL = (
     "https://health.googleapis.com/v4/users/me/dataTypes/"
     + HEART_DATA_SEGMENT + "/dataPoints")
+# The watch's 5-minute samples (HEART_SOURCE=samples, ruled 2026-10-25): the
+# same route with the `heart-rate` segment, under the same metrics scope. Read
+# from the hub with this token on 2026-10-25 (300 samples, HTTP 200).
+GOOGLE_HEALTH_HEART_RATE_LIST_URL = (
+    "https://health.googleapis.com/v4/users/me/dataTypes/heart-rate/dataPoints")
 GOOGLE_HEALTH_SCOPE = (
     "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly")
 # THE WATCH'S SLEEP AND STEPS (2026-10-25). The Owner ruled that the hub may
@@ -5228,6 +5244,10 @@ def run_heart_cycle(env, now=None, reader=None, poster=None):
     """
     if not resolve_heart_enabled(env):
         return [], []
+    # SAMPLES MODE (ruled 2026-10-25) is its own cycle; the daily path below is
+    # unchanged and remains for a device Google derives a resting rate for.
+    if resolve_heart_source(env) == "samples":
+        return run_heart_samples_cycle(env, now=now, reader=reader, poster=poster)
     config = resolve_heart_config(env)
     # BOTH refusals happen before any read or post: a missing zone must skip
     # the gauge, not guess UTC (HEART_STAMP_LOCAL_HOUR).
@@ -5302,6 +5322,726 @@ def run_heart_cycle(env, now=None, reader=None, poster=None):
     return [(HEART_GAUGE_ID, fresh, ok)], failures
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# THE HEART GAUGE FROM THE WATCH'S 5-MINUTE SAMPLES (HEART_SOURCE=samples).
+#
+# RULED 2026-10-25 (HomeHub docs/HEART_GAUGE_PLAN_2026-10-25.md, decisions
+# 8.1-8.4, all as recommended). Google Health derives NO daily resting heart
+# rate for the Owner's watch, so the daily reader above has nothing to read.
+# The hub computes one from the `heart-rate` samples it can already read - one
+# per 5 minutes - and colours it against the Owner's own usual:
+#
+#   * THE NIGHT'S FIGURE is the lowest mean of HEART_RUN_LENGTH (6) consecutive
+#     samples inside the night's window, after blips are dropped. A blip is a
+#     reading at least HEART_BLIP_DROP_BPM below BOTH neighbours: poor sensor
+#     contact, not a heart rate. On the 2026-10-25 data that rule removed
+#     exactly the three isolated lows (54, 60 and 65 bpm) and nothing else. The
+#     25th percentile and the mean are recorded beside it and never shown, so
+#     the choice can be revisited after real nights (decision 8.2).
+#   * THE WINDOW is the watch's sleep session start to start + 9 h, because the
+#     watch ends the night early (05:35 while the Owner got up near 09:00).
+#     With no session, 22:00 to 10:00 local - but then the 3-hour coverage
+#     gate counts only 00:00-08:00 (HEART_FIXED_CORE_HOURS). Measured on the
+#     night to 2026-10-24: the watch held nothing from 02:00 to 09:00, the
+#     evening alone met a whole-window gate, and the "resting" figure was an
+#     awake 78. A minimum does not mind an over-long window; a coverage count
+#     does.
+#   * THE COLOUR is NagLight's own, against a target this feeder chooses: the
+#     median of up to HEART_BASELINE_NIGHTS earlier valid nights from the same
+#     device, or the fixed HEART_TARGET_BPM until HEART_MIN_BASELINE_NIGHTS
+#     exist. min and max sit half of HEART_COLOUR_SPAN_BPM either side, so with
+#     the default 24 yellow starts at +4 and red at +12 (NagLight goes yellow
+#     at a sixth of the span and full red at half of it, GaugeFullRedFraction).
+#   * THE STAMP follows the sleep gauge's nightly contract: the night key is the
+#     local date the night ENDS; it is first published no earlier than 06:00,
+#     stamped min(12:00, now), then frozen; before 14:00 the previous PUBLISHED
+#     night stays; from 14:00 with no valid night, the gauge is unavailable.
+#
+# OBSERVED, NOT GUESSED. The sample shape was read off real bodies on
+# 2026-10-25 (HomeHub docs/research/WATCH_DATA_IN_GOOGLE_HEALTH_2026-10-25.md
+# §3.1, §3.4): `heartRate.beatsPerMinute` is a decimal string,
+# `heartRate.sampleTime.physicalTime` a `Z` stamp, and
+# `dataSource.device.manufacturer` names the watch ("FFit"). Both filters below
+# were sent by the read-only probe the same day and answered HTTP 200. `name`
+# (the Owner's Google user id) is still never read.
+# ══════════════════════════════════════════════════════════════════════════════
+
+HEART_SOURCES = ("daily", "samples")
+# The code default keeps the daily reader, so a box whose .env predates this
+# knob behaves exactly as before; the shipped .env.example sets `samples`.
+DEFAULT_HEART_SOURCE = "daily"
+HEART_RATE_MEMBER = "heartRate"
+SLEEP_MEMBER = "sleep"
+HEART_RATE_FILTER = 'heart_rate.sample_time.physical_time >= "%s"'
+SLEEP_FILTER = 'sleep.interval.end_time >= "%s"'
+HEART_RATE_PAGE_SIZE = 10000            # the API's maximum
+SLEEP_PAGE_SIZE = 25                    # the API's maximum for `sleep`
+# Far enough back to rebuild yesterday's night from scratch every cycle: its
+# fixed window opens at 22:00 two evenings ago, at most ~60 h before 10:00 today.
+HEART_LOOKBACK_SECONDS = 60 * 3600
+# A sample outside this band is not a resting heart rate in any night's window.
+HEART_SAMPLE_BAND = (35, 150)
+HEART_BLIP_DROP_BPM = 10
+# A neighbour further away than this is a gap, not a neighbour: a reading next
+# to a gap is not judged a blip.
+HEART_BLIP_NEIGHBOUR_SECONDS = 10 * 60
+HEART_RUN_LENGTH = 6
+# Six 5-minute samples span 25 minutes; 30 tolerates one missing slot.
+HEART_RUN_MAX_SPAN_SECONDS = 30 * 60
+# Three hours of samples, or the night is not valid (no value, no baseline).
+HEART_MIN_NIGHT_SAMPLES = 36
+HEART_SESSION_WINDOW_SECONDS = 9 * 3600
+HEART_FIXED_WINDOW_START_HOUR = 22      # local, the evening before the night key
+HEART_FIXED_WINDOW_END_HOUR = 10        # local, on the night key
+# With no session, coverage is counted only inside these local hours on the
+# night key (NightSignal used 00:00-07:00 as its sleep window).
+HEART_FIXED_CORE_HOURS = (0, 8)
+HEART_FIRST_PUBLISH_HOUR = 6
+HEART_GRACE_HOUR = 14
+# The state file's key for the nightly record. Its OWN validator in
+# `load_state`, never an exemption (the generic one would judge it in pounds
+# and drop it).
+HEART_NIGHTS_KEY = "heart-nights"
+HEART_NIGHTS_KEEP_DAYS = 60
+HEART_NIGHT_WINDOWS = ("session", "fixed")
+DEFAULT_HEART_SAMPLE_DEVICE = "FFit"
+DEFAULT_SAMPLES_TARGET_BPM = 75
+SAMPLES_TARGET_BOUNDS = (30, 150)
+DEFAULT_HEART_COLOUR_SPAN_BPM = 24
+HEART_COLOUR_SPAN_BOUNDS = (6, 120)
+DEFAULT_HEART_BASELINE_NIGHTS = 28
+DEFAULT_HEART_MIN_BASELINE_NIGHTS = 7
+# A manufacturer name as a vendor writes it. Anything else is not matched and
+# never logged.
+HEART_DEVICE_RE = re.compile(r"[A-Za-z0-9 ._-]{1,40}")
+
+
+def resolve_heart_source(env):
+    """`daily` or `samples` from HEART_SOURCE, or ValueError naming the knob.
+
+    Implements: SR-073, LLR-1314
+    """
+    name = (env.get("HEART_SOURCE") or DEFAULT_HEART_SOURCE).strip()
+    if name not in HEART_SOURCES:
+        raise ValueError("HEART_SOURCE=%r is not one of %s"
+                         % (name, ", ".join(HEART_SOURCES)))
+    return name
+
+
+def _whole_heart_knob(env, name, default, low, high):
+    """A plain whole-number knob inside low..high, its default when blank."""
+    raw = (env.get(name) or "").strip()
+    if not raw:
+        return default
+    if not re.fullmatch(r"[0-9]{1,3}", raw):
+        raise ValueError("%s=%r is not a plain whole number" % (name, raw))
+    number = int(raw)
+    if number < low or number > high:
+        raise ValueError("%s=%d is outside %d..%d" % (name, number, low, high))
+    return number
+
+
+def resolve_heart_samples_config(env):
+    """The samples-mode knobs as a dict, or ValueError naming the knob.
+
+    Contract:
+      Config:  HEART_SAMPLE_DEVICE (FFit), HEART_TARGET_BPM (75, the target
+               until a baseline exists), HEART_COLOUR_SPAN_BPM (24, even),
+               HEART_BASELINE_NIGHTS (28), HEART_MIN_BASELINE_NIGHTS (7).
+               HEART_MIN_BPM and HEART_MAX_BPM belong to the daily reader and
+               are not read here: the bar is centred on the target.
+      Outputs: {"device", "target", "span", "nights", "min_nights"}.
+
+    A bad knob is REFUSED, never defaulted past - the daily reader's rule.
+
+    Implements: SR-073, LLR-1314
+    """
+    device = (env.get("HEART_SAMPLE_DEVICE") or DEFAULT_HEART_SAMPLE_DEVICE).strip()
+    if not HEART_DEVICE_RE.fullmatch(device):
+        raise ValueError("HEART_SAMPLE_DEVICE is not a plain manufacturer name "
+                         "(letters, digits, space, dot, dash, underscore; 1..40)")
+    target = _whole_heart_knob(env, "HEART_TARGET_BPM", DEFAULT_SAMPLES_TARGET_BPM,
+                               *SAMPLES_TARGET_BOUNDS)
+    span = _whole_heart_knob(env, "HEART_COLOUR_SPAN_BPM",
+                             DEFAULT_HEART_COLOUR_SPAN_BPM, *HEART_COLOUR_SPAN_BOUNDS)
+    if span % 2:
+        raise ValueError("HEART_COLOUR_SPAN_BPM=%d must be even, so the target "
+                         "sits in the middle of the bar" % span)
+    nights = _whole_heart_knob(env, "HEART_BASELINE_NIGHTS",
+                               DEFAULT_HEART_BASELINE_NIGHTS, 7,
+                               HEART_NIGHTS_KEEP_DAYS - 1)
+    minimum = _whole_heart_knob(env, "HEART_MIN_BASELINE_NIGHTS",
+                                DEFAULT_HEART_MIN_BASELINE_NIGHTS, 1, nights)
+    return {"device": device, "target": target, "span": span, "nights": nights,
+            "min_nights": minimum}
+
+
+def _local_date(epoch_seconds, zone):
+    return datetime.fromtimestamp(epoch_seconds, zone).date()
+
+
+def _local_epoch(day, hour, zone):
+    """Epoch seconds of `hour`:00 local on the date `day` (DST-correct)."""
+    return int(datetime(day.year, day.month, day.day, hour, tzinfo=zone).timestamp())
+
+
+def _night_key(text):
+    """A stored night key -> date, or None unless it is exactly YYYY-MM-DD."""
+    if not isinstance(text, str):
+        return None
+    try:
+        day = datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return day if day.isoformat() == text else None
+
+
+def _round_half_up(number):
+    return int(math.floor(number + 0.5))
+
+
+def _device_of(point):
+    """`dataSource.device.manufacturer` when it is a plain name, else None."""
+    source = point.get("dataSource")
+    device = source.get("device") if isinstance(source, dict) else None
+    name = device.get("manufacturer") if isinstance(device, dict) else None
+    return name if isinstance(name, str) and HEART_DEVICE_RE.fullmatch(name) else None
+
+
+def _data_points_of(payload, where):
+    """The `dataPoints` list of one page; [] for an empty one. The envelope
+    rules are the daily parser's: an ABSENT key is a refusal, not "none"."""
+    if not isinstance(payload, dict):
+        raise SourceFailure("%s: the response body is not an object (it is a %s)"
+                            % (where, type(payload).__name__))
+    if DATA_POINTS_KEY not in payload:
+        raise SourceFailure("%s: the response body carries no `%s` key at all"
+                            % (where, DATA_POINTS_KEY))
+    points = payload.get(DATA_POINTS_KEY)
+    if points is None:
+        return []
+    if not isinstance(points, list):
+        raise SourceFailure("%s: `%s` is not a list (it is a %s)"
+                            % (where, DATA_POINTS_KEY, type(points).__name__))
+    return points
+
+
+def parse_heart_rate_page(payload, where="google-health(heart-rate)"):
+    """ONE `heart-rate` page -> [(epoch, bpm, device)]. A bad point costs itself.
+
+    `beatsPerMinute` must be the decimal string observed (HEART_BPM_RE) within
+    the API's 1..300; the time is `sampleTime.physicalTime`. A point failing
+    either is skipped, never repaired.
+
+    Implements: SR-073, LLR-1315
+    """
+    out = []
+    for point in _data_points_of(payload, where):
+        if not isinstance(point, dict):
+            continue
+        member = point.get(HEART_RATE_MEMBER)
+        if not isinstance(member, dict):
+            continue
+        raw = member.get(HEART_BPM_KEY)
+        if not isinstance(raw, str) or not HEART_BPM_RE.fullmatch(raw):
+            continue
+        bpm = int(raw)
+        if bpm < HEART_KNOB_BOUNDS[0] or bpm > HEART_KNOB_BOUNDS[1]:
+            continue
+        sample_time = member.get("sampleTime")
+        try:
+            stamp = parse_rfc3339_utc(
+                sample_time.get(PHYSICAL_TIME_KEY) if isinstance(sample_time, dict)
+                else None, where)
+        except SourceFailure:
+            continue
+        out.append((stamp, bpm, _device_of(point)))
+    return out
+
+
+def parse_sleep_page(payload, where="google-health(sleep)"):
+    """ONE `sleep` page -> [(start, end, device, main_sleep)]. A bad point costs itself.
+
+    Implements: SR-073, LLR-1315
+    """
+    out = []
+    for point in _data_points_of(payload, where):
+        if not isinstance(point, dict):
+            continue
+        member = point.get(SLEEP_MEMBER)
+        interval = member.get("interval") if isinstance(member, dict) else None
+        if not isinstance(interval, dict):
+            continue
+        try:
+            start = parse_rfc3339_utc(interval.get("startTime"), where)
+            end = parse_rfc3339_utc(interval.get("endTime"), where)
+        except SourceFailure:
+            continue
+        if not 0 < end - start <= 24 * 3600:
+            continue
+        metadata = member.get("metadata")
+        main = isinstance(metadata, dict) and metadata.get("mainSleep") is True
+        out.append((start, end, _device_of(point), main))
+    return out
+
+
+def walk_all_data_points(access_token, timeout, base, query, parser, what):
+    """Every point of a filtered list, across pages. `walk_data_points` keeps one
+    reading per walk; this one keeps them all, under the same page limit.
+
+    Implements: SR-073, LLR-1315
+    """
+    headers = {"Authorization": "Bearer " + access_token,
+               "Accept": "application/json"}
+    items, token, pages = [], None, 0
+    while True:
+        params = dict(query)
+        if token is not None:
+            params["pageToken"] = token
+        url = base + "?" + urllib.parse.urlencode(params)
+        payload = vendor_json(urllib.request.Request(url, headers=headers),
+                              timeout, "the %s list call" % what)
+        pages += 1
+        items.extend(parser(payload))
+        token = next_page_token(payload)
+        if token is None:
+            return items
+        if pages >= MAX_LIST_PAGES:
+            raise SourceFailure(
+                "google-health(%s): still not exhausted after %d pages, so this "
+                "cycle cannot know it has every sample and computes nothing."
+                % (what, pages))
+
+
+def read_google_health_heart_samples(env, heart_rate_url=None, sleep_url=None,
+                                     token_endpoint=None):
+    """Source: the last HEART_LOOKBACK_SECONDS of `heart-rate` samples and `sleep`
+    sessions -> (samples, sessions). ONE token refresh, two filtered walks.
+
+    Contract:
+      Raises:  AuthFailure for a dead refresh token, SourceFailure for every
+               other failure class - including a failed sleep read, because a
+               night computed without its session would use the wrong window.
+               An empty answer is two empty lists, not an error.
+
+    Implements: SR-073, LLR-1315
+    """
+    token_file = (env.get("WEIGHT_TOKEN_FILE") or "").strip()
+    if not token_file:
+        raise SourceFailure(
+            "google-health(heart): WEIGHT_TOKEN_FILE is unset, so there is no "
+            "refresh token to read and no heart rate was taken.")
+    refresh_token = read_refresh_token(os.path.expanduser(token_file))
+    client_id, client_secret = resolve_oauth_client(env)
+    try:
+        timeout = int(env.get("WEIGHT_TIMEOUT_SECONDS") or 30)
+    except ValueError:
+        raise SourceFailure(
+            "google-health(heart): WEIGHT_TIMEOUT_SECONDS is not a whole "
+            "number of seconds.")
+    since = iso8601_utc(cycle_now(env) - HEART_LOOKBACK_SECONDS)
+    access_token = google_access_token(client_id, client_secret, refresh_token,
+                                       timeout, token_endpoint)
+    samples = walk_all_data_points(
+        access_token, timeout, heart_rate_url or GOOGLE_HEALTH_HEART_RATE_LIST_URL,
+        {"filter": HEART_RATE_FILTER % since, "pageSize": HEART_RATE_PAGE_SIZE},
+        parse_heart_rate_page, "heart-rate")
+    sessions = walk_all_data_points(
+        access_token, timeout, sleep_url or GOOGLE_HEALTH_SLEEP_LIST_URL,
+        {"filter": SLEEP_FILTER % since, "pageSize": SLEEP_PAGE_SIZE},
+        parse_sleep_page, "sleep")
+    return samples, sessions
+
+
+def clean_heart_samples(samples, device):
+    """One device's samples, in band, de-duplicated and de-blipped, in time order.
+
+    Two samples at one instant with the same value are one; with different
+    values, neither is believed. A blip (at least HEART_BLIP_DROP_BPM below both
+    neighbours, each within HEART_BLIP_NEIGHBOUR_SECONDS) is dropped.
+
+    Implements: SR-073, LLR-1316
+    """
+    low, high = HEART_SAMPLE_BAND
+    seen = {}
+    for stamp, bpm, source in samples:
+        if source == device and low <= bpm <= high:
+            seen.setdefault(stamp, set()).add(bpm)
+    ordered = [(stamp, next(iter(values))) for stamp, values in sorted(seen.items())
+               if len(values) == 1]
+    out = []
+    for index, (stamp, bpm) in enumerate(ordered):
+        if 0 < index < len(ordered) - 1:
+            before, after = ordered[index - 1], ordered[index + 1]
+            if (stamp - before[0] <= HEART_BLIP_NEIGHBOUR_SECONDS
+                    and after[0] - stamp <= HEART_BLIP_NEIGHBOUR_SECONDS
+                    and before[1] - bpm >= HEART_BLIP_DROP_BPM
+                    and after[1] - bpm >= HEART_BLIP_DROP_BPM):
+                continue
+        out.append((stamp, bpm))
+    return out
+
+
+def heart_night_window(key, sessions, device, zone):
+    """(start, end, kind, core) of the night that ENDS on the local date `key`.
+
+    The device's sleep session ending on `key` (the main sleep, else the
+    longest) gives start .. start + HEART_SESSION_WINDOW_SECONDS, and its
+    coverage counts across the window (the session itself says the night was
+    slept in). With none: 22:00 the evening before .. 10:00 on `key`, with
+    coverage counted only inside `core`, HEART_FIXED_CORE_HOURS on `key`.
+
+    Implements: SR-073, LLR-1316
+    """
+    mine = [s for s in sessions if s[2] == device and _local_date(s[1], zone) == key]
+    if mine:
+        best = max(mine, key=lambda s: (s[3], s[1] - s[0], s[0]))
+        return best[0], best[0] + HEART_SESSION_WINDOW_SECONDS, "session", None
+    return (_local_epoch(key - timedelta(days=1), HEART_FIXED_WINDOW_START_HOUR, zone),
+            _local_epoch(key, HEART_FIXED_WINDOW_END_HOUR, zone), "fixed",
+            (_local_epoch(key, HEART_FIXED_CORE_HOURS[0], zone),
+             _local_epoch(key, HEART_FIXED_CORE_HOURS[1], zone)))
+
+
+def _percentile(sorted_values, fraction):
+    position = (len(sorted_values) - 1) * fraction
+    lower = int(math.floor(position))
+    upper = min(lower + 1, len(sorted_values) - 1)
+    return sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * (position - lower)
+
+
+def derive_heart_night(samples, window):
+    """The night's figures from cleaned samples, or None when it is not valid.
+
+    Contract:
+      Outputs: {"rhr": whole bpm, the lowest mean of HEART_RUN_LENGTH
+               consecutive samples spanning at most HEART_RUN_MAX_SPAN_SECONDS;
+               "p25", "mean": one decimal; "n": samples in the window;
+               "window": "session" | "fixed"} - or None with fewer than
+               HEART_MIN_NIGHT_SAMPLES samples (inside the window's `core`,
+               when it has one) or no qualifying run.
+
+    Implements: SR-073, LLR-1316
+    """
+    start, end, kind, core = window
+    inside = [(stamp, bpm) for stamp, bpm in samples if start <= stamp <= end]
+    counted = inside if core is None else [
+        sample for sample in inside if core[0] <= sample[0] < core[1]]
+    if len(counted) < HEART_MIN_NIGHT_SAMPLES:
+        return None
+    lowest = None
+    for index in range(len(inside) - HEART_RUN_LENGTH + 1):
+        run = inside[index:index + HEART_RUN_LENGTH]
+        if run[-1][0] - run[0][0] > HEART_RUN_MAX_SPAN_SECONDS:
+            continue
+        mean = sum(bpm for _stamp, bpm in run) / float(HEART_RUN_LENGTH)
+        if lowest is None or mean < lowest:
+            lowest = mean
+    if lowest is None:
+        return None
+    values = sorted(bpm for _stamp, bpm in inside)
+    return {"rhr": _round_half_up(lowest),
+            "p25": round(_percentile(values, 0.25), 1),
+            "mean": round(sum(values) / float(len(values)), 1),
+            "n": len(values), "window": kind}
+
+
+def upsert_heart_nights(nights, figures, device):
+    """Fold freshly derived nights into the record. Returns the changed keys.
+
+    A night that is not valid this cycle changes nothing (a stored figure is
+    not erased by a thinner read). A frozen `observed_at` is carried over: a
+    corrected night changes its value, never its stamp.
+
+    Implements: SR-073, LLR-1317
+    """
+    changed = []
+    for key, figure in figures.items():
+        if figure is None:
+            continue
+        name = key.isoformat()
+        entry = dict(figure, device=device)
+        old = nights.get(name)
+        if isinstance(old, dict) and "observed_at" in old:
+            entry["observed_at"] = old["observed_at"]
+        if old != entry:
+            nights[name] = entry
+            changed.append(name)
+    return changed
+
+
+def _plain_number(value, low, high):
+    # An int is compared directly: math.isfinite raises OverflowError on an int
+    # too large for a float, and this runs inside the loader both gauges share.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, float) and not math.isfinite(value):
+        return False
+    return low <= value <= high
+
+
+def validate_heart_nights(entry, now):
+    """The stored nightly record, each night checked; what is not credible is
+    dropped (the next save erases it). Zone-free: `check_heart_night_stamps`
+    holds each frozen stamp to its own morning once the zone is known.
+
+    Implements: SR-073, LLR-1317
+    """
+    if not isinstance(entry, dict):
+        return {}
+    today = datetime.fromtimestamp(now, timezone.utc).date()
+    oldest = today - timedelta(days=HEART_NIGHTS_KEEP_DAYS + 1)
+    newest = today + timedelta(days=1)
+    low, high = HEART_SAMPLE_BAND
+    out = {}
+    for name, night in entry.items():
+        day = _night_key(name)
+        if day is None or not oldest <= day <= newest or not isinstance(night, dict):
+            continue
+        rhr, count = night.get("rhr"), night.get("n")
+        if isinstance(rhr, bool) or not isinstance(rhr, int) or not low <= rhr <= high:
+            continue
+        if isinstance(count, bool) or not isinstance(count, int) \
+                or not HEART_MIN_NIGHT_SAMPLES <= count <= 2000:
+            continue
+        if not (_plain_number(night.get("p25"), low, high)
+                and _plain_number(night.get("mean"), low, high)):
+            continue
+        device = night.get("device")
+        if not isinstance(device, str) or not HEART_DEVICE_RE.fullmatch(device):
+            continue
+        if night.get("window") not in HEART_NIGHT_WINDOWS:
+            continue
+        clean = {"rhr": rhr, "p25": night["p25"], "mean": night["mean"],
+                 "n": count, "device": device, "window": night["window"]}
+        if "observed_at" in night:
+            try:
+                clean["observed_at"] = int(check_observed_at(
+                    night["observed_at"], now, "stored heart night"))
+            except SourceFailure:
+                pass                # the night stays; only its publication is forgotten
+        out[name] = clean
+    return out
+
+
+def check_heart_night_stamps(nights, zone):
+    """Forget any frozen stamp outside 06:00..12:00 local on its own night key:
+    a stamp there was never written by this feeder, and keeping it could make a
+    night look fresher than it is.
+
+    Implements: SR-073, LLR-1317
+    """
+    for name, night in nights.items():
+        stamp = night.get("observed_at")
+        if stamp is None:
+            continue
+        day = _night_key(name)
+        if not (_local_epoch(day, HEART_FIRST_PUBLISH_HOUR, zone) <= stamp
+                <= _local_epoch(day, HEART_STAMP_LOCAL_HOUR, zone)):
+            del night["observed_at"]
+
+
+def prune_heart_nights(nights, now, zone):
+    """Keep HEART_NIGHTS_KEEP_DAYS of nights; drop any dated after today."""
+    today = _local_date(now, zone)
+    oldest = today - timedelta(days=HEART_NIGHTS_KEEP_DAYS)
+    for name in list(nights):
+        day = _night_key(name)
+        if day is None or day < oldest or day > today:
+            del nights[name]
+
+
+def heart_target_for(nights, name, config):
+    """The target for the night `name`: the median of up to config["nights"]
+    earlier valid nights from the SAME device, rounded half up, once at least
+    config["min_nights"] exist; until then the fixed config["target"]. A new
+    device therefore starts its own baseline.
+
+    Implements: SR-073, LLR-1318
+    """
+    day = _night_key(name)
+    device = nights[name]["device"]
+    oldest = day - timedelta(days=config["nights"])
+    values = sorted(night["rhr"] for key, night in nights.items()
+                    if night.get("device") == device
+                    and _night_key(key) is not None
+                    and oldest <= _night_key(key) < day)
+    if len(values) < config["min_nights"]:
+        return config["target"]
+    middle = len(values) // 2
+    median = values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2.0
+    return _round_half_up(median)
+
+
+def heart_bar(target, config):
+    """(min, max, target) for `heart_gauge_body`: the target in the middle of a
+    config["span"]-wide bar.
+
+    Implements: SR-073, LLR-1318
+    """
+    half = config["span"] // 2
+    return (target - half, target + half, target)
+
+
+def decide_heart_night(nights, now, zone):
+    """Which night to show -> (key, stamp), or (None, None) for unavailable.
+
+    The sleep gauge's rules: today's night wins once its stamp - its frozen one,
+    or max(min(12:00, now), 06:00) at first publication - has been reached;
+    before 14:00 with none, yesterday's night stays if it was PUBLISHED (it
+    carries a frozen stamp); otherwise unavailable.
+
+    Implements: SR-073, LLR-1319
+    """
+    today = _local_date(now, zone)
+    night = nights.get(today.isoformat())
+    if night is not None:
+        stamp = night.get("observed_at")
+        if stamp is None:
+            stamp = max(min(_local_epoch(today, HEART_STAMP_LOCAL_HOUR, zone), now),
+                        _local_epoch(today, HEART_FIRST_PUBLISH_HOUR, zone))
+        if stamp <= now:
+            return today.isoformat(), stamp
+    if now < _local_epoch(today, HEART_GRACE_HOUR, zone):
+        name = (today - timedelta(days=1)).isoformat()
+        night = nights.get(name)
+        stamp = night.get("observed_at") if night is not None else None
+        if stamp is not None and stamp <= now:
+            return name, stamp
+    return None, None
+
+
+def run_heart_samples_cycle(env, now=None, reader=None, poster=None, clock=None):
+    """One heart cycle in samples mode: read, derive, decide, post.
+
+    Contract:
+      Outputs: (posted, failures) exactly as `run_heart_cycle`: `fresh` is True
+               when a night is shown. `failures` carry no health value.
+      Raises:  ValueError for a bad knob or an unusable TIMEZONE (nothing posted).
+
+    THE SAME ISOLATION AS THE DAILY CYCLE: its own load and save of the state
+    file, its own sign-in count (`heart_count_key`), never the weight gauge.
+    ONE DIFFERENCE ON A CONFIRMED SIGN-IN FAILURE: the gauge is posted
+    unavailable for as long as the failure stands, but the nightly record is
+    KEPT. It is the baseline, not a reading to forget, so the grey is held by
+    the count instead: only a SUCCESSFUL read clears it, and a network failure
+    after a confirmed sign-in failure does not bring the old night back.
+
+    THE CLOCK IS RE-READ AFTER THE FETCH (the sleep feeder's rule): a read that
+    starts at 13:59:55 and ends at 14:00:05 decides under 14:00. `clock` is the
+    tests' seam for that second reading; with `now` injected and no `clock`, the
+    injected time stands.
+
+    Implements: SR-073, LLR-1314, LLR-1315, LLR-1316, LLR-1317, LLR-1318, LLR-1319
+    """
+    config = resolve_heart_samples_config(env)
+    zone = resolve_heart_zone(env)
+    env["_heart_zone"] = zone
+    injected = now is not None
+    now = int(now if injected else time.time())
+    state_path = env.get("WEIGHT_STATE_FILE") or "/var/lib/homehub-weight/weight-state.json"
+    state_root = resolve_state_root(env)
+    feed_url = env["_feed_url"]
+    timeout = int(env.get("WEIGHT_TIMEOUT_SECONDS") or 30)
+    source = enabled_source(env)
+    env["_now"] = now
+
+    read, failures, auth_failed = None, [], False
+    try:
+        read = (reader or read_google_health_heart_samples)(env)
+    except NoWeightYet:
+        read = ([], [])
+    except AuthFailure as exc:
+        auth_failed = True
+        failures.append("%s: %s" % (source, exc))
+    except SourceFailure as exc:
+        failures.append("%s: %s" % (source, exc))
+    except Exception as exc:
+        failures.append("%s: unexpected %s" % (source, type(exc).__name__))
+    if clock is not None:
+        now = int(clock())
+    elif not injected:
+        now = int(time.time())
+
+    state = load_state(state_path, now)
+    before = json.loads(json.dumps(state, sort_keys=True))
+    count_key = heart_count_key(source)
+    counts = dict(state.get(AUTH_STATE_KEY) or {})
+    if auth_failed:
+        counts[count_key] = min(counts.get(count_key, 0) + 1, AUTH_CONFIRM_CYCLES)
+    elif read is not None:
+        counts.pop(count_key, None)          # ONLY a successful read clears it
+    confirmed = counts.get(count_key, 0) >= AUTH_CONFIRM_CYCLES
+    if auth_failed:
+        failures.append(
+            "%s: sign-in failure %d of %d%s" % (
+                source, counts[count_key], AUTH_CONFIRM_CYCLES,
+                " - confirmed, the gauge is grey until the login is renewed"
+                if confirmed else
+                " - not yet confirmed, the last night is kept"))
+    if counts:
+        state[AUTH_STATE_KEY] = counts
+    else:
+        state.pop(AUTH_STATE_KEY, None)
+
+    nights = state.get(HEART_NIGHTS_KEY) or {}
+    check_heart_night_stamps(nights, zone)
+    if read is not None:
+        samples, sessions = read
+        # NOTHING FROM THE FUTURE: a sample or a session end later than the clock
+        # (beyond the skew allowance) has not happened, and must not set tonight's
+        # figure or pick its window.
+        horizon = now + MAX_CLOCK_SKEW_SECONDS
+        samples = [sample for sample in samples if sample[0] <= horizon]
+        sessions = [session for session in sessions if session[1] <= horizon]
+        cleaned = clean_heart_samples(samples, config["device"])
+        today = _local_date(now, zone)
+        figures = {}
+        for key in (today, today - timedelta(days=1)):
+            figures[key] = derive_heart_night(
+                cleaned, heart_night_window(key, sessions, config["device"], zone))
+        upsert_heart_nights(nights, figures, config["device"])
+    prune_heart_nights(nights, now, zone)
+
+    # ONLY THE CONFIGURED DEVICE'S NIGHTS ARE SHOWN: after HEART_SAMPLE_DEVICE
+    # changes, a stored night from the old device is history, not a reading.
+    mine = {key: night for key, night in nights.items()
+            if night.get("device") == config["device"]}
+    name, stamp = (None, None) if confirmed else decide_heart_night(mine, now, zone)
+    fallback = heart_bar(config["target"], config)
+    try:
+        if name is None:
+            body = heart_gauge_body(0, None, fallback)
+        else:
+            body = heart_gauge_body(nights[name]["rhr"], stamp,
+                                    heart_bar(heart_target_for(nights, name, config),
+                                              config))
+    except (ValueError, SourceFailure) as exc:
+        failures.append("gauge %s: %s" % (HEART_GAUGE_ID, exc))
+        body, name = heart_gauge_body(0, None, fallback), None
+    try:
+        ok, detail = (poster or post_gauge)(body, feed_url, env, timeout)
+    except Exception as exc:                 # a poster bug is a failed post
+        ok, detail = False, type(exc).__name__
+    if not ok:
+        failures.append("post %s: %s" % (HEART_GAUGE_ID, detail))
+    elif name is not None:
+        # FROZEN FROM HERE ON, and only now: a stamp is the mark of a night that
+        # REACHED NagLight, which is what lets it stand in for yesterday.
+        nights[name].setdefault("observed_at", stamp)
+
+    if nights:
+        state[HEART_NIGHTS_KEY] = nights
+    else:
+        state.pop(HEART_NIGHTS_KEY, None)
+    if json.loads(json.dumps(state, sort_keys=True)) != before:
+        try:
+            save_state(state, state_path, state_root)
+        except OSError as exc:
+            failures.append("state %s: %s" % (state_path, type(exc).__name__))
+    return [(HEART_GAUGE_ID, name is not None, ok)], failures
+
+
 def report_heart(env):
     """Run the heart cycle and print its lines; returns True when it failed.
 
@@ -5340,12 +6080,17 @@ def main(argv=None):
         print("weight: configuration accepted (identity set, destination local).")
         if heart_on:
             try:
-                resolve_heart_config(env)
+                samples = resolve_heart_source(env) == "samples"
+                if samples:
+                    resolve_heart_samples_config(env)
+                else:
+                    resolve_heart_config(env)
                 resolve_heart_zone(env)
             except ValueError as exc:
                 print("heart: REFUSED - %s" % exc, file=sys.stderr)
                 return 2
-            print("heart: configuration accepted (HEART_ENABLED, range valid, zone known).")
+            print("heart: configuration accepted (HEART_ENABLED, HEART_SOURCE=%s, "
+                  "knobs valid, zone known)." % ("samples" if samples else "daily"))
         return 0
     # THE HEART HALF RUNS AFTER THE WEIGHT HALF ON EVERY PATH, INCLUDING THE
     # REFUSED ONES, and only when HEART_ENABLED is on (a heart cycle with it off

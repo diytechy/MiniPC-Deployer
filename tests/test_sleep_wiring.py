@@ -156,8 +156,9 @@ def test_the_weight_unit_hands_the_whole_env_to_the_feeder_so_heart_needs_no_hoo
 def test_the_example_ships_heart_off_with_the_documented_bounds_and_sleep_off():
     values = dict(re.findall(r"(?m)^([A-Z][A-Z0-9_]*)=(.*)$", ENV_EXAMPLE.read_text(encoding="utf-8")))
     assert values["HEART_ENABLED"] == "0"
+    # The target is the ruled 75 since 2026-10-25 (HomeHub heart gauge plan).
     assert (values["HEART_MIN_BPM"], values["HEART_MAX_BPM"], values["HEART_TARGET_BPM"]) == \
-        ("40", "100", "60")
+        ("40", "100", "75")
     assert values["SLEEP_ENABLED"] == "false" and values["SLEEP_USER"] == ""
 
 
@@ -323,12 +324,15 @@ def test_a_quoted_empty_value_is_empty(tmp_path, monkeypatch, capsys, quoted):
     assert rc == 1 and re.search(r"(?m)^MYAIR_PASSWORD\s+empty$", out)
 
 
-@pytest.mark.parametrize("heart", ["HEART_ENABLED=1\n", "HEART_ENABLED=true\n", ""])
-def test_report_fails_unless_heart_is_literally_zero(tmp_path, monkeypatch, capsys, heart):
+@pytest.mark.parametrize("heart", ["HEART_ENABLED=true\n", "HEART_ENABLED=\n", ""])
+def test_report_fails_unless_heart_is_a_literal_zero_or_one(tmp_path, monkeypatch, capsys, heart):
+    """Since 2026-10-25 the heart gauge is ruled on; 0 and 1 are the two literals
+    the feeder and firstboot read the same way."""
     rc, out, _t, _ = run_helper(tmp_path, monkeypatch, capsys, ["--report"], FULL_GOOD + heart)
-    assert rc == 1 and "HEART_ENABLED must be the literal 0" in out
-    rc, out, _t, _ = run_helper(tmp_path, monkeypatch, capsys, ["--report"], FULL_GOOD + "HEART_ENABLED=0\n")
-    assert rc == 0
+    assert rc == 1 and "HEART_ENABLED must be the literal 0 or 1" in out
+    for good in ("HEART_ENABLED=0\n", "HEART_ENABLED=1\n"):
+        rc, out, _t, _ = run_helper(tmp_path, monkeypatch, capsys, ["--report"], FULL_GOOD + good)
+        assert rc == 0
 
 
 def test_report_flags_export_and_indented_forms(tmp_path, monkeypatch, capsys):

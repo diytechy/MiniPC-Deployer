@@ -1295,6 +1295,55 @@ been entered.
 *(H1, 2026-10-11. SR-073, LLR-1091..LLR-1096. Built ahead of a data source: it
 posts "unavailable" until a device feeds it.)*
 
+> **Since 2026-10-25 the gauge has a second source, `HEART_SOURCE=samples`**
+> (LLR-1314..LLR-1319, TC-1486..TC-1492; ruled in HomeHub
+> `docs/HEART_GAUGE_PLAN_2026-10-25.md`). Google derives no daily resting rate
+> for the Owner's watch, so the daily reader below stays empty. In samples mode
+> the feeder reads the watch's 5-minute `heart-rate` samples and its `sleep`
+> sessions (both filtered to the last 60 h, one token refresh) and computes
+> each night itself:
+>
+> - **Window:** the watch's sleep session start to start + 9 h (the watch ends
+>   the night early); with no session, 22:00 to 10:00 local, and then the
+>   3-hour coverage gate (36 samples) counts only 00:00-08:00.
+> - **Cleaning:** the selected device only (`HEART_SAMPLE_DEVICE`, `FFit`),
+>   35..150 bpm, disagreeing samples at one instant dropped, and **blips**
+>   dropped: a reading at least 10 bpm below both neighbours (each within 10
+>   minutes). Measured on 2026-10-23..25: 33 of 360 readings went, 28 of them
+>   daytime swings that no night window uses. Of the 5 inside night windows, two
+>   were real blips (54 and 65 bpm) and one a probably real 69. It moved one
+>   night's figure, 76 to 78, by removing the 54.
+> - **The figure:** the lowest mean of 6 consecutive samples spanning at most
+>   30 minutes, rounded half up. The 25th percentile, the mean, the sample count,
+>   the window kind and the device are stored with it and never posted.
+> - **Colour:** `target` is the median of up to 28 earlier valid nights from the
+>   same device, rounded half up, once 7 exist; until then `HEART_TARGET_BPM`
+>   (75). `min`/`max` are target -/+ 12 (`HEART_COLOUR_SPAN_BPM` 24), so
+>   NagLight paints yellow from +4 and red from +12. A new device starts its own
+>   baseline.
+> - **Stamp:** the sleep gauge's nightly contract. The night key is the local
+>   date the night ends; it is first published no earlier than 06:00, stamped
+>   min(12:00, now), and the stamp is frozen (a later sync changes the value,
+>   never the stamp). Before 14:00 the previous published night stays; from 14:00
+>   with no valid night, unavailable.
+> - **State:** `heart-nights` in the weight state file, 60 nights, each night
+>   validated on load. A confirmed sign-in failure greys the gauge but KEEPS the
+>   record (it is the baseline); the daily mode clears its one reading instead,
+>   so here the grey is held by the count: only a successful read clears it.
+> - **Guards added by review (2026-10-25):** the clock is re-read after the
+>   fetch; samples and session ends after now (+5 min skew) are ignored; a
+>   night's stamp is frozen only after a successful POST; an oversized number in
+>   the state file is refused rather than crashing the loader both gauges share.
+>
+> Observed on the hub 2026-10-25 against live data (read only, nothing posted):
+> the night to 25 Oct gave 72 bpm from the session window, posted against the
+> fixed 75 with bar 63..87. **Not proven:** how the watch forms each 5-minute
+> value, how late a night lands in Google with background reading on, and
+> whether the watch's sleep onset is reliable across nights. Seven nights must
+> pass before the baseline colours anything.
+>
+> `weight_oauth.py capture --data-type heart-rate` saves one raw samples body.
+
 A third gauge, `heart`: **one number per day, the daily resting heart rate in
 beats per minute, lower is better.** It rides this feeder because the feeder
 already holds the Google Health connection. It ships **OFF**.

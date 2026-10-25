@@ -63,7 +63,10 @@ DEFAULT_ENV = "/opt/homehub/stack/.env"
 KEYS = ["SLEEP_ENABLED", "SLEEP_USER", "SLEEP_USER_ACCOUNT", "SLEEP_FEED_URL",
         "SLEEP_FEED_TOKEN", "SLEEP_PUBLISH", "SLEEP_STATE_FILE",
         "SLEEP_TIMEOUT_SECONDS", "MYAIR_EMAIL", "MYAIR_PASSWORD", "TIMEZONE",
-        "HEART_ENABLED", "HEART_MIN_BPM", "HEART_MAX_BPM", "HEART_TARGET_BPM"]
+        "HEART_ENABLED", "HEART_MIN_BPM", "HEART_MAX_BPM", "HEART_TARGET_BPM",
+        # The heart gauge's samples mode (2026-10-25, the Owner's ruling).
+        "HEART_SOURCE", "HEART_SAMPLE_DEVICE", "HEART_COLOUR_SPAN_BPM",
+        "HEART_BASELINE_NIGHTS", "HEART_MIN_BASELINE_NIGHTS"]
 # EXACT names: SLEEP_USR is a typo, not a key. The panel's display-sleep knobs
 # (SLEEP_MODE, SLEEP_START, SLEEP_END) share the word and are not in the set.
 ALLOWED = frozenset(KEYS)
@@ -345,8 +348,11 @@ def report(path):
     if values.get("SLEEP_ENABLED") != "true":
         print("NOTE: SLEEP_ENABLED is not the literal true - setup-sleep.sh installs nothing.")
         problems += 1
-    if values.get("HEART_ENABLED") != "0":
-        print("NOTE: HEART_ENABLED must be the literal 0 for this rollout (no heart device).")
+    # The heart gauge was ruled ON on 2026-10-25 (samples mode). Either literal is
+    # fine; anything else (blank, "true", a quoted form) is a value the feeder and
+    # firstboot may read differently.
+    if values.get("HEART_ENABLED") not in ("0", "1"):
+        print("NOTE: HEART_ENABLED must be the literal 0 or 1.")
         problems += 1
     return 0 if problems == 0 else 1
 

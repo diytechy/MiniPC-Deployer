@@ -1342,6 +1342,18 @@ posts "unavailable" until a device feeds it.)*
 > whether the watch's sleep onset is reliable across nights. Seven nights must
 > pass before the baseline colours anything.
 >
+> **The long-term goal (2026-10-25, LLR-1320, TC-1493).** A PROJECT row in the
+> Sheet, category Health, id `heart-goal` (`HEART_GOAL_CATEGORY` /
+> `HEART_GOAL_ITEM_ID`), carries `target` (bpm, 30..150), `unit: bpm` and `due`
+> (YYYY-MM-DD). Once the usual exists, the target glides in a straight line
+> from the usual on the day the goal is set to the goal on the due date, and
+> the colour compares tonight with the LOWER of the usual and the path, so an
+> illness rise still shows when you are ahead of schedule. Changing the row's
+> target or due date restarts the path from the current usual (the reset);
+> deleting the row or its target drops it. A row with a wrong unit, a bad
+> target or no due date is reported each cycle and the last good path is kept.
+> The path lives in the state file as `heart-goal`.
+>
 > `weight_oauth.py capture --data-type heart-rate` saves one raw samples body.
 
 A third gauge, `heart`: **one number per day, the daily resting heart rate in

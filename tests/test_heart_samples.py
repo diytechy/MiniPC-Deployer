@@ -615,3 +615,138 @@ def test_only_the_configured_devices_nights_are_shown(tmp_path):
     seed_nights(env, {"2026-10-25": stored_night(60, device=WATCH, observed_at=L(10, 25, 7))})
     _p, _f, body = cycle(env, L(10, 25, 9), (night_samples(), []))   # watch samples only
     assert body["value"] == 0 and "observed_at" not in body
+
+
+# ── TC-1493: the long-term goal from the Sheet's project row (2026-10-25) ────
+
+def goal_defs(tmp_path, target="60", unit="bpm", due="2027-04-25", item="heart-goal"):
+    """A Health definitions file in the shape the tracker syncs from the Sheet."""
+    defs = tmp_path / "definitions"
+    defs.mkdir(parents=True, exist_ok=True)
+    lines = ["---", "category: Health", "items:", "  - id: weigh-in",
+             "    title: Step on the scale", "    type: automated", "    recur: weekly",
+             "    target: 170", "    unit: lb", "    check: weight",
+             "  - id: %s" % item, "    title: Resting heart rate goal", "    type: project"]
+    if target is not None:
+        lines.append("    target: %s" % target)
+    if unit is not None:
+        lines.append("    unit: %s" % unit)
+    if due is not None:
+        lines.append("    due: %s" % due)
+    lines.append("---")
+    (defs / "health.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(defs)
+
+
+def test_the_goal_row_is_read_and_a_bad_one_is_refused(tmp_path):
+    defs = goal_defs(tmp_path)
+    assert feeder.read_heart_goal(defs, "Health", "heart-goal") == (60, date(2027, 4, 25))
+    assert feeder.read_heart_goal("", "Health", "heart-goal") is None
+    assert feeder.read_heart_goal(defs, "Health", "no-such-row") is None
+    assert feeder.read_heart_goal(goal_defs(tmp_path / "a", target=None), "Health", "heart-goal") is None
+    for bad in ({"unit": "lb"}, {"unit": None}, {"target": "6O"}, {"target": "20"},
+                {"due": None}, {"due": "April"}):
+        with pytest.raises(ValueError):
+            feeder.read_heart_goal(goal_defs(tmp_path / str(len(str(bad))) / "x", **bad),
+                                   "Health", "heart-goal")
+
+
+def test_the_path_glides_from_the_usual_to_the_goal_by_the_due_date():
+    path = {"target": 60, "due": "2027-04-24", "start": "2026-10-26", "start_usual": 72}
+    assert feeder.glide_target(path, date(2026, 10, 26)) == 72
+    assert feeder.glide_target(path, date(2027, 1, 24)) == 66        # halfway (90 of 180 days)
+    assert feeder.glide_target(path, date(2027, 6, 1)) == 60         # held after the due date
+
+
+def test_changing_the_row_restarts_the_path_and_removing_it_drops_it():
+    today = date(2026, 11, 2)
+    old = {"target": 60, "due": "2027-04-25", "start": "2026-10-26", "start_usual": 72}
+    assert feeder.update_heart_goal_path(old, (60, date(2027, 4, 25)), 71, today) == old
+    reset = feeder.update_heart_goal_path(old, (58, date(2027, 4, 25)), 71, today)
+    assert reset == {"target": 58, "due": "2027-04-25", "start": "2026-11-02", "start_usual": 71}
+    moved = feeder.update_heart_goal_path(old, (60, date(2027, 6, 1)), 71, today)
+    assert moved["start"] == "2026-11-02" and moved["start_usual"] == 71
+    assert feeder.update_heart_goal_path(old, None, 71, today) is None
+    waiting = feeder.update_heart_goal_path(None, (60, date(2027, 4, 25)), None, today)
+    assert waiting["start_usual"] is None                 # no usual yet: no line drawn
+    begun = feeder.update_heart_goal_path(waiting, (60, date(2027, 4, 25)), 70, date(2026, 11, 9))
+    assert begun["start"] == "2026-11-09" and begun["start_usual"] == 70
+
+
+def test_the_target_is_the_lower_of_the_usual_and_the_path():
+    cfg = feeder.resolve_heart_samples_config({})
+    nights = {"2027-01-24": stored_night(70)}
+    for i in range(1, 8):
+        nights[(date(2027, 1, 24) - timedelta(days=i)).isoformat()] = stored_night(70)
+    behind = {"target": 60, "due": "2027-04-24", "start": "2026-10-26", "start_usual": 72}
+    assert feeder.heart_target_for(nights, "2027-01-24", cfg, behind) == 66   # path pulls down
+    ahead = {"target": 60, "due": "2027-04-24", "start": "2026-10-26", "start_usual": 90}
+    assert feeder.heart_target_for(nights, "2027-01-24", cfg, ahead) == 70    # usual still rules
+    assert feeder.heart_target_for(nights, "2027-01-24", cfg, None) == 70
+
+
+def test_the_cycle_reads_the_goal_keeps_the_path_and_reports_a_bad_row(tmp_path):
+    env = make_env(tmp_path, WEIGHT_DEFINITIONS_DIR=goal_defs(tmp_path / "g"))
+    seed_nights(env, {(NIGHT - timedelta(days=i)).isoformat(): stored_night(72)
+                      for i in range(1, 8)})
+    _p, failures, body = cycle(env, L(10, 25, 8), (night_samples(floor=72), []))
+    assert failures == [] and body["target"] == 72          # day one of the path
+    assert state_of(env)[feeder.HEART_GOAL_STATE_KEY] == {
+        "target": 60, "due": "2027-04-25", "start": "2026-10-25", "start_usual": 72}
+    env["WEIGHT_DEFINITIONS_DIR"] = goal_defs(tmp_path / "bad", unit="lb")
+    _p, failures, body = cycle(env, L(10, 25, 9), (night_samples(floor=72), []))
+    assert any(line.startswith("heart goal:") for line in failures)
+    assert state_of(env)[feeder.HEART_GOAL_STATE_KEY]["start_usual"] == 72   # last good kept
+    env["WEIGHT_DEFINITIONS_DIR"] = goal_defs(tmp_path / "gone", target=None)
+    _p, failures, _b = cycle(env, L(10, 25, 10), (night_samples(floor=72), []))
+    assert feeder.HEART_GOAL_STATE_KEY not in state_of(env)
+
+
+def test_a_stored_path_is_validated_on_load():
+    good = {"target": 60, "due": "2027-04-25", "start": "2026-10-25", "start_usual": 72}
+    assert feeder.validate_heart_goal_state(good) == good
+    for bad in (dict(good, target=True), dict(good, target=10), dict(good, due="soon"),
+                dict(good, start_usual=300), "junk"):
+        assert feeder.validate_heart_goal_state(bad) is None
+
+
+def test_goal_review_fixes_rounding_future_start_and_io_errors(tmp_path, monkeypatch):
+    # Exact half-up: 97 -> 30 over 134 days, day 85 is exactly 54.5.
+    path = {"target": 30, "due": "2027-03-08", "start": "2026-10-25", "start_usual": 97}
+    assert feeder.glide_target(path, date(2027, 1, 18)) == 55
+    # A start after today (a clock that jumped) restarts the path.
+    future = {"target": 60, "due": "2027-04-25", "start": "2026-11-08", "start_usual": 72}
+    again = feeder.update_heart_goal_path(future, (60, date(2027, 4, 25)), 71, date(2026, 10, 25))
+    assert again["start"] == "2026-10-25" and again["start_usual"] == 71
+    # An I/O error reading the definitions still posts the gauge.
+    env = make_env(tmp_path, WEIGHT_DEFINITIONS_DIR=goal_defs(tmp_path / "g"))
+
+    def broken(*_a, **_k):
+        raise PermissionError("denied")
+    monkeypatch.setattr(feeder, "scan_definitions", broken)
+    _p, failures, body = cycle(env, L(10, 25, 8), (night_samples(), []))
+    assert body["value"] == 60 and any("unexpected PermissionError" in f for f in failures)
+
+
+def test_an_unexpected_error_in_the_weight_half_still_runs_the_heart_half(monkeypatch, capsys):
+    """Review round 2 (2026-10-25): a definitions directory that cannot be
+    listed used to escape main() before the heart cycle ran."""
+    for key, value in {"WEIGHT_ENABLED": "true", "WEIGHT_USER": "u",
+                       "WEIGHT_FEED_URL": "http://127.0.0.1:8080/api/feed",
+                       "HEART_ENABLED": "1", "HEART_SOURCE": "samples",
+                       "TIMEZONE": "America/Chicago"}.items():
+        monkeypatch.setenv(key, value)
+    ran = []
+
+    def weight_breaks(env):
+        raise PermissionError("denied")
+
+    def heart_runs(env):
+        ran.append("heart")
+        return [("heart", True, True)], []
+    monkeypatch.setattr(feeder, "run_cycle", weight_breaks)
+    monkeypatch.setattr(feeder, "run_heart_cycle", heart_runs)
+    assert feeder.main([]) == 2
+    assert ran == ["heart"]
+    err = capsys.readouterr().err
+    assert "unexpected PermissionError" in err and "denied" not in err

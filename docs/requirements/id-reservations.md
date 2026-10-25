@@ -19,6 +19,7 @@ truth for what each id means.
 | 2026-10-22 | Plan W3b (watches: door recorder segments, scratch identity, meeting pull) | SR-119..120; LLR-1290..1299; TC-1460..1469 (used: LLR-1290..1292, TC-1460..1466; SR-088 amended, no new SR) |
 | 2026-10-22 | Plan W8c (OtterTube on the hub: downloader, catalogue, site) | SN-051; SR-113..118; LLR-1260..1289; TC-1430..1459; IF-072..073 (used: SN-051, SR-113..117, LLR-1260..1283, TC-1430..1454, IF-072, IF-073) |
 | 2026-10-23 | defs-guard growth fix | LLR-1310..1312; TC-1480..1484 (used: none - IF-036 amended instead; tests are D23..D28 in stack/tracker/tests/defs-guard.test.sh) |
+| 2026-10-25 | heart long-term goal from the Sheet (glide path) | LLR-1320; TC-1493 (used: both; SR-073 amended) |
 | 2026-10-25 | heart gauge from 5-minute samples (HEART_SOURCE=samples) | LLR-1314..1319; TC-1486..1492 (used: all; SR-073 amended) |
 | 2026-10-25 | myAir usage minutes kept by the sleep feeder (not posted) | LLR-1313; TC-1485 (used: LLR-1313, TC-1485; SR-070 and LLR-1085 amended) |
 | 2026-10-23 | nightly backup into the unified lane | SR-121; LLR-1300; TC-1470..1479 (used: SR-121, LLR-1300, TC-1470..1475; SR-018, IF-003, IF-006 amended) |

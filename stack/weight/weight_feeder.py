@@ -6248,6 +6248,10 @@ def report_heart(env):
     except ValueError as exc:
         print("heart: REFUSED, nothing posted - %s" % exc, file=sys.stderr)
         return True
+    except Exception as exc:
+        print("heart: FAILED, nothing posted - unexpected %s" % type(exc).__name__,
+              file=sys.stderr)
+        return True
     for key, fresh, ok in posted:
         print("heart: %-10s %-12s %s" % (key, "live" if fresh else "UNAVAILABLE",
                                          "posted" if ok else "POST FAILED"))
@@ -6298,6 +6302,15 @@ def main(argv=None):
         return 2
     except ValueError as exc:
         print("weight: REFUSED, nothing posted - %s" % exc, file=sys.stderr)
+        if heart_on:
+            report_heart(env)
+        return 2
+    except Exception as exc:
+        # ANY OTHER ERROR (a definitions directory that cannot be listed, say)
+        # is reported by TYPE ONLY, and the heart half still runs: neither half
+        # may stop the other (review 2026-10-25).
+        print("weight: FAILED, nothing posted - unexpected %s" % type(exc).__name__,
+              file=sys.stderr)
         if heart_on:
             report_heart(env)
         return 2

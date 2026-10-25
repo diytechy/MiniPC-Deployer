@@ -726,3 +726,27 @@ def test_goal_review_fixes_rounding_future_start_and_io_errors(tmp_path, monkeyp
     monkeypatch.setattr(feeder, "scan_definitions", broken)
     _p, failures, body = cycle(env, L(10, 25, 8), (night_samples(), []))
     assert body["value"] == 60 and any("unexpected PermissionError" in f for f in failures)
+
+
+def test_an_unexpected_error_in_the_weight_half_still_runs_the_heart_half(monkeypatch, capsys):
+    """Review round 2 (2026-10-25): a definitions directory that cannot be
+    listed used to escape main() before the heart cycle ran."""
+    for key, value in {"WEIGHT_ENABLED": "true", "WEIGHT_USER": "u",
+                       "WEIGHT_FEED_URL": "http://127.0.0.1:8080/api/feed",
+                       "HEART_ENABLED": "1", "HEART_SOURCE": "samples",
+                       "TIMEZONE": "America/Chicago"}.items():
+        monkeypatch.setenv(key, value)
+    ran = []
+
+    def weight_breaks(env):
+        raise PermissionError("denied")
+
+    def heart_runs(env):
+        ran.append("heart")
+        return [("heart", True, True)], []
+    monkeypatch.setattr(feeder, "run_cycle", weight_breaks)
+    monkeypatch.setattr(feeder, "run_heart_cycle", heart_runs)
+    assert feeder.main([]) == 2
+    assert ran == ["heart"]
+    err = capsys.readouterr().err
+    assert "unexpected PermissionError" in err and "denied" not in err

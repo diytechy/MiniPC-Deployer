@@ -60,9 +60,13 @@ Choices where the plan left a point open (the smallest consistent one):
 - The stamp is frozen when the night is first **decided for publication**, which
   can be a cycle before a failed POST succeeds. It is therefore never *later* than
   the real first publication, and never in the future.
-- `totalUsage` and the sub-scores are **not requested at all**. The plan's
-  "derived night end from `startDate` + `totalUsage`" alternative was not proven
-  meaningful by S0b, so it is not used.
+- **`totalUsage` (minutes) is requested and KEPT, never posted** (2026-10-25,
+  the Owner's request; where it is shown and how it is used is still open). It
+  is stored per night key in the state file's `usage` part for 60 nights,
+  validated as whole minutes within 0..1440 including 0, and a night with two
+  different figures is left unchanged. The journal says only how many nights
+  were recorded. It is NOT used to derive a night's end. The sub-scores are
+  still not requested.
 
 ## When myAir is asked
 
@@ -204,9 +208,9 @@ account** (field names and meanings only — the scores went to the Owner direct
   present on 40 of 40 and always within 0..100.
 - The device reported last night by 09:59 local, well before the 14:00 grace.
 
-Only `startDate` and `sleepScore` are requested (the upstream query also asks for
-the sub-scores and usage; this feeder does not use them, so fewer health values
-cross the wire and sit in memory).
+Only `startDate`, `sleepScore` and `totalUsage` are requested (the upstream
+query also asks for the sub-scores, leak and mask figures; this feeder does not
+use them, so fewer health values cross the wire and sit in memory).
 
 ## NOT PROVEN
 

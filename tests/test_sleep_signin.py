@@ -67,15 +67,18 @@ def test_the_flow_is_four_okta_calls_then_one_graphql_call():
         [("2026-10-11", 82), ("2026-10-10", 79)]
 
 
-def test_the_query_asks_for_thirty_days_and_only_the_two_fields_it_uses():
+def test_the_query_asks_for_thirty_days_and_only_the_fields_it_keeps():
+    """The score drives the gauge; `totalUsage` is kept in the state file and
+    never posted (the Owner's request, 2026-10-25). The sub-scores, leak and
+    mask figures are still not asked for."""
     fake = FakeMyAir()
     fake.records = RECORDS
     with serve_myair(fake) as (base, _seen):
         read_through(fake, base)
     query = fake.graphql_query
     assert 'startMonth: "2026-09-12"' in query and 'endMonth: "2026-10-12"' in query
-    assert "startDate" in query and "sleepScore" in query
-    for unused in ("totalUsage", "ahi", "leakPercentile", "maskPairCount", "usageScore",
+    assert "startDate" in query and "sleepScore" in query and "totalUsage" in query
+    for unused in ("ahi", "leakPercentile", "maskPairCount", "usageScore",
                    "firstName", "fgDevices", "serialNumber"):
         assert unused not in query, unused
 

@@ -95,6 +95,15 @@ STAMP_HOUR_LOCAL = 12
 # returns for 30 days is not kept. State is pruned to this many days back.
 KEEP_NIGHTS_BACK_DAYS = 3
 MYAIR_WINDOW_DAYS = 30
+# THE NIGHTLY USAGE RECORD (2026-10-25). The Owner asked that myAir's usage
+# minutes be pulled and kept; where they are shown and how they are used is
+# still open (a CPAP-off night is expected to raise the night's heart rate, see
+# HomeHub docs/HEART_GAUGE_PLAN_2026-10-25.md 6.1). They are NOT posted. Sixty
+# nights outlast the 30-day fetch window, so the record grows past what one
+# fetch returns, and cover a 28-night baseline with room to spare.
+USAGE_KEEP_DAYS = 60
+# A night cannot hold more than a day of usage. A larger number is not usage.
+USAGE_MAX_MINUTES = 24 * 60
 
 # THE HUB AND THE VENDOR DO NOT SHARE A CLOCK. Small on purpose: it absorbs NTP
 # jitter, it does not make a future stamp look real.
@@ -118,8 +127,10 @@ MAX_BODY_BYTES = 4 * 1024 * 1024        # a month of nightly records is a few KB
 # epoch). They are separate on purpose: "before 14:00 the previous night's score
 # stays" means a night that was really on the wall, not one that merely sits in
 # the cache after an outage (Sol #1). "schedule" remembers when myAir was last
-# asked, so a one-shot unit can keep to the fetch windows below.
+# asked, so a one-shot unit can keep to the fetch windows below. "usage" is
+# {night key: minutes of CPAP use}, kept USAGE_KEEP_DAYS and never posted.
 NIGHTS_KEY = "nights"
+USAGE_KEY = "usage"
 PUBLISHED_KEY = "published"
 SCHEDULE_KEY = "schedule"
 AUTH_COUNTS_KEY = "__auth_failures__"
@@ -347,14 +358,33 @@ def first_publish_epoch(day, tz):
                            tzinfo=tz).timestamp())
 
 
-Record = namedtuple("Record", ("start_date", "score"))
+Record = namedtuple("Record", ("start_date", "score", "usage"), defaults=(None,))
+
+
+def valid_usage_minutes(raw):
+    """myAir's `totalUsage` as whole minutes, or None when it is not usable.
+
+    Contract: an int (or a whole float) within 0..USAGE_MAX_MINUTES INCLUDING 0
+    (a night with the machine unused is a real 0, if myAir reports one - which
+    is unproven, see README "NOT PROVEN"). A null, a missing key, a string, a
+    bool, NaN, a fraction or an out-of-range number is "no data" - never 0.
+
+    Implements: SR-070, LLR-1313
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    if isinstance(raw, float) and not (math.isfinite(raw) and raw == int(raw)):
+        return None
+    if raw < 0 or raw > USAGE_MAX_MINUTES:
+        return None
+    return int(raw)
 
 
 def parse_records(payload):
     """GraphQL `getPatientWrapper.sleepRecords.items` -> ([Record], unreadable_count).
 
-    Only `startDate` and `sleepScore` are read; nothing else is requested, held
-    or logged. A record whose `startDate` is not a bare date is counted and
+    Only `startDate`, `sleepScore` and `totalUsage` are read; nothing else is
+    requested, held or logged. A record whose `startDate` is not a bare date is counted and
     skipped (we cannot key it); its score is NOT parsed here, `valid_score`
     judges it in `upsert_nights`.
 
@@ -379,7 +409,7 @@ def parse_records(payload):
         if start is None:
             unreadable += 1
             continue
-        out.append(Record(start, item.get("sleepScore")))
+        out.append(Record(start, item.get("sleepScore"), item.get("totalUsage")))
     return out, unreadable
 
 
@@ -442,6 +472,42 @@ def upsert_nights(nights, records, now, tz):
         elif entry["score"] != score:
             entry["score"] = score            # a correction: value only, stamp frozen
             changed.append(name)
+    return changed
+
+
+def upsert_usage(usage, records, now, tz):
+    """Fold one fetch's usage minutes into the stored record. Returns the changed keys.
+
+    Keyed by the same night key as the score. A record for a night later than
+    today, or older than USAGE_KEEP_DAYS, is ignored; a record with no valid
+    minutes changes nothing; two records for one night with DIFFERENT minutes
+    are ambiguous and leave that night as it was for this cycle. A later fetch
+    that reports different minutes for a stored night replaces them: there is
+    no frozen stamp here, because nothing is posted.
+
+    Implements: SR-070, LLR-1313
+    """
+    today = expected_night(now, tz)
+    oldest = today - dt.timedelta(days=USAGE_KEEP_DAYS)
+    seen = {}
+    for record in records:
+        key = night_key_for(record.start_date)
+        if key > today or key < oldest:
+            continue
+        minutes = valid_usage_minutes(record.usage)
+        if minutes is None:
+            continue
+        if key in seen and seen[key] != minutes:
+            seen[key] = None                  # ambiguous: two figures for one night
+        else:
+            seen[key] = minutes
+    changed = []
+    for key, minutes in seen.items():
+        name = key.isoformat()
+        if minutes is None or usage.get(name) == minutes:
+            continue
+        usage[name] = minutes
+        changed.append(name)
     return changed
 
 
@@ -641,9 +707,33 @@ def validate_schedule(entry, now):
     return {"day": entry["day"], "attempt_at": stamp, "done": sorted(set(done)), "fails": fails}
 
 
+def validate_usage(entry, now, tz):
+    """The stored usage record, each night checked; anything not credible is dropped.
+
+    Implements: SR-070, LLR-1313
+    """
+    out = {}
+    if not isinstance(entry, dict):
+        return out
+    today = expected_night(now, tz)
+    oldest = today - dt.timedelta(days=USAGE_KEEP_DAYS)
+    for key, minutes in entry.items():
+        day = parse_night_date(key)
+        if day is None or day > today or day < oldest:
+            continue
+        if isinstance(minutes, int) and valid_usage_minutes(minutes) is not None:
+            out[key] = minutes
+    return out
+
+
+def prune_usage(state, now, tz):
+    """Drop usage nights older than USAGE_KEEP_DAYS or dated later than today."""
+    state[USAGE_KEY] = validate_usage(state[USAGE_KEY], now, tz)
+
+
 def empty_state():
     # "_notes" is transient: status lines the loader wants journalled. Never saved.
-    return {NIGHTS_KEY: {}, PUBLISHED_KEY: {}, SCHEDULE_KEY: None,
+    return {NIGHTS_KEY: {}, PUBLISHED_KEY: {}, USAGE_KEY: {}, SCHEDULE_KEY: None,
             AUTH_COUNTS_KEY: {}, AUTH_MARKER_KEY: None, "_notes": []}
 
 
@@ -1088,9 +1178,9 @@ def open_no_follow(path):
 def load_state(state_path, now, tz):
     """The state file, each part VALIDATED. A missing or unreadable file is empty.
 
-    Five parts, each by its own validator (never an exemption): the nights, the
-    published night keys, the fetch schedule, the consecutive-auth-failure
-    counter, and the sticky auth marker. Whatever the
+    Six parts, each by its own validator (never an exemption): the nights, the
+    published night keys, the nightly usage minutes, the fetch schedule, the
+    consecutive-auth-failure counter, and the sticky auth marker. Whatever the
     loader does not vouch for is dropped here - and the next `save_state` would
     erase it - which is why each recognised part needs a validator at all.
 
@@ -1114,6 +1204,7 @@ def load_state(state_path, now, tz):
     if dropped:
         state["_notes"].append("ignored %d published night key(s) dated later than tomorrow "
                                "(corrupt state or a forward clock jump)" % dropped)
+    state[USAGE_KEY] = validate_usage(data.get(USAGE_KEY), now, tz)
     state[SCHEDULE_KEY] = validate_schedule(data.get(SCHEDULE_KEY), now)
     state[AUTH_COUNTS_KEY] = validate_auth_counts(data.get(AUTH_COUNTS_KEY))
     state[AUTH_MARKER_KEY] = validate_auth_marker(data.get(AUTH_MARKER_KEY), now)
@@ -1123,16 +1214,16 @@ def load_state(state_path, now, tz):
 def save_state(state, state_path, state_root):
     """Write the state file through `open_for_write`, atomically, mode 0600.
 
-    It holds night keys, scores and timestamps, a failure count and a marker -
-    never a credential, a token, a header or a response body (asserted by test).
-    The SCORE lives here, in a 0600 file under a 0700 directory, and nowhere
-    else on the box.
+    It holds night keys, scores, usage minutes and timestamps, a failure count
+    and a marker - never a credential, a token, a header or a response body
+    (asserted by test). The SCORE and the USAGE MINUTES live here, in a 0600
+    file under a 0700 directory, and nowhere else on the box.
 
     Implements: SR-070, LLR-1085
     """
     tmp = state_path + ".tmp"
     out = {NIGHTS_KEY: state[NIGHTS_KEY], PUBLISHED_KEY: state[PUBLISHED_KEY],
-           AUTH_COUNTS_KEY: state[AUTH_COUNTS_KEY]}
+           USAGE_KEY: state[USAGE_KEY], AUTH_COUNTS_KEY: state[AUTH_COUNTS_KEY]}
     if state[SCHEDULE_KEY] is not None:
         out[SCHEDULE_KEY] = state[SCHEDULE_KEY]
     if state[AUTH_MARKER_KEY] is not None:
@@ -1498,17 +1589,19 @@ def sign_in(email, password, endpoints, timeout, opener=None):
 
 
 def graphql_query_text(today):
-    """The nightly query: the last 30 days, ONLY the two fields the contract uses.
+    """The nightly query: the last 30 days, ONLY the fields this feeder keeps.
 
-    The upstream query also asks for the sub-scores, usage and leak figures.
-    This feeder does not use them, so it does not ask: fewer health values
-    cross the wire and sit in memory. (Field names and meanings are in the
-    README, from the S0b probe.)
+    `startDate` and `sleepScore` drive the gauge; `totalUsage` (minutes) is
+    kept in the state file and never posted (2026-10-25, the Owner's request).
+    The upstream query also asks for the sub-scores and leak figures. This
+    feeder does not use them, so it does not ask: fewer health values cross the
+    wire and sit in memory. (Field names and meanings are in the README, from
+    the S0b probe.)
     """
     first = (today - dt.timedelta(days=MYAIR_WINDOW_DAYS)).isoformat()
     return ("query GetPatientSleepRecords { getPatientWrapper { "
             'sleepRecords(startMonth: "%s", endMonth: "%s") '
-            "{ items { startDate sleepScore __typename } __typename } "
+            "{ items { startDate sleepScore totalUsage __typename } __typename } "
             "__typename } }" % (first, today.isoformat()))
 
 
@@ -1747,7 +1840,12 @@ def run_cycle(env, now=None, tz=None, reader=None, poster=None, clock=None,
         changed = upsert_nights(state[NIGHTS_KEY], records, now, tz)
         if changed:
             notes.append("night key(s) updated: %s" % ", ".join(sorted(changed)))
+        # A COUNT, never the minutes: usage is a health value (SR-070).
+        usage_changed = upsert_usage(state[USAGE_KEY], records, now, tz)
+        if usage_changed:
+            notes.append("usage recorded for %d night(s)" % len(usage_changed))
     pruned_future = prune_nights(state, now, tz)
+    prune_usage(state, now, tz)
     if pruned_future:
         notes.append("pruned %d night key(s) dated later than tomorrow" % pruned_future)
 

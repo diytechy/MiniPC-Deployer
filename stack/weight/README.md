@@ -244,9 +244,18 @@ then wait at `Paste the address-bar URL here:`.
 
 1. Open that URL in a browser **on your PC** and sign in as the household
    account.
-2. Grant the health-metrics scope. Remember what it includes: blood glucose,
-   body fat, oxygen saturation, core body temperature and heart rate, because
-   there is no weight-only scope.
+2. Leave **every** permission ticked. Since 2026-10-25 `mint` asks for three
+   scopes on one token (the Owner ruled that the hub may read the watch's
+   sleep and steps, HomeHub plan decision 6.6):
+   - `googlehealth.health_metrics_and_measurements.readonly`: weight, height,
+     heart rate. It also includes blood glucose, body fat, oxygen saturation
+     and core body temperature, because there is no weight-only scope.
+     **Required:** without it nothing is written and the existing token is left
+     as it was, because the weight and heart gauges need it.
+   - `googlehealth.sleep.readonly` and
+     `googlehealth.activity_and_fitness.readonly` (steps, calories burned):
+     optional. Untick one and the token is still written, with a
+     `NOT GRANTED:` line naming what is missing.
 3. The browser lands on **"This site can't be reached" /
    `ERR_CONNECTION_REFUSED` at `localhost:8117`. THAT IS THE SUCCESS CASE.**
 4. Copy the **whole address bar** of that failed page, paste it into the SSH
@@ -261,6 +270,10 @@ weight: refresh token written to /var/lib/homehub-weight/tokens/google-health-to
 weight: the token itself was not printed, and the client secret was not copied into it.
 weight: next, capture ONE response body - see stack/weight/README.md.
 ```
+
+A `weight: NOT GRANTED: <scope>` line after them means that optional scope was
+unticked on the consent screen. The token file's `scope` field records what
+Google granted, not what was asked for.
 
 **Nothing secret is ever printed** — not the token, not the client secret, not
 the authorization code — on success, in an error, or in a traceback (there are
@@ -282,6 +295,8 @@ When it prints something else:
 | `that URL carries no state= parameter` | not the page this run opened. Start `mint` again. |
 | `that URL carries the code parameter 2 times` | the paste carries two codes; which one Google issued is not guessable, so none is exchanged. Start `mint` again. |
 | `NOTE - --token-file overrides WEIGHT_TOKEN_FILE` | not an error: you passed `--token-file` naming something other than the configured token. It is allowed and it is printed. The feeder reads `WEIGHT_TOKEN_FILE`, so a token written elsewhere is a copy the service will not use. |
+| `the health-metrics permission was not granted` | it was unticked on the consent screen. Nothing was written and the old token is untouched. Run `mint --force` again and leave every permission ticked. |
+| `Google's reply did not say which permissions were granted` | the token reply had no `scope` field, so it cannot be shown to carry the metrics scope. Nothing was written. Run `mint` again. |
 | `REFUSED: ... outside the service's own state directory` | `WEIGHT_TOKEN_FILE` points somewhere that is not under `/var/lib/homehub-weight`. The guard refuses; fix the knob. |
 
 ### The 7-day cliff: a refresh token minted for an app in Testing dies after a week (found 2026-10-11)
@@ -1074,8 +1089,10 @@ household for **nothing new**: no second consent screen, no re-mint, no
 widening. The Owner already handed this box blood glucose, body fat, oxygen
 saturation, core body temperature and heart-rate metrics when they consented for
 a weight bar, and height is inside that same grant. A test asserts the two URLs
-differ in exactly the `weight`/`height` segment and that only one scope constant
-exists, so the claim is checkable rather than remembered.
+differ in exactly the `weight`/`height` segment and that height reads under
+that one scope, so the claim is checkable rather than remembered. (Since
+2026-10-25 the feeder also defines the sleep and activity scopes for the
+watch's data; the scope-set test pins all three by name.)
 
 **The gate is CLEARED for height too — the parser is written against a real
 body.** On **2026-09-14** the Owner ran `weight_oauth.py capture --data-type
@@ -1130,10 +1147,12 @@ sudo /opt/homehub/stack/weight/weight_oauth.py capture \
 
 Delete it when you are done with it: it is one person's health data.
 
-`--data-type` is a fixed allow-list of two routes, both taken from the feeder's
-own constants — not a free `--url`, because the request carries an access token
-for the whole health-metrics scope and a knob on its destination is a way to
-send that token somewhere else.
+`--data-type` is a fixed allow-list of routes (`weight`, `height`, `heart`,
+and since 2026-10-25 `sleep` and `steps` for the watch), all taken from the
+feeder's own constants — not a free `--url`, because the request carries an
+access token for every scope the token holds, and a knob on its destination is
+a way to send that token somewhere else. `sleep` and `steps` have no parser:
+capture one body of each and read it before writing one.
 
 ### The waist: NagLight's own `/api/today`, and nothing new mounted
 
@@ -1431,7 +1450,7 @@ or the unfiltered call. The first real body must be compared with it.
 | File | What it is |
 |---|---|
 | `weight_feeder.py` | the feeder: pure core above the SHELL banner, thin I/O below |
-| `weight_oauth.py` | the two Owner-run tools: `mint` (browser consent -> refresh token) and `capture` (ONE dataPoints.list call -> a body on disk; `--data-type height` for NI_A2, `--data-type heart` for H1). No parser, and no writing door the feeder shares |
+| `weight_oauth.py` | the two Owner-run tools: `mint` (browser consent -> refresh token) and `capture` (ONE dataPoints.list call -> a body on disk; `--data-type height` for NI_A2, `--data-type heart` for H1, `sleep`/`steps` for the watch). No parser, and no writing door the feeder shares |
 | `homehub-weight.service` | oneshot unit, hardened, `ProtectHome=read-only` |
 | `homehub-weight.timer` | 15 min, justified against the `static` horizon |
 | `setup-weight.sh` | idempotent install; resolves the ONE category file by frontmatter and generates the drop-in; refuses rather than guessing |

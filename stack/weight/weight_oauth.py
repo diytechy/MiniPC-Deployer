@@ -133,8 +133,27 @@ LIST_URLS = {
     # document alone; `capture --data-type heart` is how the first real body is
     # looked at once a Fitbit-family device writes to Google Health.
     "heart": weight_feeder.GOOGLE_HEALTH_HEART_LIST_URL,
+    # The watch's sleep and steps (2026-10-25). Neither has a parser; these
+    # exist so the first real body of each is looked at before one is written.
+    "sleep": weight_feeder.GOOGLE_HEALTH_SLEEP_LIST_URL,
+    "steps": weight_feeder.GOOGLE_HEALTH_STEPS_LIST_URL,
 }
-SCOPE = weight_feeder.GOOGLE_HEALTH_SCOPE
+
+# THE SCOPES ONE TOKEN CARRIES, AND WHICH OF THEM IS NOT NEGOTIABLE. The weight
+# and heart gauges read this token and need the metrics scope; sleep and steps
+# were added on 2026-10-25 (plan decision 6.6). Google's consent screen lets the
+# account untick individual scopes, so what comes back can be any subset of
+# what was asked for. A token without the metrics scope would take the weight
+# gauge down the moment it replaced a working one, so it is REFUSED before the
+# file is touched; a missing optional scope only costs the read that needs it,
+# so the token is written and the gap is named.
+REQUIRED_SCOPE = weight_feeder.GOOGLE_HEALTH_SCOPE
+OPTIONAL_SCOPES = (weight_feeder.GOOGLE_HEALTH_SLEEP_SCOPE,
+                   weight_feeder.GOOGLE_HEALTH_ACTIVITY_SCOPE)
+SCOPES = (REQUIRED_SCOPE,) + OPTIONAL_SCOPES
+# The `scope` parameter is space-separated (RFC 6749 §3.3), and so is the
+# `scope` field of Google's token response.
+SCOPE = " ".join(SCOPES)
 
 # THE CONSENT FLOW: a registered loopback redirect, and NO LISTENER. See the
 # module docstring's companion section in README.md for the Owner's steps.
@@ -392,7 +411,7 @@ def authorization_url(client_id, redirect_uri, state, code_challenge,
     """The URL the Owner opens in a browser on their own PC.
 
     Contract:
-      Outputs: an absolute https URL carrying the client, the ONE scope, the
+      Outputs: an absolute https URL carrying the client, the scopes, the
                registered redirect, a CSRF `state` and the PKCE challenge.
 
     `access_type=offline` with `prompt=consent` is what makes Google return a
@@ -547,12 +566,48 @@ def refresh_fields(client_id, client_secret, refresh_token):
             "refresh_token": refresh_token, "grant_type": "refresh_token"}
 
 
+def missing_scopes(payload, required=REQUIRED_SCOPE, optional=OPTIONAL_SCOPES):
+    """The optional scopes Google did NOT grant. Refuses if the required one is
+    missing.
+
+    Contract:
+      Inputs:  payload - Google's parsed token response.
+      Outputs: a tuple of the optional scopes absent from its `scope` field,
+               in the order asked for; () when all were granted.
+      Raises:  Refused when the required scope is absent, or when the reply
+               does not say what was granted.
+
+    WHY A REPLY WITH NO `scope` IS REFUSED. Google's token endpoint always
+    returns it for an authorization-code exchange. A reply without one cannot
+    be shown to carry the metrics scope, and writing it would replace a token
+    that the weight and heart gauges are known to work with by one they may not.
+
+    Implements: SR-022, LLR-006
+    """
+    granted = payload.get("scope") if isinstance(payload, dict) else None
+    if not isinstance(granted, str) or not granted.strip():
+        raise Refused(
+            "Google's reply did not say which permissions were granted, so "
+            "nothing was written and the existing token file (if any) is "
+            "unchanged. Run mint again.")
+    held = set(granted.split())
+    if required not in held:
+        raise Refused(
+            "the health-metrics permission was not granted (it was unticked "
+            "on the consent screen), so nothing was written and the existing "
+            "token file (if any) is unchanged. The weight and heart gauges "
+            "need it. Run mint again and leave every permission ticked.")
+    return tuple(scope for scope in optional if scope not in held)
+
+
 def token_document(payload, minted_at, scope=SCOPE, client_key=CLIENT_ID_KEY):
     """What actually gets written to WEIGHT_TOKEN_FILE.
 
     Contract:
       Inputs:  payload - Google's parsed token response; minted_at - epoch s.
-      Outputs: a dict holding the refresh token and provenance.
+      Outputs: a dict holding the refresh token and provenance. Its `scope`
+               is what Google says it GRANTED, which may be fewer scopes than
+               were asked for; `scope` is only the fallback.
       Raises:  Refused when the response carries no refresh token.
 
     WHAT IS DELIBERATELY NOT IN IT:
@@ -1028,7 +1083,10 @@ def mint(args, out=None, prompt=None, auth_endpoint=AUTH_ENDPOINT,
                             pkce_challenge(verifier), endpoint=auth_endpoint)
     out.write(
         "\nOpen this URL in a browser ON YOUR PC (it is one line):\n\n%s\n\n"
-        "Sign in as the household account, and grant the health-metrics scope.\n"
+        "Sign in as the household account and leave EVERY permission ticked:\n"
+        "health metrics (weight, heart rate), sleep, and activity (steps).\n"
+        "Without health metrics nothing is written; without the other two the\n"
+        "token is written and the sleep or steps read is named as unavailable.\n"
         "THE BROWSER WILL THEN SHOW A 'site can't be reached' PAGE AT %s -\n"
         "THAT IS THE SUCCESS CASE. Nothing is listening there on purpose.\n"
         "Copy the WHOLE address-bar URL of that failed page and paste it below.\n"
@@ -1041,6 +1099,9 @@ def mint(args, out=None, prompt=None, auth_endpoint=AUTH_ENDPOINT,
         timeout, "the token exchange")
     document = token_document(payload, now if now is not None else time.time(),
                               client_key=client_key)
+    # BEFORE THE WRITE: `open_token_for_write` unlinks the old file, so a token
+    # without the metrics scope must be refused here or the working one is gone.
+    not_granted = missing_scopes(payload)
     with open_token_for_write(token_file, token_file, state_file, state_root) as handle:
         handle.write(json.dumps(document, indent=2, sort_keys=True) + "\n")
     handed = give_to_account(token_file, account)
@@ -1058,6 +1119,9 @@ def mint(args, out=None, prompt=None, auth_endpoint=AUTH_ENDPOINT,
               % (token_file, ", owner %s" % handed if handed else ""))
     out.write("weight: the token itself was not printed, and the client secret "
               "was not copied into it.\n")
+    for scope in not_granted:
+        out.write("weight: NOT GRANTED: %s - the read that needs it will be "
+                  "refused until mint is run again with it ticked.\n" % scope)
     out.write("weight: next, capture ONE response body - see stack/weight/README.md.\n")
     return 0
 
@@ -1185,7 +1249,8 @@ def build_parser():
              "is for NI_A2: the height parser was written against the "
              "discovery document, and this settles it against a real body. "
              "`heart` is for H1: the daily resting heart rate parser has never "
-             "seen a real body.")
+             "seen a real body. `sleep` and `steps` are the watch's "
+             "(2026-10-25): no parser exists for either yet.")
     capturer.add_argument("--out", required=True,
                           help="where to save the raw body; must not exist")
     capturer.add_argument("--page-size", type=int, default=None,

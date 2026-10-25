@@ -388,7 +388,8 @@ def test_a_symlink_inside_the_root_is_destroyed_not_followed_sr022(tmp_path):
 
     env_file = write_env(tmp_path)
     out = io.StringIO()
-    with loopback_server(json_responder(200, {"refresh_token": REFRESH_TOKEN}))             as (token_url, _seen):
+    with loopback_server(json_responder(200, {"refresh_token": REFRESH_TOKEN,
+                                              "scope": oauth.SCOPE}))             as (token_url, _seen):
         oauth.mint(mint_args(env_file, str(token), str(root), extra=["--force"]),
                    out=out, prompt=pasting(out),
                    token_endpoint=token_url + "/token", now=NOW)
@@ -433,7 +434,7 @@ def test_an_overriding_token_file_says_so_out_loud_sr022(tmp_path):
     env_file = write_env(tmp_path, WEIGHT_TOKEN_FILE=configured)
     elsewhere = str(root / "tokens" / "a-second-copy.json")
     out = io.StringIO()
-    with loopback_server(json_responder(200, {"refresh_token": REFRESH_TOKEN})) \
+    with loopback_server(json_responder(200, {"refresh_token": REFRESH_TOKEN, "scope": oauth.SCOPE})) \
             as (token_url, _seen):
         rc = oauth.mint(mint_args(env_file, elsewhere, str(root)), out=out,
                         prompt=pasting(out), token_endpoint=token_url + "/token",
@@ -456,7 +457,7 @@ def test_no_notice_is_printed_when_the_flag_names_the_configured_file_sr022(tmp_
     configured = str(root / "tokens" / "google-health-token.json")
     env_file = write_env(tmp_path, WEIGHT_TOKEN_FILE=configured)
     out = io.StringIO()
-    with loopback_server(json_responder(200, {"refresh_token": REFRESH_TOKEN})) \
+    with loopback_server(json_responder(200, {"refresh_token": REFRESH_TOKEN, "scope": oauth.SCOPE})) \
             as (token_url, _seen):
         oauth.mint(mint_args(env_file, configured, str(root)), out=out,
                    prompt=pasting(out), token_endpoint=token_url + "/token",
@@ -647,14 +648,102 @@ def test_the_capture_uses_the_route_the_discovery_document_gave_sr022():
     to catch, so the route is pinned rather than trusted."""
     assert oauth.LIST_URL == (
         "https://health.googleapis.com/v4/users/me/dataTypes/weight/dataPoints")
-    assert oauth.SCOPE == (
+    assert oauth.REQUIRED_SCOPE == (
         "https://www.googleapis.com/auth/googlehealth."
         "health_metrics_and_measurements.readonly")
 
 
+def test_the_token_asks_for_metrics_sleep_and_activity_sr022():
+    """2026-10-25: the Owner ruled that the hub may read the watch's sleep and
+    steps (plan decision 6.6). The strings are pinned against the discovery
+    document (revision 20261021), not derived, and metrics comes first because
+    it is the one the weight and heart gauges cannot do without."""
+    assert oauth.SCOPES == (
+        "https://www.googleapis.com/auth/googlehealth."
+        "health_metrics_and_measurements.readonly",
+        "https://www.googleapis.com/auth/googlehealth.sleep.readonly",
+        "https://www.googleapis.com/auth/googlehealth."
+        "activity_and_fitness.readonly")
+    assert oauth.SCOPE.split(" ") == list(oauth.SCOPES)
+    assert oauth.LIST_URLS["sleep"] == (
+        "https://health.googleapis.com/v4/users/me/dataTypes/sleep/dataPoints")
+    assert oauth.LIST_URLS["steps"] == (
+        "https://health.googleapis.com/v4/users/me/dataTypes/steps/dataPoints")
+
+
+def mint_granting(tmp_path, granted, token_text=None):
+    """Run `mint --force` against a fake Google that grants `granted` (None:
+    the reply has no `scope` field). Returns (outcome, printed, token_file),
+    where outcome is 0 or the Refused raised. `token_text`, when given, is a
+    working token file already in place."""
+    env_file = write_env(tmp_path)
+    state_root = str(tmp_path / "state")
+    token_file = tmp_path / "state" / "tokens" / "google-health-token.json"
+    if token_text is not None:
+        token_file.parent.mkdir(parents=True)
+        token_file.write_text(token_text, encoding="utf-8")
+    reply = {"refresh_token": REFRESH_TOKEN, "access_token": ACCESS_TOKEN,
+             "token_type": "Bearer"}
+    if granted is not None:
+        reply["scope"] = granted
+    out = io.StringIO()
+    with loopback_server(json_responder(200, reply)) as (url, _seen):
+        try:
+            outcome = oauth.mint(
+                mint_args(env_file, str(token_file), state_root, ["--force"]),
+                out=out, prompt=pasting(out), token_endpoint=url + "/token",
+                now=NOW)
+        except oauth.Refused as exc:
+            outcome = exc
+    return outcome, out.getvalue(), token_file
+
+
+def test_a_consent_without_the_metrics_scope_keeps_the_working_token_sr022(tmp_path):
+    """Google's consent screen lets the account untick a scope. A token without
+    the metrics one, written over a working token, would take the weight gauge
+    down - so it is refused BEFORE the old file is unlinked."""
+    working = '{"refresh_token": "the working one"}\n'
+    outcome, printed, token_file = mint_granting(
+        tmp_path, " ".join(oauth.OPTIONAL_SCOPES), token_text=working)
+    assert isinstance(outcome, oauth.Refused)
+    assert "health-metrics" in str(outcome)
+    assert token_file.read_text(encoding="utf-8") == working
+    for secret in SECRETS:
+        assert secret not in printed + str(outcome)
+
+
+def test_a_reply_that_does_not_say_what_was_granted_writes_nothing_sr022(tmp_path):
+    working = '{"refresh_token": "the working one"}\n'
+    outcome, _printed, token_file = mint_granting(tmp_path, None, token_text=working)
+    assert isinstance(outcome, oauth.Refused)
+    assert token_file.read_text(encoding="utf-8") == working
+
+
+def test_a_missing_optional_scope_is_written_and_named_sr022(tmp_path):
+    """Without sleep the token still serves weight, heart and steps, so it is
+    written - and the file's `scope` records what Google GRANTED, not what was
+    asked for, so the gap is visible in the file as well as on the terminal."""
+    granted = "%s %s" % (oauth.REQUIRED_SCOPE,
+                         "https://www.googleapis.com/auth/googlehealth."
+                         "activity_and_fitness.readonly")
+    outcome, printed, token_file = mint_granting(tmp_path, granted)
+    assert outcome == 0
+    stored = json.loads(token_file.read_text(encoding="utf-8"))
+    assert stored["scope"] == granted
+    assert "NOT GRANTED: https://www.googleapis.com/auth/googlehealth.sleep.readonly" in printed
+    assert "activity_and_fitness" not in printed.split("NOT GRANTED", 1)[1]
+
+
+def test_a_full_grant_names_nothing_as_missing_sr022(tmp_path):
+    outcome, printed, token_file = mint_granting(tmp_path, oauth.SCOPE)
+    assert outcome == 0
+    assert "NOT GRANTED" not in printed
+    assert json.loads(token_file.read_text(encoding="utf-8"))["scope"] == oauth.SCOPE
+
+
 # ── The flow's pure parts ───────────────────────────────────────────────────
 
-def test_the_authorization_url_asks_for_offline_access_and_the_one_scope_sr022():
+def test_the_authorization_url_asks_for_offline_access_and_the_scopes_sr022():
     """`access_type=offline` WITH `prompt=consent` is what returns a refresh
     token: Google omits it on a re-consent for a client the account has already
     granted, which is exactly this client (oauth2-proxy signs in with it)."""

@@ -708,3 +708,21 @@ def test_a_stored_path_is_validated_on_load():
     for bad in (dict(good, target=True), dict(good, target=10), dict(good, due="soon"),
                 dict(good, start_usual=300), "junk"):
         assert feeder.validate_heart_goal_state(bad) is None
+
+
+def test_goal_review_fixes_rounding_future_start_and_io_errors(tmp_path, monkeypatch):
+    # Exact half-up: 97 -> 30 over 134 days, day 85 is exactly 54.5.
+    path = {"target": 30, "due": "2027-03-08", "start": "2026-10-25", "start_usual": 97}
+    assert feeder.glide_target(path, date(2027, 1, 18)) == 55
+    # A start after today (a clock that jumped) restarts the path.
+    future = {"target": 60, "due": "2027-04-25", "start": "2026-11-08", "start_usual": 72}
+    again = feeder.update_heart_goal_path(future, (60, date(2027, 4, 25)), 71, date(2026, 10, 25))
+    assert again["start"] == "2026-10-25" and again["start_usual"] == 71
+    # An I/O error reading the definitions still posts the gauge.
+    env = make_env(tmp_path, WEIGHT_DEFINITIONS_DIR=goal_defs(tmp_path / "g"))
+
+    def broken(*_a, **_k):
+        raise PermissionError("denied")
+    monkeypatch.setattr(feeder, "scan_definitions", broken)
+    _p, failures, body = cycle(env, L(10, 25, 8), (night_samples(), []))
+    assert body["value"] == 60 and any("unexpected PermissionError" in f for f in failures)

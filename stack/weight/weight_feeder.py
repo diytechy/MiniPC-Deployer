@@ -208,6 +208,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from fractions import Fraction
 
 # ── The wire contract (NagLight IF-012 / this repo's IF-014) ─────────────────
 # Not tunables. This is the shape POST /api/feed accepts for a weight gauge,
@@ -5989,9 +5990,13 @@ def glide_target(path, day):
     start, due = _night_key(path["start"]), _night_key(path["due"])
     if due <= start:
         return path["target"]
-    fraction = min(max((day - start).days / float((due - start).days), 0.0), 1.0)
-    return _round_half_up(path["start_usual"]
-                          + (path["target"] - path["start_usual"]) * fraction)
+    # EXACT ARITHMETIC: a float can land a true .5 at .4999... and round it the
+    # wrong way, so the interpolation is done in fractions and rounded half up.
+    total = (due - start).days
+    elapsed = min(max((day - start).days, 0), total)
+    exact = (Fraction(path["start_usual"])
+             + Fraction(path["target"] - path["start_usual"]) * Fraction(elapsed, total))
+    return int(math.floor(exact + Fraction(1, 2)))
 
 
 def update_heart_goal_path(path, goal, usual_today, today):
@@ -6007,7 +6012,10 @@ def update_heart_goal_path(path, goal, usual_today, today):
     if goal is None:
         return None
     target, due = goal
-    if path is None or path["target"] != target or path["due"] != due.isoformat():
+    # A stored start AFTER today can only come from a clock that jumped forward;
+    # keeping it would hold the path at its start until that date, so it restarts.
+    if (path is None or path["target"] != target or path["due"] != due.isoformat()
+            or _night_key(path["start"]) > today):
         path = {"target": target, "due": due.isoformat(), "start": today.isoformat(),
                 "start_usual": None}
     if path["start_usual"] is None and usual_today is not None:
@@ -6172,6 +6180,11 @@ def run_heart_samples_cycle(env, now=None, reader=None, poster=None, clock=None)
     except ValueError as exc:
         failures.append("heart goal: %s - the row is ignored and the last good "
                         "goal kept" % exc)
+    except Exception as exc:
+        # An I/O error reading the definitions (a permission, a directory gone
+        # mid-read) must not stop the heart post: TYPE ONLY, never the message.
+        failures.append("heart goal: unexpected %s reading the definitions - the "
+                        "last good goal kept" % type(exc).__name__)
     else:
         today_name = _local_date(now, zone).isoformat()
         mine_today = {key: night for key, night in nights.items()

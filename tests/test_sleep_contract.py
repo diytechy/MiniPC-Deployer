@@ -376,8 +376,8 @@ def test_state_file_is_private_and_holds_no_credential(tz, tmp_path):
                   reader=lambda e, n, t: ([h.f.Record(h.f.parse_night_date(TODAY_START), 82)], 0))
     text = h.state_path.read_text(encoding="utf-8")
     assert "SENTINEL" not in text and "Authorization" not in text
-    assert set(json.loads(text)) <= {"nights", "published", "schedule", "__auth_failures__",
-                                     "__auth_failed__"}
+    assert set(json.loads(text)) <= {"nights", "published", "usage", "schedule",
+                                     "__auth_failures__", "__auth_failed__"}
     if os.name == "posix":
         assert (h.state_path.stat().st_mode & 0o777) == 0o600
     assert not Path(str(h.state_path) + ".tmp").exists()

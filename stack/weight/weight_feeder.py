@@ -3679,6 +3679,12 @@ def load_state(state_path, now):
             if nights:
                 out[key] = nights
             continue
+        # THE HEART GOAL'S GLIDE PATH (2026-10-25): dates and bpm, own validator.
+        if key == HEART_GOAL_STATE_KEY:
+            path = validate_heart_goal_state(entry)
+            if path is not None:
+                out[key] = path
+            continue
         if key in (HEIGHT_STATE_KEY, WAIST_STATE_KEY):
             cached = validate_stored_inches(
                 entry, now,
@@ -5851,11 +5857,112 @@ def prune_heart_nights(nights, now, zone):
             del nights[name]
 
 
-def heart_target_for(nights, name, config):
-    """The target for the night `name`: the median of up to config["nights"]
-    earlier valid nights from the SAME device, rounded half up, once at least
-    config["min_nights"] exist; until then the fixed config["target"]. A new
-    device therefore starts its own baseline.
+# ── The long-term heart goal, from the Owner's own Sheet (2026-10-25) ────────
+#
+# RULED 2026-10-25: a long-term goal of 60 bpm, editable from the Google Sheet,
+# carried by a PROJECT row (no daily tick, no nagging) whose `target`/`unit`
+# are the goal and whose `due` is the date to reach it by. The gauge's target
+# then GLIDES in a straight line from the Owner's usual on the day the goal is
+# set to the goal on the due date, and the colour compares tonight with the
+# LOWER of that path and the usual: behind schedule, the path pulls the target
+# down; ahead of it, a sudden rise is still judged against the usual, so an
+# illness spike cannot hide behind a generous path.
+#
+# THE RESET IS THE SHEET: changing the row's target OR due date restarts the
+# path from the current usual. Deleting the row (or its target) drops the path
+# and the gauge goes back to the usual alone. Like the weight goal, the row is
+# read from the definitions the tracker syncs from the Sheet
+# (WEIGHT_DEFINITIONS_DIR), never from a hub setting.
+
+DEFAULT_HEART_GOAL_ITEM_ID = "heart-goal"
+HEART_GOAL_UNIT = "bpm"
+DUE_KEY = "due"
+# The glide path in the weight state file: {"target", "due", "start",
+# "start_usual"}. Its own validator in `load_state`.
+HEART_GOAL_STATE_KEY = "heart-goal"
+
+
+def resolve_heart_goal_location(env):
+    """(category, item_id) of the goal row: HEART_GOAL_CATEGORY (Health) and
+    HEART_GOAL_ITEM_ID (heart-goal). Location knobs only; the goal itself lives
+    in the Sheet.
+
+    Implements: SR-073, LLR-1320
+    """
+    category = (env.get("HEART_GOAL_CATEGORY") or DEFAULT_GOAL_CATEGORY).strip()
+    item_id = (env.get("HEART_GOAL_ITEM_ID") or DEFAULT_HEART_GOAL_ITEM_ID).strip()
+    return category, item_id
+
+
+def read_heart_goal(defs_dir, category, item_id):
+    """The declared goal as (target_bpm, due_date), or None when none is declared.
+
+    Contract:
+      Outputs: None for no definitions directory, no such row, or a row with no
+               (or a blank) target - "no goal", and the gauge colours against
+               the usual alone.
+      Raises:  ValueError naming the file when a goal IS declared but cannot be
+               honoured: a unit that is not `bpm` (never assumed), a target that
+               is not a whole number within SAMPLES_TARGET_BOUNDS, or a `due`
+               that is missing or not YYYY-MM-DD.
+
+    Implements: SR-073, LLR-1320
+    """
+    if not defs_dir:
+        return None
+    try:
+        found, _legacy = scan_definitions(defs_dir, category, item_id)
+    except GoalMissing:
+        return None
+    if found is None:
+        return None
+    item, path = found
+    where = "%s (category %s, item %s)" % (path, category, item_id)
+    if TARGET_KEY not in item:
+        return None
+    raw = clean_scalar(one_value(item[TARGET_KEY], where, TARGET_KEY))
+    if not raw:
+        return None
+    unit = clean_scalar(one_value(item[UNIT_KEY], where, UNIT_KEY)) if UNIT_KEY in item else ""
+    if unit != HEART_GOAL_UNIT:
+        raise ValueError("%s: the heart goal needs `%s: %s`; the unit is never "
+                         "assumed" % (where, UNIT_KEY, HEART_GOAL_UNIT))
+    low, high = SAMPLES_TARGET_BOUNDS
+    if not re.fullmatch(r"[0-9]{1,3}", raw) or not low <= int(raw) <= high:
+        raise ValueError("%s: the heart goal's `%s` must be a whole number of bpm "
+                         "within %d..%d" % (where, TARGET_KEY, low, high))
+    due = _night_key(clean_scalar(one_value(item[DUE_KEY], where, DUE_KEY))
+                     if DUE_KEY in item else "")
+    if due is None:
+        raise ValueError("%s: the heart goal needs a `%s` date (YYYY-MM-DD): the "
+                         "day to reach the target by" % (where, DUE_KEY))
+    return int(raw), due
+
+
+def validate_heart_goal_state(entry):
+    """The stored glide path, or None when it is not credible.
+
+    Implements: SR-073, LLR-1320
+    """
+    if not isinstance(entry, dict):
+        return None
+    target, usual = entry.get("target"), entry.get("start_usual")
+    low, high = SAMPLES_TARGET_BOUNDS
+    if isinstance(target, bool) or not isinstance(target, int) or not low <= target <= high:
+        return None
+    if _night_key(entry.get("due")) is None or _night_key(entry.get("start")) is None:
+        return None
+    if usual is not None and (isinstance(usual, bool) or not isinstance(usual, int)
+                              or not HEART_SAMPLE_BAND[0] <= usual <= HEART_SAMPLE_BAND[1]):
+        return None
+    return {"target": target, "due": entry["due"], "start": entry["start"],
+            "start_usual": usual}
+
+
+def heart_usual(nights, name, config):
+    """The usual for night `name`: the median of up to config["nights"] earlier
+    valid nights from the SAME device, rounded half up, or None until
+    config["min_nights"] exist.
 
     Implements: SR-073, LLR-1318
     """
@@ -5867,10 +5974,62 @@ def heart_target_for(nights, name, config):
                     and _night_key(key) is not None
                     and oldest <= _night_key(key) < day)
     if len(values) < config["min_nights"]:
-        return config["target"]
+        return None
     middle = len(values) // 2
     median = values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2.0
     return _round_half_up(median)
+
+
+def glide_target(path, day):
+    """The path's value on `day`: a straight line from start_usual on `start`
+    to `target` on `due`, held at the target from the due date on.
+
+    Implements: SR-073, LLR-1320
+    """
+    start, due = _night_key(path["start"]), _night_key(path["due"])
+    if due <= start:
+        return path["target"]
+    fraction = min(max((day - start).days / float((due - start).days), 0.0), 1.0)
+    return _round_half_up(path["start_usual"]
+                          + (path["target"] - path["start_usual"]) * fraction)
+
+
+def update_heart_goal_path(path, goal, usual_today, today):
+    """The path after this cycle's read of the goal row.
+
+    `goal` None (no row, or no target): no path. A goal that differs from the
+    stored path's target or due: a NEW path starting today (the reset). A path
+    that has no start_usual yet takes today's usual once one exists, and starts
+    from today, so the line never begins from a number nobody measured.
+
+    Implements: SR-073, LLR-1320
+    """
+    if goal is None:
+        return None
+    target, due = goal
+    if path is None or path["target"] != target or path["due"] != due.isoformat():
+        path = {"target": target, "due": due.isoformat(), "start": today.isoformat(),
+                "start_usual": None}
+    if path["start_usual"] is None and usual_today is not None:
+        path = dict(path, start=today.isoformat(), start_usual=usual_today)
+    return path
+
+
+def heart_target_for(nights, name, config, path=None):
+    """The target for the night `name`.
+
+    Until the usual exists (config["min_nights"] same-device nights), the fixed
+    config["target"]. Then the usual, or, with a started goal path, the LOWER
+    of the usual and the path's value on that night.
+
+    Implements: SR-073, LLR-1318, LLR-1320
+    """
+    usual = heart_usual(nights, name, config)
+    if usual is None:
+        return config["target"]
+    if path is not None and path.get("start_usual") is not None:
+        return min(usual, glide_target(path, _night_key(name)))
+    return usual
 
 
 def heart_bar(target, config):
@@ -6003,6 +6162,28 @@ def run_heart_samples_cycle(env, now=None, reader=None, poster=None, clock=None)
         upsert_heart_nights(nights, figures, config["device"])
     prune_heart_nights(nights, now, zone)
 
+    # THE LONG-TERM GOAL (2026-10-25), from the Sheet's goal row. A row that is
+    # declared but unusable is reported and the stored path is kept as it was;
+    # no row drops the path.
+    path = state.get(HEART_GOAL_STATE_KEY)
+    try:
+        goal = read_heart_goal(env.get("WEIGHT_DEFINITIONS_DIR") or "",
+                               *resolve_heart_goal_location(env))
+    except ValueError as exc:
+        failures.append("heart goal: %s - the row is ignored and the last good "
+                        "goal kept" % exc)
+    else:
+        today_name = _local_date(now, zone).isoformat()
+        mine_today = {key: night for key, night in nights.items()
+                      if night.get("device") == config["device"]}
+        mine_today.setdefault(today_name, {"device": config["device"]})
+        path = update_heart_goal_path(path, goal, heart_usual(mine_today, today_name, config),
+                                      _local_date(now, zone))
+    if path is None:
+        state.pop(HEART_GOAL_STATE_KEY, None)
+    else:
+        state[HEART_GOAL_STATE_KEY] = path
+
     # ONLY THE CONFIGURED DEVICE'S NIGHTS ARE SHOWN: after HEART_SAMPLE_DEVICE
     # changes, a stored night from the old device is history, not a reading.
     mine = {key: night for key, night in nights.items()
@@ -6014,7 +6195,7 @@ def run_heart_samples_cycle(env, now=None, reader=None, poster=None, clock=None)
             body = heart_gauge_body(0, None, fallback)
         else:
             body = heart_gauge_body(nights[name]["rhr"], stamp,
-                                    heart_bar(heart_target_for(nights, name, config),
+                                    heart_bar(heart_target_for(nights, name, config, path),
                                               config))
     except (ValueError, SourceFailure) as exc:
         failures.append("gauge %s: %s" % (HEART_GAUGE_ID, exc))

@@ -137,6 +137,9 @@ LIST_URLS = {
     # exist so the first real body of each is looked at before one is written.
     "sleep": weight_feeder.GOOGLE_HEALTH_SLEEP_LIST_URL,
     "steps": weight_feeder.GOOGLE_HEALTH_STEPS_LIST_URL,
+    # The watch's 5-minute samples, which the heart gauge reads in samples
+    # mode (2026-10-25).
+    "heart-rate": weight_feeder.GOOGLE_HEALTH_HEART_RATE_LIST_URL,
 }
 
 # THE SCOPES ONE TOKEN CARRIES, AND WHICH OF THEM IS NOT NEGOTIABLE. The weight
@@ -1250,7 +1253,8 @@ def build_parser():
              "discovery document, and this settles it against a real body. "
              "`heart` is for H1: the daily resting heart rate parser has never "
              "seen a real body. `sleep` and `steps` are the watch's "
-             "(2026-10-25): no parser exists for either yet.")
+             "(2026-10-25): no parser exists for either yet. `heart-rate` is "
+             "the samples the heart gauge reads in samples mode.")
     capturer.add_argument("--out", required=True,
                           help="where to save the raw body; must not exist")
     capturer.add_argument("--page-size", type=int, default=None,

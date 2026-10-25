@@ -389,13 +389,21 @@ def test_the_shipped_env_example_documents_the_four_knobs_at_their_defaults():
         match = re.match(r"^(HEART_[A-Z_]+)=(.*)$", line)
         if match:
             values[match.group(1)] = match.group(2).strip()
-    assert values == {"HEART_ENABLED": "0", "HEART_MIN_BPM": "40",
-                      "HEART_MAX_BPM": "100", "HEART_TARGET_BPM": "60"}
-    # The example, fed back through the code, means "off" and the defaults.
+    # Since 2026-10-25 the example ships samples mode (HomeHub
+    # docs/HEART_GAUGE_PLAN_2026-10-25.md), its knobs at their defaults, with
+    # the target at the ruled 75 that both modes share.
+    assert values == {"HEART_ENABLED": "0", "HEART_SOURCE": "samples",
+                      "HEART_SAMPLE_DEVICE": "FFit", "HEART_TARGET_BPM": "75",
+                      "HEART_COLOUR_SPAN_BPM": "24", "HEART_BASELINE_NIGHTS": "28",
+                      "HEART_MIN_BASELINE_NIGHTS": "7",
+                      "HEART_MIN_BPM": "40", "HEART_MAX_BPM": "100"}
+    # The example, fed back through the code, means "off", samples mode at its
+    # defaults, and a daily-mode bar that is still valid.
     assert feeder.resolve_heart_enabled(values) is False
+    assert feeder.resolve_heart_source(values) == "samples"
+    assert feeder.resolve_heart_samples_config(values) == feeder.resolve_heart_samples_config({})
     assert feeder.resolve_heart_config(values) == (
-        feeder.DEFAULT_HEART_MIN_BPM, feeder.DEFAULT_HEART_MAX_BPM,
-        feeder.DEFAULT_HEART_TARGET_BPM)
+        feeder.DEFAULT_HEART_MIN_BPM, feeder.DEFAULT_HEART_MAX_BPM, 75)
 
 
 # ── TC-1177: OFF means no network, no post, no state ────────────────────────

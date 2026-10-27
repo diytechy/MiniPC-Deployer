@@ -8,7 +8,7 @@
 # its single-store layout (plan call C44): one /store mount that is the whole
 # store (Latest/, Snapshot_*/ and the run files side by side), backup exits
 # 0/1/2/4, verify exits 0/1/2. The cases below pin that contract
-# (TC-1541..TC-1547) as well as the state-update boundary.
+# (TC-1576..TC-1582) as well as the state-update boundary.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -256,7 +256,7 @@ else
     fail "TC-001 verify failure rc=$RUN_RC lastSuccess=$(success_count "$TMP/verify-failure.capture") phases='$(phases "$TMP/verify-failure.capture")'"
 fi
 
-# ── the bounded-run-loop backup exit table (TC-1541) ─────────────────────────
+# ── the bounded-run-loop backup exit table (TC-1576) ─────────────────────────
 # Exit 1 = the run COMPLETED but some files were not captured. Not a verified
 # success: no lastSuccess, non-zero exit. But the verify gate still runs, so a
 # file that stays locked cannot also starve the weekly proof.
@@ -266,9 +266,9 @@ if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/partial.capture")" = 0 ] \
    && [ "$(phases "$TMP/partial.capture")" = 'starting backing-up verifying idle ' ] \
    && grep -qF 'COMPLETED WITH FILES NOT CAPTURED (container exit 1; verify=shallow ok)' "$TMP/partial.out" \
    && grep -qF 'lastSuccess is NOT advanced' "$TMP/partial.out"; then
-    pass "TC-1541 backup exit 1 runs the verify gate, advances no lastSuccess, and fails the unit naming the set log"
+    pass "TC-1576 backup exit 1 runs the verify gate, advances no lastSuccess, and fails the unit naming the set log"
 else
-    fail "TC-1541 partial rc=$RUN_RC lastSuccess=$(success_count "$TMP/partial.capture") events=$(tr '\n' ' ' <"$TMP/partial.events")"
+    fail "TC-1576 partial rc=$RUN_RC lastSuccess=$(success_count "$TMP/partial.capture") events=$(tr '\n' ' ' <"$TMP/partial.events")"
 fi
 
 # Exit 2 = refused before changing anything; exit 4 = host problem, retry later.
@@ -279,9 +279,9 @@ if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/refused.capture")" = 0 ] \
    && grep -qF 'REFUSED the run before changing anything (exit 2)' "$TMP/refused.out" \
    && grep -qF 'dependency that cannot be loaded' "$TMP/refused.out" \
    && grep -qF 'retrying will not help' "$TMP/refused.out"; then
-    pass "TC-1541 backup exit 2 is a do-not-retry refusal naming an unloadable dependency among its causes: no verify, no lastSuccess"
+    pass "TC-1576 backup exit 2 is a do-not-retry refusal naming an unloadable dependency among its causes: no verify, no lastSuccess"
 else
-    fail "TC-1541 exit 2 rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/refused.events"): $(grep 'ERROR' "$TMP/refused.out" | head -1)"
+    fail "TC-1576 exit 2 rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/refused.events"): $(grep 'ERROR' "$TMP/refused.out" | head -1)"
 fi
 # Exit 4 also covers FileBackup C39: a source EMPTY at the start of the run while
 # the latest state holds rows, which is what an unmounted library looks like.
@@ -291,9 +291,9 @@ if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/host-stop.capture")" = 0 ] \
    && grep -qF 'STOPPED for a host problem (exit 4)' "$TMP/host-stop.out" \
    && grep -qF 'the library source was EMPTY at the start of the run while the latest state holds rows' "$TMP/host-stop.out" \
    && grep -qF 'Retry later' "$TMP/host-stop.out"; then
-    pass "TC-1541 backup exit 4 is a retry-later host stop that names the empty-source case (C39): no verify, no lastSuccess"
+    pass "TC-1576 backup exit 4 is a retry-later host stop that names the empty-source case (C39): no verify, no lastSuccess"
 else
-    fail "TC-1541 exit 4 rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/host-stop.events"): $(grep 'ERROR' "$TMP/host-stop.out" | head -1)"
+    fail "TC-1576 exit 4 rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/host-stop.events"): $(grep 'ERROR' "$TMP/host-stop.out" | head -1)"
 fi
 
 # A bounded-run-loop image never returns 3 (no witness), from backup or verify.
@@ -305,12 +305,12 @@ if [ "$OLD_IMAGE_RC" != 0 ] && [ "$RUN_RC" != 0 ] && grep -qF 'OLDER image' "$TM
    && grep -qF 'OLDER image' "$TMP/old-image-verify.out" \
    && [ "$(success_count "$TMP/old-image.capture")" = 0 ] \
    && [ "$(success_count "$TMP/old-image-verify.capture")" = 0 ]; then
-    pass "TC-1541 an exit 3 from backup or verify is reported as an older FileBackup image, with no lastSuccess"
+    pass "TC-1576 an exit 3 from backup or verify is reported as an older FileBackup image, with no lastSuccess"
 else
-    fail "TC-1541 exit 3: $(grep 'ERROR' "$TMP/old-image.out" | head -1) | $(grep 'ERROR' "$TMP/old-image-verify.out" | head -1)"
+    fail "TC-1576 exit 3: $(grep 'ERROR' "$TMP/old-image.out" | head -1) | $(grep 'ERROR' "$TMP/old-image-verify.out" | head -1)"
 fi
 
-# ── damaged objects set aside by the run (TC-1546, FileBackup C37) ───────────
+# ── damaged objects set aside by the run (TC-1581, FileBackup C37) ───────────
 # An exit 1 whose set log carries [DamagedObject] lines is store damage, not a
 # file in use: the message counts them, names Verify/, and does not claim that
 # nothing stored was lost. The (mocked) container does not touch backup.log, so
@@ -327,31 +327,31 @@ if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/damaged.capture")" = 0 ] \
    && grep -qF 'COMPLETED BUT FOUND 2 DAMAGED STORED OBJECT(S) (container exit 1; verify=shallow ok)' "$TMP/damaged.out" \
    && grep -qF "moved into $TMP/store/Verify/" "$TMP/damaged.out" \
    && ! grep -qF 'nothing already stored was lost' "$TMP/damaged.out"; then
-    pass "TC-1546 an exit 1 whose set log names damaged objects counts them, names Verify/, and claims no loss-free run"
+    pass "TC-1581 an exit 1 whose set log names damaged objects counts them, names Verify/, and claims no loss-free run"
 else
-    fail "TC-1546 damaged rc=$RUN_RC: $(grep -i 'damaged' "$TMP/damaged.out" | head -2 | tr '\n' '|')"
+    fail "TC-1581 damaged rc=$RUN_RC: $(grep -i 'damaged' "$TMP/damaged.out" | head -2 | tr '\n' '|')"
 fi
 # A set log with no such line keeps the files-not-captured reading.
 printf '2026-10-27 03:00:01.000 [WARN] could not read /source/locked.db\n' >"$TMP/store/backup.log"
 run_wrapper not-damaged "$TMP/good.env" none 1 0 200
 if [ "$RUN_RC" != 0 ] && grep -qF 'COMPLETED WITH FILES NOT CAPTURED (container exit 1; verify=skipped)' "$TMP/not-damaged.out" \
    && ! grep -qF 'DAMAGED' "$TMP/not-damaged.out"; then
-    pass "TC-1546 an exit 1 with no [DamagedObject] line is reported as files not captured only"
+    pass "TC-1581 an exit 1 with no [DamagedObject] line is reported as files not captured only"
 else
-    fail "TC-1546 not-damaged rc=$RUN_RC: $(grep -i 'exit 1' "$TMP/not-damaged.out" | head -2 | tr '\n' '|')"
+    fail "TC-1581 not-damaged rc=$RUN_RC: $(grep -i 'exit 1' "$TMP/not-damaged.out" | head -2 | tr '\n' '|')"
 fi
 rm -f "$TMP/store/backup.log"
 
-# ── the one-mount store (TC-1542) ────────────────────────────────────────────
+# ── the one-mount store (TC-1577) ────────────────────────────────────────────
 # A second mount under the store at Latest/ would make FileBackup's rename test
 # fail inside the container (exit 2). The wrapper refuses first, before docker.
 MOCK_SPLIT_LATEST=1 run_wrapper split-mount "$TMP/good.env" none 0 0 200
 if [ "$RUN_RC" != 0 ] && ! grep -q '^docker:' "$TMP/split-mount.events" \
    && [ "$(success_count "$TMP/split-mount.capture")" = 0 ] \
    && grep -qF "Latest/ and the snapshots beside it must be ONE mount" "$TMP/split-mount.out"; then
-    pass "TC-1542 a store whose Latest/ is a separate mount is refused before the container"
+    pass "TC-1577 a store whose Latest/ is a separate mount is refused before the container"
 else
-    fail "TC-1542 split mount rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/split-mount.events")"
+    fail "TC-1577 split mount rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/split-mount.events")"
 fi
 
 # The compose binding and the container config that go with the wrapper: ONE
@@ -368,9 +368,9 @@ if printf '%s\n' "$fb_block" | grep -qF -- '- ${FILEBACKUP_STORE:-/mnt/backup-dr
    && grep -qF '"ConfigVersion": 3,' "$FBJSON" \
    && grep -qF '"StorePath": "/store",' "$FBJSON" \
    && ! grep -Eq '"(BackupPath|ChangePath|SourceStatePath)"' "$FBJSON"; then
-    pass "TC-1542 compose binds one /store and no /state; filebackup.json is ConfigVersion 3 with StorePath /store only"
+    pass "TC-1577 compose binds one /store and no /state; filebackup.json is ConfigVersion 3 with StorePath /store only"
 else
-    fail "TC-1542 the compose/config contract drifted: $(printf '%s\n' "$fb_block" | grep -E ':/' | tr '\n' '|')"
+    fail "TC-1577 the compose/config contract drifted: $(printf '%s\n' "$fb_block" | grep -E ':/' | tr '\n' '|')"
 fi
 
 run_wrapper rejected-state "$TMP/good.env" shallow 0 0 500
@@ -538,7 +538,7 @@ else
 fi
 rm -rf "$TMP/store/Temp"
 
-# ── the store-layout guard (TC-1543) ─────────────────────────────────────────
+# ── the store-layout guard (TC-1578) ─────────────────────────────────────────
 # No migration into the single-store layout (FileBackup L2): an old store is
 # SET ASIDE by hand. While one still holds data where this stack knows to look,
 # the run refuses before anything is created or started, names the set-aside
@@ -553,18 +553,18 @@ if [ "$RUN_RC" != 0 ] && ! grep -q '^docker:' "$TMP/not-set-aside.events" \
    && grep -qF 'Setting the old store aside' "$TMP/not-set-aside.out" \
    && [ "$(cat "$TMP/old-backup/MANIFEST.csv")" = row ] \
    && [ -d "$TMP/old-changes/Snapshot_2026_10_01_03_00_00" ]; then
-    pass "TC-1543 a three-mount store not set aside refuses before docker, names the set-aside step, and is untouched"
+    pass "TC-1578 a three-mount store not set aside refuses before docker, names the set-aside step, and is untouched"
 else
-    fail "TC-1543 not set aside rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/not-set-aside.events"): $(grep 'single-store' "$TMP/not-set-aside.out" | head -1)"
+    fail "TC-1578 not set aside rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/not-set-aside.events"): $(grep 'single-store' "$TMP/not-set-aside.out" | head -1)"
 fi
 # Either old folder alone still refuses.
 rm -rf "$TMP/old-backup"
 run_wrapper old-changes-only "$TMP/good.env" none 0 0 200
 if [ "$RUN_RC" != 0 ] && ! grep -q '^docker:' "$TMP/old-changes-only.events" \
    && grep -qF "$TMP/old-changes still holds" "$TMP/old-changes-only.out"; then
-    pass "TC-1543 the three-mount snapshots folder alone still refuses"
+    pass "TC-1578 the three-mount snapshots folder alone still refuses"
 else
-    fail "TC-1543 old changes only rc=$RUN_RC: $(grep 'single-store' "$TMP/old-changes-only.out" | head -1)"
+    fail "TC-1578 old changes only rc=$RUN_RC: $(grep 'single-store' "$TMP/old-changes-only.out" | head -1)"
 fi
 rm -rf "$TMP/old-changes"
 # The bounded-run-loop layout INSIDE the store (backup/ and changes/) refuses too.
@@ -573,9 +573,9 @@ run_wrapper old-in-store "$TMP/good.env" none 0 0 200
 if [ "$RUN_RC" != 0 ] && ! grep -q '^docker:' "$TMP/old-in-store.events" \
    && grep -qF "$TMP/store/changes still holds the bounded-run-loop layout's snapshots" "$TMP/old-in-store.out" \
    && [ -d "$TMP/store/changes/Snapshot_2026_10_01_03_00_00" ]; then
-    pass "TC-1543 a store still holding the bounded-run-loop layout's changes/ refuses and is untouched"
+    pass "TC-1578 a store still holding the bounded-run-loop layout's changes/ refuses and is untouched"
 else
-    fail "TC-1543 old layout in store rc=$RUN_RC: $(grep 'single-store' "$TMP/old-in-store.out" | head -1)"
+    fail "TC-1578 old layout in store rc=$RUN_RC: $(grep 'single-store' "$TMP/old-in-store.out" | head -1)"
 fi
 rm -rf "$TMP/store/changes"
 # A latest state at the TOP of the store is an older layout's (the three-mount
@@ -584,9 +584,9 @@ printf 'row\n' >"$TMP/store/MANIFEST.csv"
 run_wrapper top-manifest "$TMP/good.env" none 0 0 200
 if [ "$RUN_RC" != 0 ] && ! grep -q '^docker:' "$TMP/top-manifest.events" \
    && grep -qF "$TMP/store/MANIFEST.csv is a latest state at the top of the store" "$TMP/top-manifest.out"; then
-    pass "TC-1543 a manifest at the top of the store refuses as an older layout"
+    pass "TC-1578 a manifest at the top of the store refuses as an older layout"
 else
-    fail "TC-1543 top manifest rc=$RUN_RC: $(grep 'single-store' "$TMP/top-manifest.out" | head -1)"
+    fail "TC-1578 top manifest rc=$RUN_RC: $(grep 'single-store' "$TMP/top-manifest.out" | head -1)"
 fi
 rm -f "$TMP/store/MANIFEST.csv"
 # EMPTY old folders hold nothing: a note, and the run goes on.
@@ -595,13 +595,13 @@ run_wrapper empty-legacy "$TMP/good.env" none 0 0 200
 if [ "$RUN_RC" = 0 ] && [ "$(success_count "$TMP/empty-legacy.capture")" = 1 ] \
    && grep -qF "an EMPTY folder from an older store layout is still at $TMP/old-backup" "$TMP/empty-legacy.out" \
    && grep -qF "an EMPTY folder from an older store layout is still at $TMP/store/backup" "$TMP/empty-legacy.out"; then
-    pass "TC-1543 empty old-layout folders are notes and the run goes on"
+    pass "TC-1578 empty old-layout folders are notes and the run goes on"
 else
-    fail "TC-1543 empty legacy rc=$RUN_RC: $(grep -i 'older store' "$TMP/empty-legacy.out" | head -1)"
+    fail "TC-1578 empty legacy rc=$RUN_RC: $(grep -i 'older store' "$TMP/empty-legacy.out" | head -1)"
 fi
 rmdir "$TMP/old-backup" "$TMP/store/backup"
 
-# ── the wrapper never creates Latest/ (TC-1547, FileBackup C44) ──────────────
+# ── the wrapper never creates Latest/ (TC-1582, FileBackup C44) ──────────────
 # FileBackup refuses (2) a store that holds snapshots but no Latest/, rather than
 # start a fresh full backup beside its history - and can only see that if
 # Latest/ is really missing. The wrapper must leave it missing.
@@ -611,9 +611,9 @@ run_wrapper no-latest "$TMP/good.env" none 2 0 200
 if [ "$RUN_RC" != 0 ] && grep -q '^docker:backup$' "$TMP/no-latest.events" \
    && [ ! -e "$TMP/store/Latest" ] \
    && grep -qF 'a store that holds snapshots but no Latest/' "$TMP/no-latest.out"; then
-    pass "TC-1547 a store with snapshots but no Latest/ reaches FileBackup with Latest/ still missing, and its refusal is explained"
+    pass "TC-1582 a store with snapshots but no Latest/ reaches FileBackup with Latest/ still missing, and its refusal is explained"
 else
-    fail "TC-1547 no Latest rc=$RUN_RC exists=$([ -e "$TMP/store/Latest" ] && echo yes || echo no): $(grep 'REFUSED' "$TMP/no-latest.out" | head -1)"
+    fail "TC-1582 no Latest rc=$RUN_RC exists=$([ -e "$TMP/store/Latest" ] && echo yes || echo no): $(grep 'REFUSED' "$TMP/no-latest.out" | head -1)"
 fi
 rmdir "$TMP/store/Snapshot_2026_10_01_03_00_00"
 mv "$TMP/Latest.kept" "$TMP/store/Latest"
@@ -624,13 +624,13 @@ printf 'old\n' >"$TMP/state/MANIFEST.csv"
 run_wrapper retired-state "$TMP/good.env" none 0 0 200
 if [ "$RUN_RC" = 0 ] && grep -qF "$TMP/state/MANIFEST.csv is the retired source-side record" "$TMP/retired-state.out" \
    && [ "$(cat "$TMP/state/MANIFEST.csv")" = old ]; then
-    pass "TC-1543 a verified run names the retired source-side record for deletion by hand and keeps it"
+    pass "TC-1578 a verified run names the retired source-side record for deletion by hand and keeps it"
 else
-    fail "TC-1543 retired state rc=$RUN_RC: $(grep 'retired' "$TMP/retired-state.out" | head -1)"
+    fail "TC-1578 retired state rc=$RUN_RC: $(grep 'retired' "$TMP/retired-state.out" | head -1)"
 fi
 rm -f "$TMP/state/MANIFEST.csv"
 
-# ── a documented dry run must really be one (TC-1542) ────────────────────────
+# ── a documented dry run must really be one (TC-1577) ────────────────────────
 # `FILEBACKUP_DRY_RUN=1 docker compose … run` sets the variable on the HOST and
 # compose does not pass it into the container (measured in WSL, docker compose
 # v5.3.0: the container saw it unset), so that form runs the REAL prune. Every
@@ -641,12 +641,12 @@ _bad_forms="$(grep -n 'FILEBACKUP_[A-Z_]*=[^ ]* *docker compose' "$WRAPPER" "$RO
 if [ -z "$_bad_forms" ] \
    && grep -qF -- '-e FILEBACKUP_DRY_RUN=1 filebackup' "$ROOT/stack/backup/README.md" \
    && grep -qF -- '-e FILEBACKUP_DRY_RUN=1 filebackup' "$WRAPPER"; then
-    pass "TC-1542 every documented FILEBACKUP_* switch reaches the container through -e"
+    pass "TC-1577 every documented FILEBACKUP_* switch reaches the container through -e"
 else
-    fail "TC-1542 a host-variable form that never reaches the container is documented: $_bad_forms"
+    fail "TC-1577 a host-variable form that never reaches the container is documented: $_bad_forms"
 fi
 
-# ── the system-disk manifest copy for frame-freshness (TC-1545) ──────────────
+# ── the system-disk manifest copy for frame-freshness (TC-1580) ──────────────
 # Refreshed after a COMPLETED run (exit 0 or 1), whole (published by rename);
 # left as it was after a run that did not complete; a copy that cannot be made
 # is a note, never a backup failure.
@@ -661,9 +661,9 @@ run_wrapper copy-refused "$TMP/good.env" none 2 0 200
 c3="$(cat "$TMP/latest/MANIFEST.csv" 2>/dev/null)"
 if [ "$c1" = v-complete ] && [ "$c2" = v-partial ] && [ "$c3" = v-partial ] \
    && ! find "$TMP/latest" -name '.MANIFEST.csv.*' | grep -q .; then
-    pass "TC-1545 the manifest copy is refreshed after exit 0 and 1, kept after exit 2, and leaves no temp file"
+    pass "TC-1580 the manifest copy is refreshed after exit 0 and 1, kept after exit 2, and leaves no temp file"
 else
-    fail "TC-1545 manifest copy after 0/1/2 was '$c1'/'$c2'/'$c3'"
+    fail "TC-1580 manifest copy after 0/1/2 was '$c1'/'$c2'/'$c3'"
 fi
 # A copy path whose parent is a FILE cannot be created: a note, and the run
 # still succeeds and still posts its lastSuccess.
@@ -672,9 +672,9 @@ write_config "$TMP/badcopy.env" "$TMP/not-a-dir/MANIFEST.csv"
 run_wrapper copy-fails "$TMP/badcopy.env" none 0 0 200
 if [ "$RUN_RC" = 0 ] && [ "$(success_count "$TMP/copy-fails.capture")" = 1 ] \
    && grep -qF "DEGRADED: could not refresh $TMP/not-a-dir/MANIFEST.csv for frame-freshness" "$TMP/copy-fails.out"; then
-    pass "TC-1545 a manifest copy that cannot be made is a DEGRADED note, not a failed backup"
+    pass "TC-1580 a manifest copy that cannot be made is a DEGRADED note, not a failed backup"
 else
-    fail "TC-1545 failed copy rc=$RUN_RC: $(grep 'manifest copy' "$TMP/copy-fails.out" | head -1)"
+    fail "TC-1580 failed copy rc=$RUN_RC: $(grep 'manifest copy' "$TMP/copy-fails.out" | head -1)"
 fi
 
 printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"

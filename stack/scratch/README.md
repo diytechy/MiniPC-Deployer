@@ -3,8 +3,9 @@
 Implements **SR-102** (the volume), **SR-103** (the mount guard and the writer
 unit pattern) and **SR-104** (enforced budgets). Interface for writers: **IF-071**.
 
-An 18 GiB LV `hub-scratch` in the root disk's volume group, ext4 with project
-quotas, mounted at `/srv/scratch`, for recording and staging until a new drive
+A 22 GiB LV `hub-scratch` in the root disk's volume group (made at 18 GiB on
+2026-10-22, grown online to 22 GiB from 2026-10-27), ext4 with project quotas,
+mounted at `/srv/scratch`, for recording and staging until a new drive
 is installed (the Owner, 2026-10-22). It is **scratch**: never backed up, never
 shared (HomeHub `scripts/deploy/storage-map.md` sections 1 and 3c), and a
 reimage recreates it empty.
@@ -13,7 +14,7 @@ reimage recreates it empty.
 |---|---|---|---|
 | `door/` | the door recorder (`stack/door`) | 7101 | 8 GiB (`HOMEHUB_SCRATCH_QUOTA_DOOR_MIB`) |
 | `meetings/` | meeting recording (plan W6) | 7102 | 2 GiB (`..._MEETINGS_MIB`) |
-| `clips/` | motion clips (`stack/clips`, SR-131) until the media drive exists; `CLIPS_ROOT` moves them | 7104 | 1 GiB (`..._CLIPS_MIB`) |
+| `clips/` | motion clips (`stack/clips`, SR-131) until the media drive exists; `CLIPS_ROOT` moves them | 7104 | 5 GiB (`..._CLIPS_MIB`) |
 | `ottertube/` | OtterTube downloads, publication, staging, temp, logs (plan W8) | 7103 | 6 GiB, reduced first (`..._OTTERTUBE_MIB`) |
 
 ## `homehub_scratch.py`
@@ -25,7 +26,18 @@ reimage recreates it empty.
 | `status` | read-only JSON: identity, prjquota, usable/free space, each writer's usage and limit (read back through quotactl). |
 | `guard --writer NAME` | the mount guard. Exit 0 = write, 1 = refuse, one journal line naming why. |
 
-**What `ensure` will never do**: touch an LV other than its own, resize its own,
+**Growing (2026-10-27).** When `HOMEHUB_SCRATCH_SIZE_MIB` is larger than the
+LV, `ensure` grows it ONLINE - `lvextend -l +N` by whole extents, then, with the
+volume mounted, `resize2fs` on the mounted ext4 - and resizes the quotas to the
+new usable space. `plan` lists both steps first and runs nothing. It refuses
+(exit 3, nothing changed) when the VG cannot give the extents and keep
+`HOMEHUB_SCRATCH_VG_RESERVE_MIB` (1200) unallocated. A run stopped between the
+two finishes the filesystem at the next `ensure` with it mounted. The live hub,
+measured 2026-10-27: 1341 free extents of 4 MiB; 18 -> 22 GiB takes 1024 and
+leaves 317 (1.24 GiB); the quotas then come to door 8192, meetings 2048, clips
+5120 and ottertube about 4800 MiB (reduced first, as before).
+
+**What `ensure` will never do**: touch an LV other than its own, shrink its own,
 format an LV it did not create in the same run (an existing `hub-scratch` on
 which `blkid -p` finds no signature is refused: inspect it, and if it holds
 nothing worth keeping, `lvremove ubuntu-vg/hub-scratch` and run `ensure` again -

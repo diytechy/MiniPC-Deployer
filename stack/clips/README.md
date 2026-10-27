@@ -130,7 +130,7 @@ bytes, sha256, cutter version, the encode result), one line per clip in
 
 **Room before every cut**: when the clips project would pass
 `CLIPS_QUOTA_HIGH_PCT`, the cutter first removes clips by the retention rules -
-past their age or the cap, then the oldest - until the cut fits. On the 1 GiB
+past their age or the cap, then the oldest - until the cut fits. On the 5 GiB
 scratch area this, not the hourly retention, is the normal cycle; the quota stop
 and its alert remain only for a cut that cannot fit even then. The encode makes
 room for its copy-sized output the same way.
@@ -158,7 +158,7 @@ minute of video.
 **Retention**: older than `CLIPS_RETENTION_DAYS` (365), then oldest first over
 `CLIPS_CAP_MIB` (95367 MiB = 100 GB), then oldest first while the clips quota
 project is past `CLIPS_QUOTA_HIGH_PCT` (90 %), down to 5 points under. On the
-1 GiB scratch area the quota rule is the one that acts. Every camera folder
+5 GiB scratch area the quota rule is the one that acts. Every camera folder
 under the root counts, configured or not; stale `.part` files go first. A pass
 killed while it was deleting leaves `.index-dirty`; the next pass rebuilds that
 camera's `index.jsonl` from the sidecars.
@@ -169,10 +169,10 @@ longer age out or count. At the switch, move them into the new root's camera
 folders (keeping the day folders and sidecars together), or delete them.
 
 **Where**: `CLIPS_ROOT=/srv/scratch/clips` - the scratch volume's `clips`
-project 7104, 1 GiB (`HOMEHUB_SCRATCH_QUOTA_CLIPS_MIB`), behind the scratch guard
-as writer `clips`. It is sized before ottertube, so on the live volume
-ottertube's ceiling drops from 5882 to 4858 MiB (it holds under 1 GiB of a
-3 GiB list budget). `/srv/media/Clips` is the only other accepted value; its
+project 7104, 5 GiB (`HOMEHUB_SCRATCH_QUOTA_CLIPS_MIB`) once the volume is grown
+from 18 to 22 GiB (deploy step 2), behind the scratch guard as writer `clips`. It
+is sized before ottertube, so ottertube is reduced first: about 4800 MiB granted
+on the grown volume (it holds under 1 GiB of a 3 GiB list budget). `/srv/media/Clips` is the only other accepted value; its
 guard checks a separate ext4 mount with project quotas, writable - the drive's
 identity check comes with the drive (C111). A quota hit stops cut and encode
 (exit 75, `clips-quota` alert, a stop file) until retention has made room.
@@ -208,17 +208,32 @@ sudo install -m 0644 /opt/homehub/stack/clips/homehub-clips-*.service /opt/homeh
 sudo systemctl daemon-reload
 ```
 
-**2. The clips area.** `sudo python3 /opt/homehub/stack/scratch/homehub_scratch.py plan`
-must list only: create `/srv/scratch/clips`, put it in project 7104, set clips
-to 1024 MiB and ottertube to 4858 MiB. Then `ensure`, and `status` shows
-`clips` with `limit_mib` 1024.
+**2. Grow the scratch volume and make the clips area** (the Owner, 2026-10-27:
+22 GiB, clips 5 GiB). Set `HOMEHUB_SCRATCH_SIZE_MIB=22528`,
+`HOMEHUB_SCRATCH_VG_RESERVE_MIB=1200` and `HOMEHUB_SCRATCH_QUOTA_CLIPS_MIB=5120` in
+`/opt/homehub/stack/.env` (edit in place), then read the plan - it changes nothing:
+
+```sh
+sudo vgs --units m -o vg_free,vg_extent_size,vg_free_count ubuntu-vg     # 5364 MiB / 1341 extents on 2026-10-27
+sudo python3 /opt/homehub/stack/scratch/homehub_scratch.py plan
+#   would: grow LV /dev/ubuntu-vg/hub-scratch by 1024 extents (18432 -> 22528 MiB), leaving 317 extents (1.24 GiB) free
+#   would: grow the ext4 filesystem on /dev/ubuntu-vg/hub-scratch online to fill the LV (resize2fs)
+#   would: create /srv/scratch/clips, put it in quota project 7104 (inherit)
+#   exit 3 = STOP (the VG cannot give it and keep the reserve): record the numbers, change nothing
+```
+
+Then `sudo python3 .../homehub_scratch.py ensure` (online: the recorder keeps
+writing) and `status`: `usable_mib` about 22200, door 8192, meetings 2048, clips
+5120, ottertube about 4800 (reduced first, as before). `findmnt /srv/scratch`
+and `df -h /srv/scratch` show the new size. A boot runs `ensure` too, so a raised
+knob is applied at the next boot if it is not applied by hand.
 
 **3. The knobs, still off.** Append the camera block of `.env.example`
 (`CAMERAS` .. `CLIPS_ENCODE_MAX_PER_RUN`) to `/opt/homehub/stack/.env` ONCE, with
 `CAMERA_DOOR_MOTION_CALIBRATED=true` and the zones from HomeHub
 `config.homehub.psd1` (quoted as they are there), sent over stdin
-(`ssh hub@<hub> 'sudo tee -a /opt/homehub/stack/.env >/dev/null' < block.env`),
-and `HOMEHUB_SCRATCH_QUOTA_CLIPS_MIB=1024`. Pre-flight:
+(`ssh hub@<hub> 'sudo tee -a /opt/homehub/stack/.env >/dev/null' < block.env`).
+Pre-flight:
 
 ```sh
 sudo python3 /opt/homehub/stack/camera-motion/camera_motion.py check --camera door
@@ -266,10 +281,31 @@ restart the unit, and repeat step 4.
 After the next visitor: `sudo python3 /opt/homehub/stack/clips/homehub_clips.py episodes --camera door`
 and `status`, and the clip under `/srv/scratch/clips/door/<day>/` plays.
 
-**7. Re-encode, after a day of clips.** `CLIPS_ENCODE_ENABLED=true`, run one
-batch (`sudo systemctl start homehub-clips-encode.service`), read the sidecars'
-`encode` (kept, bytes before and after, seconds) and check PSI. Keep it:
+**7. Re-encode, after a day of clips with both daylight and night in it.** First
+the trial, which replaces nothing (the Owner, 2026-10-27):
+
+```sh
+sudo python3 /opt/homehub/stack/clips/homehub_clips.py encode-trial --camera door --day <YYYY-MM-DD> --max-clips 4
+```
+
+It encodes two daylight and two night clips of that day with every combination
+of h264 and hevc (HEVC is H.265), native and 1024 square, 300 and 200 kb/s, plus
+h264 native 300 kb/s at 5 fps, and prints size (and percent of the copy), encode
+CPU and wall seconds and SSIM against the copy per combination, by day and by
+night; `trial.json` and `trial.txt` and one sample per combination are in
+`/srv/scratch/clips/.trial/door-<day>/` for the Owner to watch side by side
+(fetch them read-only). It holds the pipeline lock for at most 30 minutes, runs
+at the lowest priority, and refuses to start when the clips area is too full.
+From it the Owner chooses `CLIPS_ENCODE_CODEC`, `CLIPS_ENCODE_KBPS`, and, only if
+wanted, `CLIPS_ENCODE_SIZE` (0 = native; e.g. 1024) and `CLIPS_ENCODE_FPS`
+(0 = unchanged; e.g. 5). Then `homehub_clips.py encode-trial --clean`, set
+`CLIPS_ENCODE_ENABLED=true`, run one batch
+(`sudo systemctl start homehub-clips-encode.service`), read the sidecars' `encode`
+(kept, bytes before and after, seconds) and check PSI. Keep it:
 `sudo systemctl enable --now homehub-clips-encode.timer`; or set the knob back.
+A first look on the hub (2026-10-27, one 30 s daytime window, copy 2.31 MB):
+h264 1024 square 200 kb/s 0.75 MB, SSIM 0.927; hevc the same, 0.75 MB, 0.927;
+h264 native 300 kb/s at 5 fps 1.12 MB, 0.961.
 
 **8. Make it survive a reimage.** In HomeHub `config.homehub.psd1`, set the knobs
 that were switched on (`CAMERA_DOOR_MOTION_ENABLED`, `CAMERA_DOOR_MOTION_DECODE`

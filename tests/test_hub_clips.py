@@ -643,7 +643,7 @@ def test_tc1565_clips_is_a_scratch_writer_sized_before_ottertube():
     tight = hs.size_quotas((8192 + 2048 + 512 + 512 + 2048 + 100) * MIB, want, 2048, 512)
     assert tight == {"door": 8192, "meetings": 2048, "clips": 612, "ottertube": 512}
     s = hs.Settings({})
-    assert s.quota_mib["clips"] == 1024
+    assert s.quota_mib["clips"] == 5120   # 5 GiB once the volume is grown to 22 GiB (2026-10-27)
     with pytest.raises(hs.Stop, match="clips"):  # a writer left out is refused, not unlimited
         hs.size_quotas(18170 * MIB, {"door": 8192, "meetings": 2048, "ottertube": 6144}, 2048, 512)
 
@@ -694,7 +694,9 @@ def test_tc1566_the_template_declares_every_knob_off_with_placeholder_zones():
                        ("CLIPS_ROOT", "/srv/scratch/clips"), ("CLIPS_RETENTION_DAYS", "365"), ("CLIPS_CAP_MIB", "95367"),
                        ("CAMERA_DOOR_CLIP_PRE_SEC", "3"), ("CAMERA_DOOR_CLIP_LEASE_SEC", "5"),
                        ("CAMERA_DOOR_MOTION_APPROACH_POLYGON", "0,0;1,0;1,1;0,1"), ("CAMERA_DOOR_MOTION_ROAD_POLYGON", ""),
-                       ("CAMERA_MOTION_BUDGET_PCT", "25"), ("HOMEHUB_SCRATCH_QUOTA_CLIPS_MIB", "1024")):
+                       ("CAMERA_MOTION_BUDGET_PCT", "25"), ("HOMEHUB_SCRATCH_QUOTA_CLIPS_MIB", "5120"),
+                       ("HOMEHUB_SCRATCH_SIZE_MIB", "22528"), ("HOMEHUB_SCRATCH_VG_RESERVE_MIB", "1200"),
+                       ("CLIPS_ENCODE_SIZE", "0"), ("CLIPS_ENCODE_FPS", "0")):
         assert env.get(key) == value, key
     s = hc.ClipsSettings(env)
     assert s.cameras[0].causes == ["approach", "road-stop"]
@@ -1163,3 +1165,119 @@ def test_tc1557_the_offset_follows_the_zone_across_the_dst_change(monkeypatch):
     finally:
         monkeypatch.delenv("TZ")
         time.tzset()
+
+
+# ── TC-1575 the encode trial (the Owner, 2026-10-27) ─────────────────────────
+
+
+class FakeTrialFfmpeg:
+    """`docker run ... ffmpeg` for the trial: an encode writes a file sized by
+    its bitrate and size and prints a bench line; an SSIM run prints a score."""
+
+    def __init__(self, fail=None):
+        self.calls, self.fail = [], fail
+
+    def __call__(self, argv, stdout=None, stderr=None, timeout=None):
+        self.calls.append(argv)
+        out = argv[-1]
+        if out == "-":                                   # the SSIM run
+            enc = argv[argv.index("-i") + 1]
+            score = 0.98 if "native" in enc else 0.93
+            return subprocess.CompletedProcess(argv, 0, b"", ("[Parsed_ssim_2] SSIM Y:0.9 U:0.9 V:0.9 All:%.4f (14.1)\n"
+                                                              % score).encode())
+        if self.fail and self.fail in out:
+            return subprocess.CompletedProcess(argv, 1, b"", b"Error while opening encoder")
+        bind = argv[argv.index("-v") + 1].split(":/out")[0]
+        kbps = int(argv[argv.index("-b:v") + 1][:-1])
+        size = kbps * 10 // (2 if "scale_vaapi" in " ".join(argv) else 1)
+        with open(os.path.join(bind, out[len("/out/"):]), "wb") as handle:
+            handle.write(b"e" * size)
+        return subprocess.CompletedProcess(argv, 0, b"", b"bench: utime=1.250s stime=0.250s rtime=3.000s\n")
+
+
+def trial_day(tmp_path):
+    root = tmp_path / "clips"
+    day = root / "door" / "2026-10-26"
+    day.mkdir(parents=True)
+    stems = ["door_2026-10-26_12-00-00+0000_approach_20s", "door_2026-10-26_13-00-00+0000_road-stop_29s",
+             "door_2026-10-26_22-00-00+0000_approach_12s", "door_2026-10-26_02-00-00+0000_approach_31s"]
+    for stem in stems:
+        (day / (stem + ".mp4")).write_bytes(b"c" * 10000)
+        (day / (stem + ".json")).write_text("{}")
+    s = hc.ClipsSettings({})
+    s.root = str(root)
+    return s, root, day, stems
+
+
+def test_tc1575_the_sample_takes_day_and_night_shortest_first(tmp_path, monkeypatch):
+    monkeypatch.setattr(hc.time, "localtime", time.gmtime)
+    _s, _root, day, stems = trial_day(tmp_path)
+    assert hc.trial_sample(str(day), 2) == [(stems[0], "day"), (stems[2], "night")]
+    assert [k for _s2, k in hc.trial_sample(str(day), 4)] == ["day", "day", "night", "night"]
+
+
+def test_tc1575_every_combination_is_measured_one_sample_each_kept_and_no_clip_touched(tmp_path, monkeypatch):
+    monkeypatch.setattr(hc.time, "localtime", time.gmtime)
+    monkeypatch.setattr(hc.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, b"", b""))
+    s, root, day, stems = trial_day(tmp_path)
+    before = {p.name: p.read_bytes() for p in day.iterdir()}
+    fake = FakeTrialFfmpeg()
+    probe = lambda c, d, n: {"frames": 300, "width": 1536, "height": 1536, "duration": 30.0}  # noqa: E731
+    report = hc.encode_trial(s, "door", "2026-10-26", 2, runner=fake, prober=probe)
+    assert {p.name: p.read_bytes() for p in day.iterdir()} == before            # nothing replaced or removed
+    names = [hc.combo_name(c) for c in hc.TRIAL_COMBOS]
+    assert len(names) == 9 and "hevc_1024sq_200k" in names and "h264_native_300k_5fps" in names
+    trial = root / hc.TRIAL_DIR / "door-2026-10-26"
+    kept = sorted(p.name for p in trial.iterdir() if p.suffix == ".mp4")
+    assert kept == sorted("%s_%s.mp4" % (n, stems[0]) for n in names)          # one sample per combination
+    assert not [p for p in trial.iterdir() if p.name.endswith(".part")]
+    assert (trial / "trial.json").exists() and "hevc_native_300k" in (trial / "trial.txt").read_text()
+    rows = report["rows"]
+    assert len(rows) == 18 and all("bytes" in r and r["cpu_s"] == 1.5 and r["wall_s"] == 3.0 for r in rows)
+    native = [r for r in report["summary"] if r["combo"] == "h264_native_300k" and r["kind"] == "all"][0]
+    assert native["pct_of_copy"] == 30.0 and native["ssim_mean"] == 0.98
+    encodes = [c for c in fake.calls if c[-1] != "-"]
+    assert all(c[c.index("--cpu-shares") + 1] == "2" and "/src:ro" in " ".join(c) for c in encodes)
+    five = [c for c in encodes if "5fps" in c[-1]][0]
+    assert five[five.index("-vf") + 1] == "fps=5"
+    hevc = [c for c in encodes if "hevc_1024sq" in c[-1]][0]
+    assert hevc[hevc.index("-vf") + 1] == "scale_vaapi=w=1024:h=1024" and "hevc_vaapi" in hevc
+    assert not any("format=gray" in " ".join(c) or "v360" in " ".join(c) for c in fake.calls)  # no grey, no dewarp
+    ssim5 = [c for c in fake.calls if c[-1] == "-" and "5fps" in " ".join(c)][0]
+    assert "[1:v]fps=5[b]" in ssim5[ssim5.index("-lavfi") + 1]
+
+
+def test_tc1575_a_failure_a_full_area_a_time_budget_and_clean(tmp_path, monkeypatch):
+    monkeypatch.setattr(hc.time, "localtime", time.gmtime)
+    monkeypatch.setattr(hc.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, b"", b""))
+    s, root, day, stems = trial_day(tmp_path)
+    probe = lambda c, d, n: {"width": 1536, "height": 1536}  # noqa: E731
+    report = hc.encode_trial(s, "door", "2026-10-26", 1, runner=FakeTrialFfmpeg(fail="hevc"), prober=probe)
+    assert sum(1 for r in report["rows"] if "failed" in r) == 4 and "FAILED hevc" in hc.trial_table(report)
+    with pytest.raises(hc.QuotaStop, match="no clip is ever removed"):
+        hc.encode_trial(s, "door", "2026-10-26", 1, runner=FakeTrialFfmpeg(), prober=probe,
+                        quota_fn=lambda: (900, 1000))
+    ticks = iter(range(0, 10 ** 6, hc.TRIAL_RUN_SEC // 2 + 1))
+    cut = hc.encode_trial(s, "door", "2026-10-26", 1, runner=FakeTrialFfmpeg(), prober=probe, clock=lambda: next(ticks))
+    assert cut["stopped_early"] and len(cut["rows"]) < 9
+    assert hc.clean_trials(str(root)) > 0 and not (root / hc.TRIAL_DIR).exists()
+    assert sorted(p.name for p in day.iterdir()) == sorted([x + ".mp4" for x in stems] + [x + ".json" for x in stems])
+
+
+def test_tc1575_the_batch_size_and_rate_knobs_default_to_unchanged(tmp_path, monkeypatch):
+    plain = hc.encode_command(hc.ClipsSettings({}), "door", "/d", "a.mp4", "p")
+    assert "-vf" not in plain
+    both = hc.encode_command(hc.ClipsSettings({"CLIPS_ENCODE_SIZE": "1024", "CLIPS_ENCODE_FPS": "5"}), "door", "/d",
+                             "a.mp4", "p")
+    assert both[both.index("-vf") + 1] == "fps=5,scale_vaapi=w=1024:h=1024"
+    with pytest.raises(hc.Invalid, match="CLIPS_ENCODE_SIZE"):
+        hc.ClipsSettings({"CLIPS_ENCODE_SIZE": "1023"})
+    # a 5 fps encode of a 30 s clip holds about 150 frames, not the copy's 300
+    s, day = encode_setup(tmp_path, monkeypatch)
+    s.encode_fps = 5
+    side = json.load(open(os.path.join(day, "c.json")))
+    side["actual"] = {"start_utc_ms": T0, "end_utc_ms": T0 + 30000}
+    open(os.path.join(day, "c.json"), "w").write(json.dumps(side))
+    res = hc.encode_clip(s, "door", day, "c", runner=enc_runner(400),
+                         prober=lambda c, d, n: {"frames": 151, "duration": 30.0})
+    assert res["kept"] is True

@@ -161,8 +161,9 @@ def test_tc1375_settings_reject_a_malformed_uuid_and_read_budgets():
 class FakeHost:
     """Every command the provisioner may run, answered from a small model."""
 
-    def __init__(self, lv_exists=False, signature=None, free=5949):
+    def __init__(self, lv_exists=False, signature=None, free=5949, lv_mib=18432, fs_mib=None):
         self.lv_exists, self.signature, self.free = lv_exists, signature, free
+        self.lv_mib, self.fs_mib = lv_mib, fs_mib
         self.ran = []
 
     def run(self, argv, check=True):
@@ -173,6 +174,8 @@ class FakeHost:
         d = Done()
         if argv[0] == "vgs":
             d.stdout = "  %d 4194304\n" % self.free
+        elif argv[0] == "lvs" and "lv_size" in argv:
+            d.stdout = "  %d\n" % (self.lv_mib * 1024 * 1024)
         elif argv[0] == "lvs":
             if self.lv_exists:
                 d.stdout = "  /dev/ubuntu-vg/hub-scratch\n"
@@ -184,7 +187,9 @@ class FakeHost:
             else:
                 d.returncode = 2
         elif argv[0] == "dumpe2fs":
-            d.stdout = "Filesystem features:      has_journal ext_attr extent quota project\n"
+            fs = self.fs_mib if self.fs_mib is not None else self.lv_mib
+            d.stdout = ("Filesystem features:      has_journal ext_attr extent quota project\n"
+                        "Block count:              %d\nBlock size:               4096\n" % (fs * 256))
         return d
 
 
@@ -208,11 +213,11 @@ def provisioner(paths, apply=False, **env):
 
 def test_tc1373_plan_on_the_measured_hub_describes_every_step_and_runs_nothing(host):
     fake, paths = host
-    report = provisioner(paths).walk()
+    report = provisioner(paths).walk()   # a fresh VG of 5949 extents, the 22 GiB default and its 1200 MiB reserve
     joined = "\n".join(report["actions"])
-    assert "create LV ubuntu-vg/hub-scratch, 4608 extents" in joined
+    assert "create LV ubuntu-vg/hub-scratch, 5632 extents" in joined
     assert "make ext4" in joined and "append to" in joined and "mode 000" in joined
-    assert report["vg_leftover_gib"] == 5.24
+    assert report["vg_leftover_gib"] == 1.24
     assert not [c for c in fake.ran if c[0] in ("lvcreate", "mkfs.ext4", "mount", "systemctl")]
 
 
@@ -220,9 +225,13 @@ def test_tc1372_an_existing_lv_is_never_recreated_or_resized(host):
     fake, paths = host
     fake.lv_exists = True
     fake.signature = {"TYPE": "ext4", "LABEL": "hub-scratch", "UUID": UUID}
-    report = provisioner(paths, HOMEHUB_SCRATCH_UUID=UUID).walk()
+    report = provisioner(paths, HOMEHUB_SCRATCH_UUID=UUID, HOMEHUB_SCRATCH_SIZE_MIB="18432").walk()
     assert report["lv"] == "/dev/ubuntu-vg/hub-scratch" and report["uuid"] == UUID
-    assert not any("create LV" in a or "make ext4" in a for a in report["actions"])
+    assert not any("create LV" in a or "make ext4" in a or "grow" in a for a in report["actions"])
+    # larger than asked for: never shrunk
+    report = provisioner(paths, HOMEHUB_SCRATCH_UUID=UUID, HOMEHUB_SCRATCH_SIZE_MIB="16384").walk()
+    assert not any("grow" in a for a in report["actions"])
+    assert not [c for c in fake.ran if c[0] in ("lvextend", "lvreduce", "resize2fs")]
 
 
 def test_tc1372_a_device_with_a_foreign_signature_is_never_formatted(host):
@@ -311,3 +320,75 @@ def test_tc1373_mkfs_is_ext4_with_quota_and_project_and_no_force_flag():
     assert args[args.index("-m") + 1] == "0"
     assert args[args.index("-L") + 1] == "hub-scratch"
     assert "-F" not in args
+
+
+# ── TC-1574 the volume grows online, never shrinks (2026-10-27) ──────────────
+
+
+def test_tc1574_grow_plan_takes_whole_extents_keeps_the_reserve_and_never_shrinks():
+    # the live hub, measured 2026-10-27: 1341 free extents of 4 MiB, an 18432 MiB LV
+    got = hs.grow_plan(18432 * MIB, 22528, 1341, 4 * MIB, 1200)
+    assert got == {"extents": 1024, "new_mib": 22528, "leftover_extents": 317, "leftover_bytes": 317 * 4 * MIB}
+    assert hs.grow_plan(18432 * MIB, 18432, 1341, 4 * MIB, 1200) is None
+    assert hs.grow_plan(18432 * MIB, 10000, 1341, 4 * MIB, 1200) is None
+    assert hs.grow_plan(18432 * MIB, 18433, 1341, 4 * MIB, 0)["extents"] == 1      # rounded up to an extent
+    with pytest.raises(hs.Stop, match="Nothing was changed"):
+        hs.grow_plan(18432 * MIB, 22528, 1341, 4 * MIB, 1300)                     # 317 extents < 1300 MiB
+
+
+def test_tc1574_plan_shows_the_grow_and_ensure_extends_then_resizes_online(host, tmp_path):
+    fake, paths = host
+    fake.lv_exists, fake.free = True, 1341
+    fake.signature = {"TYPE": "ext4", "LABEL": "hub-scratch", "UUID": UUID}
+    report = provisioner(paths, HOMEHUB_SCRATCH_UUID=UUID).walk()
+    joined = "\n".join(report["actions"])
+    assert "grow LV /dev/ubuntu-vg/hub-scratch by 1024 extents (18432 -> 22528 MiB)" in joined
+    assert "grow the ext4 filesystem on /dev/ubuntu-vg/hub-scratch online" in joined
+    assert not [c for c in fake.ran if c[0] in ("lvextend", "resize2fs")]      # plan runs nothing
+
+    # ensure, with the volume mounted: lvextend, then resize2fs once the LV is larger
+    (tmp_path / "proc" / "mountinfo").write_text(
+        "29 1 253:0 / / rw - ext4 /dev/mapper/vg-root rw\n40 29 253:3 / %s rw - ext4 /dev/x rw,prjquota\n"
+        % paths.mountpoint_name)
+    p = hs.Provisioner(hs.Settings({"HOMEHUB_SCRATCH_UUID": UUID}), True, paths, vg="ubuntu-vg")
+    real = fake.run
+
+    def run(argv, check=True):
+        if argv[0] == "lvextend":
+            fake.lv_mib = 22528                      # the LV grew; the filesystem has not yet
+            fake.fs_mib = 18432
+        if argv[0] == "resize2fs":
+            fake.fs_mib = 22528
+        return real(argv, check)
+    hs.run = run
+    p.step_lv("ubuntu-vg")
+    p.step_grow_fs("/dev/ubuntu-vg/hub-scratch")
+    ran = [c for c in fake.ran if c[0] in ("lvextend", "resize2fs")]
+    assert ran == [["lvextend", "-l", "+1024", "/dev/ubuntu-vg/hub-scratch"], ["resize2fs", "/dev/ubuntu-vg/hub-scratch"]]
+    # a second run finds nothing to do
+    fake.ran.clear()
+    q = hs.Provisioner(hs.Settings({"HOMEHUB_SCRATCH_UUID": UUID}), True, paths, vg="ubuntu-vg")
+    q.step_lv("ubuntu-vg")
+    q.step_grow_fs("/dev/ubuntu-vg/hub-scratch")
+    assert not [c for c in fake.ran if c[0] in ("lvextend", "resize2fs")]
+
+
+def test_tc1574_an_interrupted_grow_is_finished_online_and_not_while_unmounted(host):
+    fake, paths = host
+    fake.lv_mib, fake.fs_mib = 22528, 18432          # lvextend ran, resize2fs did not
+    p = hs.Provisioner(hs.Settings({}), True, paths, vg="ubuntu-vg")
+    p.extent_bytes = 4 * MIB
+    p.step_grow_fs("/dev/ubuntu-vg/hub-scratch")      # the host fixture's mountinfo has no /srv/scratch
+    assert not [c for c in fake.ran if c[0] == "resize2fs"]
+    with open(paths.mountinfo, "a") as handle:
+        handle.write("40 29 253:3 / %s rw - ext4 /dev/x rw,prjquota\n" % paths.mountpoint_name)
+    p.step_grow_fs("/dev/ubuntu-vg/hub-scratch")
+    assert [c for c in fake.ran if c[0] == "resize2fs"] == [["resize2fs", "/dev/ubuntu-vg/hub-scratch"]]
+
+
+def test_tc1574_the_new_defaults_on_the_grown_live_volume():
+    s = hs.Settings({})
+    assert (s.size_mib, s.vg_reserve_mib, s.quota_mib["clips"], s.quota_mib["ottertube"]) == (22528, 1200, 5120, 6144)
+    # 22 GiB keeps the live volume's measured overhead (18170 of 18432): about 22207 MiB usable
+    got = hs.size_quotas(22207 * MIB, s.quota_mib, s.free_floor_mib, s.min_quota_mib)
+    assert got == {"door": 8192, "meetings": 2048, "clips": 5120, "ottertube": 22207 - 2048 - 8192 - 2048 - 5120}

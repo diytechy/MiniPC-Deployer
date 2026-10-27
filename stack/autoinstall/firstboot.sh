@@ -195,7 +195,8 @@ setup_docker_lv
 
 # ── 1b-scratch. THE NVMe SCRATCH VOLUME (SN-050, SR-102; stack/scratch) ──────
 #
-# 18 GiB of the VG for recording and staging, OFF THE ROOT FILESYSTEM, with a
+# 22 GiB of the VG (grown online from 18 when HOMEHUB_SCRATCH_SIZE_MIB is raised;
+# never shrunk) for recording and staging, OFF THE ROOT FILESYSTEM, with a
 # hard project quota per writer (door/ meetings/ ottertube/). AFTER 1b ON
 # PURPOSE: the docker LV takes its 60% of the free space first, exactly as it
 # always has, and the scratch LV comes out of what is left.

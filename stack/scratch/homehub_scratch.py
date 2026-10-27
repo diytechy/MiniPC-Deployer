@@ -96,13 +96,13 @@ MKFS_ARGS = ["-q", "-t", "ext4", "-O", "quota,project", "-E", "quotatype=prjquot
 #
 # clips/ (2026-10-27, SR-131): the motion clips' small, capped area until the
 # media drive exists (the Owner, 2026-10-26; HomeHub open-items C111). It sits
-# before ottertube, so on the live 18 GiB volume its 1 GiB comes out of
-# ottertube's ceiling (5882 -> 4858 MiB granted; ottertube uses under 1 GiB of a
-# 3 GiB list budget), not out of the door recording the clips are cut from.
+# before ottertube, so its room comes out of ottertube's ceiling (about 4800 MiB
+# granted on the volume grown to 22 GiB, with clips at 5 GiB; ottertube uses under
+# 1 GiB of a 3 GiB list budget), not out of the door recording the clips are cut from.
 WRITERS: Tuple[Tuple[str, int, str, int], ...] = (
     ("door", 7101, "HOMEHUB_SCRATCH_QUOTA_DOOR_MIB", 8 * 1024),
     ("meetings", 7102, "HOMEHUB_SCRATCH_QUOTA_MEETINGS_MIB", 2 * 1024),
-    ("clips", 7104, "HOMEHUB_SCRATCH_QUOTA_CLIPS_MIB", 1024),
+    ("clips", 7104, "HOMEHUB_SCRATCH_QUOTA_CLIPS_MIB", 5 * 1024),
     ("ottertube", 7103, "HOMEHUB_SCRATCH_QUOTA_OTTERTUBE_MIB", 6 * 1024),
 )
 WRITER_NAMES = tuple(w[0] for w in WRITERS)
@@ -129,8 +129,10 @@ class Settings:
 
     Contract:
       Config:  HOMEHUB_SCRATCH_UUID (the expected filesystem UUID, lowercase; empty
-               = not yet created), HOMEHUB_SCRATCH_SIZE_MIB (18432),
-               HOMEHUB_SCRATCH_VG_RESERVE_MIB (4096: VG space left unallocated),
+               = not yet created), HOMEHUB_SCRATCH_SIZE_MIB (22528: grown online
+               from 18432 when raised, never shrunk),
+               HOMEHUB_SCRATCH_VG_RESERVE_MIB (1200: VG space left unallocated by a
+               create or a grow; it was 4096 until the 2026-10-27 grow ruling),
                HOMEHUB_SCRATCH_FREE_FLOOR_MIB (2048: usable space left free when
                every writer is at its quota), HOMEHUB_SCRATCH_MIN_QUOTA_MIB (512:
                a writer reduced below this is a STOP, not a budget), and one
@@ -141,8 +143,8 @@ class Settings:
         uuid = env.get("HOMEHUB_SCRATCH_UUID", "").strip().lower()
         self.uuid = uuid if UUID_RE.fullmatch(uuid) else ""
         self.uuid_malformed = bool(uuid) and not self.uuid
-        self.size_mib = mc.knob_int(env, "HOMEHUB_SCRATCH_SIZE_MIB", 18 * 1024, 64, 1 << 22)
-        self.vg_reserve_mib = mc.knob_int(env, "HOMEHUB_SCRATCH_VG_RESERVE_MIB", 4 * 1024, 0, 1 << 22)
+        self.size_mib = mc.knob_int(env, "HOMEHUB_SCRATCH_SIZE_MIB", 22 * 1024, 64, 1 << 22)
+        self.vg_reserve_mib = mc.knob_int(env, "HOMEHUB_SCRATCH_VG_RESERVE_MIB", 1200, 0, 1 << 22)
         self.free_floor_mib = mc.knob_int(env, "HOMEHUB_SCRATCH_FREE_FLOOR_MIB", 2 * 1024, 0, 1 << 22)
         self.min_quota_mib = mc.knob_int(env, "HOMEHUB_SCRATCH_MIN_QUOTA_MIB", 512, 1, 1 << 22)
         self.quota_mib = {name: mc.knob_int(env, knob, default, 0, 1 << 22)
@@ -178,6 +180,37 @@ def capacity_plan(free_extents: int, extent_bytes: int, size_mib: int, reserve_m
                lv_extents, max(leftover, 0), max(leftover, 0) * extent_bytes / GIB, reserve_mib))
     return {"lv_extents": lv_extents, "leftover_extents": leftover,
             "leftover_bytes": leftover * extent_bytes}
+
+
+def grow_plan(lv_bytes: int, want_mib: int, free_extents: int, extent_bytes: int,
+              reserve_mib: int) -> Optional[Dict[str, int]]:
+    """How far the existing LV grows, or None when it is already at least the
+    size wanted - it is NEVER shrunk (pure).
+
+    Contract:
+      Inputs:  lv_bytes: the LV's size now; want_mib: HOMEHUB_SCRATCH_SIZE_MIB;
+               free_extents, extent_bytes: the VG's; reserve_mib: VG space that
+               must stay unallocated afterwards.
+      Outputs: {extents, new_mib, leftover_extents, leftover_bytes}.
+      Raises:  Stop with the exact numbers when the VG cannot give the extents
+               and keep its reserve. Nothing was changed.
+    Implements: SR-102, SR-131, LLR-1380.
+    """
+    if extent_bytes <= 0:
+        raise Stop("the volume group reports an extent size of %d bytes" % extent_bytes)
+    want = want_mib * MIB
+    if want <= lv_bytes:
+        return None
+    extents = -(-(want - lv_bytes) // extent_bytes)  # ceiling
+    reserve_extents = -(-reserve_mib * MIB // extent_bytes)
+    leftover = free_extents - extents
+    if leftover < reserve_extents:
+        raise Stop("growing the LV from %d to %d MiB takes %d extents of %d bytes; the VG has %d free and must keep "
+                   "%d MiB (%d extents) unallocated. Nothing was changed; lower HOMEHUB_SCRATCH_SIZE_MIB or free VG "
+                   "space first" % (lv_bytes // MIB, want_mib, extents, extent_bytes, free_extents, reserve_mib,
+                                    reserve_extents))
+    return {"extents": extents, "new_mib": (lv_bytes + extents * extent_bytes) // MIB,
+            "leftover_extents": leftover, "leftover_bytes": leftover * extent_bytes}
 
 
 def size_quotas(usable_bytes: int, requested_mib: Dict[str, int], floor_mib: int, min_mib: int) -> Dict[str, int]:
@@ -518,6 +551,19 @@ def vg_free(vg: str) -> Tuple[int, int]:
     return int(out[0]), int(out[1])
 
 
+def lv_bytes(device: str) -> int:
+    """An LV's size in bytes, exact units."""
+    return int(run(["lvs", "--noheadings", "--units", "b", "--nosuffix", "-o", "lv_size", device]).stdout.split()[0])
+
+
+def fs_bytes(device: str) -> Optional[int]:
+    """The ext4 filesystem's size on a device (block count x block size), or None."""
+    out = run(["dumpe2fs", "-h", device], check=False).stdout
+    count = re.search(r"^Block count:\s+(\d+)", out, re.M)
+    size = re.search(r"^Block size:\s+(\d+)", out, re.M)
+    return int(count.group(1)) * int(size.group(1)) if count and size else None
+
+
 def lv_path(vg: str) -> Optional[str]:
     done = run(["lvs", "--noheadings", "-o", "lv_path", "%s/%s" % (vg, LV_NAME)], check=False)
     path = done.stdout.strip()
@@ -576,6 +622,8 @@ class Provisioner:
                  vg: Optional[str] = None, mount_with: str = "systemd"):
         self.s, self.apply, self.paths = settings, apply, paths or Paths()
         self.vg, self.mount_with = vg, mount_with
+        self.lv_growing = False
+        self.extent_bytes = 0
         self.actions: List[str] = []
         self.report: Dict[str, object] = {}
 
@@ -591,6 +639,7 @@ class Provisioner:
         uuid = self.step_filesystem(device, existed)
         self.step_fstab(uuid)
         self.step_mount(uuid)
+        self.step_grow_fs(device)
         self.step_writers()
         self.report["actions"] = self.actions
         return self.report
@@ -600,10 +649,26 @@ class Provisioner:
         free, extent = vg_free(vg)
         self.report.update(vg=vg, vg_free_extents=free, vg_extent_bytes=extent,
                            vg_free_gib=round(free * extent / GIB, 2))
+        self.extent_bytes = extent
         existing = lv_path(vg)
         if existing:
             self.report["lv"] = existing
-            mc.log("scratch: %s already exists - not resized, not recreated" % existing)
+            have = lv_bytes(existing)
+            self.report["lv_mib"] = have // MIB
+            grow = grow_plan(have, self.s.size_mib, free, extent, self.s.vg_reserve_mib)
+            if grow is None:
+                mc.log("scratch: %s already exists (%d MiB, %d wanted) - not recreated, never shrunk"
+                       % (existing, have // MIB, self.s.size_mib))
+                return existing, True
+            self.report.update(lv_grow_extents=grow["extents"], lv_new_mib=grow["new_mib"],
+                               vg_leftover_gib=round(grow["leftover_bytes"] / GIB, 2))
+            # Online: lvextend grows the LV under the mounted filesystem, and
+            # step_grow_fs then grows ext4 into it (resize2fs, online for ext4).
+            self.act("grow LV %s by %d extents (%d -> %d MiB), leaving %d extents (%.2f GiB) free; never shrinks"
+                     % (existing, grow["extents"], have // MIB, grow["new_mib"], grow["leftover_extents"],
+                        grow["leftover_bytes"] / GIB),
+                     ["lvextend", "-l", "+%d" % grow["extents"], existing])
+            self.lv_growing = True
             return existing, True
         plan = capacity_plan(free, extent, self.s.size_mib, self.s.vg_reserve_mib)
         self.report.update(lv_extents=plan["lv_extents"], vg_leftover_gib=round(plan["leftover_bytes"] / GIB, 2))
@@ -702,6 +767,33 @@ class Provisioner:
         else:
             # Through the same fstab line systemd would use (util-linux mount -T).
             self.act("mount it (mount -T %s %s)" % (self.paths.fstab, mp), ["mount", "-T", self.paths.fstab, mp])
+
+    def step_grow_fs(self, device: str) -> None:
+        """Grow ext4 ONLINE into the LV when the LV is larger than the
+        filesystem by at least an extent: after a grow this run, or one an
+        earlier run was stopped between. Only while mounted (resize2fs grows a
+        mounted ext4 in place); never shrinks. Implements: LLR-1380."""
+        if not self.apply:
+            if self.lv_growing:
+                self.act("grow the ext4 filesystem on %s online to fill the LV (resize2fs)" % device)
+                return
+        if not os.path.exists(device) and not self.apply:
+            return
+        try:
+            with open(self.paths.mountinfo, encoding="utf-8", errors="replace") as handle:
+                mounted = mount_of(parse_mountinfo(handle.read()), self.paths.mountpoint_name) is not None
+        except OSError:
+            mounted = False
+        have_fs = fs_bytes(device)
+        have_lv = lv_bytes(device) if self.apply or not self.lv_growing else None
+        if have_fs is None or have_lv is None or have_lv - have_fs < max(self.extent_bytes, MIB):
+            return
+        if not mounted:
+            mc.log("scratch: the filesystem (%d MiB) is smaller than its LV (%d MiB) but not mounted; it is grown "
+                   "online at the next ensure with it mounted" % (have_fs // MIB, have_lv // MIB), warning=True)
+            return
+        self.act("grow the ext4 filesystem on %s online from %d to %d MiB (resize2fs)"
+                 % (device, have_fs // MIB, have_lv // MIB), ["resize2fs", device])
 
     def step_writers(self) -> None:
         mp = self.paths.mountpoint

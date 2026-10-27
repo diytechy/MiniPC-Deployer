@@ -50,7 +50,7 @@ past CLIPS_QUOTA_HIGH_PCT of its limit: oldest clips first. Hourly.
 
 WHERE (the Owner, 2026-10-26: the media drive is not bought yet, C111):
 CLIPS_ROOT=/srv/scratch/clips, the scratch volume's `clips` quota project
-(homehub_scratch.py, 1 GiB) behind the scratch guard. /srv/media/Clips is the
+(homehub_scratch.py, 5 GiB on the 22 GiB volume) behind the scratch guard. /srv/media/Clips is the
 other accepted value, for when the drive exists; it has a generic guard
 (a separate ext4 mount with project quotas, writable) until the media build
 adds the drive's identity check. A write that hits the quota stops the cutter
@@ -187,6 +187,12 @@ class ClipsSettings:
         self.kbps = mc.knob_int(env, "CLIPS_ENCODE_KBPS", 300, 50, 20000)
         self.keep_pct = mc.knob_int(env, "CLIPS_ENCODE_KEEP_PCT", 80, 10, 100)
         self.max_per_run = mc.knob_int(env, "CLIPS_ENCODE_MAX_PER_RUN", 20, 1, 1000)
+        # 0 = unchanged: the native raster and the camera's own frame rate. Set
+        # only after `encode-trial` showed what a smaller size or rate costs.
+        self.encode_size = mc.knob_int(env, "CLIPS_ENCODE_SIZE", 0, 0, 4096)
+        self.encode_fps = mc.knob_int(env, "CLIPS_ENCODE_FPS", 0, 0, 60)
+        if self.encode_size and (self.encode_size < 256 or self.encode_size % 2):
+            raise Invalid("CLIPS_ENCODE_SIZE must be 0 (native) or an even number of pixels, at least 256")
         self.device = env.get("CAMERA_VAAPI_DEVICE", "").strip() or "/dev/dri/renderD128"
         if not re.fullmatch(r"/dev/dri/renderD[0-9]{3}", self.device):
             raise Invalid("CAMERA_VAAPI_DEVICE must be /dev/dri/renderD<NNN>")
@@ -670,21 +676,41 @@ def cut_command(camera: str, out_dir: str, part_name: str, regenerate_fps: Optio
 def probe_command(camera: str, out_dir: str, name: str) -> List[str]:
     return docker_base("homehub-clips-probe-%s" % camera, out_dir, read_only_out=True) + [
         "--entrypoint", "ffprobe", door_relay.image_ref(), "-v", "error", "-select_streams", "v:0",
-        "-count_packets", "-show_entries", "stream=codec_name,nb_read_packets:format=duration",
+        "-count_packets", "-show_entries", "stream=codec_name,nb_read_packets,width,height:format=duration",
         "-of", "json", "/out/" + name]
+
+
+def vaapi_encode_args(device: str, src: str, codec: str, kbps: int, size: int = 0, fps: int = 0,
+                      loglevel: str = "error") -> List[str]:
+    """ffmpeg's arguments for one VA-API encode: decode on the iGPU, optionally
+    `fps` and `scale_vaapi` there too (square SIZE: the raw fisheye stays a
+    circle, never dewarped), VBR around kbps with a peak of twice that. No grey
+    or 4:0:0 output: VA-API encodes 4:2:0."""
+    vf = []
+    if fps:
+        vf.append("fps=%d" % fps)
+    if size:
+        vf.append("scale_vaapi=w=%d:h=%d" % (size, size))
+    argv = ["-nostdin", "-hide_banner", "-loglevel", loglevel,
+            "-hwaccel", "vaapi", "-hwaccel_device", device, "-hwaccel_output_format", "vaapi",
+            "-i", src, "-map", "0:v:0", "-an"]
+    if vf:
+        argv += ["-vf", ",".join(vf)]
+    argv += ["-c:v", "h264_vaapi" if codec == "h264" else "hevc_vaapi", "-rc_mode", "VBR",
+             "-b:v", "%dk" % kbps, "-maxrate", "%dk" % (2 * kbps)]
+    if codec == "hevc":
+        argv += ["-tag:v", "hvc1"]
+    return argv
 
 
 def encode_command(settings: ClipsSettings, camera: str, out_dir: str, src: str, part_name: str) -> List[str]:
     """VA-API encode of one clip, the container at the lowest CPU weight. VBR
-    around CLIPS_ENCODE_KBPS (peak twice that). Implements: LLR-1374."""
-    codec = "h264_vaapi" if settings.codec == "h264" else "hevc_vaapi"
+    around CLIPS_ENCODE_KBPS (peak twice that), at CLIPS_ENCODE_SIZE and
+    CLIPS_ENCODE_FPS when set (0 = unchanged). Implements: LLR-1374."""
     argv = docker_base("homehub-clips-encode-%s" % camera, out_dir, shares=2, device=settings.device)
-    argv += ["--entrypoint", "ffmpeg", door_relay.image_ref(), "-nostdin", "-hide_banner", "-loglevel", "error",
-             "-hwaccel", "vaapi", "-hwaccel_device", settings.device, "-hwaccel_output_format", "vaapi",
-             "-i", "/out/" + src, "-map", "0:v:0", "-an", "-c:v", codec, "-rc_mode", "VBR",
-             "-b:v", "%dk" % settings.kbps, "-maxrate", "%dk" % (2 * settings.kbps)]
-    if settings.codec == "hevc":
-        argv += ["-tag:v", "hvc1"]
+    argv += ["--entrypoint", "ffmpeg", door_relay.image_ref()]
+    argv += vaapi_encode_args(settings.device, "/out/" + src, settings.codec, settings.kbps,
+                              settings.encode_size, settings.encode_fps)
     return argv + ["-movflags", "+faststart", "-f", "mp4", "-y", "/out/" + part_name]
 
 
@@ -712,7 +738,8 @@ def run_probe(camera: str, out_dir: str, name: str, runner=subprocess.run) -> Op
         data = json.loads(done.stdout.decode("utf-8", "replace") if isinstance(done.stdout, bytes) else done.stdout)
         stream = (data.get("streams") or [{}])[0]
         return {"frames": int(stream.get("nb_read_packets") or 0), "codec": stream.get("codec_name"),
-                "duration": float((data.get("format") or {}).get("duration") or 0.0)}
+                "duration": float((data.get("format") or {}).get("duration") or 0.0),
+                "width": int(stream.get("width") or 0), "height": int(stream.get("height") or 0)}
     except (ValueError, TypeError, AttributeError):
         return None
 
@@ -1124,7 +1151,9 @@ def encode_clip(settings: ClipsSettings, camera: str, day_dir: str, stem: str,
     span = ((actual.get("end_utc_ms", 0) - actual.get("start_utc_ms", 0)) / 1000.0
             if isinstance(actual.get("end_utc_ms"), int) and isinstance(actual.get("start_utc_ms"), int) else None)
     replace = False
-    if not probed or (isinstance(want, int) and abs(int(probed["frames"]) - want) > 1):
+    if settings.encode_fps and isinstance(want, int) and span:
+        want = int(round(span * settings.encode_fps))   # fewer frames by design; the duration must still match
+    if not probed or (isinstance(want, int) and abs(int(probed["frames"]) - want) > (1 if not settings.encode_fps else 2)):
         result.update(kept=False, failed=("ffmpeg exited %s: %s" % (rc, err.strip()[-200:]) if rc else
                                           "the encode holds %s frames, not %s" % ((probed or {}).get("frames"), want)))
     elif span is not None and "duration" in probed and abs(float(probed["duration"]) - span) > 1.5:
@@ -1157,6 +1186,217 @@ def encode_clip(settings: ClipsSettings, camera: str, day_dir: str, stem: str,
         _remove(part_path)
     mc.log("clips [%s]: encode %s: %s" % (camera, stem, json.dumps(result, sort_keys=True)))
     return result
+
+
+# ── the encode trial (the Owner, 2026-10-27) ─────────────────────────────────
+#
+# Before CLIPS_ENCODE_CODEC/KBPS/SIZE/FPS are chosen: every combination below on
+# a sample of one day's real clips, day and night, measured for size, CPU, wall
+# time and SSIM against the copy. It never replaces or deletes a clip; it writes
+# only under <root>/.trial/ (quota-counted; `--clean` removes it), keeping one
+# encoded sample per combination for viewing side by side.
+
+TRIAL_DIR = ".trial"
+TRIAL_RUN_SEC = 1800           # no new encode is started after this long (the lock is shared with the cut)
+NIGHT_HOURS = (19, 7)          # local clock: from 19:00 to 07:00 a clip counts as night (IR on this camera)
+TRIAL_COMBOS = [dict(codec=c, size=z, kbps=k, fps=0) for c in ("h264", "hevc") for z in (0, 1024) for k in (300, 200)]
+TRIAL_COMBOS.append(dict(codec="h264", size=0, kbps=300, fps=5))
+BENCH_RE = re.compile(r"bench: utime=([0-9.]+)s stime=([0-9.]+)s rtime=([0-9.]+)s")
+SSIM_RE = re.compile(r"SSIM .*All:([0-9.]+)")
+
+
+def combo_name(c: Dict[str, object]) -> str:
+    return "%s_%s_%dk%s" % (c["codec"], "native" if not c["size"] else "%dsq" % c["size"], c["kbps"],
+                            "_%dfps" % c["fps"] if c["fps"] else "")
+
+
+def trial_sample(day_dir: str, max_clips: int) -> List[Tuple[str, str]]:
+    """(stem, "day"|"night") of up to max_clips clips of one day folder, split
+    between day and night by the local hour in their names, shortest first so
+    the trial stays bounded."""
+    stems = sorted(n[:-4] for n in _listdir(day_dir) if n.endswith(".mp4"))
+
+    def kind(stem: str) -> str:
+        utc = stem_utc_ms(stem)
+        hour = time.localtime(utc / 1000.0).tm_hour if utc else 12
+        return "night" if hour >= NIGHT_HOURS[0] or hour < NIGHT_HOURS[1] else "day"
+
+    def length(stem: str) -> int:
+        m = re.search(r"_(\d+)s(?:-\d+)?$", stem)
+        return int(m.group(1)) if m else 10 ** 6
+    day = sorted((s for s in stems if kind(s) == "day"), key=length)
+    night = sorted((s for s in stems if kind(s) == "night"), key=length)
+    half = max(1, max_clips // 2)
+    picked = [(s, "day") for s in day[:half]] + [(s, "night") for s in night[:max_clips - min(half, len(day))]]
+    if len(picked) < max_clips:  # one kind is short: fill from the other
+        rest = [(s, "day") for s in day[half:]] + [(s, "night") for s in night[max_clips - min(half, len(day)):]]
+        picked += rest[:max_clips - len(picked)]
+    return picked[:max_clips]
+
+
+def trial_encode_command(settings: ClipsSettings, camera: str, day_dir: str, out_dir: str, stem: str,
+                         combo: Dict[str, object], out_name: str) -> List[str]:
+    argv = docker_base("homehub-clips-trial-%s" % camera, out_dir, shares=2, device=settings.device)
+    argv += ["-v", "%s:/src:ro" % day_dir, "--entrypoint", "ffmpeg", door_relay.image_ref()]
+    args = vaapi_encode_args(settings.device, "/src/%s.mp4" % stem, str(combo["codec"]), int(combo["kbps"]),
+                             int(combo["size"]), int(combo["fps"]), loglevel="info")
+    return argv + args + ["-benchmark", "-nostats", "-movflags", "+faststart", "-f", "mp4", "-y", "/out/" + out_name]
+
+
+def trial_ssim_command(camera: str, day_dir: str, out_dir: str, stem: str, out_name: str, width: int, height: int,
+                       fps: int) -> List[str]:
+    """SSIM of an encode against its copy, in software at the lowest weight (a
+    one-off): the encode scaled back to the copy's raster, the copy taken at the
+    encode's rate when that was changed."""
+    ref = "fps=%d" % fps if fps else "null"
+    graph = "[0:v]scale=%d:%d:flags=bicubic[a];[1:v]%s[b];[a][b]ssim" % (width, height, ref)
+    argv = docker_base("homehub-clips-ssim-%s" % camera, out_dir, read_only_out=True, shares=2)
+    return argv + ["-v", "%s:/src:ro" % day_dir, "--entrypoint", "ffmpeg", door_relay.image_ref(),
+                   "-nostdin", "-hide_banner", "-loglevel", "info", "-nostats", "-i", "/out/" + out_name,
+                   "-i", "/src/%s.mp4" % stem, "-lavfi", graph, "-f", "null", "-"]
+
+
+def _text(done) -> str:
+    out = getattr(done, "stderr", b"") or b""
+    return out.decode("utf-8", "replace") if isinstance(out, bytes) else out
+
+
+def encode_trial(settings: ClipsSettings, camera: str, day: str, max_clips: int,
+                 runner=subprocess.run, prober=run_probe,
+                 quota_fn: Callable[[], Tuple[Optional[int], Optional[int]]] = lambda: (None, None),
+                 clock=time.monotonic) -> Dict[str, object]:
+    """Run the trial; returns the report (also written as trial.json and
+    trial.txt in the trial folder). Implements: LLR-1374."""
+    ok, reason = guard(settings)
+    if not ok:
+        raise GuardStop(reason)
+    day_dir = os.path.join(settings.root, camera, day)
+    sample = trial_sample(day_dir, max_clips)
+    if not sample:
+        raise Invalid("no clips in %s" % day_dir)
+    out_dir = os.path.join(settings.root, TRIAL_DIR, "%s-%s" % (camera, day))
+    copies = {stem: os.path.getsize(os.path.join(day_dir, stem + ".mp4")) for stem, _k in sample}
+    used, limit = quota_fn()
+    need = sum(copies.values()) * len(TRIAL_COMBOS)
+    if limit and used is not None and used + need > limit * settings.quota_high_pct // 100:
+        raise QuotaStop("the trial needs up to %.0f MiB and the clips area is too full for it; nothing was "
+                        "written (no clip is ever removed for a trial)" % (need / MIB))
+    os.makedirs(out_dir, mode=0o750, exist_ok=True)
+    started = clock()
+    rows: List[Dict[str, object]] = []
+    stopped_early = False
+    for combo in TRIAL_COMBOS:
+        name = combo_name(combo)
+        for index, (stem, kind) in enumerate(sample):
+            if clock() - started > TRIAL_RUN_SEC:
+                stopped_early = True
+                break
+            # The first sample of each combination is kept for viewing; the rest are measured and removed.
+            out_name = "%s_%s.mp4" % (name, stem) if index == 0 else ".%s_%s.mp4.part" % (name, stem)
+            row: Dict[str, object] = {"combo": name, "kind": kind, "clip": stem, "copy_bytes": copies[stem]}
+            docker_remove("homehub-clips-trial-%s" % camera)
+            try:
+                done = runner(trial_encode_command(settings, camera, day_dir, out_dir, stem, combo, out_name),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=900)
+                err, rc = _text(done), done.returncode
+            except subprocess.TimeoutExpired:
+                docker_remove("homehub-clips-trial-%s" % camera)
+                err, rc = "timed out after 900 s", -1
+            out_path = os.path.join(out_dir, out_name)
+            bench = BENCH_RE.search(err)
+            if rc or not os.path.exists(out_path):
+                row["failed"] = "ffmpeg exited %s: %s" % (rc, err.strip()[-200:])
+            else:
+                size = os.path.getsize(out_path)
+                row.update(bytes=size, pct_of_copy=round(100.0 * size / max(1, copies[stem]), 1))
+                if bench:
+                    row.update(cpu_s=round(float(bench.group(1)) + float(bench.group(2)), 2),
+                               wall_s=round(float(bench.group(3)), 2))
+                ref = prober(camera, day_dir, stem + ".mp4") or {}
+                if ref.get("width"):
+                    docker_remove("homehub-clips-ssim-%s" % camera)
+                    try:
+                        sd = runner(trial_ssim_command(camera, day_dir, out_dir, stem, out_name, int(ref["width"]),
+                                                       int(ref["height"]), int(combo["fps"])),
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=900)
+                        m = SSIM_RE.search(_text(sd))
+                        if m:
+                            row["ssim"] = float(m.group(1))
+                    except subprocess.TimeoutExpired:
+                        docker_remove("homehub-clips-ssim-%s" % camera)
+            if index != 0:
+                _remove(out_path)
+            rows.append(row)
+        if stopped_early:
+            break
+    report = {"camera": camera, "day": day, "clips": [{"clip": s, "kind": k, "bytes": copies[s]} for s, k in sample],
+              "rows": rows, "summary": trial_summary(rows), "stopped_early": stopped_early,
+              "folder": out_dir}
+    write_json_atomic(os.path.join(out_dir, "trial.json"), report)
+    with open(os.path.join(out_dir, "trial.txt"), "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(trial_table(report))
+    return report
+
+
+def trial_summary(rows: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+    """Per combination and kind (day, night, all): copy and encoded bytes,
+    percent, CPU and wall seconds, mean and worst SSIM."""
+    out = []
+    names = []
+    for r in rows:
+        if r["combo"] not in names:
+            names.append(r["combo"])
+    for name in names:
+        for kind in ("day", "night", "all"):
+            sel = [r for r in rows if r["combo"] == name and (kind == "all" or r["kind"] == kind) and "bytes" in r]
+            if not sel:
+                continue
+            copy = sum(int(r["copy_bytes"]) for r in sel)
+            enc = sum(int(r["bytes"]) for r in sel)
+            ssims = [float(r["ssim"]) for r in sel if "ssim" in r]
+            out.append({"combo": name, "kind": kind, "clips": len(sel), "copy_bytes": copy, "bytes": enc,
+                        "pct_of_copy": round(100.0 * enc / max(1, copy), 1),
+                        "cpu_s": round(sum(float(r.get("cpu_s", 0)) for r in sel), 2),
+                        "wall_s": round(sum(float(r.get("wall_s", 0)) for r in sel), 2),
+                        "ssim_mean": round(sum(ssims) / len(ssims), 4) if ssims else None,
+                        "ssim_min": round(min(ssims), 4) if ssims else None})
+    return out
+
+
+def trial_table(report: Dict[str, object]) -> str:
+    lines = ["encode trial: %s %s, %d clip(s)%s" % (report["camera"], report["day"], len(report["clips"]),
+                                                     " (STOPPED EARLY: time budget)" if report["stopped_early"] else ""),
+             "%-28s %-5s %5s %9s %9s %6s %7s %7s %7s" % ("combination", "kind", "clips", "copy KiB", "enc KiB",
+                                                          "% copy", "cpu s", "wall s", "SSIM")]
+    for r in report["summary"]:  # type: ignore[union-attr]
+        lines.append("%-28s %-5s %5d %9d %9d %6.1f %7.2f %7.2f %7s" % (
+            r["combo"], r["kind"], r["clips"], r["copy_bytes"] // 1024, r["bytes"] // 1024, r["pct_of_copy"],
+            r["cpu_s"], r["wall_s"], "%.4f" % r["ssim_mean"] if r["ssim_mean"] is not None else "-"))
+    failed = [r for r in report["rows"] if "failed" in r]  # type: ignore[union-attr]
+    for r in failed:
+        lines.append("FAILED %s on %s: %s" % (r["combo"], r["clip"], r["failed"]))
+    lines.append("samples to compare side by side: %s" % report["folder"])
+    return "\n".join(lines) + "\n"
+
+
+def clean_trials(root: str) -> int:
+    """Remove the trial folder (only it). Returns the files removed."""
+    base = os.path.join(root, TRIAL_DIR)
+    removed = 0
+    for top in sorted(_listdir(base)):
+        folder = os.path.join(base, top)
+        for name in _listdir(folder):
+            if _remove(os.path.join(folder, name)):
+                removed += 1
+        try:
+            os.rmdir(folder)
+        except OSError:
+            pass
+    try:
+        os.rmdir(base)
+    except OSError:
+        pass
+    return removed
 
 
 # ── retention ────────────────────────────────────────────────────────────────
@@ -1362,7 +1602,7 @@ def make_room(settings: ClipsSettings, state_dir: str, now_ms: int, need: int,
               quota_fn: Callable[[], Tuple[Optional[int], Optional[int]]]) -> int:
     """Before a write of `need` bytes: when the clips project would pass
     CLIPS_QUOTA_HIGH_PCT, remove clips by the retention rules first - those
-    past their age or the cap, then the oldest - until it fits. On the 1 GiB
+    past their age or the cap, then the oldest - until it fits. On the 5 GiB
     scratch area this, not the hourly retention, is the normal cycle; a full
     quota stays an alert only when retention cannot free enough (QuotaStop).
     Returns the bytes freed. Implements: LLR-1377."""
@@ -1523,6 +1763,37 @@ def pipeline_lock(state_dir: str) -> Iterator[bool]:
         handle.close()
 
 
+def run_encode_trial(settings: ClipsSettings, args) -> int:
+    """The encode-trial verb: under the pipeline lock (bounded by
+    TRIAL_RUN_SEC), at the lowest priority, writing only the trial folder."""
+    with pipeline_lock(args.state_dir) as got:
+        if not got:
+            mc.log("clips: another clips run holds the lock - try the trial again shortly", warning=True)
+            return 1
+        if args.clean:
+            ok, reason = guard(settings)
+            if not ok:
+                mc.log("clips: trial clean skipped - guard: %s" % reason, warning=True)
+                return EXIT_GUARD
+            print("removed %d trial file(s)" % clean_trials(settings.root))
+            return 0
+        if not args.camera or not args.day or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.day):
+            mc.log("clips: encode-trial needs --camera and --day YYYY-MM-DD (or --clean)", warning=True)
+            return 2
+        try:
+            os.nice(19)
+        except (AttributeError, OSError):
+            pass
+        try:
+            report = encode_trial(settings, args.camera, args.day, max(1, args.max_clips),
+                                  quota_fn=lambda: clips_quota(settings))
+        except (Invalid, QuotaStop, GuardStop) as exc:
+            mc.log("clips: encode-trial REFUSED - %s" % exc, warning=True)
+            return 2
+        sys.stdout.write(trial_table(report))
+        return 0
+
+
 def make_alert(env_file: str):
     def alert(key: str, title: str, body: str) -> None:
         mc.send_alert(key, "high", title, body, env_file, mc.DEFAULT_STATE_DIR, repeat_sec=86400,
@@ -1540,6 +1811,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     e = sub.add_parser("episodes")
     e.add_argument("--camera", required=True)
     e.add_argument("--hours", type=float, default=24.0)
+    t = sub.add_parser("encode-trial", help="measure every encode option on one day's clips; replaces nothing")
+    t.add_argument("--camera")
+    t.add_argument("--day", help="the local day folder, YYYY-MM-DD")
+    t.add_argument("--max-clips", type=int, default=4)
+    t.add_argument("--clean", action="store_true", help="remove the trial folder and stop")
     args = p.parse_args(argv)
     if not args.verb:
         p.print_help()
@@ -1570,6 +1846,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                               "ledger": (ledger.get(ep.id) or {}).get("status")}, sort_keys=True))
         print(json.dumps({"episodes": len(eps), "orphans": orphans, "rejected": rejected}, sort_keys=True))
         return 0
+    if args.verb == "encode-trial":
+        return run_encode_trial(settings, args)
     if not settings.enabled:
         mc.log("clips: CLIPS_ENABLED is not true - nothing to do")
         return 0

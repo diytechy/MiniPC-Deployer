@@ -1,0 +1,12 @@
+# Every minute after the last run ended, so two cuts never overlap (the
+# pipeline lock also serialises cut, encode and retention).
+[Unit]
+Description=Motion clips: cut every minute
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

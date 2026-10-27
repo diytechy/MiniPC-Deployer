@@ -1,0 +1,10 @@
+[Unit]
+Description=Motion clips: re-encode batch every 15 minutes
+
+[Timer]
+OnBootSec=15min
+OnUnitInactiveSec=15min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

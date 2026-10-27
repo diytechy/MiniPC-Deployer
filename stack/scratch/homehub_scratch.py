@@ -90,12 +90,19 @@ MKFS_ARGS = ["-q", "-t", "ext4", "-O", "quota,project", "-E", "quotatype=prjquot
 
 # The writers, their quota project ids and default budgets. ORDER IS THE
 # REDUCTION ORDER when the budgets do not fit: last first, i.e. ottertube is
-# reduced before meetings, meetings before door (the plan: "reduce ottertube
-# first"). Project ids are arbitrary but fixed: a reimage that recreates the
-# filesystem must give each directory the same project it had.
+# reduced before clips, clips before meetings, meetings before door (the plan:
+# "reduce ottertube first"). Project ids are arbitrary but fixed: a reimage that
+# recreates the filesystem must give each directory the same project it had.
+#
+# clips/ (2026-10-27, SR-131): the motion clips' small, capped area until the
+# media drive exists (the Owner, 2026-10-26; HomeHub open-items C111). It sits
+# before ottertube, so on the live 18 GiB volume its 1 GiB comes out of
+# ottertube's ceiling (5882 -> 4858 MiB granted; ottertube uses under 1 GiB of a
+# 3 GiB list budget), not out of the door recording the clips are cut from.
 WRITERS: Tuple[Tuple[str, int, str, int], ...] = (
     ("door", 7101, "HOMEHUB_SCRATCH_QUOTA_DOOR_MIB", 8 * 1024),
     ("meetings", 7102, "HOMEHUB_SCRATCH_QUOTA_MEETINGS_MIB", 2 * 1024),
+    ("clips", 7104, "HOMEHUB_SCRATCH_QUOTA_CLIPS_MIB", 1024),
     ("ottertube", 7103, "HOMEHUB_SCRATCH_QUOTA_OTTERTUBE_MIB", 6 * 1024),
 )
 WRITER_NAMES = tuple(w[0] for w in WRITERS)
@@ -190,9 +197,11 @@ def size_quotas(usable_bytes: int, requested_mib: Dict[str, int], floor_mib: int
     if budget <= 0:
         raise Stop("the filesystem has %d MiB usable, not more than the %d MiB free floor"
                    % (usable_bytes // MIB, floor_mib))
-    granted = {name: requested_mib[name] for name in WRITER_NAMES}
+    # Only the writers asked about: a caller that names a subset sizes that subset.
+    names = [name for name in WRITER_NAMES if name in requested_mib]
+    granted = {name: requested_mib[name] for name in names}
     excess = sum(granted.values()) - budget
-    for name in reversed(WRITER_NAMES):
+    for name in reversed(names):
         if excess <= 0:
             break
         # Each writer gives up space down to the minimum, never below it: a
@@ -203,7 +212,7 @@ def size_quotas(usable_bytes: int, requested_mib: Dict[str, int], floor_mib: int
         excess -= cut
     if excess > 0:
         raise Stop("%d MiB usable cannot hold the %d MiB free floor plus every writer at its %d MiB "
-                   "minimum (still %d MiB over after reducing ottertube, then meetings, then door)"
+                   "minimum (still %d MiB over after reducing ottertube, then clips, then meetings, then door)"
                    % (usable_bytes // MIB, floor_mib, min_mib, excess))
     return granted
 

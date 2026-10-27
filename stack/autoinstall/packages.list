@@ -331,6 +331,18 @@ libpam-systemd
 # A re-export of the baked apt repo is owed with this line (see the header).
 earlyoom
 
+# ── the camera motion detector's runtime (SR-128; stack/camera-motion) ──────
+# The hub runs the panel's door motion engine (OfficeWallNaglight
+# doorstream/motion.py, pinned byte for byte) on the panel's own runtime: the
+# distribution's OpenCV and NumPy, the same 4.6.0 / 1.26.4 the wall image
+# installs (stack/autoinstall/wall/packages.list), so one engine on one runtime
+# decides what is motion. Installed on every hub; the detector itself ships off
+# (CAMERA_<C>_MOTION_ENABLED). 168 packages with --no-install-recommends on the
+# live hub (apt-get -s, 2026-10-27). firstboot step 6k installs it on a hub
+# whose image predates this line when a camera's motion knob is true.
+# A re-export of the baked apt repo is owed with this line (see the header).
+python3-opencv
+
 
 # ── NOTHING FOR THE DESKTOP OR ICEDRIVE LIVES HERE ──────────────────────────
 # RULED BY THE OWNER 2026-08-27: this repo ships them OFF. "Deployer I'm okay

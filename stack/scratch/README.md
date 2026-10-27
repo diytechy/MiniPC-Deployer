@@ -13,6 +13,7 @@ reimage recreates it empty.
 |---|---|---|---|
 | `door/` | the door recorder (`stack/door`) | 7101 | 8 GiB (`HOMEHUB_SCRATCH_QUOTA_DOOR_MIB`) |
 | `meetings/` | meeting recording (plan W6) | 7102 | 2 GiB (`..._MEETINGS_MIB`) |
+| `clips/` | motion clips (`stack/clips`, SR-131) until the media drive exists; `CLIPS_ROOT` moves them | 7104 | 1 GiB (`..._CLIPS_MIB`) |
 | `ottertube/` | OtterTube downloads, publication, staging, temp, logs (plan W8) | 7103 | 6 GiB, reduced first (`..._OTTERTUBE_MIB`) |
 
 ## `homehub_scratch.py`
@@ -48,7 +49,7 @@ mount point underneath is mode 000.
 `f_blocks` less what ext4 holds back from every writer (`f_bfree - f_bavail`,
 its reserved clusters: measured, 16 MiB) — so that all three writers at their
 quotas still leave `HOMEHUB_SCRATCH_FREE_FLOOR_MIB` (2 GiB) free; ottertube is
-reduced first, then meetings, then door, none below 512 MiB. The report prints
+reduced first, then clips, then meetings, then door, none below 512 MiB. The report prints
 the numbers; record them.
 
 ### Reimage: recreated, deliberately

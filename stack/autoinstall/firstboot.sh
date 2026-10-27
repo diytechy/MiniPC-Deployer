@@ -3078,6 +3078,88 @@ else
     log "WARN: no $STACK_DIR/ottertube on the payload - no OtterTube downloader"
 fi
 
+# ── 6k. camera motion detector and motion clips (SR-128..SR-131; stack/clips) ──
+# (stack/clips/README.md)
+#
+# THE DETECTOR, one homehub-camera-motion@<camera> per name in CAMERAS, is
+# enabled always: each instance's ExecCondition reads CAMERA_<C>_MOTION_ENABLED,
+# so a camera with it off is enabled, inert and green, like the door units. It
+# ships off; switching it on is a deploy step that starts with a cost test.
+# DEPENDENCY: the engine is the panel's, on the panel's runtime, python3-opencv.
+# packages.list carries it; a hub whose image predates that gets it HERE when a
+# camera's motion knob is true (the deployer provisions what the configuration
+# enables), before the instances start, so none refuses for the want of it.
+# THE CLIP TIMERS (cut every minute, retention hourly, and the encode batch
+# only while CLIPS_ENCODE_ENABLED=true) run only while CLIPS_ENABLED=true, and
+# are disabled again when it is not (this step runs on every boot). No BindsTo=
+# a mount: CLIPS_ROOT is a knob, and the cutter's guard refuses before every
+# file instead. Started with --no-block (the 2026-08-27 deadlock).
+# BEGIN camera-clips
+if [ -d "$STACK_DIR/camera-motion" ] && [ -d "$STACK_DIR/clips" ]; then
+    install -m 0644 "$STACK_DIR/camera-motion/homehub-camera-motion@.service" /etc/systemd/system/homehub-camera-motion@.service \
+        || log "WARN: could not install homehub-camera-motion@.service"
+    for __u in homehub-clips-cut.service homehub-clips-cut.timer homehub-clips-encode.service \
+               homehub-clips-encode.timer homehub-clips-retention.service homehub-clips-retention.timer; do
+        install -m 0644 "$STACK_DIR/clips/$__u" "/etc/systemd/system/$__u" || log "WARN: could not install $__u"
+    done
+    systemctl daemon-reload || log "WARN: systemctl daemon-reload failed"
+    __cams=""
+    __motion_any=false
+    for __c in $(_env_val CAMERAS | tr -d "\"'"); do
+        case "$__c" in
+            [a-z]*) case "$__c" in *[!a-z0-9]*) log "WARN: CAMERAS holds '$__c', not a camera name - skipped"; continue ;; esac ;;
+            *) log "WARN: CAMERAS holds '$__c', not a camera name - skipped"; continue ;;
+        esac
+        __cams="$__cams $__c"
+        __C="$(printf '%s' "$__c" | tr 'a-z' 'A-Z')"
+        [ "$(_env_val "CAMERA_${__C}_MOTION_ENABLED" | tr -d "\"'")" = true ] && __motion_any=true
+    done
+    if [ "$__motion_any" = true ] && ! python3 -c 'import cv2' >/dev/null 2>&1; then
+        log "camera motion is on and python3-opencv is missing - installing it (the panel's engine runtime)"
+        if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-opencv >/dev/null 2>&1; then
+            log "  python3-opencv installed"
+        else
+            log "WARN: could not install python3-opencv - every camera's motion detector refuses to start until it is"
+        fi
+    fi
+    for __c in $__cams; do
+        __C="$(printf '%s' "$__c" | tr 'a-z' 'A-Z')"
+        systemctl enable "homehub-camera-motion@$__c.service" >/dev/null 2>&1 \
+            || log "WARN: could not enable homehub-camera-motion@$__c.service"
+        systemctl start --no-block "homehub-camera-motion@$__c.service" >/dev/null 2>&1 \
+            || log "WARN: could not queue homehub-camera-motion@$__c.service"
+        log "camera $__c: motion detector unit enabled (CAMERA_${__C}_MOTION_ENABLED=$(_env_val "CAMERA_${__C}_MOTION_ENABLED"))"
+    done
+    __clips_on="$(_env_val CLIPS_ENABLED | tr -d "\"'")"
+    __enc_on="$(_env_val CLIPS_ENCODE_ENABLED | tr -d "\"'")"
+    case "${__clips_on:-false}" in
+        true)
+            if systemctl enable homehub-clips-cut.timer homehub-clips-retention.timer >/dev/null 2>&1 \
+               && systemctl start --no-block homehub-clips-cut.timer homehub-clips-retention.timer >/dev/null 2>&1; then
+                log "motion clips: cut every minute, retention hourly (CLIPS_ENABLED=true)"
+            else
+                log "WARN: could not enable the clip cut/retention timers"
+            fi
+            if [ "$__enc_on" = true ]; then
+                systemctl enable homehub-clips-encode.timer >/dev/null 2>&1 \
+                    && systemctl start --no-block homehub-clips-encode.timer >/dev/null 2>&1 \
+                    && log "motion clips: re-encode batch every 15 min (CLIPS_ENCODE_ENABLED=true)" \
+                    || log "WARN: could not enable the clip encode timer"
+            else
+                systemctl disable --now homehub-clips-encode.timer >/dev/null 2>&1 || true
+                log "motion clips: kept as cut, no re-encode (CLIPS_ENCODE_ENABLED=${__enc_on:-unset})"
+            fi ;;
+        false)
+            systemctl disable --now homehub-clips-cut.timer homehub-clips-retention.timer homehub-clips-encode.timer >/dev/null 2>&1 || true
+            log "motion clips: off (CLIPS_ENABLED=false)" ;;
+        *)  log "WARN: CLIPS_ENABLED='$__clips_on' is not true or false - the clip timers are left as they were" ;;
+    esac
+    unset __u __c __C __cams __motion_any __clips_on __enc_on
+else
+    log "WARN: no $STACK_DIR/camera-motion or $STACK_DIR/clips on the payload - no camera motion detector or clips"
+fi
+# END camera-clips
+
 # ── 7. done ──────────────────────────────────────────────────────────────────
 date > "$MARKER"
 # A defect found in step 4b is reported HERE, at the end, and as a NON-ZERO

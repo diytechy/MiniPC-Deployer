@@ -1,0 +1,31 @@
+# homehub-clips-retention - keep motion clips CLIPS_RETENTION_DAYS (365),
+# capped at CLIPS_CAP_MIB (100 GB) and under CLIPS_QUOTA_HIGH_PCT of the clips
+# quota: oldest first, the cap winning (the Owner, 2026-10-26). Also removes
+# event-store days past CLIPS_EVENT_DAYS, stale .part files, and lifts the
+# cutter's quota stop once there is room (SR-131; stack/clips/README.md).
+[Unit]
+Description=Motion clips: retention
+Documentation=file:///opt/homehub/stack/clips/README.md
+After=homehub-firstboot.service
+AssertPathExists=/opt/homehub/stack/clips/homehub_clips.py
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/homehub/stack
+ExecStart=/usr/bin/python3 /opt/homehub/stack/clips/homehub_clips.py retention
+SyslogIdentifier=homehub-clips
+StateDirectory=homehub-clips
+StateDirectoryMode=0750
+UMask=0027
+CapabilityBoundingSet=~CAP_SYS_RESOURCE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+TimeoutStartSec=15min
+Nice=10
+CPUAccounting=true
+CPUQuota=20%
+MemoryAccounting=true
+MemoryMax=128M
+TasksMax=16

@@ -72,6 +72,7 @@ HOMEHUB_SCRATCH_FREE_FLOOR_MIB=64
 HOMEHUB_SCRATCH_MIN_QUOTA_MIB=16
 HOMEHUB_SCRATCH_QUOTA_DOOR_MIB=200
 HOMEHUB_SCRATCH_QUOTA_MEETINGS_MIB=60
+HOMEHUB_SCRATCH_QUOTA_CLIPS_MIB=40
 HOMEHUB_SCRATCH_QUOTA_OTTERTUBE_MIB=400
 EOF
 hs() { "$PY" "$SCRATCH/homehub_scratch.py" --env-file "$W/env" --root "$R" --vg hhscratchtest --mount-with mount "$@"; }
@@ -132,12 +133,13 @@ if [[ "$d_out" == *"quota exceeded"* ]] && [ "$d_mib" -ge 198 ] && [ "$d_mib" -l
     ok "6 door stopped at ${d_mib} MiB (EDQUOT), meetings still wrote, stopped at ${m_mib} MiB (EDQUOT)"
 else bad "6 door=${d_mib} '$d_out' meetings=${m_mib} '$m_out'"; fi
 
-# 7 all three full: the floor is still free
+# 7 all four full: the floor is still free
 o_out="$(fill ottertube)"
+c_out="$(fill clips)"; c_mib=$(( $(stat -c %s "$MP/clips/fill.bin") / 1048576 ))
 free_mib="$("$PY" -c 'import os,sys; s=os.statvfs(sys.argv[1]); print(s.f_bavail*s.f_frsize//1048576)' "$MP")"
-if [[ "$o_out" == *"quota exceeded"* ]] && [ "$free_mib" -ge 64 ]; then
-    ok "7 all three writers at their quotas: ${free_mib} MiB still free (floor 64)"
-else bad "7 ottertube '$o_out' free=${free_mib} MiB"; fi
+if [[ "$o_out" == *"quota exceeded"* ]] && [[ "$c_out" == *"quota exceeded"* ]] && [ "$c_mib" -ge 38 ]    && [ "$c_mib" -le 40 ] && [ "$free_mib" -ge 64 ]; then
+    ok "7 all four writers at their quotas (clips stopped at ${c_mib} MiB): ${free_mib} MiB still free (floor 64)"
+else bad "7 ottertube '$o_out' clips=${c_mib} '$c_out' free=${free_mib} MiB"; fi
 # A 1 MiB dd stops at the first block that does not fit, so up to 1 MiB of door's quota can
 # still be free, and the guard's 4 KiB probe then rightly passes (seen on the hub's kernel 147).
 # Top door off in 4 KiB blocks so it is full to the guard's own granularity first.

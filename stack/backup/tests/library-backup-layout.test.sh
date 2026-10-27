@@ -137,6 +137,35 @@ if [ "$RC" = 42 ] && [ "$(cat "$TMP/override-legacy.stub")" = "LEGACY-STUB argc=
 else
     fail "TC-1591 --layout legacy rc=$RC stub='$(cat "$TMP/override-legacy.stub")'"
 fi
+# A trailing --layout (no value) must end, not loop; an empty one is still a
+# --layout and is refused like any other on a real run.
+printf 'FILEBACKUP_LAYOUT=legacy\n' >"$STK/.env"
+: >"$TMP/trailing.stub"; : >"$TMP/trailing.calls"
+env -u FILEBACKUP_LAYOUT PATH="$TMP/bin:$PATH" STUB_LOG="$TMP/trailing.stub" CALLS="$TMP/trailing.calls" \
+    timeout 20 bash "$STK/backup/library-backup.sh" --config "$TMP/backup.env" --preflight-only --layout >"$TMP/trailing.out" 2>&1
+RC=$?
+if [ "$RC" != 0 ] && [ "$RC" != 124 ] && [ ! -s "$TMP/trailing.stub" ] && grep -qF -- '--layout wants legacy|single' "$TMP/trailing.out"; then
+    pass "TC-1591 a --layout with no value refuses at once (no argument loop)"
+else
+    fail "TC-1591 trailing --layout rc=$RC (124 = it looped until the timeout)"
+fi
+run_dispatch override-empty "FILEBACKUP_LAYOUT=legacy" --layout "" --verify none
+if [ "$RC" != 0 ] && [ "$RC" != 42 ] && [ ! -s "$TMP/override-empty.stub" ] && [ ! -s "$TMP/override-empty.calls" ] \
+   && grep -qF -- '--layout is only for --preflight-only' "$TMP/override-empty.out"; then
+    pass "TC-1591 an empty --layout on a real run is refused like any other"
+else
+    fail "TC-1591 empty --layout rc=$RC stub='$(cat "$TMP/override-empty.stub")'"
+fi
+rm -f "$STK/.env"; mkdir "$STK/.env"
+: >"$TMP/envdir.stub"; : >"$TMP/envdir.calls"
+env -u FILEBACKUP_LAYOUT PATH="$TMP/bin:$PATH" STUB_LOG="$TMP/envdir.stub" CALLS="$TMP/envdir.calls" \
+    bash "$STK/backup/library-backup.sh" --config "$TMP/backup.env" --preflight-only >"$TMP/envdir.out" 2>&1
+RC=$?; rmdir "$STK/.env"
+if [ "$RC" != 0 ] && [ "$RC" != 42 ] && [ ! -s "$TMP/envdir.stub" ] && grep -qF 'is not a readable file' "$TMP/envdir.out"; then
+    pass "TC-1591 a stack/.env that is a directory stops the run instead of guessing legacy"
+else
+    fail "TC-1591 .env directory rc=$RC stub='$(cat "$TMP/envdir.stub")'"
+fi
 if [ "$(id -u)" = 0 ]; then
     printf 'SKIP  TC-1591 an unreadable stack/.env (root reads everything)\n'
 else
@@ -147,7 +176,7 @@ else
         bash "$STK/backup/library-backup.sh" --config "$TMP/backup.env" --preflight-only >"$TMP/unreadable.out" 2>&1
     RC=$?; chmod 644 "$STK/.env"
     if [ "$RC" != 0 ] && [ "$RC" != 42 ] && [ ! -s "$TMP/unreadable.stub" ] && [ ! -s "$TMP/unreadable.calls" ] \
-       && grep -qF 'exists but cannot be read' "$TMP/unreadable.out"; then
+       && grep -qF 'is not a readable file' "$TMP/unreadable.out"; then
         pass "TC-1591 a stack/.env that exists but cannot be read stops the run instead of guessing legacy"
     else
         fail "TC-1591 unreadable .env rc=$RC stub='$(cat "$TMP/unreadable.stub")': $(tail -1 "$TMP/unreadable.out")"

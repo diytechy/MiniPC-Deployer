@@ -70,7 +70,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STACK_DIR="$(dirname "$HERE")"          # /opt/homehub/stack on the box
 
 CONFIG=""; PREFLIGHT_ONLY=0; VERIFY_MODE=auto; RECONCILE_RUN_STATE=0
-LAYOUT_OVERRIDE=""
+LAYOUT_OVERRIDE=""; LAYOUT_SEEN=0
 # The arguments the legacy hand-off below passes on: every one given, minus
 # --layout, which the legacy wrapper does not know.
 FWD_ARGS=()
@@ -80,7 +80,8 @@ while [ $# -gt 0 ]; do
         --preflight-only) PREFLIGHT_ONLY=1; FWD_ARGS+=("$1"); shift ;;
         --verify)         VERIFY_MODE="$2"; FWD_ARGS+=("$1" "$2"); shift 2 ;;
         --reconcile-run-state) RECONCILE_RUN_STATE=1; FWD_ARGS+=("$1"); shift ;;
-        --layout)         LAYOUT_OVERRIDE="${2:-}"; shift 2 ;;
+        --layout)         [ $# -ge 2 ] || die "--layout wants legacy|single"
+                          LAYOUT_OVERRIDE="$2"; LAYOUT_SEEN=1; shift 2 ;;
         -h|--help)        sed -n '2,65p' "$0"; exit 0 ;;
         *) die "unknown arg: $1 (try --help)" ;;
     esac
@@ -89,7 +90,11 @@ case "$VERIFY_MODE" in
     auto|none|shallow|deep) ;;
     *) die "--verify wants auto|none|shallow|deep, got '$VERIFY_MODE'" ;;
 esac
-if [ -n "$LAYOUT_OVERRIDE" ] && [ "$PREFLIGHT_ONLY" != 1 ]; then
+case "$LAYOUT_OVERRIDE" in
+    ""|legacy|single) ;;
+    *) die "--layout wants legacy|single, got '$LAYOUT_OVERRIDE'" ;;
+esac
+if [ "$LAYOUT_SEEN" = 1 ] && { [ -z "$LAYOUT_OVERRIDE" ] || [ "$PREFLIGHT_ONLY" != 1 ]; }; then
     die "--layout is only for --preflight-only: a real run takes its layout from FILEBACKUP_LAYOUT in stack/.env, never from the command line"
 fi
 
@@ -113,11 +118,13 @@ if [ -z "$CONFIG" ]; then
 fi
 load_config "$CONFIG"
 # A stack/.env that EXISTS BUT CANNOT BE READ stops here. load_env_file skips a
-# missing file (a bare checkout), but an unreadable one would leave the knob
+# missing file (a bare checkout), but an unreadable one - or a directory, or a
+# dangling symlink, which load_env_file also skips - would leave the knob
 # unset and quietly pick `legacy`, so a non-root preflight after the cutover
 # would report on the wrong layout.
-if [ -e "$STACK_DIR/.env" ] && [ ! -r "$STACK_DIR/.env" ]; then
-    die "$STACK_DIR/.env exists but cannot be read by $(id -un 2>/dev/null || echo this user) - refusing to guess FILEBACKUP_LAYOUT. Run as root."
+if { [ -e "$STACK_DIR/.env" ] || [ -L "$STACK_DIR/.env" ]; } \
+   && { [ ! -f "$STACK_DIR/.env" ] || [ ! -r "$STACK_DIR/.env" ]; }; then
+    die "$STACK_DIR/.env exists but is not a readable file by $(id -un 2>/dev/null || echo this user) - refusing to guess FILEBACKUP_LAYOUT. Run as root."
 fi
 load_env_file "$STACK_DIR/.env"
 

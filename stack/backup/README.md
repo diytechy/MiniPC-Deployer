@@ -790,11 +790,15 @@ on another drive is a supervised copy (`rsync -a`), checked with a `verify`
 against the copy before the original is touched; nothing here automates that,
 and the original is the Owner's to keep or remove.
 
-**Set the old store aside** — the timer off (cutover step 3), then:
+**Set the old store aside** — the timer off (cutover step 3). `library` and
+`library-changes` below are the defaults of `FILEBACKUP_BACKUP` and
+`FILEBACKUP_CHANGES`; use the values in `/opt/homehub/stack/.env` if they
+differ. Run the lines one at a time, and **stop at the first line if it prints
+STOP**: with the drive unmounted, everything after it would act on the empty
+mountpoint folder on the system disk.
 
 ```bash
-mountpoint -q /mnt/backup-drive || echo "STOP: the backup drive is not mounted"
-cd /mnt/backup-drive
+mountpoint -q /mnt/backup-drive && cd /mnt/backup-drive || { echo "STOP: the backup drive is not mounted"; false; }
 # FILEBACKUP_STORE must be neither of the two folders below nor inside one: the
 # renames would carry the new store away with them.
 ls -d library library-changes 2>&1                    # each that exists holds the old store
@@ -811,19 +815,22 @@ sudo mv -T library-changes old-library-store/library-changes
 Then the wrapper's step 2b no longer finds data at `FILEBACKUP_BACKUP` /
 `FILEBACKUP_CHANGES` and the cutover goes on (step 7).
 
-**Not verified, and worth confirming with FileBackup before the first run:**
+**The rule for a store made elsewhere: it is written by the Linux container,
+with `/source` at the library root — the same root as the hub's
+`/srv/library` — and never by a native Windows run.**
 
-- **A store written on Windows.** FileBackup records each row's path as the
-  native path below the source (`Get-SourceFileList`: the file's full name minus
-  the source root), and nothing found in `7a6a80a` normalises the separator. A
-  baseline written by a native Windows run would then hold `Shared\a.jpg` where
-  the container computes `Shared/a.jpg`, so the first hub run would see every
-  file as changed, and frame-freshness (which reads `Shared/`) would find no
-  media. A baseline written by the container (Linux, `/source` mounted at the
-  library root) does not have this problem.
-- **The same source root.** The rows are relative to the source; a baseline of a
+- **Why not Windows.** FileBackup records each row's paths with the separator
+  of the system that wrote it and finds a file again by its exact path; nothing
+  in `7a6a80a` normalises the separator (confirmed from its code). A store
+  written on Windows holds `Shared\a.jpg` where the container computes
+  `Shared/a.jpg`, so the first hub run would treat every file as new and every
+  row as gone, and frame-freshness (which reads `Shared/`) would find no media.
+  The wrapper refuses such a store (step 2c: a backslash in a path column of
+  `backup/MANIFEST.csv`, which a Linux run can never write).
+- **Why the same root.** The rows are relative to the source; a store of a
   different root (one share rather than the whole library) would not line up
-  with `/source` = `/srv/library`.
+  with `/source` = `/srv/library`, and nothing can detect that from the
+  manifest alone.
 
 Also worth knowing:
 
@@ -864,6 +871,7 @@ asks for the profile itself.
 | 1b. image contract | the image `filebackup:${FILEBACKUP_IMAGE_TAG}` is not loaded, docker cannot be asked, or its `homehub.filebackup.contract` label is not `one-mount-v2` | the knob cannot tell what is loaded under the tag. The deployed kit-12 image, a hand-tagged one and a build whose contract changed (C44) all stop here, before anything on the drives is looked at or created |
 | 2. mount identity | `/srv/library` or the backup drive is absent or read-only, or `backup/` or `changes/` is a separate mount under the store | `nofail` in the fstab means an absent drive leaves an ordinary empty **directory on the system disk**. Reuses `samba/library-guard.sh`, cross-checked against the generated fstab and `drive-identity.conf`; a **stand-in drive is yellow**, carried into the summary, not a refusal. The library-source check answers **first**; behind it, FileBackup itself stops with exit 4 when the source is empty at the start of a run while the latest state holds rows (its call C39), leaving the latest state as it was |
 | 2b. store layout | the old three-mount store (`FILEBACKUP_BACKUP` / `FILEBACKUP_CHANGES`, default `/mnt/backup-drive/library` and `library-changes`) still holds anything | starting the new layout beside it would begin a multi-day first backup into an empty store while the real history sat unused next to it. The refusal names [setting it aside](#bringing-in-a-new-store) (never a migration); an **empty** old folder is only a note |
+| 2c. Windows-written manifest | `backup/MANIFEST.csv` has a backslash in a path column (`DataPath` or `RelativePath`) | the store was written by a native Windows run, whose paths this container cannot match (see [Bringing in a new store](#bringing-in-a-new-store)); a Linux run never writes one. One streaming read of the manifest, stopping at the first hit |
 | 3. capacity | free space below `BACKUP_LIBRARY_MIN_FREE_GB` (or the system-disk floor for `/logs`) | there is **no retention** — this floor is the whole space policy |
 | 4. pre-create | — | docker **chowns** a bind source it had to create, and that is `EPERM` on the FAT-family data drives, which takes the *entire* compose command down. The config file and the library source are asserted, never created; **`backup/` and `changes/` are never created** (FileBackup's, so its refusal of a store that lost `backup/` can fire) |
 | 5. write-probe | uid 65532 cannot write the store, `backup/` or `changes/` (each when present) or `/logs` | NTFS/exFAT ownership is synthesized from mount options, so only the fstab's `uid=65532,gid=65532` grants access (**Q-FB5**). A regression must fail in the first seconds, not at hour eight |

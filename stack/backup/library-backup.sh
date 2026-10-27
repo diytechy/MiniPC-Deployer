@@ -33,6 +33,8 @@
 #                                      anything (finding H / E2 cross-check 1)
 #   2b. store-layout guard           — refuses while the old three-mount store
 #                                      still holds data (set it aside first)
+#   2c. Windows-written manifest     — refuses a latest manifest with a
+#                                      backslash in a path column
 #   3. capacity preflight            — a hard floor, posted RED (Q-FB2 carries
 #                                      the whole space burden here)
 #   4. pre-create the bind paths     — docker's chown-on-create is EPERM on the
@@ -82,7 +84,7 @@ while [ $# -gt 0 ]; do
         --reconcile-run-state) RECONCILE_RUN_STATE=1; FWD_ARGS+=("$1"); shift ;;
         --layout)         [ $# -ge 2 ] || die "--layout wants legacy|single"
                           LAYOUT_OVERRIDE="$2"; LAYOUT_SEEN=1; shift 2 ;;
-        -h|--help)        sed -n '2,65p' "$0"; exit 0 ;;
+        -h|--help)        sed -n '2,67p' "$0"; exit 0 ;;
         *) die "unknown arg: $1 (try --help)" ;;
     esac
 done
@@ -595,6 +597,35 @@ legacy_store_guard() {
 legacy_store_guard "$FB_LEGACY_BACKUP" "$FB_BACKUP"
 legacy_store_guard "$FB_LEGACY_CHANGES" "$FB_CHANGES"
 
+# ── 2c. A LATEST MANIFEST WRITTEN ON WINDOWS ─────────────────────────────────
+# FileBackup records each row's paths with the separator of the system that
+# wrote it, and finds a file again by its exact path: a store written by a
+# native Windows run holds Shared\a.jpg where this container computes
+# Shared/a.jpg, so the first run here would treat every file as new and every
+# row as gone. A Linux run never writes a backslash in either path column: its
+# portability check (Test-PortableRelativePath) refuses such a name, so the
+# file is not captured at all. So any backslash in DataPath or RelativePath
+# means the store was written on Windows, and that is a refusal, with no false
+# positive.
+#
+# COST: one sequential, streaming read of the latest manifest (about 180k
+# rows here), byte-wise (LC_ALL=C), splitting each line only at the
+# '","' between quoted fields and looking at the first two, stopping at the
+# first hit. No other file is opened, nothing is held in memory, and the drive
+# is awake for the run anyway. Every field is written quoted and neither path
+# column can hold a '"' (refused on Windows and Linux alike), so the split is
+# exact for the two columns read. A new store has no manifest yet: nothing to
+# read.
+if [ -f "$FB_BACKUP/MANIFEST.csv" ]; then
+    _bs_line="$(LC_ALL=C awk -F'","' 'NR > 1 && index($1 FS $2, "\\") { print NR; exit }' "$FB_BACKUP/MANIFEST.csv" 2>/dev/null || true)"
+    if [ -n "$_bs_line" ]; then
+        refuse "$FB_BACKUP/MANIFEST.csv was written on Windows: line $_bs_line has a backslash in a path column." \
+               "This container finds files by their exact Linux path, so continuing it would treat every file as new." \
+               "The store must be written by the Linux container with /source at the library root (README \"Bringing in a new store\")." \
+               "Nothing was created and no container ran."
+    fi
+fi
+
 # ── 3. CAPACITY PREFLIGHT — the whole of Q-FB2's space burden ─────────────────
 # There is NO retention (Q-FB2, ruled 2026-08-23: snapshots are kept
 # indefinitely and the Owner prunes by hand if space ever becomes a problem), so
@@ -880,7 +911,9 @@ SNAPSHOT_MADE=no
 
 # Re-read the fill AFTER the run: the number in the summary should describe the
 # drive the operator has now, not the one the preflight saw.
-_total="$(df_field "$FB_BACKUP" 2)"; _used="$(df_field "$FB_BACKUP" 3)"; _avail="$(df_field "$FB_BACKUP" 4)"
+# existing_ancestor: a run refused with exit 2 may leave backup/ uncreated.
+_fs="$(existing_ancestor "$FB_STORE")"
+_total="$(df_field "$_fs" 2)"; _used="$(df_field "$_fs" 3)"; _avail="$(df_field "$_fs" 4)"
 [ -n "${_total:-}" ] && [ "$_total" -gt 0 ] && FILL_PCT="$(( _used * 100 / _total ))%"
 
 # THE BACKUP-ACTION EXIT MAP (FileBackup's bounded-run-loop plan §6). Four
@@ -940,7 +973,7 @@ case "$BACKUP_RC" in
            log "  so a snapshot that needed it may no longer restore that file. README \"Damaged objects\"."
        fi
        log "  Not a verified success." ;;
-    2) FAIL_NOTE="FileBackup REFUSED the run before changing anything (exit 2) — a person must fix it; retrying will not help. The causes are: $FB_CONFIG cannot be loaded or violates the closed schema (FileBackup's container/FileBackup.schema.json), a required tool or dependency that cannot be loaded (7-Zip, the hashing package), the source root missing, backup/ and changes/ not on one mount (the rename test failed), or a latest manifest that cannot be read (move $FB_BACKUP/MANIFEST.csv aside to rebuild the latest state from the source; the snapshots are untouched). The reason is in $FB_CHANGES/backup.log and $FB_LOGS/Backup_Global.log"
+    2) FAIL_NOTE="FileBackup REFUSED the run before changing anything (exit 2) — a person must fix it; retrying will not help. The causes are: $FB_CONFIG cannot be loaded or violates the closed schema (FileBackup's container/FileBackup.schema.json), a required tool or dependency that cannot be loaded (7-Zip, the hashing package), the source root missing, backup/ and changes/ not on one mount (the rename test failed), a store whose backup/ is missing while changes/ holds snapshots (never answered with a fresh full backup: find out where backup/ went), or a latest manifest that cannot be read (move $FB_BACKUP/MANIFEST.csv aside to rebuild the latest state from the source; the snapshots are untouched). The reason is in the journal, which carries the container's output (journalctl -u homehub-library-backup.service), and in $FB_LOGS/Backup_Global.log; a refusal can come before the set log starts"
        false ;;
     3) FAIL_NOTE="the container exited 3, which a bounded-run-loop FileBackup never returns from a backup (the manifest witness is gone). This is almost certainly an OLDER image: this stack needs one built from FileBackup's BoundedRebuild work. Rebuild it (scripts/ensure-local-images.sh --rebuild) and read $FB_LOGS/Backup_Global.log"
        false ;;

@@ -667,6 +667,30 @@ for _case in nolabel:: c44:configversion-3: noimage::1; do
     fi
 done
 
+# ── a latest manifest written on Windows refuses (TC-1592) ───────────────────
+# FileBackup's real form: every field quoted, DataPath then RelativePath. A
+# backslash in a path column refuses before any container; forward slashes (and
+# a comma inside a quoted name) pass.
+cp "$TMP/store/backup/MANIFEST.csv" "$TMP/manifest.keep"
+_hdr='"DataPath","RelativePath","Length","LastWriteTimeStr","xxH2Hash","Compressed","StoredAsHashSize","Duplicate","MediaMBPerSec"'
+printf '%s\n"ab12.jpg","Shared/a.jpg","10","2026-10-01 00:00:00","ab12","No","","",""\n"cd34.jpg","Shared\\b, c.jpg","10","2026-10-01 00:00:00","cd34","No","","",""\n' "$_hdr" >"$TMP/store/backup/MANIFEST.csv"
+run_wrapper windows-manifest "$TMP/good.env" none 0 0 200
+if [ "$RUN_RC" != 0 ] && ! grep -q '^docker:' "$TMP/windows-manifest.events" \
+   && [ "$(success_count "$TMP/windows-manifest.capture")" = 0 ] \
+   && grep -qF 'was written on Windows: line 3 has a backslash in a path column' "$TMP/windows-manifest.out"; then
+    pass "TC-1592 a latest manifest with a backslash in a path column refuses before any container, naming the line"
+else
+    fail "TC-1592 windows manifest rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/windows-manifest.events"): $(grep -i 'windows' "$TMP/windows-manifest.out" | head -1)"
+fi
+printf '%s\n"ab12.jpg","Shared/a.jpg","10","2026-10-01 00:00:00","ab12","No","","",""\n"cd34.jpg","Shared/b, c.jpg","10","2026-10-01 00:00:00","cd34","No","","",""\n' "$_hdr" >"$TMP/store/backup/MANIFEST.csv"
+run_wrapper linux-manifest "$TMP/good.env" none 0 0 200
+if [ "$RUN_RC" = 0 ] && grep -q '^docker:backup$' "$TMP/linux-manifest.events"; then
+    pass "TC-1592 a manifest with forward slashes (and a comma inside a quoted name) passes the check"
+else
+    fail "TC-1592 linux manifest rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/linux-manifest.events")"
+fi
+cp "$TMP/manifest.keep" "$TMP/store/backup/MANIFEST.csv"
+
 # ── a new store: the wrapper never creates backup/ or changes/ (TC-1590) ─────
 # FileBackup creates them, and refuses a store whose backup/ is gone while
 # changes/ holds snapshots; it can only see that if backup/ is really missing.

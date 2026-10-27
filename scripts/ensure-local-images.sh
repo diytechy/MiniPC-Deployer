@@ -197,6 +197,7 @@ ensure_image "finance-auditor:${FINANCE_AUDITOR_IMAGE_TAG:-local}" "Finance-Audi
 #                     (StorePath, Latest/), which would bump it and needs its own
 #                     contract change on the hub first;
 #   pre-bounded       HEAD does not contain 7a6a80a (the kit-12 era and older);
+#   unknown-history   the checkout does not have 7a6a80a at all (shallow/older);
 #   configversion-N   it does, but the engine says another ConfigSchemaVersion.
 #   unknown           git could not be asked about the checkout at all.
 # The schema line is read from the WORKING TREE, which is what gets built.
@@ -206,6 +207,11 @@ filebackup_contract() {
     # git that cannot be asked (no checkout, safe.directory) is not an answer.
     if ! repo_git "$fb" rev-parse --verify -q HEAD >/dev/null 2>&1; then
         printf 'unknown'; return 0
+    fi
+    # A checkout that does not even have the base commit (a shallow or older
+    # clone) cannot say whether it contains it.
+    if ! repo_git "$fb" cat-file -e "${FILEBACKUP_CONTRACT_BASE}^{commit}" 2>/dev/null; then
+        printf 'unknown-history'; return 0
     fi
     if ! repo_git "$fb" merge-base --is-ancestor "$FILEBACKUP_CONTRACT_BASE" HEAD 2>/dev/null; then
         printf 'pre-bounded'; return 0

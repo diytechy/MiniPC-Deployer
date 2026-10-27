@@ -36,7 +36,7 @@
 #   {$GAME_HOST} {$GAME_WS_SECRET}
 #   {$LLM_GATEWAY_HOST}
 #   {$OTTERTUBE_HOST}
-#   {$OTTERTUBE_SITE_ENABLED}
+#   {env.OTTERTUBE_SITE_ENABLED}   (read at request time, not at parse time)
 
 {
     # WHERE rate_limit SITS IN THE CHAIN, and it is the whole point of the
@@ -918,16 +918,23 @@ ntfy.{$DOMAIN} {
 # container's OTTERTUBE_SITE_ENABLED; anything but exactly `true` is off.
 # With the site off the block still holds its certificate and answers 404 to
 # every request, on the LAN or off it (the gate comes before the @lan one; the
-# web build and the update files included), and the name has no record. With the library off the catalogue and media 502 (no
-# media server) while the web build and the update files still serve.
+# web build and the update files included), and the name has no record. With
+# the library off the catalogue and media 502 (no media server) while the web
+# build and the update files still serve.
+#
+# DELIVER THIS BLOCK AND docker-compose.yml TOGETHER and recreate caddy at once:
+# a caddy created from the older compose file has no OTTERTUBE_SITE_ENABLED in
+# its environment, so this block would answer 404 to the whole site, the live
+# library included, until it is recreated.
 {$OTTERTUBE_HOST} {
     import acme_cloudflare
     @lan remote_ip {$LAN_CIDR}
-    # The site knob, read at parse time ({$...} is substituted before the
-    # expression is compiled). A named, non-path matcher, so it keeps its place
-    # FIRST among the handles below (Caddy sorts handles by path specificity,
-    # and keeps written order among named matchers).
-    @ot_site_off expression `"{$OTTERTUBE_SITE_ENABLED}" != "true"`
+    # The site knob, read from caddy's environment at REQUEST time (the {env.*}
+    # placeholder, not the parse-time {$...}): the value is a CEL string, so no
+    # character in it can break the expression. A named, non-path matcher, so
+    # it keeps its place FIRST among the handles below (Caddy sorts handles by
+    # path specificity, and keeps written order among named matchers).
+    @ot_site_off expression `{env.OTTERTUBE_SITE_ENABLED} != "true"`
     handle @ot_site_off {
         respond "ottertube: site off" 404
     }
@@ -956,7 +963,9 @@ ntfy.{$DOMAIN} {
         # checks Content-Length against the manifest's size and hashes the
         # bytes, and the signature covers update.json's exact bytes. The
         # manifest and its signature are always revalidated; the exe is named
-        # by its commit, so it never changes under its name. `handle` sorts
+        # by its commit, so a new build gets a new name - except a rebuild of
+        # the same commit, which HomeHub's publisher refuses to put over a
+        # different exe of that name unless forced. `handle` sorts
         # ahead of every `handle_path` below, so the web build's catch-all can
         # never answer these names. Anything else in the folder (its README, a
         # publish's .tmp) has no route.

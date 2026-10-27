@@ -149,15 +149,18 @@ if start_caddy "0.0.0.0/0" -e OTTERTUBE_SITE_ENABLED=true; then
     js="$(code "$U/landing.js")"; css="$(code "$U/landing.css")"; other="$(code "$U/landing.html")"
     # the catalogue still goes to the media server (none in this lab: 502), never the page
     cat="$(code "$U/ottertube/catalog.json")"
-    if [[ "$h" == "http/"*" 200"* ]] && [ "$page_sha" = "$(file_sha "$STACK/ottertube/landing/index.html")" ] \
+    # the served stylesheet keeps `hidden` stronger than .button's display
+    # (tests/test_ottertube_updates.py TC-1540 proves it in a real browser)
+    hid="$(lab "$U/landing.css" | tr -d ' ' | grep -c '^\[hidden\]{display:none!important;}$')"
+    if [[ "$h" == "http/"*" 200"* ]] && [ "$hid" = 1 ] && [ "$page_sha" = "$(file_sha "$STACK/ottertube/landing/index.html")" ] \
         && [[ "$(hval "$h" content-security-policy)" == "default-src 'none'; script-src 'self';"* ]] \
         && [ "$js$css$other" = 200200404 ] && [ "$cat" = 502 ]; then
         ok "9 /: 200, the tracked landing page byte for byte, CSP default-src 'none'; landing.js and .css 200, another name 404; catalog.json still proxied (502 here)"
-    else bad "9 landing: js=$js css=$css other=$other catalog=$cat $(printf '%s' "$h" | head -3 | tr '\n' ' ')"; fi
+    else bad "9 landing: js=$js css=$css hidden-rule=$hid other=$other catalog=$cat $(printf '%s' "$h" | head -3 | tr '\n' ' ')"; fi
 else bad "9 caddy did not start"; fi
 
 # 6 the site knob: anything but exactly `true` is a 404 for the whole block
-for v in false True "" unset; do
+for v in false True "" 'tr"ue' unset; do
     if [ "$v" = unset ]; then start_caddy "0.0.0.0/0"; else start_caddy "0.0.0.0/0" -e "OTTERTUBE_SITE_ENABLED=$v"; fi || { bad "6 caddy did not start with the knob '$v'"; continue; }
     c1="$(code "$U/ottertube/update.json")"; c2="$(code "$U/ottertube/$EXE")"; c3="$(code "$U/ottertube/")"; c4="$(code "$U/")"
     if [ "$c1$c2$c3$c4" = 404404404404 ]; then ok "6 OTTERTUBE_SITE_ENABLED='$v': update.json, the exe, the web build and / all 404"

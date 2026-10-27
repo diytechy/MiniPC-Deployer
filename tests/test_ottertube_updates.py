@@ -139,7 +139,9 @@ def test_tc1523_later_platforms_have_reserved_names_and_update_json_stays_window
 
 def test_tc1524_the_site_knob_turns_the_block_into_404_before_anything_else():
     block = caddy_block()
-    gate = '@ot_site_off expression `"{$OTTERTUBE_SITE_ENABLED}" != "true"`\n'
+    # the runtime {env.*} placeholder, not the parse-time {$...}: a CEL string,
+    # so a quote in the value cannot break the expression
+    gate = '@ot_site_off expression `{env.OTTERTUBE_SITE_ENABLED} != "true"`\n'
     assert gate in block
     assert handle_body(block, "@ot_site_off").strip() == 'respond "ottertube: site off" 404'
     # first among the block's handles (both are named, non-path matchers, which
@@ -148,7 +150,8 @@ def test_tc1524_the_site_knob_turns_the_block_into_404_before_anything_else():
     assert first_handle == "    handle @ot_site_off {"
     assert block.index("handle @ot_site_off {") < block.index("handle @lan {")
     header = read(STACK / "caddy" / "Caddyfile").split("{$OTTERTUBE_HOST} {")[0]
-    assert "{$OTTERTUBE_SITE_ENABLED}" in header, "the env list at the top names it"
+    assert "OTTERTUBE_SITE_ENABLED" in header, "the env list at the top names it"
+    assert "{$OTTERTUBE_SITE_ENABLED}" not in block, "never substituted at parse time"
 
 
 # ── TC-1525 compose resolves the site knob, falling back to the library's ────
@@ -378,3 +381,84 @@ def test_tc1538_the_script_has_no_markup_sink():
     for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", "srcdoc"):
         assert sink not in code, sink
     assert "textContent" in code
+
+
+# ── TC-1540 the landing page in a real browser (headless Edge) ───────────────
+
+
+BROWSER_HARNESS = r"""
+const { chromium } = require(process.argv[1]);
+const http = require('http'), fs = require('fs'), path = require('path');
+const dir = process.argv[2], csp = process.argv[3], cases = JSON.parse(process.argv[4]);
+const TYPES = { 'index.html': 'text/html; charset=utf-8', 'landing.js': 'text/javascript', 'landing.css': 'text/css' };
+const MAP = { '/': 'index.html', '/landing.js': 'landing.js', '/landing.css': 'landing.css' };
+(async () => {
+  const browser = await chromium.launch({ channel: 'msedge', headless: true });
+  const out = [];
+  for (const c of cases) {
+    const server = http.createServer((req, res) => {
+      const f = MAP[req.url];
+      if (f) { res.writeHead(200, { 'Content-Type': TYPES[f], 'Content-Security-Policy': csp }); res.end(fs.readFileSync(path.join(dir, f))); return; }
+      if (req.url === '/ottertube/update.json') {
+        if (c.status === 0) { req.socket.destroy(); return; }
+        res.writeHead(c.status, { 'Content-Type': 'application/json' }); res.end(c.body || ''); return;
+      }
+      res.writeHead(404); res.end();
+    });
+    await new Promise(r => server.listen(0, '127.0.0.1', r));
+    const ctx = await browser.newContext({ javaScriptEnabled: c.js !== false });
+    const page = await ctx.newPage();
+    const errors = [];
+    page.on('console', m => { if (m.type() === 'error') errors.push(m.text()); });
+    page.on('pageerror', e => errors.push(String(e)));
+    await page.goto('http://127.0.0.1:' + server.address().port + '/');
+    if (c.js !== false) {
+      await page.waitForFunction(() => !document.getElementById('status').textContent.startsWith('Looking'), null, { timeout: 15000 });
+    }
+    const r = await page.evaluate(() => {
+      const a = document.getElementById('download');
+      const s = getComputedStyle(a);
+      return { visible: s.display !== 'none' && a.getClientRects().length > 0, href: a.getAttribute('href'),
+               text: a.textContent, status: document.getElementById('status').textContent };
+    });
+    r.errors = errors.filter(e => !/favicon/.test(e));
+    out.push(r);
+    await ctx.close();
+    await new Promise(r => server.close(r));
+  }
+  await browser.close();
+  console.log(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(3); });
+"""
+
+
+def test_tc1540_in_a_real_browser_the_link_shows_only_for_a_published_release():
+    node = shutil.which("node")
+    pw = OTTERTUBE / "desktop" / "node_modules" / "playwright-core"
+    edge = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft" / "Edge" / "Application" / "msedge.exe"
+    if not node or not pw.is_dir() or not edge.is_file():
+        pytest.skip("needs node, OtterTube's desktop/node_modules/playwright-core and Microsoft Edge (the dev PC has all three)")
+    block = caddy_block()
+    csp = re.search(r'header Content-Security-Policy "([^"]+)"', handle_body(block, "@ot_landing")).group(1)
+    cases = [
+        {"js": False, "status": 404},                              # before (or without) the script
+        {"status": 404},                                           # nothing published
+        {"status": 500},                                           # the hub errs
+        {"status": 0},                                             # the hub drops the connection
+        {"status": 200, "body": good_manifest(schema=2)},          # a manifest OtterTube refuses
+        {"status": 200, "body": good_manifest()},                  # the published release
+    ]
+    out = subprocess.run([node, "-e", BROWSER_HARNESS, str(pw), str(OT_DIR / "landing"), csp, json.dumps(cases)],
+                         capture_output=True, text=True, timeout=180)
+    assert out.returncode == 0, out.stderr[-2000:]
+    r = json.loads(out.stdout.strip().splitlines()[-1])
+    for i in range(5):
+        assert r[i]["visible"] is False, (cases[i], r[i])
+    assert r[0]["status"].startswith("Looking")
+    assert r[1]["status"] == "No release published yet."
+    assert "HTTP 500" in r[2]["status"] and "could not be reached" in r[3]["status"]
+    assert "not one OtterTube would read" in r[4]["status"]
+    assert r[5]["visible"] is True and r[5]["href"] == "/ottertube/OtterTube-abcdef1.exe"
+    assert r[5]["text"] == "Download OtterTube 0.2.0" and r[5]["status"] == "OtterTube 0.2.0, built 2026-10-27."
+    for i, x in enumerate(r):
+        assert not [e for e in x["errors"] if "Content Security Policy" in e or "Refused" in e], (i, x["errors"])

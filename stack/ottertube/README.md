@@ -31,6 +31,11 @@ its record. Set the site knob to `true` explicitly to keep the site and the
 update channel once the library goes (`OTTERTUBE_ENABLED=false`): the web build
 and the update files keep serving; the catalogue and media then 502.
 
+**Deliver the Caddyfile and `docker-compose.yml` together, and recreate caddy at once.** The Caddyfile reads
+`OTTERTUBE_SITE_ENABLED` from caddy's environment at request time, and a caddy created from the older compose
+file has no such variable: until it is recreated the whole site, the live library included, answers 404.
+Validate first: `docker exec -e OTTERTUBE_SITE_ENABLED=true caddy caddy validate ...` on the candidate.
+
 ## What runs
 
 | Piece | What |

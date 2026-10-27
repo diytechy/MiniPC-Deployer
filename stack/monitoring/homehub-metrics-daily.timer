@@ -1,0 +1,18 @@
+# 10:00 and 14:05 in the Owner's zone, whatever the box's own zone is (the
+# Owner, 2026-10-26). 10:00: sleep has landed (about 06:00-06:15) and the heart
+# night is usually in. 14:05: just after the heart gauge gives up on a night at
+# 14:00 (LLR-1319), so a late arrival is caught as the revision. Persistent:
+# a hub that was off at either time writes the row when it comes back, marked
+# late. homehub-metrics.py's DAILY_ZONE, INITIAL_AT and REVISION_AT must say
+# the same (asserted by tests/test_hub_metrics.py).
+[Unit]
+Description=HomeHub metrics log daily row, 10:00 and 14:05 America/Chicago
+
+[Timer]
+OnCalendar=*-*-* 10:00:00 America/Chicago
+OnCalendar=*-*-* 14:05:00 America/Chicago
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

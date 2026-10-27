@@ -22,6 +22,14 @@ only /var/spool/wall-meeting/ready/ and the spool's hub-state.json:
                     "mismatch NAME" (exit 3) and the file is KEPT
   report ok|full    record the hub's meetings/ quota state for the recorder
                     and the kiosk (hub-state.json, 0644)
+  status            one JSON line for the hub's metrics log (SR-122, 2026-10-26):
+                    the panel's disk check (/run/wall-disk/status.json), its
+                    freeze watchdog's last verdict (/run/wall-freeze-state/
+                    status.json) and bundle count, and its newest telemetry
+                    sample (/run/wall-panel-telemetry/latest.json). READS ONLY
+                    those three world-readable files and the bundle directory's
+                    NAMES; each file is bounded, and one that is missing or
+                    unreadable is reported as such, never an error exit.
 
 NAME must be a recording name (meeting-<UTC>.opus); anything else -- a path, a
 dot, an unknown verb, extra words -- is exit 2 with one line on stderr.
@@ -30,7 +38,7 @@ Every verb is safe to repeat, which is what makes the hub's pull retryable at
 any point: the hub deletes nothing here, and asks for a delete only after it
 has the file under its final name with the same hash.
 
-Implements: SR-110, LLR-1247, LLR-1248
+Implements: SR-110, LLR-1247, LLR-1248, SR-122, LLR-1331
 """
 from __future__ import annotations
 
@@ -47,6 +55,15 @@ NAME = re.compile(r"^meeting-[0-9]{8}T[0-9]{6}Z(-[0-9]{1,3})?\.opus$")
 SHA = re.compile(r"^[0-9a-f]{64}$")
 EXIT_USAGE, EXIT_MISMATCH = 2, 3
 MAX_COMMAND = 256
+# The `status` verb's sources (LLR-1331). Each is world-readable on the panel;
+# the wall-meeting account is given nothing new to read them.
+STATUS_SOURCES = {
+    "disk": "/run/wall-disk/status.json",
+    "freeze": "/run/wall-freeze-state/status.json",
+    "telemetry": "/run/wall-panel-telemetry/latest.json",
+}
+FREEZE_BUNDLES = "/var/log/wall-freeze"
+STATUS_MAX_BYTES = 65536
 
 
 def ready_dir(root: str) -> str:
@@ -104,7 +121,52 @@ def parse(command: str):
         return "ack", words[1:]
     if len(words) == 2 and words[0] == "report" and words[1] in ("ok", "full"):
         return "report", words[1:]
+    if words == ["status"]:
+        return "status", []
     return None
+
+
+def read_status_source(path: str):
+    """One status file as an object, or {"error": why}. Never raises."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        return {"error": "absent" if getattr(exc, "errno", None) == 2 else "unreadable"}
+    with os.fdopen(fd, "rb") as handle:
+        raw = handle.read(STATUS_MAX_BYTES + 1)
+    if len(raw) > STATUS_MAX_BYTES:
+        return {"error": "larger than %d bytes" % STATUS_MAX_BYTES}
+    try:
+        doc = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return {"error": "not JSON"}
+    return doc if isinstance(doc, dict) else {"error": "not an object"}
+
+
+def freeze_bundles(root: str):
+    """How many freeze bundles there are and the newest one's name (names only)."""
+    try:
+        names = sorted(n for n in os.listdir(root) if re.match(r"^[0-9]{8}-[0-9]{6}$", n))
+    except OSError:
+        return {"count": None, "newest": None}
+    return {"count": len(names), "newest": names[-1] if names else None}
+
+
+def do_status(out, sources=None, bundles=FREEZE_BUNDLES, now=time.time) -> int:
+    sources = STATUS_SOURCES if sources is None else sources
+    document = {"v": 1, "now": int(now())}
+    try:
+        with open("/proc/uptime", encoding="ascii") as handle:
+            document["uptime_s"] = int(float(handle.read().split()[0]))
+    except (OSError, ValueError, IndexError):
+        pass
+    for key, path in sorted(sources.items()):
+        document[key] = read_status_source(path)
+    document["freeze_bundles"] = freeze_bundles(bundles)
+    out.write((json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode())
+    out.flush()
+    return 0
 
 
 def do_get(root: str, name: str, out) -> int:
@@ -163,7 +225,7 @@ def main(argv=None, environ=None, out=None, root=None) -> int:
     root = root or SPOOL
     parsed = parse(environ.get("SSH_ORIGINAL_COMMAND", ""))
     if parsed is None:
-        print("wall-meeting-spool: refused (verbs: list | get NAME | ack NAME SHA256 | report ok|full)",
+        print("wall-meeting-spool: refused (verbs: list | get NAME | ack NAME SHA256 | report ok|full | status)",
               file=sys.stderr)
         return EXIT_USAGE
     verb, args = parsed
@@ -176,6 +238,8 @@ def main(argv=None, environ=None, out=None, root=None) -> int:
         return do_get(root, args[0], out)
     if verb == "ack":
         return do_ack(root, args[0], args[1], out)
+    if verb == "status":
+        return do_status(out)
     return do_report(root, args[0])
 
 

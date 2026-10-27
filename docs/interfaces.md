@@ -60,6 +60,7 @@ only the Contract cell's opening words; the CSV holds the contract.
 | **IF-071** | Provides | scratch-volume writers (the door recorder; meetings, plan W6; OtterTube, plan W8) | Implemented | v1 | SR-103, SR-104 | v1 scratch writer contract (SR-103, SR-104). A writer owns /srv/scratch/&lt;name>/ (door, meetings or … |
 | **IF-072** | Consumes | HomeHub (private deploy config) | Implemented | v1 | SR-114, SR-115 | v1 OtterTube curated list (SR-114). One JSON file, HomeHub scripts/deploy/ottertube/list.json, installed as … |
 | **IF-073** | Provides | OtterTube (browser build and desktop app) | Implemented | v1 | SR-117 | v1 OtterTube site (SR-117). https://&lt;OTTERTUBE_SUBDOMAIN>.&lt;DOMAIN>/ottertube/ on the LAN only (403 elsewhere … |
+| **IF-074** | Provides | HomeHub (the Owner and agents: charts, debugging, later analysis) | Implemented | v1 | SR-122, SR-123, SR-124 | v1 hub metrics log (SR-122..SR-124), all JSONL, one object per line, UTC epochs. … |
 <!-- END GENERATED IF INDEX -->
 
 ## Notes on selected interfaces (hand-written)

@@ -3147,9 +3147,22 @@ def resolve_state_root(env):
     independent of the .env, and StateDirectoryMode=0700 backs it from the
     other side.
 
+    SINCE 2026-10-26 THE UNIT HAS TWO StateDirectory= LINES (the second is the
+    raw watch record, `resolve_raw_root`), and systemd then exports the list
+    joined by ':' in declaration order. The FIRST entry is this one; the raw
+    directory is never the state root, so the state file's guard is unchanged.
+
     Implements: SR-022, LLR-006
     """
-    return (env.get("STATE_DIRECTORY") or "").strip() or DEFAULT_STATE_ROOT
+    entries = state_directories(env)
+    return entries[0] if entries else DEFAULT_STATE_ROOT
+
+
+def state_directories(env):
+    """$STATE_DIRECTORY split into its entries (systemd joins several with ':',
+    which is os.pathsep on the hub; the dev PC's ';' keeps a `C:\\...` whole)."""
+    return [entry.strip() for entry in (env.get("STATE_DIRECTORY") or "").split(os.pathsep)
+            if entry.strip()]
 
 
 def resolve_enabled(env):
@@ -5592,6 +5605,286 @@ def parse_sleep_page(payload, where="google-health(sleep)"):
     return out
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# THE RAW WATCH RECORD (the Owner, 2026-10-26; HomeHub open-items A79).
+#
+# Every cycle in samples mode already fetches the last 60 h of the watch's
+# heart-rate samples and sleep sessions and, until this, threw them away once a
+# night was summarised. The Owner ruled that the raw sources be RECORDED - not
+# analysed: nothing here derives sleep from heart rate. Each sample is appended
+# ONCE to a UTC-day JSONL file, and each sleep session the same way:
+#
+#   /var/lib/homehub-health-raw/hr-YYYYMMDD.jsonl      by the sample's UTC day
+#   /var/lib/homehub-health-raw/sleep-YYYYMMDD.jsonl   by the session END's UTC day
+#
+# "Once" is decided against the day files themselves (no index to drift): a
+# heart-rate row is the same row when its time, device and value are; a sleep
+# row when every recorded field is (a session Google revises - a later end, a
+# re-staged night - is appended again, which is the history of what was
+# served). Kept for ever (the ruling); about 300 rows a day.
+#
+# WHAT A ROW HOLDS: the served fields that describe the reading, normalised
+# (epoch seconds beside the RFC3339 string) - never the data point's `name`,
+# which carries the Google account's resource path, and never anything from a
+# request or a token.
+#
+# WHERE, AND WHY NOT THE STATE DIRECTORY. The unit's SECOND StateDirectory=
+# (homehub-health-raw): owned by this account, so the feeder may write it, and
+# separate from homehub-weight, so the chart page can be given this directory
+# read-only without being given the state file. The writes keep the state
+# file's discipline: a fixed directory from the unit (never a knob), a file name
+# matching RAW_FILE_RE, every open relative to that directory with O_NOFOLLOW.
+#
+# STEPS ARE NOT RECORDED, and that is the ruling's own condition ("only if the
+# feeder can get them without a materially larger API load"). The steps type
+# has no time filter but the interval's start, so catching a late phone sync
+# needs a lookback window like heart rate's; its points are about 1 KB each,
+# per minute, from three sources (HomeHub
+# docs/research/WATCH_DATA_IN_GOOGLE_HEALTH_2026-10-25.md 3.5), so even a 6 h
+# window is more bytes per cycle than the whole 60 h heart-rate read, and
+# whether the 10000 page size is honoured for steps is unmeasured (the capture
+# came back in pages of 50, which at 20 pages would not cover the window).
+#
+# FAILURE ISOLATION: a raw record that cannot be written is ONE failure line
+# (the unit goes red, which is true) and changes nothing about the gauge.
+# ══════════════════════════════════════════════════════════════════════════════
+
+RAW_ROOT_NAME = "homehub-health-raw"
+DEFAULT_RAW_ROOT = "/var/lib/" + RAW_ROOT_NAME
+RAW_FILE_RE = re.compile(r"^(hr|sleep)-[0-9]{8}\.jsonl$")
+RAW_RECORD_KNOB = "HEART_RAW_RECORD"
+RAW_MAX_FUTURE_SECONDS = 86400
+RAW_MAX_FILE_BYTES = 32 * 1024 * 1024
+RAW_TEXT_MAX = 64
+RAW_STAGES_MAX = 400
+
+
+def resolve_raw_record(env):
+    """HEART_RAW_RECORD: unset or `true` records, `false` does not; anything
+    else is refused (ValueError), and the cycle reports it without recording."""
+    value = (env.get(RAW_RECORD_KNOB) or "").strip()
+    if value in ("", "true"):
+        return True
+    if value == "false":
+        return False
+    raise ValueError("%s must be exactly true or false" % RAW_RECORD_KNOB)
+
+
+def resolve_raw_root(env):
+    """The unit's `StateDirectory=homehub-health-raw` entry of $STATE_DIRECTORY,
+    or None when the unit does not declare it. Never a knob: where the feeder
+    may write is the unit's decision, not the .env's."""
+    for entry in state_directories(env):
+        if os.path.basename(entry.rstrip("/\\")) == RAW_ROOT_NAME:
+            return entry
+    return None
+
+
+def _raw_text(value):
+    return value[:RAW_TEXT_MAX] if isinstance(value, str) else None
+
+
+def _raw_plain(value, depth=0):
+    """A bounded copy of plain JSON (summary/metadata blocks): scalars, short
+    strings, short lists, at most three levels; anything else is dropped."""
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        return int(value) if re.fullmatch(r"-?[0-9]{1,18}", value) else value[:RAW_TEXT_MAX]
+    if depth >= 3:
+        return None
+    if isinstance(value, list):
+        return [_raw_plain(v, depth + 1) for v in value[:50]]
+    if isinstance(value, dict):
+        return {str(k)[:RAW_TEXT_MAX]: _raw_plain(v, depth + 1) for k, v in list(value.items())[:50]}
+    return None
+
+
+def _source_fields(point):
+    source = point.get("dataSource") if isinstance(point.get("dataSource"), dict) else {}
+    device = source.get("device") if isinstance(source.get("device"), dict) else {}
+    return {"device": _raw_text(device.get("manufacturer")),
+            "form": _raw_text(device.get("formFactor")),
+            "platform": _raw_text(source.get("platform")),
+            "method": _raw_text(source.get("recordingMethod"))}
+
+
+def raw_heart_rate_rows(payload):
+    """ONE `heart-rate` page -> raw rows. A point without a readable time is not
+    a sample and is skipped; a value that is not a plain whole number is kept as
+    `bpm_raw`. Never raises. Implements: SR-073, LLR-1330"""
+    rows = []
+    points = payload.get(DATA_POINTS_KEY) if isinstance(payload, dict) else None
+    for point in points if isinstance(points, list) else []:
+        member = point.get(HEART_RATE_MEMBER) if isinstance(point, dict) else None
+        if not isinstance(member, dict):
+            continue
+        sample_time = member.get("sampleTime") if isinstance(member.get("sampleTime"), dict) else {}
+        try:
+            epoch = parse_rfc3339_utc(sample_time.get(PHYSICAL_TIME_KEY), "raw heart rate")
+        except SourceFailure:
+            continue
+        row = {"epoch": int(epoch), "t": _raw_text(sample_time.get(PHYSICAL_TIME_KEY)),
+               "utc_offset": _raw_text(sample_time.get(UTC_OFFSET_KEY))}
+        raw = member.get(HEART_BPM_KEY)
+        if isinstance(raw, str) and re.fullmatch(r"[0-9]{1,4}", raw):
+            row["bpm"] = int(raw)
+        else:
+            row["bpm"] = None
+            row["bpm_raw"] = _raw_text(raw) if isinstance(raw, str) else _raw_text(json.dumps(raw))
+        row.update(_source_fields(point))
+        rows.append(row)
+    return rows
+
+
+def raw_sleep_rows(payload):
+    """ONE `sleep` page -> raw rows: the interval, the stages, the summary and
+    the metadata as served (bounded). Never raises. Implements: SR-073, LLR-1330"""
+    rows = []
+    points = payload.get(DATA_POINTS_KEY) if isinstance(payload, dict) else None
+    for point in points if isinstance(points, list) else []:
+        member = point.get(SLEEP_MEMBER) if isinstance(point, dict) else None
+        interval = member.get("interval") if isinstance(member, dict) else None
+        if not isinstance(interval, dict):
+            continue
+        try:
+            start = parse_rfc3339_utc(interval.get("startTime"), "raw sleep")
+            end = parse_rfc3339_utc(interval.get("endTime"), "raw sleep")
+        except SourceFailure:
+            continue
+        stages = []
+        for stage in (member.get("stages") or [])[:RAW_STAGES_MAX] if isinstance(member.get("stages"), list) else []:
+            if not isinstance(stage, dict):
+                continue
+            try:
+                stages.append([int(parse_rfc3339_utc(stage.get("startTime"), "raw sleep stage")),
+                               int(parse_rfc3339_utc(stage.get("endTime"), "raw sleep stage")),
+                               _raw_text(stage.get("type"))])
+            except SourceFailure:
+                continue
+        metadata = member.get("metadata") if isinstance(member.get("metadata"), dict) else {}
+        row = {"start_epoch": int(start), "end_epoch": int(end),
+               "start": _raw_text(interval.get("startTime")), "end": _raw_text(interval.get("endTime")),
+               "type": _raw_text(member.get("type")), "stages": stages,
+               "summary": _raw_plain(member.get("summary")) if isinstance(member.get("summary"), dict) else None,
+               "metadata": _raw_plain(metadata)}
+        row.update(_source_fields(point))
+        rows.append(row)
+    return rows
+
+
+def _raw_key(kind, row):
+    if kind == "hr":
+        return (row.get("epoch"), row.get("device"), row.get("bpm"), row.get("bpm_raw"))
+    return json.dumps(row, sort_keys=True)
+
+
+def _raw_day(kind, row):
+    epoch = row.get("epoch") if kind == "hr" else row.get("end_epoch")
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y%m%d")
+
+
+def _raw_dir_fd(root):
+    """The raw root opened as a directory, refusing a symlinked root."""
+    if os.path.islink(root):
+        raise PermissionError("REFUSED: %s is a symlink; the raw record is not written" % root)
+    if DIR_FD_OPENS:
+        return os.open(root, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    return None                       # pragma: no cover - Windows dev PC
+
+
+def _raw_open(root, dir_fd, name, flags):
+    if not RAW_FILE_RE.fullmatch(name):
+        raise PermissionError("REFUSED: %r is not a raw record file name" % name)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    if dir_fd is not None:
+        return os.open(name, flags, 0o600, dir_fd=dir_fd)
+    path = os.path.join(root, name)   # pragma: no cover - Windows dev PC
+    if os.path.islink(path):
+        raise PermissionError("REFUSED: %s is a symlink" % path)
+    return os.open(path, flags, 0o600)
+
+
+def _raw_existing(root, dir_fd, name, kind):
+    try:
+        fd = _raw_open(root, dir_fd, name, os.O_RDONLY)
+    except FileNotFoundError:
+        return set()
+    keys = set()
+    with os.fdopen(fd, "rb") as handle:
+        for line in handle:
+            try:
+                row = json.loads(line.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                keys.add(_raw_key(kind, row))
+    return keys
+
+
+def record_raw(root, raw, now):
+    """Append every row of `raw` ({"hr": [...], "sleep": [...]}) not already in
+    its day file. Returns {"hr": appended, "sleep": appended}. Raises OSError /
+    PermissionError when the record cannot be written. Implements: LLR-1330"""
+    by_file = {}
+    for kind in ("hr", "sleep"):
+        for row in raw.get(kind) or []:
+            epoch = row.get("epoch") if kind == "hr" else row.get("end_epoch")
+            if not isinstance(epoch, int) or epoch < EPOCH_FLOOR or epoch > now + RAW_MAX_FUTURE_SECONDS:
+                continue
+            by_file.setdefault(("%s-%s.jsonl" % (kind, _raw_day(kind, row)), kind), []).append(row)
+    counts = {"hr": 0, "sleep": 0}
+    dir_fd = _raw_dir_fd(root)
+    try:
+        for (name, kind), rows in sorted(by_file.items()):
+            seen = _raw_existing(root, dir_fd, name, kind)
+            fresh = []
+            for row in sorted(rows, key=lambda r: (r.get("epoch") or r.get("end_epoch") or 0)):
+                key = _raw_key(kind, row)
+                if key not in seen:
+                    seen.add(key)
+                    fresh.append(row)
+            if not fresh:
+                continue
+            data = "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+                           for row in fresh).encode("utf-8")
+            fd = _raw_open(root, dir_fd, name, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+            with os.fdopen(fd, "wb") as handle:
+                if os.fstat(handle.fileno()).st_size + len(data) > RAW_MAX_FILE_BYTES:
+                    raise OSError("%s would pass its %d-byte cap" % (name, RAW_MAX_FILE_BYTES))
+                handle.write(data)
+            counts[kind] += len(fresh)
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
+    return counts
+
+
+def record_raw_cycle(env, raw, now):
+    """The cycle's raw-record step -> failure lines (empty when it recorded or
+    was switched off). Contained: nothing here can stop the gauge."""
+    if raw is None:
+        return []
+    try:
+        if not resolve_raw_record(env):
+            return []
+    except ValueError as exc:
+        return ["raw record: %s - nothing recorded" % exc]
+    root = resolve_raw_root(env)
+    if root is None:
+        return ["raw record: the unit declares no StateDirectory=%s - nothing recorded" % RAW_ROOT_NAME]
+    try:
+        counts = record_raw(root, raw, now)
+    except Exception as exc:
+        return ["raw record: could not write (%s) - nothing more recorded this cycle" % type(exc).__name__]
+    print("heart: raw record +%d heart-rate samples, +%d sleep sessions" % (counts["hr"], counts["sleep"]))
+    return []
+
+
 def walk_all_data_points(access_token, timeout, base, query, parser, what):
     """Every point of a filtered list, across pages. `walk_data_points` keeps one
     reading per walk; this one keeps them all, under the same page limit.
@@ -5623,7 +5916,8 @@ def walk_all_data_points(access_token, timeout, base, query, parser, what):
 def read_google_health_heart_samples(env, heart_rate_url=None, sleep_url=None,
                                      token_endpoint=None):
     """Source: the last HEART_LOOKBACK_SECONDS of `heart-rate` samples and `sleep`
-    sessions -> (samples, sessions). ONE token refresh, two filtered walks.
+    sessions -> (samples, sessions, raw). ONE token refresh, two filtered walks;
+    `raw` is the same pages' rows for the raw watch record ({"hr", "sleep"}).
 
     Contract:
       Raises:  AuthFailure for a dead refresh token, SourceFailure for every
@@ -5649,15 +5943,25 @@ def read_google_health_heart_samples(env, heart_rate_url=None, sleep_url=None,
     since = iso8601_utc(cycle_now(env) - HEART_LOOKBACK_SECONDS)
     access_token = google_access_token(client_id, client_secret, refresh_token,
                                        timeout, token_endpoint)
+    # THE RAW ROWS RIDE THE SAME PAGES (the raw watch record, 2026-10-26): each
+    # page is read once and parsed twice, so recording costs no extra call.
+    raw = {"hr": [], "sleep": []}
+
+    def tee(parser, extractor, sink):
+        def both(payload):
+            sink.extend(extractor(payload))
+            return parser(payload)
+        return both
+
     samples = walk_all_data_points(
         access_token, timeout, heart_rate_url or GOOGLE_HEALTH_HEART_RATE_LIST_URL,
         {"filter": HEART_RATE_FILTER % since, "pageSize": HEART_RATE_PAGE_SIZE},
-        parse_heart_rate_page, "heart-rate")
+        tee(parse_heart_rate_page, raw_heart_rate_rows, raw["hr"]), "heart-rate")
     sessions = walk_all_data_points(
         access_token, timeout, sleep_url or GOOGLE_HEALTH_SLEEP_LIST_URL,
         {"filter": SLEEP_FILTER % since, "pageSize": SLEEP_PAGE_SIZE},
-        parse_sleep_page, "sleep")
-    return samples, sessions
+        tee(parse_sleep_page, raw_sleep_rows, raw["sleep"]), "sleep")
+    return samples, sessions, raw
 
 
 def clean_heart_samples(samples, device):
@@ -6099,7 +6403,8 @@ def run_heart_samples_cycle(env, now=None, reader=None, poster=None, clock=None)
     tests' seam for that second reading; with `now` injected and no `clock`, the
     injected time stands.
 
-    Implements: SR-073, LLR-1314, LLR-1315, LLR-1316, LLR-1317, LLR-1318, LLR-1319
+    Implements: SR-073, LLR-1314, LLR-1315, LLR-1316, LLR-1317, LLR-1318, LLR-1319,
+                LLR-1330
     """
     config = resolve_heart_samples_config(env)
     zone = resolve_heart_zone(env)
@@ -6154,7 +6459,10 @@ def run_heart_samples_cycle(env, now=None, reader=None, poster=None, clock=None)
     nights = state.get(HEART_NIGHTS_KEY) or {}
     check_heart_night_stamps(nights, zone)
     if read is not None:
-        samples, sessions = read
+        samples, sessions = read[0], read[1]
+        # THE RAW WATCH RECORD, before anything is filtered or cleaned: what
+        # Google served is what is kept. Its failure is a line, never the gauge.
+        failures.extend(record_raw_cycle(env, read[2] if len(read) > 2 else None, now))
         # NOTHING FROM THE FUTURE: a sample or a session end later than the clock
         # (beyond the skew allowance) has not happened, and must not set tonight's
         # figure or pick its window.

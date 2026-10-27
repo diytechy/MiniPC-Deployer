@@ -26,8 +26,13 @@ needs_bash = pytest.mark.skipif(BASH is None, reason="needs bash")
 # Read from the panel 2026-10-22 (sha256sum over the live files):
 #   /usr/local/sbin/wall-freeze-watch.sh, /etc/systemd/system/wall-freeze-watch.service,
 #   /etc/wall-panel/freeze-watch.env
+#
+# wall-freeze-watch.sh CHANGED DELIBERATELY on 2026-10-26 (SR-122, LLR-1331): it
+# also writes its last verdict to /run/wall-freeze-state/status.json for the hub's
+# metrics log. The live copy read 4e4e70803616bb7113c53b3200bb148ded5302e14b9b943653a253698dd0f39f
+# before that; this is the payload's new hash, live once the paired release ships it.
 LIVE_SHA256 = {
-    "wall-freeze-watch.sh": "4e4e70803616bb7113c53b3200bb148ded5302e14b9b943653a253698dd0f39f",
+    "wall-freeze-watch.sh": "3c186674f317b2a4c1c1a98090652b3f8dc376a35e81a7a195bedecb50bd1392",
     "wall-freeze-watch.service": "cf070193ebf4735815039b20b27904176a11a1862f8ca8cd6d6379df113746b6",
     "wall-freeze-watch.env": "b2a6ae4c2c5cf822bba292fe25e04541bf764659b3570e367f2603b4e9f243f3",
 }

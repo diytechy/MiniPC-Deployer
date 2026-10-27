@@ -28,3 +28,8 @@
         href: https://actual.admin.{{HOMEPAGE_VAR_DOMAIN}}/
         description: Budget (its own password as well)
         siteMonitor: http://actual:5006
+    # The hub metrics log's charts (SR-124): static files served by Caddy
+    # itself, so there is no container to probe and no status dot.
+    - Metrics:
+        href: https://metrics.admin.{{HOMEPAGE_VAR_DOMAIN}}/
+        description: Trend charts from the hub metrics log (nightly rows, 5-minute snapshots, raw watch samples)

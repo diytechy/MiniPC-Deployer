@@ -590,6 +590,43 @@ actual.admin.{$DOMAIN} {
     }
 }
 
+# ── metrics.admin.<domain> — the hub metrics log's charts (SR-124) ──────────
+# The Owner's ruling 2026-10-26 (HomeHub open-items A79, decision 3.4): a small
+# LAN-only chart page on the hub that reads the log files. It is HEALTH DATA
+# (sleep, heart rate, weight), so it sits in the admin zone behind the one
+# admin login, like Dozzle: no login of its own (P4). Static files only - no
+# process of its own, nothing it can be asked to change:
+#   /        the page (stack/monitoring/metrics-site/, read-only)
+#   /data/*  /var/lib/homehub-metrics (snapshots, daily.jsonl), read-only
+#   /raw/*   /var/lib/homehub-health-raw (the heart feeder's raw watch
+#            samples), read-only
+# No browse: the page computes each day file's name from its date, and a 404 is
+# a day with no record. no-store, so a chart never shows a cached yesterday.
+metrics.admin.{$DOMAIN} {
+    import acme_cloudflare
+    import hsts
+    @lan remote_ip {$LAN_CIDR}
+    handle @lan {
+        import protect_admin
+        header Cache-Control "no-store"
+        handle_path /data/* {
+            root * /srv/metrics/data
+            file_server
+        }
+        handle_path /raw/* {
+            root * /srv/metrics/raw
+            file_server
+        }
+        handle {
+            root * /srv/metrics/site
+            file_server
+        }
+    }
+    handle {
+        respond "metrics: LAN only" 403
+    }
+}
+
 # ── the OLD names, for ONE release: redirects into the admin namespace ──────
 # actual.<domain> ({$ACTUAL_HOST}) and dns.<domain> used to be the sites
 # themselves, each behind its own basic_auth. They moved under admin. because

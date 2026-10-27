@@ -1,0 +1,440 @@
+<!doctype html>
+<!--
+  The hub metrics log's chart page (SR-124; the Owner's ruling 2026-10-26,
+  HomeHub open-items A79, decision 3.4). Served by Caddy at
+  metrics.admin.<domain>, behind the admin login, from
+  stack/monitoring/metrics-site/. It READS the log files and nothing else:
+    data/daily.jsonl                 the daily rows (latest row per night wins)
+    data/snapshot-YYYYMMDD.jsonl     5-minute snapshots (.jsonl.gz after 7 days)
+    raw/hr-YYYYMMDD.jsonl            the watch's raw heart-rate samples (UTC day)
+    raw/sleep-YYYYMMDD.jsonl         the watch's raw sleep sessions (UTC day of the end)
+  No libraries, no network beyond this site: every chart is drawn here as SVG.
+  One measure per chart (never two y-scales), one colour, a crosshair and a
+  tooltip on hover, and every chart has its numbers in a table underneath.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hub Metrics</title>
+<style>
+:root {
+  color-scheme: light;
+  --surface-0: #f4f4f2;
+  --surface-1: #fcfcfb;
+  --border: #dddcd7;
+  --grid: #ebeae6;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #77766f;
+  --series-1: #2a78d6;
+  --band: rgba(42, 120, 214, 0.10);
+  --critical: #c42b2b;
+  --good: #1f7a3a;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --surface-0: #121211;
+    --surface-1: #1a1a19;
+    --border: #34332f;
+    --grid: #262624;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #96958c;
+    --series-1: #3987e5;
+    --band: rgba(57, 135, 229, 0.16);
+    --critical: #e66767;
+    --good: #4cb36b;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-0: #121211;
+  --surface-1: #1a1a19;
+  --border: #34332f;
+  --grid: #262624;
+  --text-primary: #f0efec;
+  --text-secondary: #c3c2b7;
+  --text-muted: #96958c;
+  --series-1: #3987e5;
+  --band: rgba(57, 135, 229, 0.16);
+  --critical: #e66767;
+  --good: #4cb36b;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--surface-0); color: var(--text-primary);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header { padding: 16px 16px 8px; max-width: 1200px; margin: 0 auto; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+.sub { color: var(--text-secondary); margin: 0; }
+nav, .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
+button, select, input {
+  font: inherit; color: var(--text-primary); background: var(--surface-1);
+  border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px;
+}
+button[aria-pressed="true"] { border-color: var(--series-1); box-shadow: inset 0 0 0 1px var(--series-1); }
+main { max-width: 1200px; margin: 0 auto; padding: 0 16px 32px; }
+.status { color: var(--text-secondary); margin: 8px 0 16px; min-height: 1.4em; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
+.card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 12px; min-width: 0; }
+.card h2 { font-size: 14px; margin: 0; }
+.card .latest { color: var(--text-secondary); font-size: 13px; margin: 2px 0 6px; }
+.chart { position: relative; }
+.chart svg { display: block; width: 100%; height: 180px; overflow: visible; }
+.chart .axis text { fill: var(--text-muted); font-size: 11px; }
+.chart .gridline { stroke: var(--grid); stroke-width: 1; }
+.chart .line { fill: none; stroke: var(--series-1); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.chart .dot { fill: var(--series-1); stroke: var(--surface-1); stroke-width: 2; }
+.chart .dot.stale { fill: var(--surface-1); stroke: var(--series-1); }
+.chart .band { fill: var(--band); }
+.chart .cross { stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 3 3; }
+.tip {
+  position: absolute; pointer-events: none; background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 8px; font-size: 12px; white-space: nowrap; display: none;
+  box-shadow: 0 2px 8px rgba(0,0,0,.15); z-index: 2;
+}
+details { margin-top: 6px; }
+summary { color: var(--text-secondary); cursor: pointer; font-size: 12px; }
+table { border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 4px; }
+th, td { text-align: left; padding: 2px 6px; border-bottom: 1px solid var(--grid); }
+.tablewrap { max-height: 220px; overflow: auto; }
+.now { margin-bottom: 16px; }
+.now ul { margin: 4px 0; padding-left: 18px; }
+.bad { color: var(--critical); }
+.ok { color: var(--good); }
+@media (max-width: 420px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Hub metrics</h1>
+  <p class="sub">The hub's metrics log: nightly rows, 5-minute snapshots and the watch's raw samples. Read-only.</p>
+  <nav aria-label="Views">
+    <button data-view="nightly" aria-pressed="true">Nightly</button>
+    <button data-view="recent" aria-pressed="false">Recent</button>
+    <button data-view="heart" aria-pressed="false">Heart rate</button>
+  </nav>
+  <div class="controls" id="controls"></div>
+</header>
+<main>
+  <div class="status" id="status" role="status"></div>
+  <section class="now" id="now"></section>
+  <div class="grid" id="charts"></div>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const pad2 = (n) => String(n).padStart(2, "0");
+const ymd = (d) => "" + d.getUTCFullYear() + pad2(d.getUTCMonth() + 1) + pad2(d.getUTCDate());
+const DAY = 86400000;
+
+// ── reading the log files ───────────────────────────────────────────────────
+function parseLines(text) {
+  const out = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try { const v = JSON.parse(line); if (v && typeof v === "object") out.push(v); } catch (e) { /* a torn line */ }
+  }
+  return out;
+}
+async function fetchJsonl(path) {
+  const r = await fetch(path, { cache: "no-store" });
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(path + ": HTTP " + r.status);
+  return parseLines(await r.text());
+}
+async function fetchGz(path) {
+  const r = await fetch(path, { cache: "no-store" });
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(path + ": HTTP " + r.status);
+  if (typeof DecompressionStream === "undefined") throw new Error("this browser cannot read .gz day files");
+  const stream = r.body.pipeThrough(new DecompressionStream("gzip"));
+  return parseLines(await new Response(stream).text());
+}
+async function dayFile(dir, prefix, day) {
+  const plain = await fetchJsonl(dir + "/" + prefix + "-" + day + ".jsonl");
+  if (plain) return plain;
+  return (await fetchGz(dir + "/" + prefix + "-" + day + ".jsonl.gz")) || [];
+}
+async function daysBetween(dir, prefix, fromMs, toMs) {
+  const days = [];
+  for (let t = Date.UTC(new Date(fromMs).getUTCFullYear(), new Date(fromMs).getUTCMonth(), new Date(fromMs).getUTCDate());
+       t <= toMs; t += DAY) days.push(ymd(new Date(t)));
+  const parts = await Promise.all(days.map((d) => dayFile(dir, prefix, d).catch(() => [])));
+  return parts.flat();
+}
+
+// ── one chart: a single measure over time, SVG, crosshair + tooltip ─────────
+const NS = "http://www.w3.org/2000/svg";
+function el(name, attrs, parent) {
+  const node = document.createElementNS(NS, name);
+  for (const k in attrs) node.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(node);
+  return node;
+}
+function niceTicks(lo, hi, count) {
+  if (lo === hi) { lo -= 1; hi += 1; }
+  const step0 = (hi - lo) / count, mag = Math.pow(10, Math.floor(Math.log10(step0)));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= step0) || step0;
+  const out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(10));
+  return out;
+}
+function fmtTime(ms, span) {
+  const d = new Date(ms);
+  if (span > 3 * DAY) return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+function fmtVal(v, unit) { return (Math.round(v * 100) / 100) + (unit ? " " + unit : ""); }
+
+// points: [{t: ms, v: number, stale?: bool, label?: string}] ; bands: [[ms, ms]]
+function chart(title, unit, points, opts) {
+  opts = opts || {};
+  const card = document.createElement("div");
+  card.className = "card";
+  const h = document.createElement("h2");
+  h.textContent = title;
+  card.appendChild(h);
+  const latest = document.createElement("div");
+  latest.className = "latest";
+  card.appendChild(latest);
+  points = points.filter((p) => typeof p.v === "number" && isFinite(p.v)).sort((a, b) => a.t - b.t);
+  if (!points.length) {
+    latest.textContent = "no data in this range";
+    $("charts").appendChild(card);
+    return;
+  }
+  const last = points[points.length - 1];
+  latest.textContent = "latest " + fmtVal(last.v, unit) + " - " + (last.label || new Date(last.t).toLocaleString());
+  const wrap = document.createElement("div");
+  wrap.className = "chart";
+  card.appendChild(wrap);
+  $("charts").appendChild(card);
+
+  const W = Math.max(280, wrap.clientWidth || 340), H = 180, L = 40, R = 8, T = 8, B = 22;
+  const svg = el("svg", { viewBox: "0 0 " + W + " " + H, role: "img", "aria-label": title }, wrap);
+  const t0 = opts.from != null ? opts.from : points[0].t, t1 = opts.to != null ? opts.to : last.t;
+  let lo = Math.min(...points.map((p) => p.v)), hi = Math.max(...points.map((p) => p.v));
+  if (opts.zero) lo = Math.min(0, lo);
+  const pad = (hi - lo) * 0.08 || 1;
+  lo -= pad; hi += pad;
+  const x = (t) => L + (W - L - R) * (t1 === t0 ? 0.5 : (t - t0) / (t1 - t0));
+  const y = (v) => T + (H - T - B) * (1 - (v - lo) / (hi - lo));
+  const axis = el("g", { class: "axis" }, svg);
+  for (const v of niceTicks(lo, hi, 4)) {
+    el("line", { class: "gridline", x1: L, x2: W - R, y1: y(v), y2: y(v) }, svg);
+    el("text", { x: L - 6, y: y(v) + 4, "text-anchor": "end" }, axis).textContent = v;
+  }
+  for (let i = 0; i <= 3; i++) {
+    const t = t0 + (t1 - t0) * i / 3;
+    el("text", { x: x(t), y: H - 6, "text-anchor": i === 0 ? "start" : i === 3 ? "end" : "middle" }, axis)
+      .textContent = fmtTime(t, t1 - t0);
+  }
+  for (const [a, b] of opts.bands || []) {
+    const xa = Math.max(L, x(a)), xb = Math.min(W - R, x(b));
+    if (xb > xa) el("rect", { class: "band", x: xa, y: T, width: xb - xa, height: H - T - B }, svg);
+  }
+  // A gap longer than `gap` ms breaks the line: a missing stretch is shown missing.
+  const gap = opts.gap || Infinity;
+  let d = "", prev = null;
+  for (const p of points) {
+    d += (prev === null || p.t - prev > gap ? "M" : "L") + x(p.t).toFixed(1) + " " + y(p.v).toFixed(1) + " ";
+    prev = p.t;
+  }
+  el("path", { class: "line", d: d }, svg);
+  if (opts.dots) for (const p of points) el("circle", { class: "dot" + (p.stale ? " stale" : ""), cx: x(p.t), cy: y(p.v), r: 4 }, svg);
+
+  const cross = el("line", { class: "cross", y1: T, y2: H - B, visibility: "hidden" }, svg);
+  const marker = el("circle", { class: "dot", r: 4, visibility: "hidden" }, svg);
+  const tip = document.createElement("div");
+  tip.className = "tip";
+  wrap.appendChild(tip);
+  svg.addEventListener("pointermove", (ev) => {
+    const box = svg.getBoundingClientRect();
+    const t = t0 + ((ev.clientX - box.left) * W / box.width - L) / (W - L - R) * (t1 - t0);
+    let best = points[0];
+    for (const p of points) if (Math.abs(p.t - t) < Math.abs(best.t - t)) best = p;
+    const px = x(best.t), py = y(best.v);
+    cross.setAttribute("x1", px); cross.setAttribute("x2", px); cross.setAttribute("visibility", "visible");
+    marker.setAttribute("cx", px); marker.setAttribute("cy", py); marker.setAttribute("visibility", "visible");
+    tip.textContent = fmtVal(best.v, unit) + (best.stale ? " (stale)" : "") + " - " +
+      (best.label || new Date(best.t).toLocaleString());
+    tip.style.display = "block";
+    const left = px * box.width / W;
+    tip.style.left = Math.min(box.width - tip.offsetWidth, Math.max(0, left - tip.offsetWidth / 2)) + "px";
+    tip.style.top = Math.max(0, py * box.height / H - 34) + "px";
+  });
+  svg.addEventListener("pointerleave", () => {
+    tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); marker.setAttribute("visibility", "hidden");
+  });
+
+  const det = document.createElement("details");
+  det.innerHTML = "<summary>Table</summary>";
+  det.addEventListener("toggle", () => {
+    if (!det.open || det.querySelector("table")) return;
+    const w = document.createElement("div");
+    w.className = "tablewrap";
+    const tbl = document.createElement("table");
+    tbl.innerHTML = "<thead><tr><th>When</th><th>" + (unit || "Value") + "</th></tr></thead>";
+    const body = document.createElement("tbody");
+    for (const p of points.slice().reverse().slice(0, 2000)) {
+      const tr = document.createElement("tr");
+      const a = document.createElement("td"), b = document.createElement("td");
+      a.textContent = p.label || new Date(p.t).toLocaleString();
+      b.textContent = fmtVal(p.v, "") + (p.stale ? " (stale)" : "");
+      tr.append(a, b);
+      body.appendChild(tr);
+    }
+    tbl.appendChild(body);
+    w.appendChild(tbl);
+    det.appendChild(w);
+  });
+  card.appendChild(det);
+}
+
+// ── the three views ─────────────────────────────────────────────────────────
+function setStatus(text) { $("status").textContent = text; }
+function clear() { $("charts").innerHTML = ""; $("now").innerHTML = ""; }
+const path = (obj, keys) => keys.reduce((o, k) => (o == null ? undefined : o[k]), obj);
+
+async function nightly() {
+  const ctl = $("controls");
+  ctl.innerHTML = '<label>Nights <select id="n"><option>30</option><option selected>90</option>' +
+    '<option>365</option><option value="0">all</option></select></label>';
+  $("n").addEventListener("change", draw);
+  setStatus("loading daily rows...");
+  const rows = (await fetchJsonl("data/daily.jsonl")) || [];
+  // The latest row per night wins: the 14:05 revision over the 10:00 initial.
+  const byNight = new Map();
+  for (const r of rows) {
+    if (typeof r.night !== "string") continue;
+    const had = byNight.get(r.night);
+    if (!had || (r.epoch || 0) > (had.epoch || 0)) byNight.set(r.night, r);
+  }
+  function draw() {
+    clear();
+    const keep = +$("n").value;
+    let nights = [...byNight.values()].sort((a, b) => a.night < b.night ? -1 : 1);
+    if (keep) nights = nights.slice(-keep);
+    setStatus(nights.length + " nights (latest row per night: a 14:05 revision replaces the 10:00 row)");
+    const at = (r) => Date.parse(r.night + "T12:00:00");
+    const series = (fn) => nights.map((r) => { const v = fn(r); return v == null ? null :
+      { t: at(r), v: v.v, stale: v.stale, label: r.night + " (" + r.kind + ")" }; }).filter(Boolean);
+    const opts = { dots: true, gap: 1.5 * DAY };
+    chart("Heart: resting (night)", "bpm", series((r) => r.heart_night && { v: r.heart_night.rhr }), opts);
+    chart("CPAP usage", "min", series((r) => r.sleep && r.sleep.cpap_minutes != null && { v: r.sleep.cpap_minutes }),
+      Object.assign({ zero: true }, opts));
+    chart("Sleep score", "", series((r) => r.sleep && r.sleep.score != null && { v: r.sleep.score }), opts);
+    chart("Hub CPU, overnight max", "°C", series((r) => path(r, ["overnight", "cpu_c"]) && { v: r.overnight.cpu_c[1] }), opts);
+    const ids = new Set();
+    for (const r of nights) for (const id in (r.gauges || {})) ids.add(id);
+    for (const id of [...ids].sort()) {
+      let unit = "";
+      const pts = series((r) => {
+        const g = r.gauges && r.gauges[id];
+        if (!g || typeof g.value !== "number" || !g.observed_at) return null;
+        unit = g.unit || unit;
+        return { v: g.value, stale: !!g.stale };
+      });
+      chart("Gauge: " + id, unit, pts, opts);
+    }
+  }
+  draw();
+}
+
+async function recent() {
+  const ctl = $("controls");
+  ctl.innerHTML = '<label>Range <select id="r"><option value="1">24 hours</option><option value="2">2 days</option>' +
+    '<option value="7">7 days</option><option value="30">30 days</option></select></label>';
+  $("r").addEventListener("change", load);
+  async function load() {
+    clear();
+    const days = +$("r").value, to = Date.now(), from = to - days * DAY;
+    setStatus("loading " + days + " day(s) of snapshots...");
+    const recs = (await daysBetween("data", "snapshot", from, to)).filter((r) => r.epoch * 1000 >= from)
+      .sort((a, b) => a.epoch - b.epoch);
+    setStatus(recs.length + " snapshots since " + new Date(from).toLocaleString());
+    const last = recs[recs.length - 1];
+    if (last) now(last);
+    const s = (keys) => recs.map((r) => ({ t: r.epoch * 1000, v: path(r, keys) }));
+    const opts = { from: from, to: to, gap: 15 * 60000 };
+    chart("Hub CPU temperature", "°C", s(["host", "telemetry", "cpu_c"]), opts);
+    chart("Hub NVMe temperature", "°C", s(["host", "telemetry", "nvme_c"]), opts);
+    chart("Hub load (1 min)", "", recs.map((r) => ({ t: r.epoch * 1000, v: (path(r, ["host", "telemetry", "load"]) || [])[0] })), opts);
+    chart("Hub memory available", "MB", s(["host", "mem", "avail_mb"]), opts);
+    chart("Panel CPU temperature", "°C", s(["panel", "telemetry", "cpu_c"]), opts);
+    chart("Panel CPU busy", "%", s(["panel", "telemetry", "cpu_pct"]), opts);
+    chart("Panel reached", "", recs.map((r) => ({ t: r.epoch * 1000, v: path(r, ["panel", "ok"]) ? 1 : 0 })), opts);
+    const ids = new Set();
+    for (const r of recs) for (const g of path(r, ["gauges", "list"]) || []) ids.add(g.id);
+    for (const id of [...ids].sort()) {
+      let unit = "";
+      const pts = recs.map((r) => {
+        const g = (path(r, ["gauges", "list"]) || []).find((x) => x.id === id);
+        if (!g || !g.observed_at) return null;
+        unit = g.unit || unit;
+        return { t: r.epoch * 1000, v: g.value, stale: !!g.stale };
+      }).filter(Boolean);
+      chart("Gauge: " + id, unit, pts, opts);
+    }
+  }
+  await load();
+}
+
+function now(last) {
+  const box = $("now");
+  const failed = path(last, ["units", "failed"]) || [];
+  const down = (path(last, ["containers", "list"]) || []).filter((c) => c.state !== "running" || c.health === "unhealthy");
+  const watch = path(last, ["monitors", "watch", "rows"]) || {};
+  const firing = Object.keys(watch).filter((k) => watch[k] !== "ok");
+  const stale = (path(last, ["gauges", "list"]) || []).filter((g) => g.stale).map((g) => g.id);
+  const item = (label, list) => "<li>" + label + ": " + (list.length
+    ? '<span class="bad">' + list.map((x) => String(x).replace(/[<>&]/g, "")).join(", ") + "</span>"
+    : '<span class="ok">none</span>') + "</li>";
+  box.innerHTML = "<strong>Now (" + new Date(last.epoch * 1000).toLocaleString() + ")</strong><ul>" +
+    item("Failed units", failed) + item("Containers not running or unhealthy", down.map((c) => c.name)) +
+    item("Watches not ok", firing) + item("Stale gauges", stale) +
+    item("Panel", path(last, ["panel", "ok"]) ? [] : [path(last, ["panel", "error"]) || "not reached"]) + "</ul>";
+}
+
+async function heart() {
+  const ctl = $("controls");
+  const today = new Date();
+  ctl.innerHTML = '<label>Night ending <input type="date" id="d"></label>';
+  $("d").value = today.getFullYear() + "-" + pad2(today.getMonth() + 1) + "-" + pad2(today.getDate());
+  $("d").addEventListener("change", load);
+  async function load() {
+    clear();
+    const [Y, M, D] = $("d").value.split("-").map(Number);
+    const to = new Date(Y, M - 1, D, 12).getTime(), from = to - 18 * 3600000;   // 18:00 .. 12:00 local
+    setStatus("loading raw samples...");
+    const hr = (await daysBetween("raw", "hr", from, to)).filter((r) => r.epoch * 1000 >= from && r.epoch * 1000 <= to);
+    const sleep = await daysBetween("raw", "sleep", from, to + DAY);
+    const bands = sleep.filter((s) => s.end_epoch * 1000 >= from && s.start_epoch * 1000 <= to)
+      .map((s) => [s.start_epoch * 1000, s.end_epoch * 1000]);
+    const devices = [...new Set(hr.map((r) => r.device || "unknown"))];
+    setStatus(hr.length + " raw heart-rate samples, " + bands.length + " sleep session(s) shaded. Raw: nothing cleaned.");
+    for (const dev of devices.sort()) {
+      chart("Heart rate - " + dev, "bpm", hr.filter((r) => (r.device || "unknown") === dev)
+        .map((r) => ({ t: r.epoch * 1000, v: r.bpm })), { from: from, to: to, bands: bands, gap: 20 * 60000 });
+    }
+    if (!devices.length) chart("Heart rate", "bpm", [], {});
+  }
+  await load();
+}
+
+const VIEWS = { nightly: nightly, recent: recent, heart: heart };
+for (const b of document.querySelectorAll("nav button")) {
+  b.addEventListener("click", () => {
+    for (const o of document.querySelectorAll("nav button")) o.setAttribute("aria-pressed", String(o === b));
+    clear();
+    VIEWS[b.dataset.view]().catch((e) => setStatus("could not load: " + e.message));
+  });
+}
+nightly().catch((e) => setStatus("could not load: " + e.message));
+</script>
+</body>
+</html>

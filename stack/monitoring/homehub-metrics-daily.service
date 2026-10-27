@@ -1,0 +1,31 @@
+# homehub-metrics-daily - the metrics log's row for the night that ended this
+# morning (SN-048, SR-123; the Owner, 2026-10-26, HomeHub open-items A79): every
+# gauge with its observed_at and stale flag, the heart feeder's night, the
+# CPAP's usage minutes and score, the overnight temperature range and the backup
+# results. 10:00 writes the `initial` row and 14:05 the `revision`; both are
+# kept. A run that finds its row already written writes nothing, so the timer's
+# catch-up (Persistent=true) cannot double one. Record only.
+[Unit]
+Description=HomeHub metrics log: the daily row (10:00 initial, 14:05 revision)
+Documentation=file:///opt/homehub/stack/monitoring/README.md
+After=local-fs.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/homehub/stack/monitoring/homehub-metrics.py daily
+SyslogIdentifier=homehub-metrics
+StateDirectory=homehub-metrics
+StateDirectoryMode=0700
+UMask=0077
+TimeoutStartSec=100
+Nice=10
+CPUAccounting=true
+CPUQuota=25%
+MemoryAccounting=true
+MemoryMax=128M
+TasksMax=32
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only

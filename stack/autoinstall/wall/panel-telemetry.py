@@ -43,6 +43,40 @@ RETENTION_DAYS = int(os.environ.get("PANEL_TELEMETRY_RETENTION_DAYS", "7"))
 CAP_BYTES = int(os.environ.get("PANEL_TELEMETRY_CAP_BYTES", str(50 * 1024 * 1024)))
 KIOSK_PROCESS_NAMES = os.environ.get("PANEL_TELEMETRY_KIOSK_PROCS", "cage,electron,projectm").split(",")
 STALE_THRESHOLD_S = 15.0
+# The newest full sample, world-readable, for the hub's metrics log (2026-10-26,
+# HomeHub open-items A79): the meeting account's forced command (`status`)
+# reads it, and that account cannot read this unit's private state directory.
+# The unit points it into its own RuntimeDirectory; empty = not written.
+LATEST_PATH = os.environ.get("PANEL_TELEMETRY_LATEST_PATH", "")
+LATEST_MAX_BYTES = 32768
+
+
+def _write_latest(path, record):
+    """Replace `path` with `record` atomically, mode 0644. Never raises: the
+    record on disk is the telemetry; this copy is a convenience for the hub."""
+    if not path:
+        return False
+    tmp = None
+    try:
+        line = json.dumps(record, sort_keys=True)
+        if len(line) > LATEST_MAX_BYTES:
+            return False
+        directory = os.path.dirname(path) or "."
+        tmp = os.path.join(directory, ".latest.%d" % os.getpid())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o644)
+        with os.fdopen(fd, "w") as handle:
+            if hasattr(os, "fchmod"):
+                os.fchmod(handle.fileno(), 0o644)   # the unit's UMask=0077 would make it 0600
+            handle.write(line + "\n")
+        os.replace(tmp, path)
+        return True
+    except (OSError, TypeError, ValueError):
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        return False
 
 # This-panel sensor inventory (see build/panel-telemetry-inventory-20260914 for
 # how it was derived): which hwmon *names* and thermal_zone *types* exist, and
@@ -599,6 +633,7 @@ def cmd_run(args):
                 if gap is not None:
                     record["suspend_gap_s"] = gap
                 _append_record(state_dir, record)
+                _write_latest(LATEST_PATH, record)
 
                 prev_boottime = cur_boottime
                 next_full_sample = tick_start + INTERVAL_S

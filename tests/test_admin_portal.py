@@ -28,7 +28,7 @@ ENVEX = STACK / ".env.example"
 HOMEPAGE = STACK / "homepage"
 ADMIN_AUTH = STACK / "admin-auth"
 
-ADMIN_SITES = ("admin", "kuma.admin", "logs.admin", "dns.admin", "actual.admin")
+ADMIN_SITES = ("admin", "kuma.admin", "logs.admin", "dns.admin", "actual.admin", "metrics.admin")
 PHASE_B = {  # label -> (upstream, compose service, bind knob, port knob)
     "photos": ("immich-server:2283", "immich-server", "IMMICH_BIND_IP", "IMMICH_PORT"),
     "jellyfin": ("jellyfin:8096", "jellyfin", "JELLYFIN_BIND_IP", "JELLYFIN_PORT"),

@@ -2975,7 +2975,7 @@ if [ -d "$STACK_DIR/monitoring" ]; then
     # ISO9660 drops executable bits; the units run the .py files through
     # python3 and the helper through bash, so this is for hand runs only.
     chmod 0755 "$_mon/homehub-alert.sh" "$_mon/homehub-telemetry.py" "$_mon/homehub-disk-check.py" \
-        "$_mon/homehub-watch.py" "$_mon/homehub-liveness.py" 2>/dev/null || true
+        "$_mon/homehub-watch.py" "$_mon/homehub-liveness.py" "$_mon/homehub-metrics.py" 2>/dev/null || true
     install -m 0644 "$_mon/homehub-telemetry.service"  /etc/systemd/system/homehub-telemetry.service  || log "WARN: could not install homehub-telemetry.service"
     install -m 0644 "$_mon/homehub-telemetry.timer"    /etc/systemd/system/homehub-telemetry.timer    || log "WARN: could not install homehub-telemetry.timer"
     install -m 0644 "$_mon/homehub-disk-check.service" /etc/systemd/system/homehub-disk-check.service || log "WARN: could not install homehub-disk-check.service"
@@ -2984,6 +2984,13 @@ if [ -d "$STACK_DIR/monitoring" ]; then
     install -m 0644 "$_mon/homehub-watch.timer"        /etc/systemd/system/homehub-watch.timer        || log "WARN: could not install homehub-watch.timer"
     install -m 0644 "$_mon/homehub-liveness.service"   /etc/systemd/system/homehub-liveness.service   || log "WARN: could not install homehub-liveness.service"
     install -m 0644 "$_mon/homehub-liveness.timer"     /etc/systemd/system/homehub-liveness.timer     || log "WARN: could not install homehub-liveness.timer"
+    # The metrics log (SR-122, SR-123; the Owner, 2026-10-26): record only, like the rest.
+    install -m 0644 "$_mon/homehub-metrics-snapshot.service" /etc/systemd/system/homehub-metrics-snapshot.service || log "WARN: could not install homehub-metrics-snapshot.service"
+    install -m 0644 "$_mon/homehub-metrics-snapshot.timer"   /etc/systemd/system/homehub-metrics-snapshot.timer   || log "WARN: could not install homehub-metrics-snapshot.timer"
+    install -m 0644 "$_mon/homehub-metrics-daily.service"    /etc/systemd/system/homehub-metrics-daily.service    || log "WARN: could not install homehub-metrics-daily.service"
+    install -m 0644 "$_mon/homehub-metrics-daily.timer"      /etc/systemd/system/homehub-metrics-daily.timer      || log "WARN: could not install homehub-metrics-daily.timer"
+    install -m 0644 "$_mon/homehub-metrics-copy.service"     /etc/systemd/system/homehub-metrics-copy.service     || log "WARN: could not install homehub-metrics-copy.service"
+    install -m 0644 "$_mon/homehub-metrics-copy.timer"       /etc/systemd/system/homehub-metrics-copy.timer       || log "WARN: could not install homehub-metrics-copy.timer"
     systemctl daemon-reload || log "WARN: systemctl daemon-reload failed"
     _mon_converge() {   # TIMER KNOB - converge one monitor's timer to its knob
         local _v
@@ -3003,9 +3010,12 @@ if [ -d "$STACK_DIR/monitoring" ]; then
     _mon_converge homehub-disk-check.timer HOMEHUB_DISK_CHECK_ENABLED
     _mon_converge homehub-watch.timer      HOMEHUB_WATCH_ENABLED
     _mon_converge homehub-liveness.timer   HOMEHUB_LIVENESS_ENABLED
+    _mon_converge homehub-metrics-snapshot.timer HOMEHUB_METRICS_ENABLED
+    _mon_converge homehub-metrics-daily.timer    HOMEHUB_METRICS_ENABLED
+    _mon_converge homehub-metrics-copy.timer     HOMEHUB_METRICS_ENABLED
     unset -f _mon_converge
 else
-    log "WARN: no $STACK_DIR/monitoring on the payload - no telemetry, disk alarm, watches or liveness probe."
+    log "WARN: no $STACK_DIR/monitoring on the payload - no telemetry, disk alarm, watches, liveness probe or metrics log."
 fi
 # END hub-monitoring
 

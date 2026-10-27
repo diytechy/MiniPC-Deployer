@@ -34,6 +34,14 @@ NoNewPrivileges=yes
 # a trip back to a browser.
 ProtectHome=read-only
 StateDirectory=homehub-weight
+# THE RAW WATCH RECORD (the Owner, 2026-10-26; weight_feeder.resolve_raw_root):
+# the heart half appends the watch's raw heart-rate samples and sleep sessions
+# here, kept for ever. A SECOND directory, not a subdirectory of the first, so
+# the metrics chart page can be given it read-only (stack/docker-compose.yml,
+# caddy) without being given the state file. List directives accumulate:
+# systemd creates both, owned by this account, and exports both in
+# $STATE_DIRECTORY joined by ':' in this order - homehub-weight stays first.
+StateDirectory=homehub-health-raw
 StateDirectoryMode=0700
 WorkingDirectory=/var/lib/homehub-weight
 

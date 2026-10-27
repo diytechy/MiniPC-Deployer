@@ -1,0 +1,36 @@
+# homehub-metrics-snapshot - one line of the hub metrics log every 5 minutes
+# (SN-048, SR-122; the Owner, 2026-10-26, HomeHub open-items A79): the gauges as
+# the tracker serves them, the newest telemetry sample, containers, units, the
+# monitors' verdicts, the wall panel's status and, hourly, NVMe SMART. Record
+# only. Read it with: python3 /opt/homehub/stack/monitoring/homehub-metrics.py summary
+#
+# ITS OWN UNIT, NOT THE TELEMETRY SAMPLER'S: that one runs every 30 s under a
+# 25 s timeout with no network; this one talks to the tracker on loopback and to
+# the panel over ssh, so it carries its own deadline (SNAPSHOT_DEADLINE_SEC in
+# the script) inside the TimeoutStartSec below.
+[Unit]
+Description=HomeHub metrics log: 5-minute snapshot (gauges, host, containers, units, panel)
+Documentation=file:///opt/homehub/stack/monitoring/README.md
+After=local-fs.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/homehub/stack/monitoring/homehub-metrics.py snapshot
+SyslogIdentifier=homehub-metrics
+StateDirectory=homehub-metrics
+StateDirectoryMode=0700
+UMask=0077
+# Bounded like its neighbours: a monitor must never be the reason the hub is
+# slow, and a run stuck behind a stalled call cannot pile up behind its timer.
+TimeoutStartSec=120
+Nice=10
+CPUAccounting=true
+CPUQuota=25%
+MemoryAccounting=true
+MemoryMax=128M
+TasksMax=32
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only

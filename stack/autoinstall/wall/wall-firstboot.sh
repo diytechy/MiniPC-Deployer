@@ -2613,6 +2613,21 @@ if [ "$WALL_TELEMETRY_ENABLED" = true ]; then
     if enable_unit_now "SN-S: panel telemetry collector enabled (5s presentation poll, 5s full sample)" wall-panel-telemetry.service; then
         :
     fi
+    # enable --now does not restart a RUNNING collector, so a release that
+    # changed it (2026-10-26: the latest.json copy for the hub's metrics log)
+    # would wait for the next reboot. Restart it when the unit or either .py
+    # differs from what the last run started.
+    _tel_sum="$(cd "$PAYLOAD" && cat wall-panel-telemetry.service panel-telemetry.py panel_telemetry_core.py \
+        2>/dev/null | sha256sum | cut -d' ' -f1)"
+    if [ "$_tel_sum" != "$(cat /opt/wall-panel/.telemetry-payload.sha256 2>/dev/null)" ]; then
+        if systemctl restart wall-panel-telemetry.service >/dev/null 2>&1; then
+            printf '%s\n' "$_tel_sum" > /opt/wall-panel/.telemetry-payload.sha256 2>/dev/null || :
+            log "SN-S: panel telemetry collector restarted on its new definition"
+        else
+            warn "SN-S: wall-panel-telemetry.service did not restart on its new definition"
+        fi
+    fi
+    unset _tel_sum
 else
     systemctl disable --now wall-panel-telemetry.service >/dev/null 2>&1 || true
     log "SN-S: panel telemetry collector disabled"

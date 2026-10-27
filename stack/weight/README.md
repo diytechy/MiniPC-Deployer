@@ -1477,6 +1477,49 @@ the goal, never posts the weight gauge or the check-off, and touches only the
 Neither half can change the other's posted body or state; the tests assert it in
 both directions.
 
+### The raw watch record (the Owner, 2026-10-26; LLR-1330)
+
+In samples mode every cycle already fetches the last 60 h of the watch's
+heart-rate samples and sleep sessions. Since 2026-10-26 it also **records them**,
+before anything is filtered or cleaned, once each, in UTC-day JSONL files:
+
+| File | One row per | "Once" means |
+|---|---|---|
+| `/var/lib/homehub-health-raw/hr-YYYYMMDD.jsonl` | heart-rate sample (by its UTC day) | the same time, device and value |
+| `/var/lib/homehub-health-raw/sleep-YYYYMMDD.jsonl` | sleep session (by its end's UTC day) | every recorded field the same; a session Google revises is appended again |
+
+A row is the served reading, normalised (epoch beside the RFC3339 string, the
+device, platform and recording method; for sleep the stages, summary and
+metadata) - never the data point's `name`, which carries the account's resource
+path. It rides the same pages, so it costs **no extra API call**. Kept for ever;
+about 300 rows a day. **Nothing analyses it** (the ruling: record the raw
+sources; sleep from heart rate is not built).
+
+- **Where:** the unit's SECOND `StateDirectory=homehub-health-raw`, owned by
+  this account, separate from `homehub-weight` so the metrics chart page can be
+  given it read-only without the state file. The writes keep the state file's
+  discipline: the directory comes from `$STATE_DIRECTORY` (never a knob), file
+  names must match `^(hr|sleep)-[0-9]{8}\.jsonl$`, every open is relative to the
+  directory with `O_NOFOLLOW`, and a file stops at 32 MiB.
+- **Off switch:** `HEART_RAW_RECORD=false`. Anything but `true`/`false` (or
+  unset) is one failure line and nothing recorded.
+- **Failure isolation:** the gauge's page parser runs first and the raw
+  extraction after it, guarded; a record that cannot be written or a page that
+  cannot be read into raw rows is one failure line (the unit goes red); the gauge
+  is posted exactly as before. A unit not yet re-installed with the second
+  `StateDirectory=` (re-run `setup-weight.sh`) is a WARNING line only, so the
+  unit stays green: red there would read as a sign-in failure.
+- **Not backed up on the hub** (not in the config backups); copied weekly into
+  the Owner's Docs folder on the library by `homehub-metrics-copy`
+  (`stack/monitoring/README.md`), which the library backup covers.
+- **Steps are not recorded**, and that was the ruling's own condition ("only if
+  the feeder can get them without a materially larger API load"). The steps type
+  can only be filtered on its interval start, so catching a late phone sync needs
+  a lookback window like heart rate's; its points are about 1 KB each, per
+  minute, from three sources, so even a 6 h window is more bytes per cycle than
+  the whole 60 h heart-rate read, and whether the 10 000 page size is honoured
+  for steps is unmeasured (the 2026-10-25 capture came in pages of 50).
+
 ### Not proven
 
 **No resting-heart-rate body has ever been captured.** The parser is written from

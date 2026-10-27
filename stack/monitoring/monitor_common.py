@@ -724,3 +724,241 @@ def dns_answer_ok(packet: bytes, query_id: int) -> Tuple[bool, str]:
     }
     label = names.get(rcode, "rcode %d" % rcode)
     return rcode in (0, 3), label
+
+
+# ── day files: one JSONL file per UTC day, bounded, compressed when old ─────
+#
+# The shape homehub-telemetry introduced (LLR-1152), made reusable for a record
+# that is KEPT LONG: the hub metrics log keeps a year of 5-minute snapshots
+# (the Owner, 2026-10-26), so its old days are gzip'd rather than kept plain.
+# Retention counts day FILES, never wall-clock age, so a clock that jumps
+# forward cannot delete a year of real records in one run; the file being
+# written is never deleted or compressed; a day file at its cap is not appended
+# to. Implements: SR-122, LLR-1321
+
+
+def day_file_name(prefix: str, epoch: float) -> str:
+    """`<prefix>-YYYYMMDD.jsonl` for the UTC day of `epoch`."""
+    return "%s-%s.jsonl" % (prefix, time.strftime("%Y%m%d", time.gmtime(epoch)))
+
+
+def _day_file_re(prefix: str):
+    return re.compile(r"^%s-([0-9]{8})\.jsonl(\.gz)?$" % re.escape(prefix))
+
+
+def plan_day_files(
+    files: List[Tuple[str, int]],
+    prefix: str,
+    active: str,
+    keep_days: int,
+    compress_after_days: int,
+    cap_bytes: int,
+) -> Tuple[List[str], List[str]]:
+    """(delete, compress) for one record's day files. Pure.
+
+    Contract:
+      Inputs:  files: [(name, size)] in the directory (anything that is not a
+               `<prefix>-YYYYMMDD.jsonl[.gz]` or its `.gz.tmp` is ignored);
+               active: the plain file being written now.
+      Outputs: names to delete and plain names to compress, never `active`.
+               * a `.gz.tmp` is a compression that did not finish: deleted;
+               * a day held both plain and `.gz` had its compression finish
+                 (the rename is atomic) but not the unlink: the plain goes;
+               * all but the newest `keep_days` DAYS go, then the oldest until
+                 the total fits `cap_bytes`;
+               * of what is left, plain days outside the newest
+                 `compress_after_days` are compressed.
+    """
+    pattern = _day_file_re(prefix)
+    tmp_re = re.compile(r"^%s-[0-9]{8}\.jsonl\.gz\.tmp$" % re.escape(prefix))
+    delete = [n for n, _ in files if tmp_re.match(n) and n != active]
+    days: Dict[str, Dict[str, int]] = {}
+    for name, size in files:
+        m = pattern.match(name)
+        if m:
+            days.setdefault(m.group(1), {})[name] = size
+    for day, names in days.items():
+        plain, packed = "%s-%s.jsonl" % (prefix, day), "%s-%s.jsonl.gz" % (prefix, day)
+        if plain in names and packed in names and plain != active:
+            delete.append(plain)
+            del names[plain]
+    ordered = sorted(days)
+    active_day = (pattern.match(active) or [None, None])[1]
+    keep = set(ordered[-keep_days:]) if keep_days > 0 else set()
+    if active_day:
+        keep.add(active_day)
+    for day in ordered:
+        if day not in keep:
+            delete.extend(sorted(days[day]))
+    remaining = [d for d in ordered if d in keep]
+    total = sum(sum(days[d].values()) for d in remaining)
+    for day in list(remaining):
+        if total <= cap_bytes:
+            break
+        if day == active_day:
+            continue
+        delete.extend(sorted(days[day]))
+        total -= sum(days[day].values())
+        remaining.remove(day)
+    recent = set(remaining[-compress_after_days:]) if compress_after_days > 0 else set()
+    compress = []
+    for day in remaining:
+        plain = "%s-%s.jsonl" % (prefix, day)
+        if day not in recent and day != active_day and plain in days[day]:
+            compress.append(plain)
+    return delete, compress
+
+
+def compress_day_file(directory: str, name: str) -> Tuple[bool, str]:
+    """gzip `name` to `name.gz` (via `.gz.tmp`, fsync'd, renamed), then unlink the
+    plain file. Never raises; a failure leaves the plain file as it was."""
+    import gzip  # local: only the long-kept records need it
+    import shutil
+
+    src = os.path.join(directory, name)
+    tmp = src + ".gz.tmp"
+    try:
+        # mtime=0 and the source's own mtime carried over: the same day always
+        # gzips to the same bytes with the same stamp, so a weekly copy that
+        # compared it as plain-gzip'd-on-the-fly and later as this file sees
+        # one file, not two (homehub-metrics.py copy).
+        stamp = os.stat(src).st_mtime
+        with open(src, "rb") as raw, open(tmp, "wb") as out:
+            with gzip.GzipFile(filename="", mode="wb", compresslevel=6, fileobj=out, mtime=0) as packed:
+                shutil.copyfileobj(raw, packed, 65536)
+            out.flush()
+            os.fsync(out.fileno())
+        os.utime(tmp, (stamp, stamp))
+        os.replace(tmp, src + ".gz")
+        os.unlink(src)
+        return True, "compressed %s" % name
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False, "could not compress %s: %s" % (name, exc)
+
+
+def enforce_day_files(
+    directory: str,
+    prefix: str,
+    active: str,
+    keep_days: int,
+    compress_after_days: int,
+    cap_bytes: int,
+    max_compress: int = 2,
+) -> List[str]:
+    """Apply plan_day_files to `directory`; returns one note per action or
+    failure. At most `max_compress` files are compressed per call, so a backlog
+    (a box that was off for a month) is worked off over several runs instead of
+    holding one run for minutes."""
+    notes = []
+    try:
+        files = [(n, os.path.getsize(os.path.join(directory, n))) for n in os.listdir(directory)]
+    except OSError as exc:
+        return ["retention could not list %s: %s" % (directory, exc)]
+    delete, compress = plan_day_files(files, prefix, active, keep_days, compress_after_days, cap_bytes)
+    for victim in delete:
+        try:
+            os.unlink(os.path.join(directory, victim))
+            notes.append("deleted %s" % victim)
+        except OSError as exc:
+            notes.append("could not delete %s: %s" % (victim, exc))
+    for name in compress[:max_compress]:
+        notes.append(compress_day_file(directory, name)[1])
+    return notes
+
+
+def append_jsonl(path: str, record: dict, cap_bytes: int) -> Tuple[bool, str]:
+    """Append one compact JSON line to `path`, refusing past `cap_bytes`. (ok, why)."""
+    try:
+        # allow_nan=False: a NaN would make the line unreadable JSON for every reader.
+        line = json.dumps(record, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+    except ValueError:
+        # One non-finite float must not cost the whole line: it becomes null,
+        # and the line names the top-level blocks that carried one.
+        try:
+            blocks = sorted(k for k, v in record.items() if _has_nonfinite(v)) if isinstance(record, dict) else []
+            record = dict(_finite(record), nonfinite=blocks) if isinstance(record, dict) else _finite(record)
+        except RecursionError:
+            return False, "the record could not be encoded (a cycle); not appending"
+        try:
+            line = json.dumps(record, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+        except (TypeError, ValueError, RecursionError) as exc:   # a cycle is ValueError too
+            return False, "the record could not be encoded (%s); not appending" % type(exc).__name__
+    except TypeError as exc:
+        return False, "the record could not be encoded (%s); not appending" % type(exc).__name__
+    size = len(line.encode("utf-8"))      # bytes, not characters: the cap is on disk
+    try:
+        os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+        current = os.path.getsize(path) if os.path.exists(path) else 0
+        if current + size > cap_bytes:
+            return False, "%s has reached its %d-byte cap; not appending" % (os.path.basename(path), cap_bytes)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(line)
+    except OSError as exc:
+        return False, "could not append to %s: %s" % (path, exc)
+    return True, "recorded %d bytes" % size
+
+
+def _has_nonfinite(value) -> bool:
+    if isinstance(value, float):
+        return value != value or value in (float("inf"), float("-inf"))
+    if isinstance(value, dict):
+        return any(_has_nonfinite(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_has_nonfinite(v) for v in value)
+    return False
+
+
+def _finite(value):
+    """`value` with every NaN/inf float replaced by None (containers copied)."""
+    if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+        return None
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite(v) for v in value]
+    return value
+
+
+def iter_jsonl(path: str):
+    """Every well-formed JSON object in a plain or `.gz` JSONL file, in order.
+    Torn lines (a write cut by a full disk) and an unreadable file are skipped."""
+    import gzip
+
+    try:
+        if path.endswith(".gz"):
+            handle = gzip.open(path, "rt", encoding="utf-8", errors="replace")
+        else:
+            handle = open(path, encoding="utf-8", errors="replace")
+        with handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(record, dict):
+                    yield record
+    except (OSError, EOFError):
+        return
+
+
+def day_files_between(directory: str, prefix: str, since: Optional[float], until: Optional[float]) -> List[str]:
+    """Paths of the day files whose UTC day overlaps [since, until], oldest first.
+    The `.gz` of a day wins over a leftover plain copy of it."""
+    pattern = _day_file_re(prefix)
+    lo = time.strftime("%Y%m%d", time.gmtime(since)) if since is not None else "00000000"
+    hi = time.strftime("%Y%m%d", time.gmtime(until)) if until is not None else "99999999"
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    chosen: Dict[str, str] = {}
+    for name in names:
+        m = pattern.match(name)
+        if m and lo <= m.group(1) <= hi:
+            if m.group(1) not in chosen or name.endswith(".gz"):
+                chosen[m.group(1)] = name
+    return [os.path.join(directory, chosen[d]) for d in sorted(chosen)]

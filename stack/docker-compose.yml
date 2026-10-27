@@ -198,6 +198,15 @@ services:
       # a README only; the coordinator fills it with `rsync --delete` INTO the
       # directory (replacing the directory itself would detach this mount).
       - ./ottertube/web:/srv/ottertube/web:ro
+      # The metrics log's chart page and the files it reads (SR-124), all
+      # read-only, served at metrics.admin.<domain> behind the admin login. The
+      # two state directories belong to their writers' StateDirectory= (root for
+      # the metrics units, homehub-weight for the raw watch samples); a bind
+      # mount made before the unit first ran creates the directory, and systemd
+      # corrects its owner and mode the first time the writer starts.
+      - ./monitoring/metrics-site:/srv/metrics/site:ro
+      - /var/lib/homehub-metrics:/srv/metrics/data:ro
+      - /var/lib/homehub-health-raw:/srv/metrics/raw:ro
       # THE ACCESS LOG fail2ban READS, and it is a BIND MOUNT rather than a
       # named volume on purpose: fail2ban runs on the HOST and has to be able to
       # tail the file. Only the admin sign-in host and the LLM gateway log here

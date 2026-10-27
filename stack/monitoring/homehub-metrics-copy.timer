@@ -1,0 +1,15 @@
+# Weekly, Sunday 18:30 in the Owner's zone: clear of the 03:00 nightly config
+# and library backups (a hash-recalc night runs the library backup to about
+# 09:00), the 10:00/14:05 daily rows, the 01:20 OtterTube download and the
+# 02:10 IceDrive profile capture. Persistent: a hub that was off then copies
+# when it comes back. A copy that finds nothing new writes nothing.
+[Unit]
+Description=HomeHub metrics log weekly copy to the library, Sunday 18:30 America/Chicago
+
+[Timer]
+OnCalendar=Sun *-*-* 18:30:00 America/Chicago
+AccuracySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

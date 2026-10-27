@@ -19,6 +19,13 @@ StateDirectoryMode=0750
 UMask=0077
 Environment=PANEL_TELEMETRY_STATE_DIR=/var/lib/wall-panel-telemetry
 Environment=PANEL_TELEMETRY_PRESENTATION_PATH=/run/wall-panel-renderer/presentation-snapshot.json
+# The newest full sample, 0644, for the hub's metrics log (2026-10-26): the
+# wall-meeting forced command's `status` verb reads it; it cannot read the
+# private state directory above. Nothing in it is private (temperatures, CPU,
+# kiosk process sizes, the presentation mode).
+RuntimeDirectory=wall-panel-telemetry
+RuntimeDirectoryMode=0755
+Environment=PANEL_TELEMETRY_LATEST_PATH=/run/wall-panel-telemetry/latest.json
 ExecStart=/usr/bin/python3 /opt/wall-panel/stack/autoinstall/wall/panel-telemetry.py --state-dir /var/lib/wall-panel-telemetry run
 Restart=on-failure
 RestartSec=5

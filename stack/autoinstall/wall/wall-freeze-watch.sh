@@ -33,6 +33,11 @@ SEAT_USER=${SEAT_USER:-panel}
 SEAT_UID=${SEAT_UID:-1000}
 OUT_ROOT=${OUT_ROOT:-/var/log/wall-freeze}
 RUN_DIR=/run/wall-freeze-watch
+# The watchdog's last verdict as one small JSON file (2026-10-26, for the hub's
+# metrics log: the meeting account's forced command reads it for `status`).
+# Its own root-owned directory, not RUN_DIR: the probe writes RUN_DIR as the
+# seat user, who must not be able to rewrite the verdict on itself.
+STATUS_DIR=${STATUS_DIR:-/run/wall-freeze-state}
 
 mkdir -p "$OUT_ROOT"
 # The probe runs AS THE SEAT USER, so the directory it writes into must belong
@@ -40,7 +45,23 @@ mkdir -p "$OUT_ROOT"
 # -- and the failure is invisible if you only ever test against a frozen one.
 install -d -o "$SEAT_USER" -g "$SEAT_USER" -m 0755 "$RUN_DIR"
 
+install -d -o root -g root -m 0755 "$STATUS_DIR" 2>/dev/null || true
+
 log() { printf '[freeze-watch] %s\n' "$*"; }
+
+# write_status RESULT DRAW_S -> $STATUS_DIR/status.json, replaced atomically.
+# A failure to write it never touches the watchdog itself.
+write_status() {
+    local tmp="$STATUS_DIR/.status.$$"
+    if printf '{"ts":%s,"result":"%s","draw_s":%s,"fails":%d,"threshold":%d,"captured":%d,"recover":%d}\n' \
+            "$(date +%s)" "$1" "${2:-null}" "${fails:-0}" "${FAIL_THRESHOLD:-0}" "${captured:-0}" "${RECOVER:-0}" \
+            > "$tmp" 2>/dev/null && chmod 0644 "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$STATUS_DIR/status.json" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+        rm -f "$tmp" 2>/dev/null
+    fi
+    return 0
+}
 
 # cage picks its own socket name; guessing wayland-0 is how you get a hang that
 # has nothing to do with the bug you are chasing.
@@ -140,6 +161,7 @@ while true; do
         fails=0
         captured=0
         log "ok draw=${elapsed}s ebusy=${ebusy}"
+        write_status ok "$elapsed"
     else
         fails=$(( fails + 1 ))
         log "NO FRAME (${fails}/${FAIL_THRESHOLD}) probe>${PROBE_TIMEOUT}s ebusy=${ebusy}${PROBE_ERR:+ err=\"$PROBE_ERR\"}"
@@ -152,6 +174,7 @@ while true; do
                 systemctl restart getty@tty1.service
             fi
         fi
+        write_status no-frame ""
     fi
     sleep "$INTERVAL"
 done

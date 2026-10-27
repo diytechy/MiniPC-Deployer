@@ -1,12 +1,12 @@
 # monitoring — the hub watches itself (SN-048)
 
-Implements **SN-048**, **SR-085** .. **SR-089** (the wall image's freeze watchdog,
+Implements **SN-048**, **SR-085** .. **SR-089** and **SR-122** .. **SR-124** (the metrics log; the wall image's freeze watchdog,
 **SR-090**, lives in `stack/autoinstall/wall/`).
 
 The hub records memory pressure every 30 s (SN-046, `stack/recovery/`), but until
 this directory nothing read its temperatures, nothing alarmed on a filling disk,
 and nothing noticed the offsite sync client being down for most of
-2026-09-19..10-21. These four timers close that gap. **They record and alert
+2026-09-19..10-21. These four timers close that gap (and the metrics log, below, keeps the history). **They record and alert
 only: nothing here starts, stops, kills or reboots anything.** The opt-in
 recovery supervisor (`HUB_WATCHDOG_ENABLED`) stays the only component on the box
 that may act, and nothing here is on its path.
@@ -135,12 +135,74 @@ written. The journal extract covers a named list of units and tags only, and
 every captured line passes the secrets-floor redactor before it is written.
 Read a bundle: `sudo ls /var/lib/homehub-evidence/; sudo cat .../manifest.json`.
 
+### The metrics log (SR-122..SR-124)
+
+Ruled by the Owner on 2026-10-26 (HomeHub open-items A79, plan
+`docs/HUB_METRICS_LOG_PLAN_2026-10-26.md` in HomeHub): a record for trend charts
+and for debugging by the Owner and agents. **Record only: no alert, no action.**
+
+| Timer | When | Writes |
+|---|---|---|
+| `homehub-metrics-snapshot.timer` | every 5 min, on the clock | `/var/lib/homehub-metrics/snapshot-YYYYMMDD.jsonl` (UTC day) |
+| `homehub-metrics-daily.timer` | 10:00 and 14:05 America/Chicago, `Persistent=true` | `/var/lib/homehub-metrics/daily.jsonl` |
+| `homehub-metrics-copy.timer` | Sunday 18:30 America/Chicago, `Persistent=true` | a copy in `HOMEHUB_METRICS_COPY_DIR` on the library |
+
+- **The snapshot** (one line, about 3-6 KB): every gauge as the tracker's
+  `/api/today` serves it (value, range, target, `observed_at`, the computed
+  `stale` and colour), read as `HOMEHUB_METRICS_USER` - the tracker's real user,
+  because the tracker mints a new user for ANY `X-Forwarded-User`, so a blank
+  knob asks nothing; the newest `homehub-telemetry` sample; memory and uptime;
+  every container's state, health and restart count; every `homehub-*.service`'s
+  last result and every failed unit; the watch/disk/liveness verdicts and the
+  meeting pull's last run; the **wall panel's status** (below); NVMe SMART once
+  an hour. Each block that fails is recorded as `{"ok": false, "error": ...}`
+  and costs nothing else. One run deadline (100 s) inside `TimeoutStartSec=120`.
+  Its own unit, not the 30 s telemetry sampler's (25 s, no network).
+- **The panel's status** is pulled over the meeting pull's own key and forced
+  command (`homehub_meetings.ssh_argv`, but `StrictHostKeyChecking=yes`: the
+  pull pins the host key, this never does) with the verb `status`. The panel
+  answers from three world-readable files: `/run/wall-disk/status.json`,
+  `/run/wall-freeze-state/status.json` (the freeze watchdog's last verdict) and
+  `/run/wall-panel-telemetry/latest.json` (the newest telemetry sample), plus the
+  freeze bundles' count. The hub keeps a short summary of each.
+- **The daily row** is for the night that ended that morning: every gauge with
+  `observed_at` and `stale` (and `missing`, the ones without a believable
+  reading), the heart feeder's night summary, the CPAP's usage minutes and
+  score, the overnight (22:00-08:00) CPU/NVMe temperature range, the backup
+  units' results. `kind` is `initial` (10:00) or `revision` (14:05); both are
+  kept, `late` marks a catch-up more than 30 min after its time, a chart takes
+  the latest row per night. A run that finds its row written writes nothing;
+  nothing is back-filled for an earlier night.
+- **Retention:** 365 snapshot day files, gzip'd (deterministically) after 7, at
+  most 16 MiB a day and 1 GiB in all; `daily.jsonl` for ever (64 MiB cap).
+- **Where it is kept** (the Owner, 2026-10-26): on the hub NOT in the config
+  backups, and never under the tracker's data folder (its git mirror is pushed
+  to GitHub). Once a week `copy` puts the closed snapshot days (gzip'd),
+  `daily.jsonl` and the raw watch samples into `HOMEHUB_METRICS_COPY_DIR`, a
+  folder in the Owner's private Docs tree on the library, which the library's own
+  backup covers. It skips, journalled, unless `/srv/library` is in the mount
+  table and carries `.homehub-library` (root is not stopped by the bare
+  mountpoint's mode 000), and unless the folder's parent already exists. It
+  never copies today's file and never deletes at the destination; a file whose
+  size and mtime already match is skipped. Each run leaves
+  `/var/lib/homehub-metrics/copy-status.json` (last run, result, last success,
+  last skip and why), and every snapshot carries it as `monitors.copy`, so a
+  skipped week shows without the journal.
+- **Charts:** `https://metrics.admin.<domain>/` (Caddy, behind the admin login,
+  `stack/monitoring/metrics-site/`): nightly rows, recent snapshots, and a night's
+  raw heart rate with its sleep sessions shaded. Static files only.
+
+Read it: `python3 homehub-metrics.py summary [--hours 24]`,
+`export [--daily] [--since ISO] [--until ISO]`, or `sudo zcat
+/var/lib/homehub-metrics/snapshot-YYYYMMDD.jsonl.gz | jq .` for an old day.
+
 ## Knobs
 
 All in the stack `.env` (`stack/.env.example`, section "Hub continuous
 monitoring"). An unset knob is its default; the four switches default ON:
 `HOMEHUB_TELEMETRY_ENABLED`, `HOMEHUB_DISK_CHECK_ENABLED`,
-`HOMEHUB_WATCH_ENABLED`, `HOMEHUB_LIVENESS_ENABLED`. Firstboot step 6h installs
+`HOMEHUB_WATCH_ENABLED`, `HOMEHUB_LIVENESS_ENABLED`, and `HOMEHUB_METRICS_ENABLED` for
+the metrics log's three timers. Firstboot step 6h installs
 the units on every boot and converges each timer to its knob.
 
 **Overrides for drills** go in `/etc/homehub-monitor/override.env`, which the

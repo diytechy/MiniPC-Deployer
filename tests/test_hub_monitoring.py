@@ -1850,7 +1850,7 @@ def test_env_example_declares_every_monitoring_knob_tc1304():
     process_env = {"HOMEHUB_MONITOR_STATE_DIR", "HOMEHUB_MONITOR_ENV_FILE", "HOMEHUB_ALERT_HELPER",
                    "HOMEHUB_MONITOR_SYS_ROOT", "HOMEHUB_MONITOR_PROC_ROOT", "HOMEHUB_TELEMETRY_DIR",
                    "HOMEHUB_EVIDENCE_DIR", "HOMEHUB_WATCH_TABLE", "HOMEHUB_MONITOR_OVERRIDE_FILE",
-                   "HOMEHUB_ALERT_BASH"}  # fmt: skip
+                   "HOMEHUB_ALERT_BASH", "HOMEHUB_METRICS_DIR", "HOMEHUB_HEALTH_RAW_DIR"}  # fmt: skip
     missing = sorted(
         k
         for k in read - process_env

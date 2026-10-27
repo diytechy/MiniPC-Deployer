@@ -1,0 +1,37 @@
+# homehub-metrics-copy - once a week, copy the metrics log's closed day files,
+# its daily rows and the heart feeder's raw watch samples into a folder in the
+# Owner's private Docs tree on the library drive, so the library's own backup
+# carries them (the Owner, 2026-10-26; HomeHub open-items A79). On the hub the
+# files stay out of the config backups. Never deletes at the destination.
+#
+# THE LIBRARY MUST REALLY BE THERE. /srv/library's bare mountpoint is chmod 000,
+# which does not stop root, so the script checks the mount table and the
+# library's marker file itself and SKIPS (journalled, exit 0) without them.
+# Not RequiresMountsFor=: a missing USB disk is a skipped week, not a red unit.
+[Unit]
+Description=HomeHub metrics log: weekly copy into the Owner's Docs on the library
+Documentation=file:///opt/homehub/stack/monitoring/README.md
+After=local-fs.target homehub-backup.service homehub-library-backup.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/homehub/stack/monitoring/homehub-metrics.py copy
+SyslogIdentifier=homehub-metrics
+# Its status file (copy-status.json) sits beside the log it copies.
+StateDirectory=homehub-metrics
+StateDirectoryMode=0700
+# The library mount fixes owner and mode itself (ntfs-3g uid=0,gid=household,
+# umask=0002): what lands there is readable through the Owner's share.
+UMask=0002
+TimeoutStartSec=1800
+Nice=15
+IOSchedulingClass=idle
+CPUAccounting=true
+CPUQuota=25%
+MemoryAccounting=true
+MemoryMax=128M
+TasksMax=16
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only

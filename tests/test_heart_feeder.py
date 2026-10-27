@@ -396,7 +396,7 @@ def test_the_shipped_env_example_documents_the_four_knobs_at_their_defaults():
                       "HEART_SAMPLE_DEVICE": "FFit", "HEART_TARGET_BPM": "75",
                       "HEART_COLOUR_SPAN_BPM": "24", "HEART_BASELINE_NIGHTS": "28",
                       "HEART_MIN_BASELINE_NIGHTS": "7", "HEART_GOAL_CATEGORY": "Health",
-                      "HEART_GOAL_ITEM_ID": "heart-goal",
+                      "HEART_GOAL_ITEM_ID": "heart-goal", "HEART_RAW_RECORD": "true",
                       "HEART_MIN_BPM": "40", "HEART_MAX_BPM": "100"}
     # The example, fed back through the code, means "off", samples mode at its
     # defaults, and a daily-mode bar that is still valid.

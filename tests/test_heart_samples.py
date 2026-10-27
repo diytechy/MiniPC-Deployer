@@ -276,7 +276,7 @@ def test_the_reader_sends_both_filters_and_walks_pages(tmp_path):
         handler.wfile.write(raw)
 
     with loopback_server(respond) as (base, seen):
-        samples, sessions = feeder.read_google_health_heart_samples(
+        samples, sessions, _raw = feeder.read_google_health_heart_samples(
             env, heart_rate_url=base + "/hr", sleep_url=base + "/sleep",
             token_endpoint=base + "/token")
     assert samples == [(t, 78, WATCH), (t + 300, 78, WATCH)]

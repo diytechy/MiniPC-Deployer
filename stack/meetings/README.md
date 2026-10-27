@@ -25,6 +25,14 @@ wall-meeting account                        │   2. ssh … list
                                                 6. ssh … report ok|full
 ```
 
+**The same key reads the panel's status** (2026-10-26, SR-122): the hub's
+metrics snapshot runs `ssh … status` every 5 minutes through this account's
+forced command, which answers one JSON line from three world-readable files (the
+disk check, the freeze watchdog's last verdict, the newest telemetry sample) and
+the freeze bundles' count. It reads nothing else, and the metrics run never
+accepts a host key: first contact stays this pull's job
+(`stack/monitoring/README.md`, "The metrics log").
+
 Every step is safe to repeat. A transfer that is interrupted or arrives with the
 wrong hash leaves the panel's copy and is tried again on the next run; an ack whose
 reply was lost is repaired by the next run without a second download.

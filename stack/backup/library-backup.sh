@@ -14,10 +14,16 @@
 # REQUIRES a FileBackup image built from BoundedRebuild WITH ITS SINGLE-STORE
 # LAYOUT (plan call C44, rulings L1-L6 - not yet built there): ONE writable
 # /store mount that IS the set's store, holding Latest/, every Snapshot_<date>/
-# and the run files side by side; filebackup.json at ConfigVersion 3 with
+# and the run files side by side; filebackup-store.json at ConfigVersion 3 with
 # StorePath=/store (a ConfigVersion 2 config is refused by such an image, and
 # an image without C44 refuses this config); no /state mount; and the backup
 # exit table 0/1/2/4 below. README "The single-store layout".
+#
+# ONLY WHEN FILEBACKUP_LAYOUT=single (stack/.env; SR-133). The default is
+# `legacy`: the run is handed, arguments unchanged, to library-backup-legacy.sh,
+# the three-mount wrapper the deployed kit-12 image needs, kept byte for byte as
+# it was before this layout merged. So a stack delivery changes nothing until
+# the Owner switches the knob at the cutover (README "The layout knob").
 #
 # Sequence (each step below carries the failure it exists to prevent):
 #   1. single-instance lock          — the first real run is a multi-day job
@@ -58,13 +64,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STACK_DIR="$(dirname "$HERE")"          # /opt/homehub/stack on the box
 
 CONFIG=""; PREFLIGHT_ONLY=0; VERIFY_MODE=auto; RECONCILE_RUN_STATE=0
+# Kept whole for the legacy hand-off below, which must see exactly these.
+ORIG_ARGS=("$@")
 while [ $# -gt 0 ]; do
     case "$1" in
         --config)         CONFIG="$2"; shift 2 ;;
         --preflight-only) PREFLIGHT_ONLY=1; shift ;;
         --verify)         VERIFY_MODE="$2"; shift 2 ;;
         --reconcile-run-state) RECONCILE_RUN_STATE=1; shift ;;
-        -h|--help)        sed -n '2,49p' "$0"; exit 0 ;;
+        -h|--help)        sed -n '2,59p' "$0"; exit 0 ;;
         *) die "unknown arg: $1 (try --help)" ;;
     esac
 done
@@ -94,6 +102,30 @@ fi
 load_config "$CONFIG"
 load_env_file "$STACK_DIR/.env"
 
+# ── 0. THE LAYOUT KNOB (SR-133): legacy until the cutover ────────────────────
+# The hub runs the kit-12 image on the three-mount store (/state, /backup,
+# /changes) until the Owner builds a single-store image, sets the old store
+# aside and switches this knob. Until then the run belongs to the wrapper that
+# image needs, unchanged: everything below this block would refuse that store
+# (step 2b) and bind mounts that image cannot use. Read here, after both config
+# files, because stack/.env is where the knob lives and where compose reads the
+# store paths. Unset is legacy, so a hub whose .env predates the knob (a stack
+# delivery without a re-materialised .env) keeps exactly what it ran.
+# Invoked through bash because the payload's scripts carry no execute bit
+# (late-command 5c sets it on this file only). A hand-off posts nothing.
+FB_LAYOUT="${FILEBACKUP_LAYOUT:-legacy}"
+case "$FB_LAYOUT" in
+    legacy)
+        log "store layout: FILEBACKUP_LAYOUT=legacy - the three-mount layout; handing the run to library-backup-legacy.sh"
+        exec bash "$HERE/library-backup-legacy.sh" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"} ;;
+    single) ;;
+    *) die "config: FILEBACKUP_LAYOUT='$FB_LAYOUT' is neither legacy nor single (stack/.env). Nothing was started and nothing was posted." ;;
+esac
+# The compose service and the container config of the single-store layout.
+# Separate from the legacy `filebackup` service and filebackup.json so that both
+# layouts can be installed side by side and the knob alone chooses.
+FB_SERVICE=filebackup-store
+
 # The reserved IF-010 item is not a generic `/api/feed` lane. This wrapper owns
 # only its lastSuccess field; the library/Samba monitor owns shareHealth. Their
 # independent writes are what let share recovery reveal an old backup age
@@ -101,7 +133,10 @@ load_env_file "$STACK_DIR/.env"
 FILE_SHARE_BACKUP_FEED_ID="${FILE_SHARE_BACKUP_FEED_ID:-file-share-backup-health}"
 export FILE_SHARE_BACKUP_FEED_ID
 
-FB_CONFIG="${FILEBACKUP_CONFIG:-/etc/homehub-backup/filebackup.json}"
+# The single-store config (ConfigVersion 3). FILEBACKUP_STORE_CONFIG, not the
+# legacy FILEBACKUP_CONFIG, so an override written for one layout can never
+# point the other at the wrong document.
+FB_CONFIG="${FILEBACKUP_STORE_CONFIG:-/etc/homehub-backup/filebackup-store.json}"
 FB_SOURCE="${FILEBACKUP_SOURCE:-/srv/library}"
 # FB_STORE, FB_LATEST (= store/Latest), and the folders of the two older
 # layouts that step 2b refuses (FB_OLD_*, FB_LEGACY_*), from common.sh.
@@ -264,11 +299,17 @@ if [ "$RECONCILE_RUN_STATE" = 1 ]; then
     # we cannot tell, leave the phase exactly as it is. A phase left standing is
     # repaired by the next cycle; one withdrawn wrongly says a running backup
     # ended, which is the lie this whole lane exists to prevent.
+    # BOTH services are asked: a container of either layout writing the backup
+    # drive is a backup still going, whichever wrapper started it.
     fb_containers=""
-    if ! fb_containers="$(docker ps --filter "label=com.docker.compose.service=filebackup" --format '{{.ID}}' 2>/dev/null)"; then
-        log "run-state: cannot ask docker whether FileBackup is running — leaving the phase alone"
-        exit 0
-    fi
+    for _svc in "$FB_SERVICE" filebackup; do
+        if ! _ids="$(docker ps --filter "label=com.docker.compose.service=$_svc" --format '{{.ID}}' 2>/dev/null)"; then
+            log "run-state: cannot ask docker whether FileBackup is running — leaving the phase alone"
+            exit 0
+        fi
+        fb_containers="${fb_containers:+$fb_containers }$_ids"
+    done
+    fb_containers="${fb_containers% }"
     if [ -n "$fb_containers" ]; then
         log "run-state: a FileBackup container is still running ($fb_containers) — leaving the phase alone"
         exit 0
@@ -550,8 +591,8 @@ if [ "$_avail" -lt $(( MIN_FREE_GB * 1000000000 )) ]; then
     refuse "the backup drive is below its floor: $(gb "$_avail") GB free on $BACKUP_MOUNT, floor is ${MIN_FREE_GB} GB (${FILL_PCT} full)." \
         "THERE IS NO AUTOMATIC RETENTION (Q-FB2) — nothing here deletes a snapshot, so this will not clear itself." \
         "The manual relief valve, in this order:" \
-        "  cd $STACK_DIR && docker compose --profile filebackup run --rm -T filebackup snapshots" \
-        "  docker compose --profile filebackup run --rm -T -e FILEBACKUP_DRY_RUN=1 filebackup prune -Snapshot <name>   # dry run first (-e, not a host variable)" \
+        "  cd $STACK_DIR && docker compose --profile filebackup run --rm -T $FB_SERVICE snapshots" \
+        "  docker compose --profile filebackup run --rm -T -e FILEBACKUP_DRY_RUN=1 $FB_SERVICE prune -Snapshot <name>   # dry run first (-e, not a host variable)" \
         "NEVER delete a Snapshot_* folder by hand — it is the only copy of the states it holds." \
         "Or lower BACKUP_LIBRARY_MIN_FREE_GB in backup.env if this floor is simply too high for this drive."
 fi
@@ -587,9 +628,9 @@ log "capacity: logs $(gb "$_sa") GB free (floor ${MIN_FREE_STATE_GB} GB)"
 # (The layout before this one pre-created backup/ here, which is the same trap.)
 [ -r "$FB_CONFIG" ] \
     || refuse "the container's config $FB_CONFIG is missing or unreadable." \
-              "It is a TRACKED template (stack/backup/filebackup.json) installed by autoinstall late-command 5c." \
+              "It is a TRACKED template (stack/backup/filebackup-store.json) installed by autoinstall late-command 5c, and by hand at the cutover (README \"The layout knob\")." \
               "Without it the container exits 2 having done nothing; refuse here instead, where the message is useful." \
-              "By hand:  install -m0644 -o root -g root $STACK_DIR/backup/filebackup.json $FB_CONFIG"
+              "By hand:  install -m0644 -o root -g root $STACK_DIR/backup/filebackup-store.json $FB_CONFIG"
 [ -d "$FB_SOURCE" ] || refuse "the library source $FB_SOURCE is not a directory"
 for _d in "$FB_STORE" "$FB_LOGS"; do
     if [ ! -d "$_d" ]; then
@@ -750,7 +791,7 @@ fi
 # NO PRUNE STEP ANYWHERE BELOW. Q-FB2 ruled retention NONE; the space burden is
 # carried entirely by step 3's floor and by the fill percentage in the summary.
 fb_run() {
-    ( cd "$STACK_DIR" && docker compose --profile filebackup run --rm -T filebackup "$@" )
+    ( cd "$STACK_DIR" && docker compose --profile filebackup run --rm -T "$FB_SERVICE" "$@" )
 }
 
 # count_snapshots : how many Snapshot_* trees the change root holds. A run that
@@ -804,7 +845,7 @@ run_state backing-up
 # means compose's inline default (5), and the container's own fallback (9) is
 # only reachable through an older docker-compose.yml.
 log "7-Zip level for compressed files: FILEBACKUP_7Z_LEVEL=${FILEBACKUP_7Z_LEVEL:-<unset: compose defaults it to 5>} (the Owner's ruling is 5 = Normal; FileBackup alone would use 9)"
-log "running: docker compose --profile filebackup run --rm -T filebackup backup"
+log "running: docker compose --profile filebackup run --rm -T $FB_SERVICE backup"
 BACKUP_RC=0
 fb_run backup || BACKUP_RC=$?
 log_slice_peak "after backup (exit $BACKUP_RC)"

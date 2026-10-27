@@ -1,0 +1,406 @@
+#!/usr/bin/env bash
+# THE LEGACY LAYOUT'S SUITE (SR-133, TC-1587). Below this paragraph the file is
+# IceDrive-DesktopDirection's stack/backup/tests/library-backup-state.test.sh at
+# 8d87d0b, unchanged: the suite of the three-mount wrapper the deployed kit-12
+# image needs. Its env files carry no FILEBACKUP_LAYOUT, so every case runs
+# through library-backup.sh's default hand-off to library-backup-legacy.sh, and
+# passing here is the proof that a stack delivery changes nothing until the
+# knob is switched. Retire it with library-backup-legacy.sh.
+#
+# TC-001 / SR-018 — execute the real FileBackup host wrapper at its state-update
+# boundary.  Mocks replace only host tools (mount topology, docker and curl); the
+# script under test remains library-backup.sh, so the order after preflight,
+# backup and optional restore verification cannot drift unobserved.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../../.." && pwd)"
+WRAPPER="$ROOT/stack/backup/library-backup.sh"
+PASS=0; FAIL=0
+pass() { PASS=$((PASS + 1)); printf 'PASS  %s\n' "$*"; }
+fail() { FAIL=$((FAIL + 1)); printf 'FAIL  %s\n' "$*"; }
+
+[ -x "$WRAPPER" ] || { echo "FATAL: missing wrapper $WRAPPER" >&2; exit 2; }
+TMP="$(mktemp -d)"
+KEEP_TMP="${KEEP_TMP:-0}"
+cleanup() { [ "$KEEP_TMP" = 1 ] && { printf 'tmp kept: %s\n' "$TMP"; return; }; rm -rf "$TMP"; }
+trap cleanup EXIT
+mkdir -p "$TMP/bin" "$TMP/src" "$TMP/backup" "$TMP/changes" "$TMP/state" "$TMP/logs"
+: >"$TMP/filebackup.json"
+
+# The actual wrapper asks findmnt two subtly different questions: the exact
+# source mount must remain its own mountpoint, while the changes path must be on
+# the same enclosing mount as the backup store.  This mock models both facts.
+cat >"$TMP/bin/findmnt" <<'EOF'
+#!/usr/bin/env bash
+last=""; for arg in "$@"; do last="$arg"; done
+if [[ " $* " == *" --target "* ]]; then
+    case "$last" in
+        "$FILEBACKUP_SOURCE") printf '%s\n' "$FILEBACKUP_SOURCE" ;;
+        "$FILEBACKUP_BACKUP"|"$FILEBACKUP_CHANGES") printf '%s\n' "$FILEBACKUP_BACKUP" ;;
+        *) printf '%s\n' "$last" ;;
+    esac
+elif [[ " $* " == *" -o SOURCE,FSTYPE "* ]]; then
+    printf 'mockfs ext4\n'
+fi
+EOF
+cat >"$TMP/bin/df" <<'EOF'
+#!/usr/bin/env bash
+printf 'Filesystem 1B-blocks Used Available Use%% Mounted on\n'
+printf 'mockfs 1000000000000 100000000000 900000000000 10%% /mock\n'
+EOF
+cat >"$TMP/bin/flock" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat >"$TMP/bin/chown" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat >"$TMP/bin/runuser" <<'EOF'
+#!/usr/bin/env bash
+while [ "$1" != -- ]; do shift; done
+shift
+"$@"
+EOF
+cat >"$TMP/bin/id" <<'EOF'
+#!/usr/bin/env bash
+# Git Bash has no Unix root account; the wrapper only needs this probe to choose
+# its runuser path, whose mock executes the requested touch in the temp tree.
+[ "${1:-}" = -u ] && { printf '0\n'; exit 0; }
+exit 1
+EOF
+cat >"$TMP/bin/docker" <<'EOF'
+#!/usr/bin/env bash
+# The reconciler asks the DAEMON whether a FileBackup container is still up,
+# because the flock cannot answer that: `compose run` containers are daemon-owned
+# and outlive a SIGKILLed client. MOCK_FB_RUNNING models "still up";
+# MOCK_DOCKER_PS_RC models "cannot tell".
+if [ "${1:-}" = ps ]; then
+    [ "${MOCK_DOCKER_PS_RC:-0}" = 0 ] || exit "${MOCK_DOCKER_PS_RC}"
+    [ -n "${MOCK_FB_RUNNING:-}" ] && printf '%s\n' "$MOCK_FB_RUNNING"
+    exit 0
+fi
+last=""; for arg in "$@"; do last="$arg"; done
+printf '%s\n' "docker:$last" >>"$EVENTS"
+case "$last" in
+    backup) exit "${MOCK_BACKUP_RC:-0}" ;;
+    verify|-Deep) exit "${MOCK_VERIFY_RC:-0}" ;;
+    *) exit 97 ;;
+esac
+EOF
+cat >"$TMP/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+body=""
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = -d ]; then body="$2"; shift 2; continue; fi
+    shift
+done
+printf '%s\n' "$body" >>"$CAPTURE"
+printf 'state\n' >>"$EVENTS"
+printf '%s' "${MOCK_HTTP_CODE:-200}"
+EOF
+chmod +x "$TMP/bin"/*
+
+cat >"$TMP/fstab" <<EOF
+mock $TMP/src ext4 defaults 0 0
+mock $TMP/backup ext4 defaults 0 0
+EOF
+cat >"$TMP/mountinfo" <<EOF
+24 22 0:31 / $TMP/src rw,relatime - tmpfs tmpfs rw
+25 22 0:32 / $TMP/backup rw,relatime - tmpfs tmpfs rw
+EOF
+# The guard also asks the kernel whether each mounted device still EXISTS
+# (e32a1b4: a vanished device is a stale mount). 0:31 and 0:32 are fictional, so
+# model them as present; without this every run refused as "stale" and the
+# suite asserted nothing past the preflight.
+mkdir -p "$TMP/sys-dev-block"
+: >"$TMP/sys-dev-block/0:31"; : >"$TMP/sys-dev-block/0:32"
+
+write_config() {
+    local target="$1"
+    cat >"$target" <<EOF
+FILEBACKUP_CONFIG=$TMP/filebackup.json
+FILEBACKUP_SOURCE=$TMP/src
+FILEBACKUP_STATE=$TMP/state
+FILEBACKUP_BACKUP=$TMP/backup
+FILEBACKUP_CHANGES=$TMP/changes
+FILEBACKUP_LOGS=$TMP/logs
+FILEBACKUP_USER_NAME=root
+LIBRARY_MOUNTS_FSTAB=$TMP/fstab
+DRIVE_IDENTITY_FILE=$TMP/no-identity
+BACKUP_LIBRARY_MIN_FREE_GB=1
+BACKUP_LIBRARY_MIN_FREE_STATE_GB=1
+BACKUP_DRIVE_DEVICES=""
+FILE_SHARE_BACKUP_FEED_ID=file-share-backup-health
+FILE_SHARE_BACKUP_STATE_URL=http://mock.invalid/api/backup-state
+EOF
+}
+write_config "$TMP/good.env"
+cat >"$TMP/preflight-failure.env" <<EOF
+FILEBACKUP_CONFIG=$TMP/missing-filebackup.json
+FILEBACKUP_SOURCE=$TMP/src
+FILEBACKUP_STATE=$TMP/state
+FILEBACKUP_BACKUP=$TMP/backup
+FILEBACKUP_CHANGES=$TMP/changes
+FILEBACKUP_LOGS=$TMP/logs
+FILEBACKUP_USER_NAME=root
+LIBRARY_MOUNTS_FSTAB=$TMP/fstab
+DRIVE_IDENTITY_FILE=$TMP/no-identity
+BACKUP_LIBRARY_MIN_FREE_GB=1
+BACKUP_LIBRARY_MIN_FREE_STATE_GB=1
+BACKUP_DRIVE_DEVICES=""
+FILE_SHARE_BACKUP_FEED_ID=file-share-backup-health
+FILE_SHARE_BACKUP_STATE_URL=http://mock.invalid/api/backup-state
+EOF
+
+run_wrapper() {
+    local name="$1" config="$2" verify="$3" backup_rc="$4" verify_rc="$5" http_code="$6"
+    : >"$TMP/$name.capture"; : >"$TMP/$name.events"
+    PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" SYS_DEV_BLOCK_DIR="$TMP/sys-dev-block" CAPTURE="$TMP/$name.capture" EVENTS="$TMP/$name.events" \
+        MOCK_BACKUP_RC="$backup_rc" MOCK_VERIFY_RC="$verify_rc" MOCK_HTTP_CODE="$http_code" \
+        LIBRARY_ROOT="$TMP/src" \
+        LIBRARY_BACKUP_LOCK="$TMP/$name.lock" \
+        bash "$WRAPPER" --config "$config" --verify "$verify" >"$TMP/$name.out" 2>&1
+    RUN_RC=$?
+}
+post_count() { [ -s "$1" ] && wc -l <"$1" | tr -d ' ' || printf 0; }
+# The assertions below count LASTSUCCESS posts, not total posts. Run phases
+# (SR-065 as amended) share this endpoint as an independent field, so a total
+# count would now conflate "claimed a backup succeeded" with "said where the run
+# is" — which is exactly the confusion the separate field exists to prevent.
+# grep -c PRINTS 0 and EXITS 1 on no match, so a `|| printf 0` fallback appends a
+# second zero and every comparison against "0" fails. Take the output, drop the
+# status.
+success_count() { local n; n="$(grep -c '"lastSuccess"' "$1" 2>/dev/null)"; printf '%s' "${n:-0}"; }
+phases() { grep -o '"runState":"[a-z-]*"' "$1" 2>/dev/null | sed 's/.*:"//;s/"//' | tr '\n' ' '; }
+
+run_reconcile() {
+    local name="$1" lock="$2"
+    : >"$TMP/$name.capture"; : >"$TMP/$name.events"
+    PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" SYS_DEV_BLOCK_DIR="$TMP/sys-dev-block" CAPTURE="$TMP/$name.capture" EVENTS="$TMP/$name.events" \
+        MOCK_HTTP_CODE=200 LIBRARY_ROOT="$TMP/src" LIBRARY_BACKUP_LOCK="$lock" \
+        MOCK_FB_RUNNING="${MOCK_FB_RUNNING:-}" MOCK_DOCKER_PS_RC="${MOCK_DOCKER_PS_RC:-0}" \
+        bash "$WRAPPER" --config "$TMP/good.env" --reconcile-run-state >"$TMP/$name.out" 2>&1
+    RUN_RC=$?
+}
+
+# Green means both the backup action and the configured verify action returned
+# success.  The event log proves the one state post follows both, not merely a
+# passing shell exit or a mocked helper called in isolation.
+run_wrapper success "$TMP/good.env" shallow 0 0 200
+if [ "$RUN_RC" = 0 ] && [ "$(success_count "$TMP/success.capture")" = 1 ] \
+   && grep -Eq '^\{"id":"file-share-backup-health","lastSuccess":"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"\}$' "$TMP/success.capture" \
+   && [ "$(tr '\n' ' ' <"$TMP/success.events")" = 'state state docker:backup state docker:verify state state ' ]; then
+    pass "TC-001 SR-018 posts exactly one lastSuccess only after backup and verification"
+else
+    fail "TC-001 success boundary rc=$RUN_RC lastSuccess=$(success_count "$TMP/success.capture") events=$(tr '\n' ' ' <"$TMP/success.events")"
+fi
+
+# The phase order is the contract the wall reads. `verifying` must sit between
+# the two container calls, and `idle` must come AFTER lastSuccess so the lane
+# never shows "finished, at yesterday's age" for even one poll.
+if [ "$(phases "$TMP/success.capture")" = 'starting backing-up verifying idle ' ] \
+   && [ "$(grep -n '"runState":"idle"' "$TMP/success.capture" | cut -d: -f1)" -gt "$(grep -n '"lastSuccess"' "$TMP/success.capture" | cut -d: -f1)" ]; then
+    pass "SR-065 phases run starting -> backing-up -> verifying -> idle, with idle after the success"
+else
+    fail "SR-065 phase order was '$(phases "$TMP/success.capture")'"
+fi
+
+# INDEPENDENCE. No phase post may carry another field: a producer saying where a
+# run is must never be able to clear a share fault or claim freshness.
+if ! grep '"runState"' "$TMP/success.capture" | grep -q '"lastSuccess"\|"shareHealth"'; then
+    pass "SR-065 a phase post carries no other state field"
+else
+    fail "SR-065 a phase post carried a second signal: $(grep '"runState"' "$TMP/success.capture")"
+fi
+
+run_wrapper preflight "$TMP/preflight-failure.env" none 0 0 200
+if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/preflight.capture")" = 0 ] \
+   && ! grep -q docker "$TMP/preflight.events" \
+   && [ "$(phases "$TMP/preflight.capture")" = 'starting idle ' ]; then
+    pass "TC-001 SR-018 preflight refusal posts no lastSuccess, starts no container, and withdraws its phase"
+else
+    fail "TC-001 preflight failure rc=$RUN_RC lastSuccess=$(success_count "$TMP/preflight.capture") phases='$(phases "$TMP/preflight.capture")'"
+fi
+
+run_wrapper container-failure "$TMP/good.env" none 1 0 200
+if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/container-failure.capture")" = 0 ] \
+   && [ "$(phases "$TMP/container-failure.capture")" = 'starting backing-up idle ' ]; then
+    pass "TC-001 SR-018 failed container posts no lastSuccess and ends idle"
+else
+    fail "TC-001 container failure rc=$RUN_RC lastSuccess=$(success_count "$TMP/container-failure.capture") phases='$(phases "$TMP/container-failure.capture")'"
+fi
+
+run_wrapper verify-failure "$TMP/good.env" shallow 0 3 200
+if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/verify-failure.capture")" = 0 ] \
+   && [ "$(phases "$TMP/verify-failure.capture")" = 'starting backing-up verifying idle ' ]; then
+    pass "TC-001 SR-018 failed verification posts no lastSuccess and ends idle"
+else
+    fail "TC-001 verify failure rc=$RUN_RC lastSuccess=$(success_count "$TMP/verify-failure.capture") phases='$(phases "$TMP/verify-failure.capture")'"
+fi
+
+run_wrapper rejected-state "$TMP/good.env" shallow 0 0 500
+if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/rejected-state.capture")" = 1 ]; then
+    pass "TC-001 SR-018 non-200 state update fails the wrapper without a second success post"
+else
+    fail "TC-001 state rejection rc=$RUN_RC lastSuccess=$(success_count "$TMP/rejected-state.capture")"
+fi
+
+# RECONCILE. The stale-phase recovery is lock-aware rather than time-bounded:
+# library backups are legitimately bimodal, so no duration could tell a long run
+# from a dead one, but the kernel drops the lock when a holder dies.
+run_reconcile reconcile-free "$TMP/reconcile-free.lock"
+if [ "$RUN_RC" = 0 ] && [ "$(phases "$TMP/reconcile-free.capture")" = 'idle ' ] \
+   && [ "$(success_count "$TMP/reconcile-free.capture")" = 0 ] \
+   && ! grep -q docker "$TMP/reconcile-free.events"; then
+    pass "SR-065 reconcile withdraws a stale phase, claims no success, and starts no container"
+else
+    fail "SR-065 reconcile rc=$RUN_RC phases='$(phases "$TMP/reconcile-free.capture")' events=$(tr '\n' ' ' <"$TMP/reconcile-free.events")"
+fi
+
+# A HELD LOCK IS THE ANSWER, NOT A REFUSAL: a live run owns the phase, so
+# reconcile must leave it alone and exit zero — it runs on a 10-minute timer.
+cat >"$TMP/bin/flock" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$TMP/bin/flock"
+run_reconcile reconcile-held "$TMP/reconcile-held.lock"
+if [ "$RUN_RC" = 0 ] && [ "$(post_count "$TMP/reconcile-held.capture")" = 0 ]; then
+    pass "SR-065 reconcile leaves a live run's phase alone and exits zero"
+else
+    fail "SR-065 reconcile with a held lock rc=$RUN_RC posts=$(post_count "$TMP/reconcile-held.capture")"
+fi
+
+# And a NORMAL run that cannot take the lock still posts nothing at all — the
+# running backup owns the lane, and a second start must not touch it.
+run_wrapper lock-held "$TMP/good.env" none 0 0 200
+if [ "$RUN_RC" != 0 ] && [ "$(post_count "$TMP/lock-held.capture")" = 0 ]; then
+    pass "SR-018 a start refused by a held lock posts nothing"
+else
+    fail "SR-018 lock-held start rc=$RUN_RC posts=$(post_count "$TMP/lock-held.capture")"
+fi
+
+# ADVERSARIAL REVIEW, 2026-09-08 — one case per accepted finding.
+
+# RESTORE THE LOCK MOCK. The held-lock cases above replaced it with a permanent
+# failure, and everything below needs to actually acquire the lock; without this
+# they all fail as "another backup is already running", which looks like a
+# product defect and is purely harness state.
+cat >"$TMP/bin/flock" <<'FLOCKEOF'
+#!/usr/bin/env bash
+exit 0
+FLOCKEOF
+chmod +x "$TMP/bin/flock"
+
+# F1: the flock does NOT prove FileBackup stopped. `compose run` containers are
+# daemon-owned, so a SIGKILLed wrapper releases the lock while the container
+# keeps writing. Reconcile must fail CLOSED on both "still up" and "cannot tell".
+MOCK_FB_RUNNING=abc123 run_reconcile reconcile-container "$TMP/reconcile-container.lock"
+if [ "$RUN_RC" = 0 ] && [ "$(post_count "$TMP/reconcile-container.capture")" = 0 ]; then
+    pass "F1 reconcile leaves the phase alone while a FileBackup container is still running"
+else
+    fail "F1 reconcile withdrew a phase with a live container: posts=$(post_count "$TMP/reconcile-container.capture")"
+fi
+
+MOCK_DOCKER_PS_RC=1 run_reconcile reconcile-unknown "$TMP/reconcile-unknown.lock"
+if [ "$RUN_RC" = 0 ] && [ "$(post_count "$TMP/reconcile-unknown.capture")" = 0 ]; then
+    pass "F1 reconcile fails closed when it cannot tell whether a container is running"
+else
+    fail "F1 reconcile withdrew a phase without proof: posts=$(post_count "$TMP/reconcile-unknown.capture")"
+fi
+
+# F5: a preflight is a diagnostic, not an attempt. It must claim no phase at all,
+# or a SUCCESSFUL preflight strands `starting` on the wall with nothing to
+# withdraw it.
+: >"$TMP/preflight-only.capture"; : >"$TMP/preflight-only.events"
+PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" SYS_DEV_BLOCK_DIR="$TMP/sys-dev-block" CAPTURE="$TMP/preflight-only.capture"     EVENTS="$TMP/preflight-only.events" MOCK_HTTP_CODE=200 LIBRARY_ROOT="$TMP/src"     LIBRARY_BACKUP_LOCK="$TMP/preflight-only.lock"     bash "$WRAPPER" --config "$TMP/good.env" --preflight-only >"$TMP/preflight-only.out" 2>&1
+PF_RC=$?
+if [ "$PF_RC" = 0 ] && [ "$(post_count "$TMP/preflight-only.capture")" = 0 ]; then
+    pass "F5 a successful preflight-only run claims no phase and strands nothing"
+else
+    fail "F5 preflight-only rc=$PF_RC posts=$(post_count "$TMP/preflight-only.capture") phases='$(phases "$TMP/preflight-only.capture")'"
+fi
+
+# F2: FILE_SHARE_BACKUP_STATE_LAST_CODE is ONE global, overwritten by every post.
+# The never-silent-green check must judge the lastSuccess post, not the idle that
+# follows it. Here lastSuccess fails and the later idle succeeds.
+cat >"$TMP/bin/curl" <<'CURLEOF'
+#!/usr/bin/env bash
+body=""
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = -d ]; then body="$2"; shift 2; continue; fi
+    shift
+done
+printf '%s
+' "$body" >>"$CAPTURE"
+printf 'state
+' >>"$EVENTS"
+case "$body" in
+    *lastSuccess*) printf '%s' "${MOCK_SUCCESS_CODE:-200}" ;;
+    *)             printf '%s' "${MOCK_HTTP_CODE:-200}" ;;
+esac
+CURLEOF
+chmod +x "$TMP/bin/curl"
+: >"$TMP/split.capture"; : >"$TMP/split.events"
+PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" SYS_DEV_BLOCK_DIR="$TMP/sys-dev-block" CAPTURE="$TMP/split.capture"     EVENTS="$TMP/split.events" MOCK_BACKUP_RC=0 MOCK_VERIFY_RC=0     MOCK_HTTP_CODE=200 MOCK_SUCCESS_CODE=500 LIBRARY_ROOT="$TMP/src"     LIBRARY_BACKUP_LOCK="$TMP/split.lock"     bash "$WRAPPER" --config "$TMP/good.env" --verify shallow >"$TMP/split.out" 2>&1
+SPLIT_RC=$?
+if [ "$SPLIT_RC" != 0 ] && grep -q FATAL "$TMP/split.out"; then
+    pass "F2 a failed lastSuccess still fails the unit even when the later idle post succeeds"
+else
+    fail "F2 a failed lastSuccess was masked by the following idle post (rc=$SPLIT_RC)"
+fi
+
+# ── hub recovery C4: the backup slice's exact peak (SR-049) ──────────────────
+# Logged after the backup AND after the verify, from the slice that outlives
+# each --rm container. A diagnostic: an unreadable slice never fails the run.
+mkdir -p "$TMP/slice"
+printf '3221225472\n' >"$TMP/slice/memory.peak"
+FILEBACKUP_SLICE_CGROUP="$TMP/slice" run_wrapper peak "$TMP/good.env" shallow 0 0 200
+if [ "$RUN_RC" = 0 ] \
+   && grep -qF 'filebackup slice memory.peak: 3221225472 bytes (3072 MiB) after backup (exit 0)' "$TMP/peak.out" \
+   && grep -qF 'memory.peak: 3221225472 bytes (3072 MiB) after shallow verify (exit 0)' "$TMP/peak.out"; then
+    pass "TC-1064 the slice's memory.peak is logged after the backup and after the verify"
+else
+    fail "TC-1064 slice peak not logged (rc=$RUN_RC): $(grep 'memory.peak' "$TMP/peak.out" | tr '\n' '|')"
+fi
+FILEBACKUP_SLICE_CGROUP="$TMP/no-such-slice" run_wrapper nopeak "$TMP/good.env" none 0 0 200
+if [ "$RUN_RC" = 0 ] && grep -qF 'filebackup slice memory.peak: unavailable' "$TMP/nopeak.out"; then
+    pass "TC-1064 an unreadable slice is reported and does not fail the run"
+else
+    fail "TC-1064 an unreadable slice changed the run (rc=$RUN_RC)"
+fi
+
+# ── hub recovery §8: staging left by an interrupted run refuses, NAMED ────────
+# Temp predates two recovery events; the one that names the backup is chosen
+# over the later one that does not, and an event older than Temp is ignored by
+# its MTIME even though its name sorts last.
+mkdir -p "$TMP/changes/Temp" "$TMP/events"
+printf 'staged\n' >"$TMP/changes/Temp/only-copy"
+touch -d '2026-10-01 00:00:00' "$TMP/changes/Temp"
+printf '{"action": "kill", "details": {"interrupts_backup": true}}\n' >"$TMP/events/20261005T010203Z-bbbbbbbb-kill.json"
+printf '{"action": "restart-ssh", "details": {}}\n' >"$TMP/events/20261005T020000Z-bbbbbbbb-restart-ssh.json"
+printf '{"action": "reboot", "details": {"interrupts_backup": true}}\n' >"$TMP/events/20261009T000000Z-aaaaaaaa-reboot.json"
+touch -d '2026-09-01 00:00:00' "$TMP/events/20261009T000000Z-aaaaaaaa-reboot.json"
+RECOVERY_EVENTS_DIR="$TMP/events" run_wrapper staging "$TMP/good.env" shallow 0 0 200
+if [ "$RUN_RC" != 0 ] \
+   && grep -qF 'LIBRARY BACKUP REFUSED: staging needs recovery (interrupted by recovery event 20261005T010203Z-bbbbbbbb-kill)' "$TMP/staging.out" \
+   && ! grep -q '^docker:' "$TMP/staging.events" \
+   && [ "$(success_count "$TMP/staging.capture")" = 0 ] \
+   && [ "$(cat "$TMP/changes/Temp/only-copy")" = staged ]; then
+    pass "TC-1065 staging left by an interrupted run refuses with the recovery event that named the backup, and Temp is untouched"
+else
+    fail "TC-1065 staging refusal rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/staging.events"): $(grep 'REFUSED' "$TMP/staging.out" | head -2 | tr '\n' '|')"
+fi
+RECOVERY_EVENTS_DIR="$TMP/no-events" run_wrapper staging2 "$TMP/good.env" shallow 0 0 200
+if [ "$RUN_RC" != 0 ] \
+   && grep -qF 'LIBRARY BACKUP REFUSED: staging needs recovery (interrupted by recovery event none recorded)' "$TMP/staging2.out"; then
+    pass "TC-1065 with no recovery event recorded the refusal says so rather than inventing one"
+else
+    fail "TC-1065 no-event refusal rc=$RUN_RC: $(grep 'REFUSED' "$TMP/staging2.out" | head -1)"
+fi
+rm -rf "$TMP/changes/Temp"
+
+printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ]

@@ -1004,6 +1004,11 @@ autoinstall:
     # like the mosquitto config. Hence 0644 root (readable, since the container
     # binds it read-only) rather than the 0600 the site secrets get.
     - install -m0644 -o root -g root /target/opt/homehub/stack/backup/filebackup.json /target/etc/homehub-backup/filebackup.json
+    # And the single-store layout's config (ConfigVersion 3, StorePath=/store),
+    # bound only by the filebackup-store service, which runs only when
+    # FILEBACKUP_LAYOUT=single. Installed beside the legacy one so the knob
+    # alone chooses (stack/backup/README.md "The layout knob").
+    - install -m0644 -o root -g root /target/opt/homehub/stack/backup/filebackup-store.json /target/etc/homehub-backup/filebackup-store.json
     # install -m0644 for the same ISO9660-executable-bit reason as 5b above.
     - install -m0644 /target/opt/homehub/stack/backup/systemd/homehub-library-backup.service /target/etc/systemd/system/homehub-library-backup.service
     - install -m0644 /target/opt/homehub/stack/backup/systemd/homehub-library-backup.timer /target/etc/systemd/system/homehub-library-backup.timer
@@ -1051,7 +1056,9 @@ autoinstall:
           echo "homehub: $u installed and enabled."
         done
         for f in /etc/homehub-backup/filebackup.json \
-                 /opt/homehub/stack/backup/library-backup.sh; do
+                 /etc/homehub-backup/filebackup-store.json \
+                 /opt/homehub/stack/backup/library-backup.sh \
+                 /opt/homehub/stack/backup/library-backup-legacy.sh; do
           [ -s "$f" ] || { echo "homehub: FATAL - $f is missing or empty." >&2; rc=1; }
         done
         if [ "$rc" -ne 0 ]; then

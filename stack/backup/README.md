@@ -562,9 +562,11 @@ The second service. `library-backup.sh` is a **host** wrapper around exactly one
 `docker compose run`; everything else in it is proof that the run should happen.
 
 ```
-library-backup.sh                        the host side (bash, root, one-shot)
-filebackup.json                          the container's config — TRACKED, installed
+library-backup.sh                        the host side (bash, root, one-shot); single layout
+library-backup-legacy.sh                 the legacy layout's wrapper, frozen (FILEBACKUP_LAYOUT)
+filebackup.json                          the legacy container config — TRACKED, installed
                                          to /etc/homehub-backup/filebackup.json 0644
+filebackup-store.json                    the single-store container config, installed beside it
 systemd/homehub-library-backup.service   Type=oneshot, TimeoutStartSec=infinity
 systemd/homehub-library-backup.timer     03:00 box-local (same transaction as the nightly, After= orders it), Persistent=true
 ```
@@ -576,7 +578,11 @@ hand-tagged one carries no `homehub.source.revision` stamp) and baked into the
 ISO payload by `vmtest/export-images.sh`, which enables the `filebackup` profile
 unconditionally for the bake.
 
-> **This stack needs a FileBackup image built from FileBackup's bounded-run-loop
+> **Everything from here on is the `single` layout** of
+> [the layout knob](#the-layout-knob--filebackup_layout-legacy-until-the-cutover);
+> the default, `legacy`, runs the deployed image unchanged.
+>
+> **This layout needs a FileBackup image built from FileBackup's bounded-run-loop
 > work** (branch `BoundedRebuild`, 2026-10-24 — **not in a released image yet**).
 > The sibling checkout must be on that work, or on a later commit that contains
 > it, when the image is built. An older image does not fit: it expects a `/state`
@@ -599,6 +605,92 @@ unconditionally for the bake.
 > **not built yet**. An image without it refuses this stack's `filebackup.json`
 > (ConfigVersion 3), and an image with it refuses the previous one. The commits
 > that brought this layout to HomeHub are marked as needing it.
+
+### The layout knob — `FILEBACKUP_LAYOUT` (legacy until the cutover)
+
+Two store layouts are installed side by side, and `FILEBACKUP_LAYOUT` in
+`stack/.env` (SR-133; HomeHub's `config.homehub.psd1` pins it) chooses:
+
+| | `legacy` — **the default**, and what an unset value means | `single` |
+|---|---|---|
+| image | the one the hub runs today (kit 12, `filebackup:local` from FileBackup `4b809d1` — inferred from records, confirm with `docker image inspect`) | one built from `BoundedRebuild` **with C44** (not built yet) |
+| store | three mounts: `/state` (system disk), `/backup`, `/changes` (`FILEBACKUP_STATE`/`_BACKUP`/`_CHANGES`) | one mount, `/store` (`FILEBACKUP_STORE`), below |
+| compose service | `filebackup` | `filebackup-store` |
+| container config | `filebackup.json` (ConfigVersion 2) | `filebackup-store.json` (ConfigVersion 3) |
+| wrapper | `library-backup-legacy.sh`, which `library-backup.sh` hands the run to with its arguments unchanged | `library-backup.sh` itself (everything below this section) |
+| frame-freshness reads | the `/state` record, with its `.meta` row-count check | the system-disk copy the wrapper publishes |
+
+**A stack delivery changes nothing until the knob is switched.** The legacy
+wrapper is the integration branch's wrapper as it was before this layout
+merged, byte for byte (pinned by `tests/library-backup-layout.test.sh`), and that
+branch's own suite runs against it through the default
+(`tests/library-backup-legacy.test.sh`). The legacy service and config are
+unchanged. `frame-freshness.sh` reads the **newer** of the two system-disk
+manifests, so on a legacy hub, where there is no copy, it reads `/state`
+exactly as before. Neither service is in `COMPOSE_PROFILES`, and a plain
+`docker compose config` (firstboot's bind-source pre-creation) sees neither, so
+nothing creates `library-store/` on the backup drive. What a delivery cannot do
+is make an old `/etc/homehub-backup/filebackup-store.json` appear: that file
+comes from late-command 5c on a reimage, or from the cutover below.
+
+The knob does **not** protect against the image changing under it. A
+`filebackup:local` built from `BoundedRebuild` (with or without C44) and run in
+the legacy layout fails loudly (the three-mount config and mounts are refused);
+that is the build hazard of HomeHub open-items C110, and the reason the old
+image is kept under its own tag at step 2 below.
+
+#### The cutover, in this order
+
+1. **FileBackup first.** Its C44 work package (the single-store layout) built,
+   independently reviewed and merged on `BoundedRebuild` (its ruling L6); and
+   the second half of its call C43 (prune and pool-resolve reading one
+   manifest at a time) in the same image, because the verify gate runs by
+   itself once the timer is on (see
+   [Verify and prune memory](#verify-and-prune-memory-filebackup-c43-not-yet-safe-on-the-hub)).
+2. **Build the image** from that commit (`scripts/ensure-local-images.sh
+   --rebuild`, the sibling checkout on it). On the hub, before loading it, keep
+   the deployed image for the rollback: read its stamp
+   (`docker image inspect filebackup:local`) and
+   `docker tag filebackup:local filebackup:kit12`. Then load the new one as
+   `filebackup:local`. From here the legacy layout no longer runs; nothing runs
+   meanwhile (the timer is off, open-items E13).
+3. **Deliver this stack and install the config:**
+   `install -m0644 -o root -g root /opt/homehub/stack/backup/filebackup-store.json /etc/homehub-backup/filebackup-store.json`.
+4. **Set the old store aside** — there is no migration (FileBackup L2, L5):
+   [Setting the old store aside](#setting-the-old-store-aside). A store already
+   made by hand to be the new baseline must be in the single-store layout at
+   `FILEBACKUP_STORE` (`Latest/` and `Snapshot_*` side by side); one in another
+   layout is refused by step 2b like any old store.
+5. **Switch the knob:** `FILEBACKUP_LAYOUT='single'` in HomeHub's
+   `config.homehub.psd1`, materialise, ship the `.env`. Then
+   `sudo /opt/homehub/stack/backup/library-backup.sh --preflight-only` must
+   pass (it creates nothing and starts no container).
+6. **The first run, by hand, under a protective cap** (E13's return
+   conditions): `FILEBACKUP_MEM_LIMIT=4g` in the `.env` (compose sets the equal
+   `memswap_limit` itself), never uncapped; start it so an SSH drop cannot kill
+   it — `sudo systemd-run --unit=library-backup-first --property=TimeoutStartSec=infinity /opt/homehub/stack/backup/library-backup.sh --verify none`
+   — and poll the run container's `memory.peak` every 10 s while it runs (it
+   is `--rm`; the slice's peak, which the wrapper logs, is an upper bound).
+   Expect days: it is a full first backup.
+7. **Size the limit and turn the timer on:** `FILEBACKUP_MEM_LIMIT` at about
+   twice that peak, then `systemctl enable --now homehub-library-backup.timer`.
+
+#### Rolling back the cutover
+
+- **Before step 4** (the old store still in its places): set
+  `FILEBACKUP_LAYOUT=legacy` again and `docker tag filebackup:kit12
+  filebackup:local`. Nothing else changed.
+- **After step 4:** the same, plus the set-aside renames reversed (the old
+  folders back to `library` and `library-changes`), with the new store moved
+  aside in its turn. Not verified; treat it as the Owner's decision.
+
+#### Retiring the legacy layout
+
+Only once the single-store store has a verified history: delete
+`library-backup-legacy.sh`, `tests/library-backup-legacy.test.sh`,
+`filebackup.json` and the `filebackup` service (giving `filebackup-store` the
+name back), drop the hand-off, and retire `FILEBACKUP_STATE`/`_BACKUP`/`_CHANGES`
+from HomeHub's config. Until then they are the rollback.
 
 ### The single-store layout
 
@@ -673,9 +765,8 @@ stat -c '%d %n' . old-library-store library library-changes library-store 2>/dev
 sudo mv -T library         old-library-store/library           # whichever of these exist
 sudo mv -T library-changes old-library-store/library-changes
 sudo mv -T library-store   old-library-store/library-store
-# Deploy this stack with an image that has C44, then start the clean backup:
-sudo systemctl start homehub-library-backup.service
-sudo systemctl start homehub-library-backup.timer
+# Then go on with the cutover (the layout knob, steps 5-7): the knob, the
+# first run by hand under the 4 GB cap, and only then the timer.
 ```
 
 - **Space.** The first clean backup is a full one, beside the set-aside store,
@@ -688,9 +779,10 @@ sudo systemctl start homehub-library-backup.timer
 - **Restoring from the set-aside store** uses the kit inside it
   (`bash/reconstruct.sh` in its latest state or a snapshot). Its folders have
   moved, so pass its roots explicitly as that kit's `--help` describes.
-- **`stack/.env`:** drop `FILEBACKUP_STATE`, `FILEBACKUP_BACKUP` and
-  `FILEBACKUP_CHANGES` (HomeHub's materialiser). They are read only to find an
-  old store, and after the renames their defaults name nothing.
+- **`stack/.env`:** keep `FILEBACKUP_STATE`, `FILEBACKUP_BACKUP` and
+  `FILEBACKUP_CHANGES` until the legacy layout is retired: they are its paths
+  (the rollback), and in the single layout they are read only to find an old
+  store, which after the renames they no longer name.
 - **The old source-side record**, `/var/lib/homehub-filebackup/state/MANIFEST.csv`,
   belongs to the old store; the wrapper names it after each verified run until
   you delete it.
@@ -809,9 +901,9 @@ nothing:
 
 ```bash
 cd /opt/homehub/stack
-docker compose --profile filebackup run --rm -T -e FILEBACKUP_REPAIR=1 filebackup verify -WhatIf  # preview: moves nothing
-docker compose --profile filebackup run --rm -T -e FILEBACKUP_REPAIR=1 filebackup verify          # duplicates, and objects damaged by length
-docker compose --profile filebackup run --rm -T -e FILEBACKUP_REPAIR=1 filebackup verify -Deep    # and objects whose bytes do not hash to their name
+docker compose --profile filebackup run --rm -T -e FILEBACKUP_REPAIR=1 filebackup-store verify -WhatIf  # preview: moves nothing
+docker compose --profile filebackup run --rm -T -e FILEBACKUP_REPAIR=1 filebackup-store verify          # duplicates, and objects damaged by length
+docker compose --profile filebackup run --rm -T -e FILEBACKUP_REPAIR=1 filebackup-store verify -Deep    # and objects whose bytes do not hash to their name
 ```
 
 `-e` is required: a variable set on the host shell is **not** passed into the
@@ -858,14 +950,14 @@ When the Owner does want space back, the procedure is manual and in this order:
 cd /opt/homehub/stack
 # 1. list what exists. The output is line-framed JSON: take exactly the [ .. ]
 #    block by line — never a greedy regex. Empty is `[]`.
-docker compose --profile filebackup run --rm -T filebackup snapshots
+docker compose --profile filebackup run --rm -T filebackup-store snapshots
 # 2. DRY RUN the removal first. `-e` is what makes it a dry run: a variable set
 #    on the host shell (FILEBACKUP_DRY_RUN=1 docker compose …) is NOT passed into
 #    the container, so that form silently runs the REAL prune.
-docker compose --profile filebackup run --rm -T -e FILEBACKUP_DRY_RUN=1 filebackup \
+docker compose --profile filebackup run --rm -T -e FILEBACKUP_DRY_RUN=1 filebackup-store \
     prune -Snapshot Snapshot_2026-08-23
 # 3. then for real.
-docker compose --profile filebackup run --rm -T filebackup prune -Snapshot Snapshot_2026-08-23
+docker compose --profile filebackup run --rm -T filebackup-store prune -Snapshot Snapshot_2026-08-23
 ```
 
 **Never delete a `Snapshot_*` folder by hand.** It is the only copy of the states
@@ -908,14 +1000,16 @@ the data:
    > root is content-addressed, not a browsable mirror (Q-FB1 withdrawn
    > 2026-08-26), so you cannot eyeball what you are about to lose — the file
    > names are opaque hashes. Take an inventory first:
-   > `docker compose --profile filebackup run --rm -T filebackup snapshots`.
+   > `docker compose --profile filebackup run --rm -T filebackup-store snapshots`
+   > (`filebackup` in the legacy layout).
 4. **The bash service is unaffected.** Its sets, its timer, its `backup` lane and
    its retention are all independent of any of the above. What you lose is the
    library coverage, which is what there was before this shipped.
 
 **Rolling the image back past the single-store layout** is a different thing
-and is **not verified**: an image without C44 cannot read this store or this
-`filebackup.json` at all. Going back means the older image *and* the older stack
+and is **not verified**: an image without C44 cannot read this store or
+`filebackup-store.json` at all. The way back is the knob's
+[rollback](#rolling-back-the-cutover): `FILEBACKUP_LAYOUT=legacy` and the kept kit-12 image. Going back means the older image *and* the older stack
 files *and* the set-aside old store renamed back into its places — the
 [set-aside renames](#setting-the-old-store-aside), reversed — with the new
 store left aside in turn. Treat that as a decision for the Owner, not a routine
@@ -938,10 +1032,13 @@ later needs no migration.
 
 ### The config file
 
-`filebackup.json` is **tracked** and installed to
-`/etc/homehub-backup/filebackup.json` at 0644 root by autoinstall late-command
-5c — not through the `site/` payload the secrets take. Every path in it
-(`/source`, `/store`) is a **container-internal mount
+Two configs, one per layout, both **tracked** and installed by autoinstall
+late-command 5c at 0644 root — not through the `site/` payload the secrets take:
+`filebackup.json` (legacy: ConfigVersion 2, `/source`, `/state`, `/backup`,
+`/changes`, unchanged from before the knob) to
+`/etc/homehub-backup/filebackup.json`, and `filebackup-store.json` (single) to
+`/etc/homehub-backup/filebackup-store.json`. The notes below are the single
+layout's. Every path in them (`/source`, `/store`) is a **container-internal mount
 target** fixed by `docker-compose.yml`; it derives from the storage map not at
 all and carries no secret, no serial and nothing site-specific. The host paths it
 pairs with are the `FILEBACKUP_*` knobs in `stack/.env`.

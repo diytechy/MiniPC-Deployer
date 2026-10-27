@@ -132,7 +132,8 @@ mkdir -p "$TMP/sys-dev-block"
 write_config() {
     local target="$1" copy="${2:-$TMP/latest/MANIFEST.csv}"
     cat >"$target" <<EOF
-FILEBACKUP_CONFIG=$TMP/filebackup.json
+FILEBACKUP_LAYOUT=single
+FILEBACKUP_STORE_CONFIG=$TMP/filebackup.json
 FILEBACKUP_SOURCE=$TMP/src
 FILEBACKUP_STORE=$TMP/store
 FILEBACKUP_STATE=$TMP/state
@@ -152,7 +153,8 @@ EOF
 }
 write_config "$TMP/good.env"
 cat >"$TMP/preflight-failure.env" <<EOF
-FILEBACKUP_CONFIG=$TMP/missing-filebackup.json
+FILEBACKUP_LAYOUT=single
+FILEBACKUP_STORE_CONFIG=$TMP/missing-filebackup.json
 FILEBACKUP_SOURCE=$TMP/src
 FILEBACKUP_STORE=$TMP/store
 FILEBACKUP_STATE=$TMP/state
@@ -358,17 +360,20 @@ fi
 # writable /store, no /state, and a ConfigVersion 3 config naming only
 # StorePath=/store (FileBackup L1: BackupPath and ChangePath are gone, and an
 # image with the single-store layout refuses a config that still names them),
-# with no SourceStatePath (ignored with a warning every run).
+# with no SourceStatePath (ignored with a warning every run). In the
+# single-store layout that is the `filebackup-store` service and
+# filebackup-store.json (SR-133: the legacy `filebackup` service keeps the
+# three-mount layout, which library-backup-layout.test.sh pins).
 COMPOSE="$ROOT/stack/docker-compose.yml"
-FBJSON="$ROOT/stack/backup/filebackup.json"
-fb_block="$(awk '/^  filebackup:/{on=1; next} on && /^  [a-z]/{exit} on' "$COMPOSE")"
+FBJSON="$ROOT/stack/backup/filebackup-store.json"
+fb_block="$(awk '/^  filebackup-store:/{on=1; next} on && /^  [a-z]/{exit} on' "$COMPOSE")"
 # shellcheck disable=SC2016  # the ${...} is compose's own interpolation, matched literally
 if printf '%s\n' "$fb_block" | grep -qF -- '- ${FILEBACKUP_STORE:-/mnt/backup-drive/library-store}:/store' \
    && ! printf '%s\n' "$fb_block" | grep -Eq -- '^ *- .*:/(state|backup|changes)$' \
    && grep -qF '"ConfigVersion": 3,' "$FBJSON" \
    && grep -qF '"StorePath": "/store",' "$FBJSON" \
    && ! grep -Eq '"(BackupPath|ChangePath|SourceStatePath)"' "$FBJSON"; then
-    pass "TC-1577 compose binds one /store and no /state; filebackup.json is ConfigVersion 3 with StorePath /store only"
+    pass "TC-1577 filebackup-store binds one /store and no /state; filebackup-store.json is ConfigVersion 3 with StorePath /store only"
 else
     fail "TC-1577 the compose/config contract drifted: $(printf '%s\n' "$fb_block" | grep -E ':/' | tr '\n' '|')"
 fi
@@ -638,9 +643,10 @@ rm -f "$TMP/state/MANIFEST.csv"
 # Comment lines are skipped: the README's own warning quotes the bad form.
 _bad_forms="$(grep -n 'FILEBACKUP_[A-Z_]*=[^ ]* *docker compose' "$WRAPPER" "$ROOT/stack/backup/README.md" 2>/dev/null \
               | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)"
+# shellcheck disable=SC2016  # $FB_SERVICE is the wrapper's text, matched literally
 if [ -z "$_bad_forms" ] \
-   && grep -qF -- '-e FILEBACKUP_DRY_RUN=1 filebackup' "$ROOT/stack/backup/README.md" \
-   && grep -qF -- '-e FILEBACKUP_DRY_RUN=1 filebackup' "$WRAPPER"; then
+   && grep -qF -- '-e FILEBACKUP_DRY_RUN=1 filebackup-store' "$ROOT/stack/backup/README.md" \
+   && grep -qF -- '-e FILEBACKUP_DRY_RUN=1 $FB_SERVICE' "$WRAPPER"; then
     pass "TC-1577 every documented FILEBACKUP_* switch reaches the container through -e"
 else
     fail "TC-1577 a host-variable form that never reaches the container is documented: $_bad_forms"

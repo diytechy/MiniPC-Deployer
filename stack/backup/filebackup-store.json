@@ -1,0 +1,12 @@
+{
+  "ConfigVersion": 3,
+  "BackupSets": [
+    {
+      "Name": "library",
+      "SourcePath": "/source",
+      "StorePath": "/store",
+      "HashRecalcFreq": "W",
+      "CompressEnabled": true
+    }
+  ]
+}

@@ -942,7 +942,62 @@ services:
       - /etc/homehub-backup/filebackup.json:/config/FileBackup.json:ro
       # The library, READ-ONLY. FileBackup reads the source in place — there is
       # no staging copy for these sets, which is the NVMe staging bomb that this
-      # service's arrival dissolves. Nothing is ever written into it.
+      # service's arrival dissolves.
+      - ${FILEBACKUP_SOURCE:-/srv/library}:/source:ro
+      # Manifest/hash cache. On the SYSTEM disk on purpose: it is small, and it
+      # must survive a backup drive being unplugged.
+      - ${FILEBACKUP_STATE:-/var/lib/homehub-filebackup/state}:/state
+      # The mirror (Q-FB1: PreserveFolderTree) and the snapshot history, both on
+      # the backup drive.
+      - ${FILEBACKUP_BACKUP:-/mnt/backup-drive/library}:/backup
+      - ${FILEBACKUP_CHANGES:-/mnt/backup-drive/library-changes}:/changes
+      - ${FILEBACKUP_LOGS:-/var/log/homehub-filebackup}:/logs
+    tmpfs:
+      # read_only: true leaves the process no writable scratch at all; pwsh
+      # needs one. noexec/nosuid/nodev so it cannot become a foothold.
+      - /tmp:rw,noexec,nosuid,nodev
+
+  # ── filebackup-store — the SAME library backup, single-store layout (SR-133) ──
+  # FileBackup's single-store layout (its plan call C44): ONE writable /store
+  # mount that IS the set's store. Chosen by FILEBACKUP_LAYOUT=single and run
+  # only by library-backup.sh in that mode; the `filebackup` service above is
+  # the three-mount layout the deployed kit-12 image needs, and the knob's
+  # default. Two services, not one with interpolated mounts, because a layout
+  # is a different SET of mounts and compose cannot drop a volume by variable.
+  # Both carry the `filebackup` profile, so neither starts on `up -d`, and a
+  # plain `docker compose config` (firstboot's bind-source pre-creation, step
+  # 4a-pre-2) sees neither, so nothing here creates a folder on the backup
+  # drive at boot.
+  #
+  # EVERYTHING BUT `volumes` IS THE `filebackup` SERVICE'S, KEY FOR KEY; the
+  # comments above it hold for both. tests/test_filebackup_layouts.py asserts
+  # the equality, so a hardening change made to one cannot miss the other.
+  # When the legacy layout is retired this service takes the `filebackup`
+  # name back (README "The layout knob").
+  filebackup-store:
+    image: filebackup:${FILEBACKUP_IMAGE_TAG}
+    profiles: ["filebackup"]
+    user: "65532:65532"
+    cgroup_parent: homehub-filebackup.slice
+    mem_limit: ${FILEBACKUP_MEM_LIMIT:-0}
+    memswap_limit: ${FILEBACKUP_MEM_LIMIT:-0}
+    read_only: true
+    network_mode: none
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      FILEBACKUP_CONFIG_PATH: /config/FileBackup.json
+      FILEBACKUP_LOG_PATH: /logs/Backup_Global.log
+      FILEBACKUP_7Z_LEVEL: ${FILEBACKUP_7Z_LEVEL:-5}
+    volumes:
+      # The single-store set definition: ConfigVersion 3, StorePath=/store. A
+      # file of its own (stack/backup/filebackup-store.json, installed by
+      # late-command 5c beside filebackup.json), because an image with C44
+      # refuses the legacy document and an image without it refuses this one.
+      - /etc/homehub-backup/filebackup-store.json:/config/FileBackup.json:ro
+      # The library, READ-ONLY. Nothing is ever written into it.
       - ${FILEBACKUP_SOURCE:-/srv/library}:/source:ro
       # THE STORE: ONE writable mount on the backup drive that IS the library
       # set's whole store (FileBackup's single-store layout, plan call C44 -
@@ -952,13 +1007,10 @@ services:
       # style choice: it moves objects between Latest/ and the snapshots by
       # rename only and refuses (exit 2) a store a rename cannot cross — and
       # Linux cannot rename across two bind mounts even on one filesystem.
-      # filebackup.json says StorePath=/store (ConfigVersion 3). There is no
-      # /state mount: the latest manifest is FileBackup's only record.
+      # There is no /state mount: the latest manifest is FileBackup's only record.
       - ${FILEBACKUP_STORE:-/mnt/backup-drive/library-store}:/store
       - ${FILEBACKUP_LOGS:-/var/log/homehub-filebackup}:/logs
     tmpfs:
-      # read_only: true leaves the process no writable scratch at all; pwsh
-      # needs one. noexec/nosuid/nodev so it cannot become a foothold.
       - /tmp:rw,noexec,nosuid,nodev
 
   # ── ddns — RETIRED 2026-10-15 (the Owner) ─────────────────────────────────────

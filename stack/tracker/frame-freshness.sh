@@ -63,12 +63,18 @@
 #
 # ── IT MUST NEVER WAKE THE LIBRARY DRIVE EITHER ──────────────────────────────
 # The "when did the media last change" half does NOT walk /srv/library. It reads
-# the copy of the latest library manifest that library-backup.sh publishes to the
-# SYSTEM disk after every completed nightly run (FileBackup's bounded engine no
-# longer keeps a source-side record there of its own). That is one pass over a
-# local CSV, so it cannot spin up the parked 4 TB platter, nor the backup drive
-# the real manifest lives on — the same contract library-guard.sh and the
-# backup drive-health unit both keep (WI-10.10).
+# a library manifest on the SYSTEM disk, and there are two, one per store layout
+# (library-backup.sh FILEBACKUP_LAYOUT, SR-133): the legacy engine's own
+# source-side record under /state, which it rewrites every run; and the copy
+# that library-backup.sh publishes after every completed single-store run
+# (FileBackup's bounded engine keeps no source-side record of its own). The
+# NEWER of the two is read, so neither a delivery nor the cutover needs this
+# file touched: a hub on the legacy layout has no copy and reads /state exactly
+# as before, and the first single-store run makes the copy the newer one. A
+# rollback to legacy makes /state the newer one again. Either is one pass over
+# a local CSV, so it cannot spin up the parked 4 TB platter, nor the backup
+# drive the real manifest lives on — the same contract library-guard.sh and
+# the backup drive-health unit both keep (WI-10.10).
 #
 # ── CREDENTIALS: REUSED, NOT ADDED ───────────────────────────────────────────
 # The mount uses the CIFS credentials the backup already has
@@ -109,9 +115,13 @@ FRAME_WALK_TIMEOUT=60
 # generous. Nothing here does timezone-exact arithmetic on purpose.
 FRAME_PROBE_MAX_AGE_DAYS=7
 FRAME_DRIFT_MAX_DAYS=7
-# library-backup.sh's system-disk copy of the latest manifest (its
-# LIBRARY_MANIFEST_COPY, same default). Overridable as MANIFEST in $FRAME_CONF.
-MANIFEST="/var/lib/homehub-filebackup/latest/MANIFEST.csv"
+# The two system-disk manifests (the header above): library-backup.sh's copy for
+# the single-store layout (its LIBRARY_MANIFEST_COPY, same default) and the
+# legacy engine's /state record. MANIFEST, when set in $FRAME_CONF, pins one
+# file and skips the choice; empty, the newer of the two is read (below).
+FRAME_MANIFEST_COPY="/var/lib/homehub-filebackup/latest/MANIFEST.csv"
+FRAME_MANIFEST_LEGACY="/var/lib/homehub-filebackup/state/MANIFEST.csv"
+MANIFEST=""
 # Scope: the WHOLE of Shared, every subtree (plan §7.2). The extension
 # allow-list is the only filter, which is why it is an allow-list and not a
 # deny-list — see the note in the plan §7.1.
@@ -144,6 +154,18 @@ if [ -f "$FRAME_CONF" ]; then
         esac
         printf -v "$__k" '%s' "$__v" 2>/dev/null && export "$__k"
     done <"$FRAME_CONF"
+fi
+
+# THE NEWER OF THE TWO (SR-133). `-nt` is true when the copy's mtime is later,
+# or when the copy exists and the legacy record does not; a tie, or neither
+# file, reads the legacy record, whose "cannot read" message then names the
+# path a legacy hub has always had. Two stats on the system disk: no drive wakes.
+if [ -z "$MANIFEST" ]; then
+    if [ "$FRAME_MANIFEST_COPY" -nt "$FRAME_MANIFEST_LEGACY" ]; then
+        MANIFEST="$FRAME_MANIFEST_COPY"
+    else
+        MANIFEST="$FRAME_MANIFEST_LEGACY"
+    fi
 fi
 
 log()  { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
@@ -292,12 +314,24 @@ read_shared() {
     fi
 
     # A TRUNCATED file would compute a max over a prefix — green from missing
-    # rows (review, 2026-09-07). The old reader caught that by comparing the row
-    # count to FileBackup's witness sidecar, which the bounded engine no longer
-    # writes. It cannot happen to this file: library-backup.sh publishes the copy
-    # by rename on one filesystem, so a reader sees the old copy or the new one,
-    # whole. When it was written is the copy's own mtime.
-    MANIFEST_WRITTEN="$(date -u -r "$MANIFEST" +%Y-%m-%dT%H:%M:%S 2>/dev/null || true)"
+    # rows (review, 2026-09-07). The LEGACY record is rewritten in place by the
+    # nightly, so a run that opens it mid-rewrite sees a valid but truncated
+    # file; its own sidecar says how many rows a complete one has, and comparing
+    # the parsed count to that refuses the prefix. The single-store COPY has no
+    # sidecar and needs none: library-backup.sh publishes it by rename on one
+    # filesystem, so a reader sees the old copy or the new one, whole. So the
+    # check runs exactly when a sidecar is there, and when it was written is the
+    # sidecar's word, else (the copy only) the file's own mtime.
+    local declared=""
+    if [ -r "$MANIFEST.meta" ]; then
+        declared="$(sed -n 's/^Rows=//p' "$MANIFEST.meta" | head -1 | tr -dc '0-9')"
+        MANIFEST_WRITTEN="$(sed -n 's/^Written=//p' "$MANIFEST.meta" | head -1 | cut -c1-19)"
+    fi
+    # The mtime stands in only for a file that has no sidecar by design, so the
+    # legacy record reads exactly as it always did (empty when its .meta is gone).
+    if [ -z "$MANIFEST_WRITTEN" ] && [ "$MANIFEST" != "$FRAME_MANIFEST_LEGACY" ]; then
+        MANIFEST_WRITTEN="$(date -u -r "$MANIFEST" +%Y-%m-%dT%H:%M:%S 2>/dev/null || true)"
+    fi
 
     local out
     out="$(MANIFEST="$MANIFEST" SHARED_PREFIX="$SHARED_PREFIX" python3 - <<'PY' 2>/dev/null
@@ -378,9 +412,10 @@ PY
         *) shared_err="the manifest parser produced no usable answer"; return 1 ;;
     esac
 
-    local unparsed
+    local total unparsed
     SHARED_NEWEST="$(printf '%s\n' "$out" | sed -n 's/^newest=//p' | head -1)"
     SHARED_ROWS="$(printf '%s\n' "$out"   | sed -n 's/^rows=//p'   | head -1)"
+    total="$(printf '%s\n' "$out"         | sed -n 's/^total=//p'  | head -1)"
     unparsed="$(printf '%s\n' "$out"      | sed -n 's/^unparsed=//p' | head -1)"
 
     if ! is_num "$SHARED_NEWEST"; then
@@ -392,6 +427,10 @@ PY
         # bound — but it is named, because a parser quietly skipping rows is how
         # the first cut went wrong.
         shared_err="note: $unparsed timestamp(s) under $SHARED_PREFIX did not parse"
+    fi
+    if is_num "$declared" && is_num "$total" && [ "$declared" -ne "$total" ]; then
+        shared_err="the manifest looks INCOMPLETE: it declares $declared row(s) but $total were read (a rewrite in progress?) — refusing to judge freshness from a partial file"
+        SHARED_NEWEST=""; return 1
     fi
     return 0
 }

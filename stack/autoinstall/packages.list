@@ -333,7 +333,7 @@ earlyoom
 
 # ── the camera motion detector's runtime (SR-128; stack/camera-motion) ──────
 # The hub runs the panel's door motion engine (OfficeWallNaglight
-# doorstream/motion.py, pinned byte for byte) on the panel's own runtime: the
+# doorstream/motion.py, pinned, its code unchanged) on the panel's own runtime: the
 # distribution's OpenCV and NumPy, the same 4.6.0 / 1.26.4 the wall image
 # installs (stack/autoinstall/wall/packages.list), so one engine on one runtime
 # decides what is motion. Installed on every hub; the detector itself ships off

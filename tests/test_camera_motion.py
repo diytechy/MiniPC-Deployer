@@ -78,16 +78,54 @@ def test_tc1543_the_engine_is_the_pinned_bytes_and_an_edited_copy_is_refused(tmp
     with pytest.raises(cm.Invalid, match="not the pinned engine"):
         cm.load_engine(str(edited), cm.PIN_FILE)
     assert b"\r\n" not in data
+    # The public copy carries no comment and no date (the Owner's ruling, 2026-10-27).
+    text = data.decode("utf-8")
+    import io
+    import tokenize
+    assert not [t for t in tokenize.generate_tokens(io.StringIO(text).readline) if t.type == tokenize.COMMENT]
+    assert not re.search(r"20\d\d-\d\d-\d\d|\b\d{1,2}:\d\d\b", text)
+
+
+def code_only(source):
+    """The program without its comments and docstrings: ast.dump of the tree
+    with every module/class/function docstring removed (comments never reach
+    the tree), and the token stream with COMMENT/NL tokens and docstring
+    strings dropped. Two files with equal results run the same code."""
+    import ast
+    import io
+    import tokenize
+    tree = ast.parse(source)
+    doc_lines = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
+            first = node.body[0]
+            if isinstance(first, ast.Expr) and isinstance(getattr(first, "value", None), ast.Constant) \
+                    and isinstance(first.value.value, str):
+                doc_lines.add(first.lineno)
+                node.body = node.body[1:] or [ast.Pass()]
+    tokens = [(t.type, t.string) for t in tokenize.generate_tokens(io.StringIO(source).readline)
+              if t.type not in (tokenize.COMMENT, tokenize.NL)
+              and not (t.type == tokenize.STRING and t.start[0] in doc_lines)]
+    # A removed docstring leaves its NEWLINE behind; drop NEWLINEs that follow a NEWLINE or INDENT.
+    collapsed = []
+    for tok in tokens:
+        if tok[0] == tokenize.NEWLINE and collapsed and collapsed[-1][0] in (tokenize.NEWLINE, tokenize.INDENT):
+            continue
+        collapsed.append(tok)
+    return ast.dump(tree), collapsed
 
 
 @pytest.mark.skipif(not (OWN_REPO / ".git").exists() or not shutil.which("git"),
                     reason="sibling OfficeWallNaglight checkout absent; set OWN_REPO")
-def test_tc1543_the_pinned_commit_holds_exactly_these_bytes():
+def test_tc1543_the_scrubbed_engine_is_the_pinned_commits_code():
     pin = cm.read_pin()
     shown = subprocess.run(["git", "-C", str(OWN_REPO), "show", "%s:%s" % (pin["COMMIT"], pin["PATH"])],
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
     assert shown.returncode == 0, shown.stderr[-300:]
-    assert shown.stdout == (STACK / "camera-motion" / "motion_engine.py").read_bytes()
+    panel = shown.stdout.decode("utf-8")
+    hub = (STACK / "camera-motion" / "motion_engine.py").read_text(encoding="utf-8")
+    assert code_only(hub) == code_only(panel), "the hub's engine is not the panel's code"
+    assert hub != panel  # the scrubbed copy, not the original
     last = subprocess.run(["git", "-C", str(OWN_REPO), "log", "-1", "--format=%H", pin["COMMIT"], "--", pin["PATH"]],
                           stdout=subprocess.PIPE, universal_newlines=True, timeout=60).stdout.strip()
     assert last == pin["LAST_CHANGE"]

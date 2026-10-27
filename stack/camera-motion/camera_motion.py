@@ -12,7 +12,9 @@ its own motion events (ONVIF) is another source writing the same records; the
 cutter does not change.
 
 ONE ENGINE, NOT TWO. motion_engine.py is OfficeWallNaglight doorstream/motion.py
-byte for byte (motion-engine.pin), the replay-validated detector the panel runs,
+at a pinned commit (motion-engine.pin) with its comments removed - this
+repository is public - and its code unchanged (a test compares the syntax
+trees): the replay-validated detector the panel runs,
 fed exactly what the panel feeds it: the RAW fisheye decoded from the relay,
 `fps=<sample_fps>,scale=256:256:flags=area,format=gray`, the arrival clock
 from time.monotonic(). The run refuses to start when the file is not the pinned

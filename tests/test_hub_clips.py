@@ -408,6 +408,13 @@ def test_tc1559_untrusted_timestamps_are_regenerated_and_the_guard_comes_first(t
     hc.cut_episode(settings, cam, ep, plan, str(tmp_path), runner=fake,
                    prober=lambda c, d, n: {"frames": plan.frames})
     assert fake.argv[fake.argv.index("-bsf:v") + 1] == "setts=ts=N/(10*TB)"
+    # a camera that slowed to 8 fps in the dark: the clip is retimed at 8, not the nominal 10
+    slow = hc.Loaded(Seg("door-slow.ts", T0 / 1000.0 - 10), ts_bytes(200, broken=True), 10, next_start=T0 / 1000.0 + 15)
+    plan8 = hc.plan_window([slow], ep.window[0] / 1000.0, ep.window[1] / 1000.0, 10)
+    fake8 = FakeFfmpeg()
+    hc.cut_episode(settings, cam, ep, plan8, str(tmp_path), runner=fake8,
+                   prober=lambda c, d, n: {"frames": plan8.frames, "duration": plan8.frames / 8.0})
+    assert fake8.argv[fake8.argv.index("-bsf:v") + 1] == "setts=ts=N/(8*TB)"
     monkeypatch.setattr(hc, "guard", lambda settings: (False, "not mounted"))
     with pytest.raises(hc.GuardStop):
         hc.cut_episode(settings, cam, ep, plan, str(tmp_path), runner=pytest.fail, prober=None)
@@ -988,3 +995,171 @@ def test_tc1564_a_guard_refusal_during_retention_alerts_and_exits_76(tmp_path, m
     monkeypatch.setattr(hc, "apply_retention", refused)
     assert hc.main(["--env-file", str(env), "--state-dir", str(tmp_path / "state"), "retention"]) == hc.EXIT_GUARD
     assert sent[0][0] == "clips-guard"
+
+
+# ── fix round after the Opus review (2026-10-27) ─────────────────────────────
+
+
+def part_segment(seg_dir, start_epoch, frames):
+    """An open segment (.ts.part) as the recorder leaves it mid-rotation."""
+    write_segment(seg_dir, start_epoch, frames)
+    day = time.strftime("%Y-%m-%d", time.gmtime(start_epoch))
+    name = time.strftime("door-%Y%m%dT%H%M%SZ.ts", time.gmtime(start_epoch))
+    path = os.path.join(seg_dir, day, name)
+    os.rename(path, path + ".part")
+    return path
+
+
+def test_tc1560_a_rotation_during_a_backlogged_pass_is_seen_by_the_next_episode(tmp_path, monkeypatch):
+    state, seg_dir = str(tmp_path / "state"), str(tmp_path / "segs")
+    root = tmp_path / "clips"
+    root.mkdir()
+    monkeypatch.setattr(hc.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, b"", b""))
+    settings = hc.ClipsSettings({"CAMERA_DOOR_SEGMENT_DIR": seg_dir})
+    settings.root = str(root)
+    final = part_segment(seg_dir, T0 / 1000.0 - 60, 1201)            # 19:49:00 .. 19:51:00, still open
+    for r in (rec(1, "approach", "event", T0), rec(2, "approach", "event", T0 + 30000)):
+        ev.append(state, r)
+    frames = {}
+    real_cut = hc.cut_episode
+
+    def cut(settings_, cam_, ep, plan, state_dir, runner_=None, prober=None, localtime=time.localtime):
+        frames["want"] = plan.frames
+        result = real_cut(settings_, cam_, ep, plan, state_dir, runner=FakeFfmpeg(),
+                          prober=lambda c, d, n: {"frames": frames["want"]})
+        if os.path.exists(final + ".part"):
+            os.rename(final + ".part", final)                         # the recorder rotates mid-pass
+        return result
+    monkeypatch.setattr(hc, "cut_episode", cut)
+    counts = hc.cut_camera(settings, settings.cameras[0], state, T0 + 300000)  # a backlog: 5 min late
+    assert counts["cut"] == 2 and counts["lost"] == 0
+
+
+def test_tc1560_a_listed_segment_that_cannot_be_opened_waits_never_lost(tmp_path, monkeypatch):
+    state, seg_dir = str(tmp_path / "state"), str(tmp_path / "segs")
+    settings = hc.ClipsSettings({"CAMERA_DOOR_SEGMENT_DIR": seg_dir})
+    write_segment(seg_dir, T0 / 1000.0 - 60, 1200)
+    ev.append(state, rec(1, "approach", "event", T0))
+    monkeypatch.setattr(hc, "load_segment", lambda *a, **k: None)   # renamed or pruned since listed
+    counts = hc.cut_camera(settings, settings.cameras[0], state, T0 + 600000)
+    assert counts == {"cut": 0, "lost": 0, "failed": 0, "waiting": 1, "rejected_records": 0}
+    assert json.load(open(hc.ledger_path(state, "door")))["episodes"] == {}
+
+
+def clip_files(root, day, stem, size, start_ms):
+    d = root / "door" / day
+    d.mkdir(parents=True, exist_ok=True)
+    (d / (stem + ".mp4")).write_bytes(b"x" * size)
+    (d / (stem + ".json")).write_text(json.dumps({
+        "v": 1, "actual": {"start_utc_ms": start_ms, "end_utc_ms": start_ms + 9000}, "camera": "door",
+        "cause": "approach", "coverage": "full", "events": [{"utc_ms": start_ms + 3000}], "episode": stem}))
+
+
+def test_tc1564_room_is_made_before_a_cut_oldest_first_and_only_a_hopeless_case_stops(tmp_path):
+    root = tmp_path / "clips"
+    s = hc.ClipsSettings({})
+    s.root = str(root)
+    for i in range(3):
+        clip_files(root, "2026-10-2%d" % i, "door_2026-10-2%d_10-00-00+0000_approach_9s" % i, 1000, T0 - (6 - i) * 86400000)
+    other = {"v": 0}
+    one = 1000 + (root / "door" / "2026-10-20" / "door_2026-10-20_10-00-00+0000_approach_9s.json").stat().st_size
+
+    def quota():
+        files = [p for p in root.rglob("*") if p.is_file()]
+        return sum(p.stat().st_size for p in files) + other["v"], 10000
+
+    def left():
+        return sorted(p.name[:15] for p in root.rglob("*.mp4"))
+    other["v"] = 9000 - 3 * one           # exactly at the 90 % ceiling
+    assert hc.make_room(s, str(tmp_path), T0, 10, quota) == one      # just enough: the oldest only
+    assert left() == ["door_2026-10-21", "door_2026-10-22"]
+    assert hc.make_room(s, str(tmp_path), T0, 10, quota) == 0        # it fits now: nothing removed
+    other["v"] = 9900
+    with pytest.raises(hc.QuotaStop, match="cannot hold"):
+        hc.make_room(s, str(tmp_path), T0, 500, quota)              # even with every clip gone it does not
+
+
+def test_tc1564_the_cutter_makes_room_before_cutting(tmp_path, monkeypatch):
+    state, seg_dir = str(tmp_path / "state"), str(tmp_path / "segs")
+    settings = hc.ClipsSettings({"CAMERA_DOOR_SEGMENT_DIR": seg_dir})
+    write_segment(seg_dir, T0 / 1000.0 - 60, 1200)
+    ev.append(state, rec(1, "approach", "event", T0))
+    order = []
+    monkeypatch.setattr(hc, "make_room", lambda *a, **k: order.append(("room", a[3])))
+    monkeypatch.setattr(hc, "cut_episode", lambda *a, **k: order.append(("cut",)) or {"status": "cut", "clip": "x"})
+    hc.cut_camera(settings, settings.cameras[0], state, T0 + 60000, quota_fn=lambda: (0, 1))
+    assert [o[0] for o in order] == ["room", "cut"] and order[0][1] > 0
+
+
+def test_tc1553_index_timing_spreads_to_the_next_segment_and_the_cut_is_regenerated_at_that_rate():
+    data = ts_bytes(100, broken=True)
+    idx = hc.scan_frames(data, False)
+    times, mode = hc.frame_times(idx, 1000.0, 10, next_start=1012.5)          # 8 fps in low light
+    assert mode == "index" and times[99] == pytest.approx(1012.375)
+    assert hc.frame_times(idx, 1000.0, 10, next_start=1100.0)[0][99] == pytest.approx(1009.9)  # a restart: nominal
+    slow = hc.Loaded(Seg("door-x.ts", 1000.0), data, 10, next_start=1012.5)
+    plan = hc.plan_window([slow], 1002.0, 1010.0, 10)      # 8 s at 8 fps: 2 s longer than nominal would say
+    assert plan.rate == pytest.approx(8.0) and plan.regenerate
+    assert "setts=ts=N/(8*TB)" in hc.cut_command("door", "/d", "p", plan.rate)
+    assert hc.duration_plausible(plan.frames / 8.0, plan, 10)
+    assert not hc.duration_plausible(plan.frames / 10.0 - 1.1, plan, 10)
+
+
+def test_tc1562_an_encode_whose_replace_never_happened_is_reconciled_by_size(tmp_path, monkeypatch):
+    s, day = encode_setup(tmp_path, monkeypatch)
+    side = json.load(open(os.path.join(day, "c.json")))
+    side.update(bytes=400, sha256="enc", encode={"kept": True, "bytes_copy": 1000, "bytes_encoded": 400,
+                                                  "sha256_copy": "copy"})
+    open(os.path.join(day, "c.json"), "w").write(json.dumps(side))
+    assert hc.reconcile_encodes(str(tmp_path), "door", T0 / 1000.0) == 1
+    side = json.load(open(os.path.join(day, "c.json")))
+    assert side["bytes"] == 1000 and side["sha256"] == "copy" and side["encode"]["kept"] is False
+    assert hc.reconcile_encodes(str(tmp_path), "door", T0 / 1000.0) == 0
+
+
+def test_tc1562_a_kept_encode_records_the_hash_of_the_copy(tmp_path, monkeypatch):
+    s, day = encode_setup(tmp_path, monkeypatch)
+    res = hc.encode_clip(s, "door", day, "c", runner=enc_runner(400), prober=lambda c, d, n: {"frames": 300})
+    assert res["kept"] and res["sha256_copy"] == "x"
+
+
+def test_tc1563_a_dirty_index_is_rebuilt_from_the_sidecars(tmp_path):
+    root = tmp_path / "clips"
+    stem = "door_2026-10-26_10-00-00+0000_approach_9s"
+    clip_files(root, "2026-10-26", stem, 10, T0)
+    (root / "door" / "index.jsonl").write_text(json.dumps({"clip": "2026-01-01/gone.mp4"}) + "\n")  # the clip's line lost
+    hc.mark_index_dirty(str(root / "door"))
+    s = hc.ClipsSettings({})
+    s.root = str(root)
+    hc.apply_retention(s, str(tmp_path / "state"), T0)
+    lines = [json.loads(l) for l in (root / "door" / "index.jsonl").read_text().splitlines()]
+    assert [l["clip"] for l in lines] == ["2026-10-26/%s.mp4" % stem] and lines[0]["event_utc_ms"] == T0 + 3000
+    assert not (root / "door" / hc.INDEX_DIRTY).exists()
+
+
+def test_tc1559_a_clip_already_cut_for_the_episode_is_recorded_not_cut_twice(tmp_path, monkeypatch):
+    settings, cam, seg, root = cut_setup(tmp_path, monkeypatch)
+    ep = hc.build_episodes([rec(1, "approach", "event", T0)], cam.causes, 3000, 5000, 600000)[0][0]
+    plan = hc.plan_window([seg], ep.window[0] / 1000.0, ep.window[1] / 1000.0, 10)
+    first = hc.cut_episode(settings, cam, ep, plan, str(tmp_path), runner=FakeFfmpeg(),
+                           prober=lambda c, d, n: {"frames": plan.frames}, localtime=time.gmtime)
+    again = hc.cut_episode(settings, cam, ep, plan, str(tmp_path), runner=pytest.fail, prober=None,
+                           localtime=time.gmtime)
+    assert again == {"status": "cut", "clip": first["clip"], "recovered": True}
+    assert len(list(root.rglob("*.mp4"))) == 1
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="time.tzset is POSIX only; this runs under Linux/WSL")
+def test_tc1557_the_offset_follows_the_zone_across_the_dst_change(monkeypatch):
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        before = 1793511000000     # 2026-11-01T05:30:00Z = 01:30 EDT
+        after = before + 3600000   # 06:30Z = 01:30 EST, after the clocks went back
+        a = hc.clip_stem("door", before, "approach", 9)[1]
+        b = hc.clip_stem("door", after, "approach", 9)[1]
+        assert a == "door_2026-11-01_01-30-00-0400_approach_9s" and b == "door_2026-11-01_01-30-00-0500_approach_9s"
+        assert hc.stem_utc_ms(a) == before and hc.stem_utc_ms(b) == after
+    finally:
+        monkeypatch.delenv("TZ")
+        time.tzset()

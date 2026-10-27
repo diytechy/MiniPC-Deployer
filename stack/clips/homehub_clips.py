@@ -296,9 +296,15 @@ def scan_frames(data: bytes, part: bool) -> FrameIndex:
     return idx
 
 
-def frame_times(idx: FrameIndex, start: float, fps: int) -> Tuple[List[float], str]:
+def frame_times(idx: FrameIndex, start: float, fps: int,
+                next_start: Optional[float] = None) -> Tuple[List[float], str]:
     """Wall time of each frame: the segment's start plus its PTS offset, or,
-    when the PTS cannot be believed, its index at the nominal rate. PTS is
+    when the PTS cannot be believed, its index spread evenly from this
+    segment's start to the NEXT segment's start (the camera drops its frame
+    rate in low light and infrared, so the nominal rate would drift by seconds
+    over ten minutes) - at the nominal rate only for the open .part, or when the
+    next start implies a rate above nominal or under half of it (a recorder
+    restart lies between them). PTS is
     believed when every frame has one, every step is forward and under 60 s
     (a hole the recorder rode out without ending the segment), and the whole
     span is at least half what the frame count implies and at most twice that
@@ -315,18 +321,27 @@ def frame_times(idx: FrameIndex, start: float, fps: int) -> Tuple[List[float], s
         if n == 1 or (all(0 < s < 60 * 90000 for s in steps) and 0.5 * expected <= span <= 2.0 * expected + 60):
             base = pts[0]
             return [start + ((p - base) % PTS_WRAP) / 90000.0 for p in pts], "pts"  # type: ignore[operator]
-    return [start + i / float(fps) for i in range(n)], "index"
+    period = 1.0 / fps
+    if next_start is not None and n > 1:
+        measured = (next_start - start) / float(n)
+        if 0.95 / fps <= measured <= 2.0 / fps:
+            period = measured
+    return [start + i * period for i in range(n)], "index"
 
 
 class Loaded:
     """One segment, read once into memory and indexed, so a prune or a rename
     by the recorder cannot pull the bytes from under a cut."""
 
-    def __init__(self, seg: Segment, data: bytes, fps: int):
+    def __init__(self, seg: Segment, data: bytes, fps: int, next_start: Optional[float] = None):
         self.seg = seg
         self.data = data
         self.idx = scan_frames(data, seg.part)
-        self.times, self.timing = frame_times(self.idx, seg.start, fps)
+        self.times, self.timing = frame_times(self.idx, seg.start, fps, None if seg.part else next_start)
+        n = len(self.times)
+        # The segment's own frame period: what its frames were actually spaced at.
+        self.period = (self.times[-1] - self.times[0]) / (n - 1) if n > 1 and self.times[-1] > self.times[0] \
+            else 1.0 / fps
 
     def span(self, fps: int) -> Tuple[float, float]:
         if not self.times:
@@ -334,17 +349,20 @@ class Loaded:
         return self.times[0], self.times[-1] + 1.0 / fps
 
 
-def load_segment(seg: Segment, fps: int, cache: Dict[Tuple[str, int], "Loaded"]) -> Optional[Loaded]:
+def load_segment(seg: Segment, fps: int, cache: Dict[tuple, "Loaded"],
+                 next_start: Optional[float] = None) -> Optional[Loaded]:
+    """The segment read and indexed, or None when it cannot be opened (the
+    recorder renamed or pruned it since it was listed)."""
     try:
         with open(seg.path, "rb") as handle:
             size = os.fstat(handle.fileno()).st_size
-            key = (seg.path, size)
+            key = (seg.path, size, next_start)
             if key in cache:
                 return cache[key]
             data = handle.read(size)
     except OSError:
         return None
-    loaded = Loaded(seg, data, fps)
+    loaded = Loaded(seg, data, fps, next_start)
     cache[key] = loaded
     return loaded
 
@@ -420,6 +438,7 @@ class Plan:
         self.end_covered = False
         self.start_covered = False
         self.gaps: List[Dict[str, object]] = []
+        self.rate = 0.0  # frames per second the chosen frames were recorded at
 
     @property
     def coverage(self) -> str:
@@ -467,13 +486,14 @@ def plan_window(loaded: Sequence[Loaded], ws: float, we: float, fps: int) -> Opt
         return None
     fps_period = 1.0 / fps
     plan.frames = last - first + 1
-    plan.actual = (flat[first][2], flat[last][2] + fps_period)
+    plan.actual = (flat[first][2], flat[last][2] + loaded[flat[last][0]].period)
     if plan.end_covered and flat[last + 1][2] - plan.actual[1] > GAP_SEC and we - plan.actual[1] > fps_period:
         # The recording passes the window's end only after a hole (a recorder
         # restart): waiting cannot fill it, and the clip must not claim it.
         plan.gaps.append({"after_utc_ms": int(plan.actual[1] * 1000),
                           "seconds": round(we - plan.actual[1], 1)})
     # Group the chosen frames by segment into byte ranges.
+    recorded = 0.0
     pos = first
     previous: Optional[Loaded] = None
     while pos <= last:
@@ -488,11 +508,12 @@ def plan_window(loaded: Sequence[Loaded], ws: float, we: float, fps: int) -> Opt
         byte_from = 0 if fi == 0 else seg.idx.offsets[fi]
         byte_to = seg.idx.offsets[lfi + 1] if lfi + 1 < len(seg.idx.offsets) else seg.idx.end
         plan.pieces.append((seg, byte_from, byte_to, byte_from > 0))
+        recorded += seg.times[lfi] - seg.times[fi] + seg.period
         if seg.timing != "pts":
             plan.timing = "index"
             plan.regenerate = True
         if previous is not None:
-            prev_end = previous.times[-1] + fps_period
+            prev_end = previous.times[-1] + previous.period
             gap = seg.times[0] - prev_end
             if gap > GAP_SEC:
                 plan.gaps.append({"after_utc_ms": int(prev_end * 1000), "seconds": round(gap, 1)})
@@ -503,6 +524,9 @@ def plan_window(loaded: Sequence[Loaded], ws: float, we: float, fps: int) -> Opt
                 plan.regenerate = True
         previous = seg
         pos = end_pos + 1
+    # The rate the clip's timestamps are regenerated at: what the camera
+    # actually delivered over these frames, not the nominal rate.
+    plan.rate = plan.frames / recorded if recorded > 0 else float(fps)
     return plan
 
 
@@ -630,15 +654,16 @@ def docker_base(name: str, out_dir: str, read_only_out: bool = False, shares: in
     return argv
 
 
-def cut_command(camera: str, out_dir: str, part_name: str, regenerate_fps: Optional[int]) -> List[str]:
+def cut_command(camera: str, out_dir: str, part_name: str, regenerate_fps: Optional[float]) -> List[str]:
     """ffmpeg reading MPEG-TS on stdin, stream copy to MP4 (+faststart). With
-    regenerate_fps the video timestamps are rewritten N/fps (the setts filter:
-    still no re-encode). Implements: LLR-1371."""
+    regenerate_fps the video timestamps are rewritten N/rate, at the rate the
+    frames were recorded at (the setts filter: still no re-encode).
+    Implements: LLR-1371."""
     argv = docker_base("homehub-clips-cut-%s" % camera, out_dir, stdin=True) + [
         "--entrypoint", "ffmpeg", door_relay.image_ref(), "-hide_banner", "-loglevel", "error",
         "-f", "mpegts", "-i", "pipe:0", "-map", "0:v:0", "-c", "copy", "-an"]
     if regenerate_fps:
-        argv += ["-bsf:v", "setts=ts=N/(%d*TB)" % regenerate_fps]
+        argv += ["-bsf:v", "setts=ts=N/(%s*TB)" % format(round(regenerate_fps, 4), "g")]
     return argv + ["-movflags", "+faststart", "-f", "mp4", "-y", "/out/" + part_name]
 
 
@@ -762,10 +787,16 @@ def cut_episode(settings: ClipsSettings, cam: CameraSettings, ep: Episode, plan:
     n = 1
     base = stem
     while os.path.exists(os.path.join(day_dir, stem + ".mp4")) or os.path.exists(os.path.join(day_dir, stem + ".json")):
+        # A pass killed after the rename but before its ledger save left this
+        # episode's clip already here: it is recorded, not cut a second time.
+        side = mc.load_json(os.path.join(day_dir, stem + ".json"), {})
+        if side.get("episode") == ep.id and os.path.exists(os.path.join(day_dir, stem + ".mp4")):
+            mc.log("clips [%s]: %s/%s.mp4 already holds %s - recorded, not cut again" % (cam.camera, day, stem, ep.id))
+            return {"status": "cut", "clip": "%s/%s.mp4" % (day, stem), "recovered": True}
         n += 1
         stem = "%s-%d" % (base, n)
     part = stem + ".mp4.part"
-    argv = cut_command(cam.camera, day_dir, part, cam.fps if plan.regenerate else None)
+    argv = cut_command(cam.camera, day_dir, part, (plan.rate or cam.fps) if plan.regenerate else None)
     docker_remove("homehub-clips-cut-%s" % cam.camera)
     # stderr into a file, not a pipe: an ffmpeg complaining at length about a
     # damaged segment must not block on a full pipe while we block feeding it.
@@ -849,10 +880,10 @@ def cut_episode(settings: ClipsSettings, cam: CameraSettings, ep: Episode, plan:
 
 
 def duration_plausible(duration: float, plan: Plan, fps: int) -> bool:
-    """The MP4's duration agrees with its frames: within 1 s of frames / fps
+    """The MP4's duration agrees with its frames: within 1 s of frames / rate
     when the timestamps were regenerated, and never under half of it (a cut of
     broken-PTS frames whose timestamps were NOT restored plays in an instant)."""
-    expected = plan.frames / float(fps)
+    expected = plan.frames / float(plan.rate or fps)
     if duration < 0.5 * expected:
         return False
     return not plan.regenerate or abs(duration - expected) <= 1.0
@@ -907,15 +938,20 @@ def mark_index_dirty(cam_dir: str) -> None:
 
 
 def cut_camera(settings: ClipsSettings, cam: CameraSettings, state_dir: str, now_ms: int,
-               runner=subprocess.Popen, prober=run_probe, alert=None) -> Dict[str, int]:
+               runner=subprocess.Popen, prober=run_probe, alert=None,
+               quota_fn: Optional[Callable[[], Tuple[Optional[int], Optional[int]]]] = None) -> Dict[str, int]:
     """One camera's pass: build episodes from the store, cut what is ready,
-    record what is lost. Returns counts. Implements: LLR-1371, LLR-1373."""
+    record what is lost. The segments are listed again for every episode (a
+    pass can run long behind a backlog while the recorder rotates and prunes),
+    and a listed segment that can no longer be opened makes the episode WAIT
+    for the next pass, never lost or partial. Before each cut, room for it is
+    made by the retention rules (make_room). Returns counts.
+    Implements: LLR-1371, LLR-1373."""
     ledger = load_ledger(state_dir, cam.camera, now_ms)
     records, rejected = ev.read(state_dir, cam.camera, cam.sources, now_ms - LOOKBACK_MS)
     episodes, _orphans = build_episodes(records, cam.causes, cam.pre_ms, cam.lease_ms, cam.max_ms)
-    segs = list_segments(cam.segment_dir, cam.camera)
-    oldest = segs[0].start if segs else None
-    cache: Dict[Tuple[str, int], Loaded] = {}
+    quota_fn = quota_fn or (lambda: clips_quota(settings))
+    cache: Dict[tuple, Loaded] = {}
     counts = {"cut": 0, "lost": 0, "failed": 0, "waiting": 0, "rejected_records": rejected}
     lost_new: List[str] = []
     try:
@@ -924,14 +960,22 @@ def cut_camera(settings: ClipsSettings, cam: CameraSettings, state_dir: str, now
                 continue
             ws, we = ep.window
             plan = None
+            segs = list_segments(cam.segment_dir, cam.camera) if now_ms >= we + SETTLE_MS else []
+            oldest = segs[0].start if segs else None
             if now_ms >= we + SETTLE_MS:
-                needed = [s for i, s in enumerate(segs)
+                needed = [(s, segs[i + 1].start if i + 1 < len(segs) else None) for i, s in enumerate(segs)
                           if s.start * 1000 < we and (i + 1 == len(segs) or segs[i + 1].start * 1000 > ws - 2000)]
                 # Only this episode's segments stay in memory (each is ~50 MB).
-                keep = {s.path for s in needed}
+                keep = {s.path for s, _n in needed}
                 for key in [k for k in cache if k[0] not in keep]:
                     del cache[key]
-                loaded = [x for x in (load_segment(s, cam.fps, cache) for s in needed) if x and x.times]
+                got = [(s, load_segment(s, cam.fps, cache, nxt)) for s, nxt in needed]
+                if any(x is None for _s, x in got):
+                    # Renamed (.part -> .ts) or pruned since it was listed: the
+                    # next pass lists the tree as it is then.
+                    counts["waiting"] += 1
+                    continue
+                loaded = [x for _s, x in got if x is not None and x.times]
                 plan = plan_window(loaded, ws / 1000.0, we / 1000.0, cam.fps) if loaded else None
             state = readiness(now_ms, ep, plan, oldest)
             entry: Dict[str, object] = {"start_ms": ws, "event_ms": ep.start_ms, "end_ms": we, "at_ms": now_ms,
@@ -948,6 +992,7 @@ def cut_camera(settings: ClipsSettings, cam: CameraSettings, state_dir: str, now
                     lost_new.append(when)
                 mc.log("clips [%s]: %s at %s LOST - %s" % (cam.camera, ep.cause, when, entry["why"]), warning=True)
                 continue
+            make_room(settings, state_dir, now_ms, planned_bytes(plan), quota_fn)  # type: ignore[arg-type]
             result = cut_episode(settings, cam, ep, plan, state_dir, runner, prober)  # type: ignore[arg-type]
             retries = ledger.setdefault("retries", {})  # type: ignore[union-attr]
             attempts = int(retries.pop(ep.id, 0)) + 1  # type: ignore[union-attr]
@@ -972,6 +1017,34 @@ def cut_camera(settings: ClipsSettings, cam: CameraSettings, state_dir: str, now
 
 
 # ── the encode batch ─────────────────────────────────────────────────────────
+
+
+def reconcile_encodes(root: str, camera: str, now: Optional[float] = None) -> int:
+    """A sidecar written for an encode whose replace never happened (killed
+    between the two) still describes the encoded file while the copy is on
+    disk: found by size, it is put back to the copy's bytes and hash and the
+    encode recorded as not kept. Returns how many were reconciled."""
+    fixed = 0
+    cam_dir = os.path.join(root, camera)
+    since = time.strftime("%Y-%m-%d", time.localtime((now or time.time()) - ENCODE_LOOKBACK_DAYS * 86400))
+    for day in sorted(d for d in _days(cam_dir) if d >= since):
+        day_dir = os.path.join(cam_dir, day)
+        for name in sorted(_listdir(day_dir)):
+            if not name.endswith(".json"):
+                continue
+            side_path = os.path.join(day_dir, name)
+            side = mc.load_json(side_path, {})
+            enc = side.get("encode") if isinstance(side.get("encode"), dict) else None
+            try:
+                size = os.path.getsize(side_path[:-5] + ".mp4")
+            except OSError:
+                continue
+            if enc and enc.get("kept") and size != side.get("bytes") and size == enc.get("bytes_copy"):
+                side["bytes"], side["sha256"] = size, enc.get("sha256_copy")
+                enc.update(kept=False, failed="the encoded file never replaced the copy")
+                write_json_atomic(side_path, side)
+                fixed += 1
+    return fixed
 
 
 def encode_candidates(root: str, camera: str, now: Optional[float] = None) -> List[Tuple[str, str]]:
@@ -1009,7 +1082,8 @@ def _days(cam_dir: str) -> List[str]:
 
 
 def encode_clip(settings: ClipsSettings, camera: str, day_dir: str, stem: str,
-                runner=subprocess.run, prober=run_probe) -> Dict[str, object]:
+                runner=subprocess.run, prober=run_probe,
+                quota_fn: Optional[Callable[[], Tuple[Optional[int], Optional[int]]]] = None) -> Dict[str, object]:
     """Encode one clip; replace the copy only when verified and small enough.
     The sidecar's `encode` records the outcome either way, so a clip is tried
     once. Raises QuotaStop / GuardStop. Implements: LLR-1374, LLR-1375."""
@@ -1018,6 +1092,8 @@ def encode_clip(settings: ClipsSettings, camera: str, day_dir: str, stem: str,
         raise GuardStop(reason)
     src = os.path.join(day_dir, stem + ".mp4")
     side_path = os.path.join(day_dir, stem + ".json")
+    if quota_fn is not None:  # the encoded file is written beside the copy
+        make_room(settings, "", int(time.time() * 1000), os.path.getsize(src), quota_fn)
     side = mc.load_json(side_path, {})
     part = stem + ".enc.mp4.part"
     part_path = os.path.join(day_dir, part)
@@ -1059,6 +1135,9 @@ def encode_clip(settings: ClipsSettings, camera: str, day_dir: str, stem: str,
         replace = after * 100 <= before * settings.keep_pct
         result["kept"] = replace
         if replace:
+            # The copy's identity stays in the record: if the replace below
+            # never happens, reconcile_encodes finds the copy by its size.
+            result["sha256_copy"] = side.get("sha256")
             side["bytes"] = after
             side["sha256"] = sha256_file(part_path)
     side["encode"] = result
@@ -1196,6 +1275,13 @@ def apply_retention(settings: ClipsSettings, state_dir: str, now_ms: int,
     stale = 0
     for camera in cameras:
         cam_dir = os.path.join(settings.root, camera)
+        if os.path.exists(os.path.join(cam_dir, INDEX_DIRTY)):
+            # A pass was killed while this index was out of date: rebuild it.
+            ok, reason = guard(settings)
+            if not ok:
+                raise GuardStop(reason)
+            if rebuild_index(cam_dir):
+                _remove(os.path.join(cam_dir, INDEX_DIRTY))
         for day in _days(cam_dir):
             day_dir = os.path.join(cam_dir, day)
             for name in _listdir(day_dir):
@@ -1214,19 +1300,7 @@ def apply_retention(settings: ClipsSettings, state_dir: str, now_ms: int,
     clips = list_clips(settings.root, cameras)
     doomed = retention_plan(clips, now_ms, settings.retention_days, settings.cap_mib * MIB,
                             used, limit, settings.quota_high_pct)
-    if doomed:
-        ok, reason = guard(settings)  # the scan took a while: is this still the clips area?
-        if not ok:
-            raise GuardStop(reason)
-    gone = set()
-    for camera in {os.path.basename(os.path.dirname(c[1])) for c in doomed}:
-        mark_index_dirty(os.path.join(settings.root, camera))
-    for _start, day_dir, stem, _size in doomed:
-        if _remove(os.path.join(day_dir, stem + ".mp4")):
-            _remove(os.path.join(day_dir, stem + ".json"))
-            gone.add((os.path.basename(os.path.dirname(day_dir)), "%s/%s.mp4" % (os.path.basename(day_dir), stem)))
-        else:
-            mc.log("clips: could not remove %s/%s.mp4 - its index line stays" % (day_dir, stem), warning=True)
+    remove_clips(settings, doomed)
     for camera in cameras:
         cam_dir = os.path.join(settings.root, camera)
         for day in _days(cam_dir):
@@ -1234,20 +1308,123 @@ def apply_retention(settings: ClipsSettings, state_dir: str, now_ms: int,
                 os.rmdir(os.path.join(cam_dir, day))  # only when empty
             except OSError:
                 pass
-        # Rewritten after deletions, and on any later pass while a pass that
-        # deleted was killed before it got here (the dirty marker).
-        if any(c == camera for c, _clip in gone) or os.path.exists(os.path.join(cam_dir, INDEX_DIRTY)):
-            ok, reason = guard(settings)  # the deletions took a while: the index is a write
-            if not ok:
-                raise GuardStop(reason)
-            if rewrite_index(os.path.join(cam_dir, "index.jsonl"), {clip for c, clip in gone if c == camera}):
-                _remove(os.path.join(cam_dir, INDEX_DIRTY))
     events_removed = ev.prune_days(state_dir, sorted(set(cameras) | {c.camera for c in settings.cameras}),
                                    settings.event_days, now_ms / 1000.0)
     if doomed:
         mc.log("clips: retention removed %d clip(s), %.1f MiB" % (len(doomed), sum(c[3] for c in doomed) / MIB))
     return {"removed": len(doomed), "removed_mib": round(sum(c[3] for c in doomed) / MIB, 1),
             "stale_parts": stale, "event_days_removed": len(events_removed), "kept": len(clips) - len(doomed)}
+
+
+def planned_bytes(plan: Plan) -> int:
+    """What a cut will write: its TS bytes plus the MP4's own tables (a few
+    percent) and the sidecar."""
+    raw = sum(b - a + (len(seg.idx.header) if h else 0) for seg, a, b, h in plan.pieces)
+    return int(raw * 1.05) + 64 * 1024
+
+
+def remove_clips(settings: ClipsSettings, doomed: Sequence[Tuple[int, str, str, int]]) -> Tuple[set, int]:
+    """Delete clips (mp4, then its sidecar) with the guard asked first and the
+    camera's index marked dirty while it is out of date; empty day folders go;
+    the index is rewritten without them. Returns (gone, bytes freed)."""
+    if not doomed:
+        return set(), 0
+    ok, reason = guard(settings)
+    if not ok:
+        raise GuardStop(reason)
+    gone = set()
+    freed = 0
+    cameras = {os.path.basename(os.path.dirname(c[1])) for c in doomed}
+    for camera in cameras:
+        mark_index_dirty(os.path.join(settings.root, camera))
+    for _start, day_dir, stem, size in doomed:
+        if _remove(os.path.join(day_dir, stem + ".mp4")):
+            _remove(os.path.join(day_dir, stem + ".json"))
+            gone.add((os.path.basename(os.path.dirname(day_dir)), "%s/%s.mp4" % (os.path.basename(day_dir), stem)))
+            freed += size
+            try:
+                os.rmdir(day_dir)  # only when empty
+            except OSError:
+                pass
+        else:
+            mc.log("clips: could not remove %s/%s.mp4 - its index line stays" % (day_dir, stem), warning=True)
+    for camera in cameras:
+        cam_dir = os.path.join(settings.root, camera)
+        ok, reason = guard(settings)  # the deletions took a while: the index is a write
+        if not ok:
+            raise GuardStop(reason)
+        if rewrite_index(os.path.join(cam_dir, "index.jsonl"), {clip for c, clip in gone if c == camera}):
+            _remove(os.path.join(cam_dir, INDEX_DIRTY))
+    return gone, freed
+
+
+def make_room(settings: ClipsSettings, state_dir: str, now_ms: int, need: int,
+              quota_fn: Callable[[], Tuple[Optional[int], Optional[int]]]) -> int:
+    """Before a write of `need` bytes: when the clips project would pass
+    CLIPS_QUOTA_HIGH_PCT, remove clips by the retention rules first - those
+    past their age or the cap, then the oldest - until it fits. On the 1 GiB
+    scratch area this, not the hourly retention, is the normal cycle; a full
+    quota stays an alert only when retention cannot free enough (QuotaStop).
+    Returns the bytes freed. Implements: LLR-1377."""
+    used, limit = quota_fn()
+    if not limit or used is None:
+        return 0
+    ceiling = limit * settings.quota_high_pct // 100
+    if used + need <= ceiling:
+        return 0
+    clips = list_clips(settings.root)
+    rules = retention_plan(clips, now_ms, settings.retention_days, settings.cap_mib * MIB)
+    doomed = list(rules)
+    projected = used + need - sum(c[3] for c in doomed)
+    chosen = {id(c) for c in doomed}
+    for c in clips:  # oldest first
+        if projected <= ceiling:
+            break
+        if id(c) not in chosen:
+            doomed.append(c)
+            projected -= c[3]
+    _gone, freed = remove_clips(settings, doomed)
+    mc.log("clips: made room for %.1f MiB: removed %d clip(s), %.1f MiB" % (need / MIB, len(_gone), freed / MIB))
+    if used + need - freed > limit:
+        raise QuotaStop("the clips area (%d MiB) cannot hold %.1f MiB more even after removing %d older clip(s)"
+                        % (limit // MIB, need / MIB, len(_gone)))
+    return freed
+
+
+def index_line_from_sidecar(day: str, stem: str, side: Dict[str, object]) -> Optional[Dict[str, object]]:
+    actual = side.get("actual") if isinstance(side.get("actual"), dict) else {}
+    events = side.get("events") if isinstance(side.get("events"), list) else []
+    start, end = actual.get("start_utc_ms"), actual.get("end_utc_ms")  # type: ignore[union-attr]
+    if side.get("v") != 1 or not isinstance(start, int) or not isinstance(end, int):
+        return None
+    first = events[0].get("utc_ms") if events and isinstance(events[0], dict) else None
+    return {"v": 1, "clip": "%s/%s.mp4" % (day, stem), "camera": side.get("camera"), "cause": side.get("cause"),
+            "event_utc_ms": first if isinstance(first, int) else start, "start_utc_ms": start,
+            "end_utc_ms": end, "seconds": round((end - start) / 1000.0, 1), "coverage": side.get("coverage")}
+
+
+def rebuild_index(cam_dir: str) -> bool:
+    """The index made again from the sidecars of the clips that exist, oldest
+    first: the repair for a pass killed while the index was marked dirty
+    (lines lost as well as lines left behind)."""
+    path = os.path.join(cam_dir, "index.jsonl")
+    tmp = path + ".part"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+            for day in sorted(_days(cam_dir)):
+                day_dir = os.path.join(cam_dir, day)
+                for name in sorted(_listdir(day_dir)):
+                    if not name.endswith(".json") or not os.path.exists(os.path.join(day_dir, name[:-5] + ".mp4")):
+                        continue
+                    line = index_line_from_sidecar(day, name[:-5], mc.load_json(os.path.join(day_dir, name), {}))
+                    if line:
+                        handle.write(json.dumps(line, sort_keys=True, separators=(",", ":")) + "\n")
+        os.replace(tmp, path)
+        return True
+    except OSError as exc:
+        _remove(tmp)
+        mc.log("clips: could not rebuild %s: %s" % (path, exc), warning=True)
+        return False
 
 
 def rewrite_index(path: str, gone: set) -> bool:
@@ -1439,12 +1616,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 for cam in settings.cameras:
                     if spent():
                         break
+                    reconcile_encodes(settings.root, cam.camera)
                     for day_dir, stem in encode_candidates(settings.root, cam.camera):
                         # Bounded in count AND time: the batch shares the pipeline lock
                         # with the cut, which must not wait long behind it.
                         if spent():
                             break
-                        encode_clip(settings, cam.camera, day_dir, stem)
+                        encode_clip(settings, cam.camera, day_dir, stem, quota_fn=lambda: clips_quota(settings))
                         done += 1
                 return 0
         except QuotaStop as exc:

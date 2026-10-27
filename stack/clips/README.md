@@ -40,7 +40,7 @@ camera ──1 conn── go2rtc relay ──┬── recorder ── /srv/scra
 | Piece | Where | Switch | Runs |
 |---|---|---|---|
 | detector, one per camera | `../camera-motion/camera_motion.py run`, `homehub-camera-motion@<cam>.service` | `CAMERA_<CAM>_MOTION_ENABLED` (**false**) | always, while on |
-| the engine | `../camera-motion/motion_engine.py` = OfficeWallNaglight `doorstream/motion.py` byte for byte (`motion-engine.pin`) | — | inside the detector |
+| the engine | `../camera-motion/motion_engine.py` = OfficeWallNaglight `doorstream/motion.py`, comments removed, code unchanged (`motion-engine.pin`) | — | inside the detector |
 | event store | `clip_events.py` → `/var/lib/homehub-clips/events/<cam>/<source>-<UTC day>.jsonl` | — | — |
 | cut | `homehub_clips.py cut`, `homehub-clips-cut.timer` | `CLIPS_ENABLED` (**false**) | every minute after the last run |
 | re-encode | `homehub_clips.py encode`, `homehub-clips-encode.timer` | `CLIPS_ENCODE_ENABLED` (**false**) | every 15 min, Nice 19, idle I/O, container `--cpu-shares 2` |
@@ -55,8 +55,11 @@ camera's knob is true and it is missing (the image carries it in
 ## The detector
 
 * **One engine.** `motion_engine.py` is the panel's replay-validated engine at
-  the commit and sha256 in `motion-engine.pin`; the run refuses (exit 78, an
-  alert, no restart loop) if the file is anything else. It is fed exactly what
+  the commit in `motion-engine.pin`, with the source's comments removed (they
+  record dated observations of a household, and this repository is public;
+  the Owner, 2026-10-27) and its code unchanged: TC-1543 compares the syntax
+  trees with the panel's file at that commit. The run refuses (exit 78, an
+  alert, no restart loop) if the file's sha256 is not the pin's. It is fed exactly what
   the panel feeds it: the RAW fisheye from the relay through
   `fps=5,scale=256:256:flags=area,format=gray` (the test compares the string with
   the panel's `motion_filter`), on the `time.monotonic()` arrival clock, on the
@@ -103,11 +106,17 @@ The window is `CAMERA_<C>_CLIP_PRE_SEC` (3 s) before the first event to its end.
 (or 3 minutes went by), copy-only: from the last keyframe at or before the window
 start (the camera sends one a second, so up to 1 s more pre-roll) to before the
 first frame at or after its end. Frames are timed by the segment's name plus PTS
-- or by index at `CAMERA_<C>_FPS` when the camera sent broken PTS (measured:
-2026-10-26 12:00Z, a 10-minute segment spanning 0.07 s of PTS). The bytes go to
+- or, when the camera sent broken PTS (measured: a 10-minute segment spanning
+0.07 s of PTS), by index, spread evenly from the segment's start to the NEXT
+segment's start (the camera slows down in low light and infrared; the nominal
+`CAMERA_<C>_FPS` is used only for the open `.part`). The segments are listed
+again for every episode, and a segment that was listed but can no longer be
+opened (rotated, pruned) makes the episode wait for the next pass - never lost,
+never partial. The bytes go to
 ffmpeg in the relay's pinned image (no network, read-only, no capabilities),
 `-c copy`, MP4 `+faststart`, as `.mp4.part`; timestamps are regenerated only for
-index timing or a recorder restart inside the window; ffprobe must count exactly
+index timing or a recorder restart inside the window, at the rate the frames
+were actually recorded at (frames over their span, not the nominal rate); ffprobe must count exactly
 the planned frames before the rename. Measured on the dev PC on five real
 segments: clips of 11.5-29.4 s at 10 fps, frame counts as planned, no decode
 error, the broken-PTS one included.
@@ -119,6 +128,16 @@ record, requested and actual windows, segments, timing, coverage, gaps, frames,
 bytes, sha256, cutter version, the encode result), one line per clip in
 `<root>/door/index.jsonl`.
 
+**Room before every cut**: when the clips project would pass
+`CLIPS_QUOTA_HIGH_PCT`, the cutter first removes clips by the retention rules -
+past their age or the cap, then the oldest - until the cut fits. On the 1 GiB
+scratch area this, not the hourly retention, is the normal cycle; the quota stop
+and its alert remain only for a cut that cannot fit even then. The encode makes
+room for its copy-sized output the same way.
+
+**No duplicates**: a pass killed after a clip's rename but before its ledger
+entry finds the clip by its sidecar's episode next time and records it.
+
 **Loss**: a window the recording no longer covers (pruned) or never did (the
 recorder was down) is recorded `lost` and alerted (`clips-lost-<cam>`, at most
 daily). A failed cut is retried on the next two runs, then recorded `failed`.
@@ -127,7 +146,9 @@ daily). A failed cut is retried on the next two runs, then recorded `failed`.
 peak of twice that; the encoded file replaces the copy only when its frame count
 matches and it is at most `CLIPS_ENCODE_KEEP_PCT` (80 %) of the copy; otherwise
 the copy stays. A batch looks at the last 7 days of clips and starts no new
-encode after 10 minutes (it shares one lock with the cut). Measured on the hub 2026-10-27, a 30 s daytime window with
+encode after 10 minutes (it shares one lock with the cut). The sidecar keeps the
+copy's sha256 beside the encoded file's; an encode killed between writing its
+record and replacing the file is found by size on the next batch and put back. Measured on the hub 2026-10-27, a 30 s daytime window with
 movement: copy 2.31 MB, VBR 300 kb/s 1.09 MB, 450 kb/s 1.68 MB (both judged
 visually close to the copy at full size); constant QP 30 was 3.4 MB - larger
 than the copy, because the camera's daylight stream is already lean. A night
@@ -138,7 +159,14 @@ minute of video.
 `CLIPS_CAP_MIB` (95367 MiB = 100 GB), then oldest first while the clips quota
 project is past `CLIPS_QUOTA_HIGH_PCT` (90 %), down to 5 points under. On the
 1 GiB scratch area the quota rule is the one that acts. Every camera folder
-under the root counts, configured or not; stale `.part` files go first.
+under the root counts, configured or not; stale `.part` files go first. A pass
+killed while it was deleting leaves `.index-dirty`; the next pass rebuilds that
+camera's `index.jsonl` from the sidecars.
+
+**Switching `CLIPS_ROOT` strands the old area.** Retention, status and the
+encode look only at the current root, so the clips already in the old one no
+longer age out or count. At the switch, move them into the new root's camera
+folders (keeping the day folders and sidecars together), or delete them.
 
 **Where**: `CLIPS_ROOT=/srv/scratch/clips` - the scratch volume's `clips`
 project 7104, 1 GiB (`HOMEHUB_SCRATCH_QUOTA_CLIPS_MIB`), behind the scratch guard
@@ -151,10 +179,12 @@ identity check comes with the drive (C111). A quota hit stops cut and encode
 
 ## Tests
 
-* `tests/test_hub_clips.py` (TC-1541, 1542, 1551-1566, 1568; TC-1569 with
-  `HOMEHUB_CLIPS_SEGMENTS=<a door segment tree>` on a Linux docker host).
+* `tests/test_hub_clips.py` (TC-1541, 1542, 1551-1566, 1568). TC-1569 runs
+  only on Linux with docker (WSL on the dev PC), with
+  `HOMEHUB_CLIPS_SEGMENTS=<a door segment tree>` and `-m release`; the DST
+  check of TC-1557 needs `time.tzset` (POSIX) and is skipped on Windows.
 * `tests/test_camera_motion.py` (TC-1543-1550, 1567): the real engine on
-  synthetic frames; the panel's filter and the pinned bytes against the sibling
+  synthetic frames; the panel's filter and the engine's code against the sibling
   OfficeWallNaglight checkout; no private zone in this repository.
 * `../scratch/tests/scratch-fs.root-test.sh` check 7: `clips` stops at its quota.
 

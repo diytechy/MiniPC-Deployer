@@ -447,9 +447,9 @@ SOURCE_MOUNT="$(mount_of "$FB_SOURCE")"
 [ "$SOURCE_MOUNT" = "$FB_SOURCE" ] \
     || refuse "the library source $FB_SOURCE is not a mountpoint of its own — it resolves to '${SOURCE_MOUNT:-?}'." \
               "That means the library drive is not mounted and $FB_SOURCE is an empty directory on that filesystem." \
-              "A backup of it would be a backup of nothing. The bounded FileBackup engine only WARNS on an empty" \
-              "source (it moves the whole latest state into a snapshot, and back on the next good run), so this" \
-              "refusal is now the only thing that stops an unmounted library becoming tonight's latest state."
+              "A backup of it would be a backup of nothing. FileBackup itself stops with exit 4 when the source is" \
+              "empty at the start of a run while the latest state holds rows (its call C39), leaving the latest state" \
+              "as it was; this refusal answers first, before the drive spins up or a container starts, and names the cause."
 preflight_mount "$FB_SOURCE" library
 
 BACKUP_MOUNT="$(mount_of "$FB_STORE")"
@@ -724,6 +724,19 @@ count_snapshots() {
     find "$FB_CHANGES" -mindepth 1 -maxdepth 1 -type d -name 'Snapshot_*' 2>/dev/null | grep -c . || true
 }
 
+# set_log_count TEXT : how many lines of the set log carry TEXT (a fixed
+# string). FileBackup starts backup.log afresh in every run that takes its lock,
+# so after a completed run the file holds that run alone. An absent or
+# unreadable log counts 0: the message then says less, and the exit code is
+# unchanged. `|| true` because grep -c exits 1 on no match and errtrace would
+# fire the ERR trap inside the substitution.
+set_log_count() {
+    local log="$FB_CHANGES/backup.log" n=""
+    [ -r "$log" ] && n="$(grep -cF -- "$1" "$log" 2>/dev/null || true)"
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    printf '%s' "$n"
+}
+
 # log_slice_peak WHEN — the backup's exact memory peak (hub recovery C4).
 # The filebackup service runs under homehub-filebackup.slice (compose
 # cgroup_parent), and the SLICE's cgroup outlives each `--rm` container, so its
@@ -774,12 +787,23 @@ _total="$(df_field "$FB_BACKUP" 2)"; _used="$(df_field "$FB_BACKUP" 3)"; _avail=
 # exists to close. The set log ($FB_CHANGES/backup.log) names every file.
 #
 #   0  every file captured                       -> on to the verify gate
-#   1  the run COMPLETED, some files were not    -> on to the verify gate, then
-#      captured; what is stored is safe             FAIL: not a verified success
+#   1  the run COMPLETED, but some files were    -> on to the verify gate, then
+#      not captured (in use, unreadable, or an      FAIL: not a verified success
+#      unportable name, which since FileBackup
+#      C42 includes paths differing only in
+#      letter case), and/or a stored object was
+#      found DAMAGED by its listing and set aside
+#      into changes/Verify/ (C37; [DamagedObject]
+#      lines in the set log, counted below)
 #   2  refused before changing anything; a       -> FAIL now, "do not retry"
-#      person must fix it
+#      person must fix it (since the 2026-10-26
+#      review this includes a required dependency
+#      that cannot be loaded, once an unhandled 1)
 #   4  stopped by a host problem, or FileBackup's -> FAIL now, "retry later" (the
-#      own lock is held                             next timer run is the retry)
+#      own lock is held, or (C39) the source was    next timer run is the retry)
+#      EMPTY at the start while the latest state
+#      holds rows - an unmounted library looks
+#      exactly like that
 #
 # ONLY 0 IS A VERIFIED SUCCESS (the Owner's lane, SR-018). An exit 1 is "partial,
 # no data lost", but a file that was never captured is a file the lane would
@@ -790,18 +814,34 @@ _total="$(df_field "$FB_BACKUP" 2)"; _used="$(df_field "$FB_BACKUP" 3)"; _avail=
 #
 # A backup never returns 3 any more: the manifest witness is gone. A 3 here
 # means an image OLDER than the one this file is written for.
+#
+# THE ONE THING READ OUT OF THE SET LOG is the count of [DamagedObject] lines,
+# and only after an exit 1. It is the difference between "a file was in use"
+# and "the store itself lost bytes" (FileBackup C37: an object a power cut left
+# empty or the wrong length), which the message must not blur: the first is
+# routine, the second means a snapshot may no longer restore that file. Any
+# other detail stays in the log, named, rather than parsed here.
 BACKUP_PARTIAL=0
+DAMAGED_SET_ASIDE=0
 case "$BACKUP_RC" in
     0) log "container: backup COMPLETE (exit 0) — every file captured; snapshot created: $SNAPSHOT_MADE, drive $FILL_PCT full" ;;
     1) BACKUP_PARTIAL=1
-       log "container: backup COMPLETED WITH FILES NOT CAPTURED (exit 1) — snapshot created: $SNAPSHOT_MADE, drive $FILL_PCT full."
-       log "  Every file it could read is stored and nothing already stored was lost; each file it could not"
-       log "  capture kept its previous row and is named in $FB_CHANGES/backup.log. Not a verified success." ;;
-    2) FAIL_NOTE="FileBackup REFUSED the run before changing anything (exit 2) — a person must fix it; retrying will not help. The causes are: $FB_CONFIG cannot be loaded or violates the closed schema (FileBackup's container/FileBackup.schema.json), a missing tool, the source root missing, backup/ and changes/ not on one mount (the rename test failed), or a latest manifest that cannot be read (move $FB_BACKUP/MANIFEST.csv aside to rebuild the latest state from the source; the snapshots are untouched). The reason is in $FB_CHANGES/backup.log and $FB_LOGS/Backup_Global.log"
+       DAMAGED_SET_ASIDE="$(set_log_count '[DamagedObject]')"
+       log "container: backup COMPLETED, NOT A FULL SUCCESS (exit 1) — snapshot created: $SNAPSHOT_MADE, drive $FILL_PCT full."
+       log "  Each file it could not capture kept its previous row and is named in $FB_CHANGES/backup.log: a file in"
+       log "  use or unreadable, or a name Windows or Linux cannot restore (paths differing only in letter case count)."
+       if [ "$DAMAGED_SET_ASIDE" -gt 0 ]; then
+           log "  AND $DAMAGED_SET_ASIDE STORED OBJECT(S) WERE FOUND DAMAGED ([DamagedObject] in that log): empty, or a raw"
+           log "  object of the wrong length, as a power cut can leave one. Each was moved into $FB_CHANGES/Verify/"
+           log "  (never deleted, never reused). Its content is stored again only while a source file still holds it,"
+           log "  so a snapshot that needed it may no longer restore that file. README \"Damaged objects\"."
+       fi
+       log "  Not a verified success." ;;
+    2) FAIL_NOTE="FileBackup REFUSED the run before changing anything (exit 2) — a person must fix it; retrying will not help. The causes are: $FB_CONFIG cannot be loaded or violates the closed schema (FileBackup's container/FileBackup.schema.json), a required tool or dependency that cannot be loaded (7-Zip, the hashing package), the source root missing, backup/ and changes/ not on one mount (the rename test failed), or a latest manifest that cannot be read (move $FB_BACKUP/MANIFEST.csv aside to rebuild the latest state from the source; the snapshots are untouched). The reason is in $FB_CHANGES/backup.log and $FB_LOGS/Backup_Global.log"
        false ;;
     3) FAIL_NOTE="the container exited 3, which a bounded-run-loop FileBackup never returns from a backup (the manifest witness is gone). This is almost certainly an OLDER image: this stack needs one built from FileBackup's BoundedRebuild work. Rebuild it (scripts/ensure-local-images.sh --rebuild) and read $FB_LOGS/Backup_Global.log"
        false ;;
-    4) FAIL_NOTE="FileBackup STOPPED for a host problem (exit 4): the backup drive is full or went away, or another FileBackup run holds its lock ($FB_CHANGES/Temp.lock — a manual verify or prune?). Nothing stored is lost; a stop is no worse than a kill, and the next run keeps the progress. Retry later: the next timer run does that by itself, or fix the host and run systemctl start homehub-library-backup.service. Read $FB_CHANGES/backup.log"
+    4) FAIL_NOTE="FileBackup STOPPED for a host problem (exit 4): the backup drive is full or went away; another FileBackup run holds its lock ($FB_CHANGES/Temp.lock — a manual verify or prune?); or the library source was EMPTY at the start of the run while the latest state holds rows, which is exactly what an unmounted or failed library drive looks like (FileBackup C39 — the latest state was left as it was). Nothing stored is lost; a stop is no worse than a kill, and the next run keeps the progress. Retry later: the next timer run does that by itself, or fix the host (is $FB_SOURCE mounted and populated?) and run systemctl start homehub-library-backup.service. Read $FB_CHANGES/backup.log"
        false ;;
     125|126|127) FAIL_NOTE="docker itself failed (exit $BACKUP_RC) before FileBackup ran — usually a missing image. Is filebackup:\${FILEBACKUP_IMAGE_TAG} loaded? \`docker image ls filebackup\`; it is baked by vmtest/export-images.sh and loaded by firstboot"
        false ;;
@@ -840,12 +880,24 @@ publish_manifest_copy() {
 publish_manifest_copy
 
 # ── 8. THE VERIFY GATE — weekly, deep monthly ────────────────────────────────
-# A backup nobody reads is a hypothesis. `verify` re-proves the stored manifest
-# and reports any object stored twice (DuplicateObject); -Deep additionally
-# proves payload identity, hashing every object against its name (a mismatch is
-# DamagedObject), which costs real time and so is monthly rather than weekly.
+# A backup nobody reads is a hypothesis. `verify` re-proves the stored manifest,
+# reports any object stored twice (DuplicateObject) and, since FileBackup C37,
+# any object whose length its name rules out (DamagedObject: empty, or a raw
+# object of another length); -Deep additionally proves payload identity,
+# hashing every object against its name (a mismatch is also DamagedObject),
+# which costs real time and so is monthly rather than weekly.
 # REPORT ONLY: this gate never passes FILEBACKUP_REPAIR. Moving duplicates and
 # damaged objects into $FB_CHANGES/Verify/ is a person's call (README).
+#
+# MEMORY - NOT YET SAFE ON THE HUB'S STORE (FileBackup C43, 2026-10-27). Until
+# FileBackup's follow-up to C43 lands, a verify (its pool-resolve check) still
+# holds every snapshot manifest in memory at once: about 420 MB per HomeHub
+# manifest, the mechanism of the 2026-10-04 outage. This gate is scheduled by
+# the calendar below and NOTHING here stops it yet - deliberately, because
+# disabling it is the Owner's call, recorded in docs/status.md. What would
+# gate it: running the unit with --verify none (ExecStart), or a knob read
+# here, until an image with that follow-up is deployed; FILEBACKUP_MEM_LIMIT
+# would turn a runaway into an OOM kill of this container instead of the box.
 #
 # `auto` = the FIRST occurrence of BACKUP_LIBRARY_VERIFY_DAY each month is deep,
 # every other occurrence is shallow, and every other day skips. Computed from the
@@ -866,6 +918,9 @@ VERIFY_NOTE="skipped"
 PARTIAL_SUFFIX=""
 if [ "$BACKUP_PARTIAL" = 1 ]; then
     PARTIAL_SUFFIX=". The backup itself also completed with files not captured (exit 1; see $FB_CHANGES/backup.log)"
+    if [ "$DAMAGED_SET_ASIDE" -gt 0 ]; then
+        PARTIAL_SUFFIX="$PARTIAL_SUFFIX and $DAMAGED_SET_ASIDE damaged stored object(s) set aside into $FB_CHANGES/Verify/"
+    fi
 fi
 if [ "$VERIFY_RUN" != none ]; then
     VERIFY_ARGS=(verify)
@@ -887,7 +942,7 @@ if [ "$VERIFY_RUN" != none ]; then
         0) VERIFY_NOTE="$VERIFY_RUN ok"
            log "verify: CLEAN (exit 0)" ;;
         1) VERIFY_NOTE="$VERIFY_RUN FINDINGS"
-           FAIL_NOTE="verify exit 1 — FINDINGS: the store disagrees with its manifests somewhere. Read the [Class] lines in $FB_LOGS/Backup_Global.log. PoolUnresolvable is a row with no bytes anywhere (not restorable until the next backup re-stores it from the source); DuplicateObject is a second copy of one object (harmless, costs space — expected once after a store from the old engine); DamagedObject (-Deep) is an object whose bytes do not match its name. Moving duplicates and damaged objects aside into $FB_CHANGES/Verify/ (never deleted) is a person's call: README \"Verify findings\"$PARTIAL_SUFFIX"
+           FAIL_NOTE="verify exit 1 — FINDINGS: the store disagrees with its manifests somewhere. Read the [Class] lines in $FB_LOGS/Backup_Global.log. PoolUnresolvable is a row with no bytes anywhere (not restorable until the next backup re-stores it from the source); DuplicateObject is a second copy of one object (harmless, costs space — expected once after a store from the old engine); DamagedObject is an object whose length its name rules out (empty, or a raw object of another length — any verify) or, under -Deep, whose bytes do not hash to its name. Moving duplicates and damaged objects aside into $FB_CHANGES/Verify/ (never deleted) is a person's call: README \"Verify findings\"$PARTIAL_SUFFIX"
            false ;;
         2) VERIFY_NOTE="$VERIFY_RUN REFUSED (precondition)"
            FAIL_NOTE="verify exit 2 — precondition failure: the verify could not run at all (no backup root, no manifest to verify, -Deep without 7-Zip, or a host problem that stopped it). Retrying unchanged will not help. Read $FB_LOGS/Backup_Global.log"
@@ -908,7 +963,11 @@ fi
 # non-zero exit so the unit and the hub watch (watch.table `library-backup`)
 # show it. The data already stored is safe, and the message says so.
 if [ "$BACKUP_PARTIAL" = 1 ]; then
-    FAIL_NOTE="the backup COMPLETED WITH FILES NOT CAPTURED (container exit 1; verify=$VERIFY_NOTE). Every file it could read is stored and nothing already stored was lost, but at least one file was not captured, so this is not a verified success and lastSuccess is NOT advanced. Each file is named in $FB_CHANGES/backup.log — usually a file in use or unreadable; the next run tries it again"
+    if [ "$DAMAGED_SET_ASIDE" -gt 0 ]; then
+        FAIL_NOTE="the backup COMPLETED BUT FOUND $DAMAGED_SET_ASIDE DAMAGED STORED OBJECT(S) (container exit 1; verify=$VERIFY_NOTE). Each [DamagedObject] line in $FB_CHANGES/backup.log names an object that was empty or the wrong length — what a power cut can leave — and was moved into $FB_CHANGES/Verify/, never deleted and never reused. Its content is stored again only while a source file still holds it, so a snapshot that needed it may no longer restore that file. Any file not captured is named in the same log. This is not a verified success and lastSuccess is NOT advanced. README \"Damaged objects\""
+    else
+        FAIL_NOTE="the backup COMPLETED WITH FILES NOT CAPTURED (container exit 1; verify=$VERIFY_NOTE). Every file it could read is stored and nothing already stored was lost, but at least one file was not captured, so this is not a verified success and lastSuccess is NOT advanced. Each file is named in $FB_CHANGES/backup.log — usually a file in use or unreadable, or a name Windows or Linux cannot restore (paths differing only in letter case count); the next run tries it again"
+    fi
     false
 fi
 

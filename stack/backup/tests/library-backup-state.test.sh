@@ -6,7 +6,7 @@
 #
 # The wrapper is written for a FileBackup image built from its bounded-run-loop
 # work (BoundedRebuild): one /store mount, backup exits 0/1/2/4, verify exits
-# 0/1/2. The cases below pin that contract (TC-1541..TC-1545) as well as the
+# 0/1/2. The cases below pin that contract (TC-1541..TC-1546) as well as the
 # state-update boundary.
 set -uo pipefail
 
@@ -274,17 +274,21 @@ run_wrapper refused "$TMP/good.env" shallow 2 0 200
 if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/refused.capture")" = 0 ] \
    && ! grep -q 'docker:verify' "$TMP/refused.events" \
    && grep -qF 'REFUSED the run before changing anything (exit 2)' "$TMP/refused.out" \
+   && grep -qF 'dependency that cannot be loaded' "$TMP/refused.out" \
    && grep -qF 'retrying will not help' "$TMP/refused.out"; then
-    pass "TC-1541 backup exit 2 is a do-not-retry refusal: no verify, no lastSuccess"
+    pass "TC-1541 backup exit 2 is a do-not-retry refusal naming an unloadable dependency among its causes: no verify, no lastSuccess"
 else
     fail "TC-1541 exit 2 rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/refused.events"): $(grep 'ERROR' "$TMP/refused.out" | head -1)"
 fi
+# Exit 4 also covers FileBackup C39: a source EMPTY at the start of the run while
+# the latest state holds rows, which is what an unmounted library looks like.
 run_wrapper host-stop "$TMP/good.env" shallow 4 0 200
 if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/host-stop.capture")" = 0 ] \
    && ! grep -q 'docker:verify' "$TMP/host-stop.events" \
    && grep -qF 'STOPPED for a host problem (exit 4)' "$TMP/host-stop.out" \
+   && grep -qF 'the library source was EMPTY at the start of the run while the latest state holds rows' "$TMP/host-stop.out" \
    && grep -qF 'Retry later' "$TMP/host-stop.out"; then
-    pass "TC-1541 backup exit 4 is a retry-later host stop: no verify, no lastSuccess"
+    pass "TC-1541 backup exit 4 is a retry-later host stop that names the empty-source case (C39): no verify, no lastSuccess"
 else
     fail "TC-1541 exit 4 rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/host-stop.events"): $(grep 'ERROR' "$TMP/host-stop.out" | head -1)"
 fi
@@ -302,6 +306,38 @@ if [ "$OLD_IMAGE_RC" != 0 ] && [ "$RUN_RC" != 0 ] && grep -qF 'OLDER image' "$TM
 else
     fail "TC-1541 exit 3: $(grep 'ERROR' "$TMP/old-image.out" | head -1) | $(grep 'ERROR' "$TMP/old-image-verify.out" | head -1)"
 fi
+
+# ── damaged objects set aside by the run (TC-1546, FileBackup C37) ───────────
+# An exit 1 whose set log carries [DamagedObject] lines is store damage, not a
+# file in use: the message counts them, names Verify/, and does not claim that
+# nothing stored was lost. The (mocked) container does not touch backup.log, so
+# the log written here stands for the one the run leaves.
+cat >"$TMP/store/changes/backup.log" <<'EOF'
+2026-10-27 03:00:01.000 [INFO] Backup set 'library' starting
+2026-10-27 03:00:02.000 [WARN] [DamagedObject] '/store/backup/aaaa.jpg' is damaged (empty), as a power loss can leave it; moved it to '/store/changes/Verify/backup/aaaa.jpg' and it is not reused.
+2026-10-27 03:00:02.100 [WARN] [DamagedObject] '/store/changes/Snapshot_2026_10_01_03_00_00/bbbb.mp4' is damaged (length), as a power loss can leave it; moved it to '/store/changes/Verify/Snapshot_2026_10_01_03_00_00/bbbb.mp4' and it is not reused.
+EOF
+run_wrapper damaged "$TMP/good.env" shallow 1 0 200
+if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/damaged.capture")" = 0 ] \
+   && grep -q '^docker:verify$' "$TMP/damaged.events" \
+   && grep -qF 'AND 2 STORED OBJECT(S) WERE FOUND DAMAGED' "$TMP/damaged.out" \
+   && grep -qF 'COMPLETED BUT FOUND 2 DAMAGED STORED OBJECT(S) (container exit 1; verify=shallow ok)' "$TMP/damaged.out" \
+   && grep -qF "moved into $TMP/store/changes/Verify/" "$TMP/damaged.out" \
+   && ! grep -qF 'nothing already stored was lost' "$TMP/damaged.out"; then
+    pass "TC-1546 an exit 1 whose set log names damaged objects counts them, names Verify/, and claims no loss-free run"
+else
+    fail "TC-1546 damaged rc=$RUN_RC: $(grep -i 'damaged' "$TMP/damaged.out" | head -2 | tr '\n' '|')"
+fi
+# A set log with no such line keeps the files-not-captured reading.
+printf '2026-10-27 03:00:01.000 [WARN] could not read /source/locked.db\n' >"$TMP/store/changes/backup.log"
+run_wrapper not-damaged "$TMP/good.env" none 1 0 200
+if [ "$RUN_RC" != 0 ] && grep -qF 'COMPLETED WITH FILES NOT CAPTURED (container exit 1; verify=skipped)' "$TMP/not-damaged.out" \
+   && ! grep -qF 'DAMAGED' "$TMP/not-damaged.out"; then
+    pass "TC-1546 an exit 1 with no [DamagedObject] line is reported as files not captured only"
+else
+    fail "TC-1546 not-damaged rc=$RUN_RC: $(grep -i 'exit 1' "$TMP/not-damaged.out" | head -2 | tr '\n' '|')"
+fi
+rm -f "$TMP/store/changes/backup.log"
 
 # ── the one-mount store (TC-1542) ────────────────────────────────────────────
 # A second mount under the store at changes/ would make FileBackup's rename test

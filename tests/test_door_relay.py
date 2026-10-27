@@ -585,6 +585,22 @@ def test_tc1395_an_interrupted_segment_is_cut_back_to_its_last_whole_frame(tmp_p
     assert len(raw) - last_pes == 3 * 188
 
 
+@needs_select_on_pipes
+def test_tc1395_a_cut_back_segment_keeps_the_time_of_its_last_write(tmp_path, monkeypatch):
+    # A stall ends the run 30 s after the last data; the truncation must not stamp
+    # the file with that moment (the clip cutter reads mtime as where the frames end).
+    alerts = []
+    r = make_recorder(tmp_path, [(True, "ok")] * 5, alerts)
+    r.clock = lambda: 1000.0
+    monkeypatch.setattr(rec.time, "time", lambda: 1793000000.0)        # the wall clock while data arrives
+    data = b"".join(stream(15)) + b"".join([pes(99 * 9000, False), body()])
+    assert r.consume(FakeStream(data)) == 1
+    monkeypatch.setattr(rec.time, "time", lambda: 1793000030.0)        # the stall, 30 s later
+    r.finalise()
+    (seg,) = list((tmp_path / "door").rglob("door-*.ts"))
+    assert seg.stat().st_mtime == pytest.approx(1793000000.0, abs=1)
+
+
 def test_tc1396_continuity_counts_gaps_over_tolerance():
     seg = [(0.0, 600.0), (600.5, 600.0), (1230.0, 570.0), (1800.0, 600.0)]
     c = rec.continuity(seg, 0.0, 2400.0)

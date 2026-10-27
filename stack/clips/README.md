@@ -107,9 +107,15 @@ The window is `CAMERA_<C>_CLIP_PRE_SEC` (3 s) before the first event to its end.
 start (the camera sends one a second, so up to 1 s more pre-roll) to before the
 first frame at or after its end. Frames are timed by the segment's name plus PTS
 - or, when the camera sent broken PTS (measured: a 10-minute segment spanning
-0.07 s of PTS), by index, spread evenly from the segment's start to the NEXT
-segment's start (the camera slows down in low light and infrared; the nominal
-`CAMERA_<C>_FPS` is used only for the open `.part`). The segments are listed
+0.07 s of PTS), by index, spread evenly from the segment's start to where its
+frames end: the open `.part`'s last write (its mtime), and for a finished
+segment the earlier of its last write and the next segment's start (the camera
+slows down in low light and infrared). Anchored by its own last write, a slow
+rate is trusted down to 0.5 fps; anchored by the next segment's start, a rate
+under half the nominal may hide a recorder restart, so the nominal
+`CAMERA_<C>_FPS` is used then - as it is with no anchor, or above the nominal
+rate. The recorder keeps a cut-back segment's mtime at its last write. The
+segments are listed
 again for every episode, and a segment that was listed but can no longer be
 opened (rotated, pruned) makes the episode wait for the next pass - never lost,
 never partial. The bytes go to

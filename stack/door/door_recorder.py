@@ -388,6 +388,7 @@ class Recorder:
         self.frame_starts = collections.deque(maxlen=1024)
         self.last_size = 64 * MIB
         self.stopping = False
+        self.last_write = None  # type: Optional[float]  # wall time of the latest bytes written
 
     def _alert(self, key: str, title: str, body: str) -> None:
         mc.send_alert(key, "high", title, body, self.env_file, mc.DEFAULT_STATE_DIR, log_tag="homehub-door-recorder")
@@ -405,6 +406,9 @@ class Recorder:
         last video PES start that is actually on disk (the frame that never
         finished goes). A file left with no whole frame is removed. The file is
         unbuffered, so what `written` counts is exactly what the disk holds.
+        The truncation would stamp the file with the moment of the stall (up to
+        DOOR_RECORDER_STALL_SEC after the last data); its mtime is put back to
+        the last write, which the clip cutter reads as where the frames end.
         Implements: LLR-1232.
         """
         if self.handle is None:
@@ -417,6 +421,14 @@ class Recorder:
                 self.written = cut
             except OSError:
                 pass
+            if self.last_write is not None:
+                try:
+                    if os.utime in os.supports_fd:
+                        os.utime(fd, (self.last_write, self.last_write))
+                    else:  # the dev PC's test runner
+                        os.utime(self.part, (self.last_write, self.last_write))
+                except OSError:
+                    pass
         try:
             os.fsync(fd)
         except OSError:
@@ -492,6 +504,7 @@ class Recorder:
             self.quota_stop(exc, ddir)
             raise
         self.written = self.first_frame_start = self.last_frame_start = 0
+        self.last_write = None
         self.frame_starts.clear()
 
     def quota_stop(self, exc: OSError, where: str) -> None:
@@ -518,6 +531,7 @@ class Recorder:
                 n = self.handle.write(view)
                 self.written += n
                 view = view[n:]
+            self.last_write = time.time()
         except OSError as exc:
             self.quota_stop(exc, self.part or self.root)
             raise

@@ -211,7 +211,10 @@ sudo systemctl daemon-reload
 **2. Grow the scratch volume and make the clips area** (the Owner, 2026-10-27:
 22 GiB, clips 5 GiB). Set `HOMEHUB_SCRATCH_SIZE_MIB=22528`,
 `HOMEHUB_SCRATCH_VG_RESERVE_MIB=1200` and `HOMEHUB_SCRATCH_QUOTA_CLIPS_MIB=5120` in
-`/opt/homehub/stack/.env` (edit in place), then read the plan - it changes nothing:
+`/opt/homehub/stack/.env` TOGETHER, edited in place (the live file still says
+`VG_RESERVE_MIB=4096`, which the VG cannot keep with a 4 GiB grow: the grow would be
+refused - with an alert, the volume carrying on at 18 GiB - not done). Then read
+the plan - it changes nothing:
 
 ```sh
 sudo vgs --units m -o vg_free,vg_extent_size,vg_free_count ubuntu-vg     # 5364 MiB / 1341 extents on 2026-10-27
@@ -219,7 +222,7 @@ sudo python3 /opt/homehub/stack/scratch/homehub_scratch.py plan
 #   would: grow LV /dev/ubuntu-vg/hub-scratch by 1024 extents (18432 -> 22528 MiB), leaving 317 extents (1.24 GiB) free
 #   would: grow the ext4 filesystem on /dev/ubuntu-vg/hub-scratch online to fill the LV (resize2fs)
 #   would: create /srv/scratch/clips, put it in quota project 7104 (inherit)
-#   exit 3 = STOP (the VG cannot give it and keep the reserve): record the numbers, change nothing
+#   "grow_refused" in the report (the VG cannot give it and keep the reserve): fix the knobs first
 ```
 
 Then `sudo python3 .../homehub_scratch.py ensure` (online: the recorder keeps
@@ -285,8 +288,16 @@ and `status`, and the clip under `/srv/scratch/clips/door/<day>/` plays.
 the trial, which replaces nothing (the Owner, 2026-10-27):
 
 ```sh
-sudo python3 /opt/homehub/stack/clips/homehub_clips.py encode-trial --camera door --day <YYYY-MM-DD> --max-clips 4
+sudo systemd-run --wait --pipe --quiet -p CapabilityBoundingSet=~CAP_SYS_RESOURCE -p NoNewPrivileges=yes -p Nice=19 -p IOSchedulingClass=idle -p CPUQuota=25% /usr/bin/python3 /opt/homehub/stack/clips/homehub_clips.py encode-trial --camera door --day <YYYY-MM-DD> --max-clips 4
 ```
+
+Through `systemd-run`, NOT `sudo python3 ...`: a root shell holds CAP_SYS_RESOURCE,
+for which the quota is no wall, so the clips guard refuses it (and says this
+command). The unit drops the capability, as the clips units do, and runs at Nice
+19 with idle I/O; the trial's encoder and SSIM containers are capped at
+`--cpus 0.4` with the lowest CPU weight. The same goes for any other verb that
+writes the clips area by hand; `status` and `episodes` only read and run as they
+are.
 
 It encodes two daylight and two night clips of that day with every combination
 of h264 and hevc (HEVC is H.265), native and 1024 square, 300 and 200 kb/s, plus
@@ -298,7 +309,7 @@ night; `trial.json` and `trial.txt` and one sample per combination are in
 at the lowest priority, and refuses to start when the clips area is too full.
 From it the Owner chooses `CLIPS_ENCODE_CODEC`, `CLIPS_ENCODE_KBPS`, and, only if
 wanted, `CLIPS_ENCODE_SIZE` (0 = native; e.g. 1024) and `CLIPS_ENCODE_FPS`
-(0 = unchanged; e.g. 5). Then `homehub_clips.py encode-trial --clean`, set
+(0 = unchanged; e.g. 5). Then `sudo systemd-run --wait --pipe --quiet -p CapabilityBoundingSet=~CAP_SYS_RESOURCE -p NoNewPrivileges=yes -p Nice=19 -p IOSchedulingClass=idle -p CPUQuota=25% /usr/bin/python3 /opt/homehub/stack/clips/homehub_clips.py encode-trial --clean`, set
 `CLIPS_ENCODE_ENABLED=true`, run one batch
 (`sudo systemctl start homehub-clips-encode.service`), read the sidecars' `encode`
 (kept, bytes before and after, seconds) and check PSI. Keep it:

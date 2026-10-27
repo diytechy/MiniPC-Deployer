@@ -619,13 +619,23 @@ class Provisioner:
     """
 
     def __init__(self, settings: Settings, apply: bool, paths: Optional[Paths] = None,
-                 vg: Optional[str] = None, mount_with: str = "systemd"):
+                 vg: Optional[str] = None, mount_with: str = "systemd", env_file: str = mc.DEFAULT_ENV_FILE):
         self.s, self.apply, self.paths = settings, apply, paths or Paths()
-        self.vg, self.mount_with = vg, mount_with
+        self.vg, self.mount_with, self.env_file = vg, mount_with, env_file
         self.lv_growing = False
+        self.pending_grow = None  # type: Optional[Dict[str, int]]
         self.extent_bytes = 0
         self.actions: List[str] = []
         self.report: Dict[str, object] = {}
+
+    def alert(self, key: str, title: str, body: str) -> None:
+        """One high alert through the monitors' helper (rate-limited per key);
+        never fatal to the provisioner."""
+        try:
+            mc.send_alert(key, "high", title, body, self.env_file, mc.DEFAULT_STATE_DIR, repeat_sec=86400,
+                          log_tag="homehub-scratch")
+        except Exception as exc:  # noqa: BLE001 - an alert failure must not stop the volume
+            mc.log("scratch: alert not sent: %s" % exc, warning=True)
 
     def act(self, what: str, argv: Optional[Sequence[str]] = None) -> None:
         self.actions.append(what)
@@ -637,6 +647,7 @@ class Provisioner:
         vg = self.vg or root_vg()
         device, existed = self.step_lv(vg)
         uuid = self.step_filesystem(device, existed)
+        self.step_grow_lv(device)      # only after the filesystem proved to be ours
         self.step_fstab(uuid)
         self.step_mount(uuid)
         self.step_grow_fs(device)
@@ -655,20 +666,25 @@ class Provisioner:
             self.report["lv"] = existing
             have = lv_bytes(existing)
             self.report["lv_mib"] = have // MIB
-            grow = grow_plan(have, self.s.size_mib, free, extent, self.s.vg_reserve_mib)
-            if grow is None:
+            try:
+                self.pending_grow = grow_plan(have, self.s.size_mib, free, extent, self.s.vg_reserve_mib)
+            except Stop as exc:
+                # A grow the VG cannot give is NOT a stop of the volume: it stays at
+                # its size, is mounted and its writers budgeted as before - only
+                # the grow waits, with an alert (every boot runs ensure).
+                self.pending_grow = None
+                self.report["grow_refused"] = str(exc)
+                mc.log("scratch: the grow was REFUSED - %s; the volume stays at %d MiB" % (exc, have // MIB),
+                       warning=True)
+                if self.apply:
+                    self.alert("scratch-grow", "HomeHub: the scratch volume could not grow",
+                               "%s. It stays at %d MiB and keeps working." % (exc, have // MIB))
+                return existing, True
+            if self.pending_grow is None:
                 mc.log("scratch: %s already exists (%d MiB, %d wanted) - not recreated, never shrunk"
                        % (existing, have // MIB, self.s.size_mib))
-                return existing, True
-            self.report.update(lv_grow_extents=grow["extents"], lv_new_mib=grow["new_mib"],
-                               vg_leftover_gib=round(grow["leftover_bytes"] / GIB, 2))
-            # Online: lvextend grows the LV under the mounted filesystem, and
-            # step_grow_fs then grows ext4 into it (resize2fs, online for ext4).
-            self.act("grow LV %s by %d extents (%d -> %d MiB), leaving %d extents (%.2f GiB) free; never shrinks"
-                     % (existing, grow["extents"], have // MIB, grow["new_mib"], grow["leftover_extents"],
-                        grow["leftover_bytes"] / GIB),
-                     ["lvextend", "-l", "+%d" % grow["extents"], existing])
-            self.lv_growing = True
+            else:
+                self.pending_grow["from_mib"] = have // MIB
             return existing, True
         plan = capacity_plan(free, extent, self.s.size_mib, self.s.vg_reserve_mib)
         self.report.update(lv_extents=plan["lv_extents"], vg_leftover_gib=round(plan["leftover_bytes"] / GIB, 2))
@@ -767,6 +783,23 @@ class Provisioner:
         else:
             # Through the same fstab line systemd would use (util-linux mount -T).
             self.act("mount it (mount -T %s %s)" % (self.paths.fstab, mp), ["mount", "-T", self.paths.fstab, mp])
+
+    def step_grow_lv(self, device: str) -> None:
+        """lvextend, after step_filesystem has checked the label, the UUID and
+        the quota features: an LV holding anything else is never grown.
+        Implements: LLR-1380."""
+        grow = self.pending_grow
+        if not grow:
+            return
+        self.report.update(lv_grow_extents=grow["extents"], lv_new_mib=grow["new_mib"],
+                           vg_leftover_gib=round(grow["leftover_bytes"] / GIB, 2))
+        # Online: lvextend grows the LV under the mounted filesystem, and
+        # step_grow_fs then grows ext4 into it (resize2fs, online for ext4).
+        self.act("grow LV %s by %d extents (%d -> %d MiB), leaving %d extents (%.2f GiB) free; never shrinks"
+                 % (device, grow["extents"], grow["from_mib"], grow["new_mib"], grow["leftover_extents"],
+                    grow["leftover_bytes"] / GIB),
+                 ["lvextend", "-l", "+%d" % grow["extents"], device])
+        self.lv_growing = True
 
     def step_grow_fs(self, device: str) -> None:
         """Grow ext4 ONLINE into the LV when the LV is larger than the
@@ -886,7 +919,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         p.print_help()
         return 2
     try:
-        report = Provisioner(settings, args.verb == "ensure", paths, args.vg, args.mount_with).walk()
+        report = Provisioner(settings, args.verb == "ensure", paths, args.vg, args.mount_with, args.env_file).walk()
     except Stop as exc:
         mc.log("scratch: STOP - %s" % exc, warning=True)
         return EXIT_STOP

@@ -362,6 +362,7 @@ def test_tc1574_plan_shows_the_grow_and_ensure_extends_then_resizes_online(host,
         return real(argv, check)
     hs.run = run
     p.step_lv("ubuntu-vg")
+    p.step_grow_lv("/dev/ubuntu-vg/hub-scratch")
     p.step_grow_fs("/dev/ubuntu-vg/hub-scratch")
     ran = [c for c in fake.ran if c[0] in ("lvextend", "resize2fs")]
     assert ran == [["lvextend", "-l", "+1024", "/dev/ubuntu-vg/hub-scratch"], ["resize2fs", "/dev/ubuntu-vg/hub-scratch"]]
@@ -369,6 +370,7 @@ def test_tc1574_plan_shows_the_grow_and_ensure_extends_then_resizes_online(host,
     fake.ran.clear()
     q = hs.Provisioner(hs.Settings({"HOMEHUB_SCRATCH_UUID": UUID}), True, paths, vg="ubuntu-vg")
     q.step_lv("ubuntu-vg")
+    q.step_grow_lv("/dev/ubuntu-vg/hub-scratch")
     q.step_grow_fs("/dev/ubuntu-vg/hub-scratch")
     assert not [c for c in fake.ran if c[0] in ("lvextend", "resize2fs")]
 
@@ -404,3 +406,33 @@ def test_tc1574_plan_lists_the_resize_an_interrupted_grow_still_owes_while_unmou
     assert p.actions == ["grow the ext4 filesystem on /dev/ubuntu-vg/hub-scratch online from 18432 to 22528 MiB "
                          "once mounted (resize2fs)"]
     assert not [c for c in fake.ran if c[0] == "resize2fs"]
+
+
+def test_tc1574_a_grow_the_vg_cannot_give_alerts_and_the_volume_carries_on(host, monkeypatch):
+    fake, paths = host
+    fake.lv_exists, fake.free = True, 1341
+    fake.signature = {"TYPE": "ext4", "LABEL": "hub-scratch", "UUID": UUID}
+    sent = []
+    monkeypatch.setattr(hs.mc, "send_alert", lambda key, *a, **k: sent.append(key))
+    # the live .env still says VG_RESERVE_MIB=4096: 1341 - 1024 extents cannot keep it
+    p = hs.Provisioner(hs.Settings({"HOMEHUB_SCRATCH_UUID": UUID, "HOMEHUB_SCRATCH_VG_RESERVE_MIB": "4096"}), True,
+                       paths, vg="ubuntu-vg")
+    p.step_lv("ubuntu-vg")
+    uuid = p.step_filesystem("/dev/ubuntu-vg/hub-scratch", True)
+    p.step_grow_lv("/dev/ubuntu-vg/hub-scratch")
+    assert uuid == UUID and "grow_refused" in p.report and sent == ["scratch-grow"]
+    assert not [c for c in fake.ran if c[0] in ("lvextend", "resize2fs")]
+    # and in plan mode it is reported, not alerted
+    sent.clear()
+    plan = hs.Provisioner(hs.Settings({"HOMEHUB_SCRATCH_UUID": UUID, "HOMEHUB_SCRATCH_VG_RESERVE_MIB": "4096"}), False,
+                          paths, vg="ubuntu-vg").walk()
+    assert "grow_refused" in plan and sent == [] and not any("grow LV" in a for a in plan["actions"])
+
+
+def test_tc1574_an_lv_that_is_not_ours_is_never_grown(host):
+    fake, paths = host
+    fake.lv_exists, fake.free = True, 1341
+    fake.signature = {"TYPE": "ext4", "LABEL": "hub-scratch", "UUID": "0" * 8 + UUID[8:]}   # another filesystem
+    with pytest.raises(hs.Refused):
+        hs.Provisioner(hs.Settings({"HOMEHUB_SCRATCH_UUID": UUID}), True, paths, vg="ubuntu-vg").walk()
+    assert not [c for c in fake.ran if c[0] == "lvextend"]

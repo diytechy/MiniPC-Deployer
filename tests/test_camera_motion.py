@@ -246,11 +246,11 @@ def test_tc1547_the_real_engine_through_the_spooler_writes_one_unbroken_window(t
                                    "DOORBELL_MOTION_APPROACH_POLYGON": ZONE.strip('"')})
     motion = engine.MotionEngine(config)
     state = str(tmp_path)
-    writer = cm.EventWriter(state, "door", clock=lambda: 1793044200.0)
+    writer = cm.EventWriter(state, "door", clock=lambda: 1792439400.0)
     spool = cm.SignalSpooler(writer.emit)
     rng = np.random.default_rng(1)
     background = (120 + rng.integers(0, 6, (256, 256))).astype(np.uint8)
-    base_ms = 1793044200000
+    base_ms = 1792439400000
     for i in range(120):
         frame = background.copy()
         if 20 <= i < 45:                          # a dark figure crosses the zone for 5 s
@@ -280,10 +280,10 @@ def test_tc1547_the_real_engine_through_the_spooler_writes_one_unbroken_window(t
 def test_tc1548_replay_decodes_by_index_without_retiming_read_only_and_offline():
     class S:
         decode, stream_fps, device = "software", 10, "/dev/dri/renderD128"
-    argv = cm.replay_command("/srv/scratch/door/2026-10-26/door-x.ts", S, 5.0, "img@sha256:x")
+    argv = cm.replay_command("/srv/scratch/door/2026-10-19/door-x.ts", S, 5.0, "img@sha256:x")
     assert argv[argv.index("-vf") + 1] == "select=not(mod(n\\,2)),scale=256:256:flags=area,format=gray"
     assert argv[argv.index("-fps_mode") + 1] == "passthrough" and argv.index("-fps_mode") > argv.index("-vf")
-    assert "/srv/scratch/door/2026-10-26/door-x.ts:/seg.ts:ro" in argv and argv[argv.index("--network") + 1] == "none"
+    assert "/srv/scratch/door/2026-10-19/door-x.ts:/seg.ts:ro" in argv and argv[argv.index("--network") + 1] == "none"
     S.decode = "vaapi"
     argv = cm.replay_command("/x.ts", S, 5.0, "img")
     assert "--device" in argv and "scale_vaapi" in argv[argv.index("-vf") + 1]
@@ -387,9 +387,9 @@ def test_tc1543_a_missing_engine_is_a_refusal_not_a_crash(tmp_path, monkeypatch)
 
 @needs_cv
 def test_tc1548_a_failed_decode_fails_the_replay_and_a_non_integer_rate_is_refused(tmp_path):
-    seg_dir = tmp_path / "segs" / "2026-10-26"
+    seg_dir = tmp_path / "segs" / "2026-10-19"
     seg_dir.mkdir(parents=True)
-    (seg_dir / "door-20261026T195000Z.ts").write_bytes(b"")
+    (seg_dir / "door-20261019T195000Z.ts").write_bytes(b"")
     env = write_env(tmp_path, CAMERA_DOOR_SEGMENT_DIR=str(tmp_path / "segs").replace("\\", "/"))
 
     class Proc:
@@ -404,7 +404,7 @@ def test_tc1548_a_failed_decode_fails_the_replay_and_a_non_integer_rate_is_refus
         def wait(self):
             self.returncode = 183
     lines = []
-    rc = cm.replay(env, "door", 1793044200.0, 1793044800.0, None, False, runner=Proc, out=lines.append)
+    rc = cm.replay(env, "door", 1792439400.0, 1792440000.0, None, False, runner=Proc, out=lines.append)
     summary = json.loads(lines[-1])
     assert rc == 1 and summary["frames"] == 3 and "Invalid data" in summary["failed_segments"][0]
     with pytest.raises(cm.Invalid, match="whole multiple"):
@@ -413,10 +413,10 @@ def test_tc1548_a_failed_decode_fails_the_replay_and_a_non_integer_rate_is_refus
 
 
 def test_tc1548_replay_warms_up_on_earlier_segments_but_reports_only_its_window(tmp_path, monkeypatch):
-    since = 1793044200.0                              # 19:50:00Z
-    seg_dir = tmp_path / "segs" / "2026-10-26"
+    since = 1792439400.0                              # 19:50:00Z
+    seg_dir = tmp_path / "segs" / "2026-10-19"
     seg_dir.mkdir(parents=True)
-    for name in ("door-20261026T194000Z.ts", "door-20261026T195000Z.ts"):
+    for name in ("door-20261019T194000Z.ts", "door-20261019T195000Z.ts"):
         (seg_dir / name).write_bytes(b"")
     env = write_env(tmp_path, CAMERA_DOOR_SEGMENT_DIR=str(tmp_path / "segs").replace("\\", "/"))
 

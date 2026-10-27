@@ -39,7 +39,7 @@ import homehub_scratch as hs  # noqa: E402
 from ts_fixture import body, pat, pes, pmt, stream  # noqa: E402
 
 MIB = 1024 * 1024
-T0 = 1793044200000  # 2026-10-26T19:50:00Z
+T0 = 1792439400000  # 2026-10-19T19:50:00Z
 
 
 @pytest.fixture(autouse=True)
@@ -80,7 +80,7 @@ def test_tc1542_the_store_is_per_day_deduped_and_skips_what_is_not_a_record(tmp_
     assert ev.append(state, rec(2, "visitor", "renewal", T0))[0]  # the same record twice
     assert not ev.append(state, dict(rec(4, "approach", "event", T0), kind="start"))[0]
     names = sorted(os.listdir(tmp_path / "events" / "door"))
-    assert names == ["hub-motion-2026-10-25.jsonl", "hub-motion-2026-10-26.jsonl"]
+    assert names == ["hub-motion-2026-10-18.jsonl", "hub-motion-2026-10-19.jsonl"]
     with open(tmp_path / "events" / "door" / names[1], "a") as handle:
         handle.write('{"torn": \n')
         handle.write(json.dumps(rec(9, "approach", "event", T0, camera="garage")) + "\n")
@@ -89,7 +89,7 @@ def test_tc1542_the_store_is_per_day_deduped_and_skips_what_is_not_a_record(tmp_
     assert ev.read(state, "door", ["onvif"], day1) == ([], 0)
     assert [r["id"] for r in ev.read(state, "door", ["hub-motion"], T0)[0]] == ["r.2", "r.3"]
     removed = ev.prune_days(state, ["door"], 1, T0 / 1000.0 + 86400)
-    assert [os.path.basename(p) for p in removed] == ["hub-motion-2026-10-25.jsonl"]
+    assert [os.path.basename(p) for p in removed] == ["hub-motion-2026-10-18.jsonl"]
 
 
 # ── TC-1551 settings ─────────────────────────────────────────────────────────
@@ -258,7 +258,7 @@ def test_tc1557_names_are_local_time_with_the_offset_across_dst():
         return lt
     # struct_time carries no tm_gmtoff on every platform: format the offset ourselves.
     day, stem = hc.clip_stem("door", T0 + 61000, "road-stop", 29.4, localtime=zone(-5, 1))
-    assert day == "2026-10-26" and stem.startswith("door_2026-10-26_14-51-01") and stem.endswith("_road-stop_29s")
+    assert day == "2026-10-19" and stem.startswith("door_2026-10-19_14-51-01") and stem.endswith("_road-stop_29s")
     real_day, real_stem = hc.clip_stem("door", T0, "approach", 45)
     assert re.fullmatch(r"door_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}[+-]\d{4}_approach_45s", real_stem), real_stem
     assert real_day == real_stem[5:15]  # the folder is the name's local date
@@ -359,7 +359,7 @@ def test_tc1559_the_cut_feeds_exactly_the_planned_bytes_and_publishes_a_verified
     probe = lambda c, d, n: {"frames": plan.frames, "duration": 11.0, "codec": "h264"}  # noqa: E731
     result = hc.cut_episode(settings, cam, ep, plan, str(tmp_path / "state"), runner=fake, prober=probe,
                             localtime=time.gmtime)
-    assert result == {"status": "cut", "clip": "2026-10-26/door_2026-10-26_19-50-00+0000_approach_11s.mp4"} or \
+    assert result == {"status": "cut", "clip": "2026-10-19/door_2026-10-19_19-50-00+0000_approach_11s.mp4"} or \
         result["status"] == "cut"
     _seg, frm, to, _h = plan.pieces[0]
     assert bytes(fake.fed) == seg.idx.header + seg.data[frm:to]
@@ -427,7 +427,7 @@ def write_segment(seg_dir, start_epoch, frames, part=False):
     day = time.strftime("%Y-%m-%d", time.gmtime(start_epoch))
     name = time.strftime("door-%Y%m%dT%H%M%SZ.ts", time.gmtime(start_epoch)) + (".part" if part else "")
     os.makedirs(os.path.join(seg_dir, day), exist_ok=True)
-    pts = 900000 + int((start_epoch - 1793040000) * 90000)
+    pts = 900000 + int((start_epoch - 1792435200) * 90000)
     with open(os.path.join(seg_dir, day, name), "wb") as handle:
         handle.write(ts_bytes(frames, start_pts=pts))
 
@@ -498,7 +498,7 @@ def test_tc1560_a_failed_cut_is_retried_twice_then_recorded(tmp_path, monkeypatc
 
 def test_tc1561_the_encoder_is_vaapi_at_the_lowest_weight():
     s = hc.ClipsSettings({"CLIPS_ENCODE_KBPS": "250"})
-    argv = hc.encode_command(s, "door", "/srv/scratch/clips/door/2026-10-26", "a.mp4", "a.enc.mp4.part")
+    argv = hc.encode_command(s, "door", "/srv/scratch/clips/door/2026-10-19", "a.mp4", "a.enc.mp4.part")
     joined = " ".join(argv)
     assert argv[argv.index("--cpu-shares") + 1] == "2" and argv[argv.index("--device") + 1] == "/dev/dri/renderD128"
     assert "-hwaccel vaapi" in joined and "-c:v h264_vaapi" in joined and "-b:v 250k -maxrate 500k" in joined
@@ -511,7 +511,7 @@ def test_tc1561_the_encoder_is_vaapi_at_the_lowest_weight():
 def encode_setup(tmp_path, monkeypatch, copy_bytes=1000):
     monkeypatch.setattr(hc, "guard", lambda settings: (True, "ok"))
     monkeypatch.setattr(hc.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, b"", b""))
-    day = tmp_path / "door" / "2026-10-26"
+    day = tmp_path / "door" / "2026-10-19"
     day.mkdir(parents=True)
     (day / "c.mp4").write_bytes(b"c" * copy_bytes)
     (day / "c.json").write_text(json.dumps({"v": 1, "frames": 300, "bytes": copy_bytes, "sha256": "x", "encode": None}))
@@ -579,8 +579,8 @@ def test_tc1563_retention_removes_pairs_rewrites_the_index_and_tidies(tmp_path, 
     s = hc.ClipsSettings({})
     s.root = str(root)
     s.cap_mib = 1
-    old_day = root / "door" / "2026-10-20"
-    new_day = root / "door" / "2026-10-26"
+    old_day = root / "door" / "2026-10-13"
+    new_day = root / "door" / "2026-10-19"
     for day, stem, start, size in ((old_day, "door_old", T0 - 6 * 86400000, 700 * 1024),
                                    (new_day, "door_new", T0, 500 * 1024)):
         day.mkdir(parents=True)
@@ -589,13 +589,13 @@ def test_tc1563_retention_removes_pairs_rewrites_the_index_and_tidies(tmp_path, 
     (new_day / "door_crash.mp4.part").write_bytes(b"p")
     os.utime(new_day / "door_crash.mp4.part", (0, 0))
     (root / "door" / "index.jsonl").write_text(
-        json.dumps({"clip": "2026-10-20/door_old.mp4"}) + "\n" + json.dumps({"clip": "2026-10-26/door_new.mp4"}) + "\n")
+        json.dumps({"clip": "2026-10-13/door_old.mp4"}) + "\n" + json.dumps({"clip": "2026-10-19/door_new.mp4"}) + "\n")
     ev.append(str(state), rec(1, "approach", "event", T0 - 30 * 86400000))
     result = hc.apply_retention(s, str(state), T0)
     assert result["removed"] == 1 and result["stale_parts"] == 1 and result["event_days_removed"] == 1
     assert not old_day.exists() and sorted(os.listdir(new_day)) == ["door_new.json", "door_new.mp4"]
     assert [json.loads(l)["clip"] for l in (root / "door" / "index.jsonl").read_text(encoding="utf-8").splitlines()] == [
-        "2026-10-26/door_new.mp4"]
+        "2026-10-19/door_new.mp4"]
 
 
 def test_tc1564_a_quota_stop_holds_the_cutter_until_retention_makes_room(tmp_path, monkeypatch):
@@ -712,9 +712,9 @@ def test_tc1568_status_reports_events_clips_backlog_and_the_detector(tmp_path, m
     s.root = str(root)
     monkeypatch.setattr(hc, "clips_quota", lambda settings: (10 * MIB, 1024 * MIB))
     ev.append(str(state), rec(1, "approach", "event", T0 - 1000))
-    day = root / "door" / "2026-10-26"
+    day = root / "door" / "2026-10-19"
     day.mkdir(parents=True)
-    stem = "door_2026-10-26_14-49-00-0500_approach_10s"   # 19:49:00Z, a minute before T0
+    stem = "door_2026-10-19_14-49-00-0500_approach_10s"   # 19:49:00Z, a minute before T0
     (day / (stem + ".mp4")).write_bytes(b"x" * 100)
     (day / (stem + ".json")).write_text(json.dumps({"v": 1, "encode": None}))
     import monitor_common as mc
@@ -722,7 +722,7 @@ def test_tc1568_status_reports_events_clips_backlog_and_the_detector(tmp_path, m
     out = hc.status(s, str(state), T0)
     door = out["cameras"]["door"]
     assert out["quota"] == {"used_mib": 10, "limit_mib": 1024} and out["clips"] == 1
-    assert door["events_24h"] == 1 and door["last_clip"] == "2026-10-26/%s.mp4" % stem and door["last_clip_age_min"] == 1.0
+    assert door["events_24h"] == 1 and door["last_clip"] == "2026-10-19/%s.mp4" % stem and door["last_clip_age_min"] == 1.0
     assert door["encode_backlog"] == 1 and door["detector"] == {"frames": 5}
 
 
@@ -818,11 +818,11 @@ def test_tc1555_a_hole_at_the_window_end_is_a_gap_not_full_coverage():
 
 
 def test_tc1552_a_name_that_is_not_a_time_is_not_a_segment(tmp_path):
-    day = tmp_path / "2026-10-26"
+    day = tmp_path / "2026-10-19"
     day.mkdir()
     (day / "door-20261399T999999Z.ts").write_bytes(b"")
-    (day / "door-20261026T195000Z.ts").write_bytes(b"")
-    assert [s.name for s in hc.list_segments(str(tmp_path), "door")] == ["door-20261026T195000Z.ts"]
+    (day / "door-20261019T195000Z.ts").write_bytes(b"")
+    assert [s.name for s in hc.list_segments(str(tmp_path), "door")] == ["door-20261019T195000Z.ts"]
 
 
 def test_tc1559_a_cut_that_plays_in_an_instant_is_refused(tmp_path, monkeypatch):
@@ -869,8 +869,8 @@ def test_tc1563_stale_parts_go_before_the_quota_is_read_and_unconfigured_cameras
 
 
 def test_tc1557_a_names_time_reads_back_to_utc():
-    assert hc.stem_utc_ms("door_2026-10-26_14-51-01-0500_road-stop_29s") == T0 + 61000
-    assert hc.stem_utc_ms("door_2026-10-26_19-51-01+0000_approach_9s-2") == T0 + 61000
+    assert hc.stem_utc_ms("door_2026-10-19_14-51-01-0500_road-stop_29s") == T0 + 61000
+    assert hc.stem_utc_ms("door_2026-10-19_19-51-01+0000_approach_9s-2") == T0 + 61000
     assert hc.stem_utc_ms("c") is None
 
 
@@ -899,28 +899,28 @@ def test_tc1551_a_lease_as_long_as_the_cap_is_refused():
 
 def test_tc1557_a_name_with_an_impossible_time_does_not_read_as_one():
     assert hc.stem_utc_ms("door_2026-10-32_10-00-00+0000_approach_9s") is None
-    assert hc.stem_utc_ms("door_2026-10-26_10-00-00+9959_approach_9s") is None
+    assert hc.stem_utc_ms("door_2026-10-19_10-00-00+9959_approach_9s") is None
 
 
 def test_tc1563_the_index_loses_lines_of_clips_that_are_already_gone_and_orphan_sidecars_go(tmp_path):
     root = tmp_path / "clips"
-    day = root / "door" / "2026-10-26"
+    day = root / "door" / "2026-10-19"
     day.mkdir(parents=True)
-    keep = "door_2026-10-26_10-00-00+0000_approach_9s"
+    keep = "door_2026-10-19_10-00-00+0000_approach_9s"
     (day / (keep + ".mp4")).write_bytes(b"x")
-    (day / "door_2026-10-26_09-00-00+0000_approach_9s.json").write_text("{}")   # its clip never landed
-    os.utime(day / "door_2026-10-26_09-00-00+0000_approach_9s.json", (0, 0))
+    (day / "door_2026-10-19_09-00-00+0000_approach_9s.json").write_text("{}")   # its clip never landed
+    os.utime(day / "door_2026-10-19_09-00-00+0000_approach_9s.json", (0, 0))
     old = root / "door" / "2026-01-01"
     old.mkdir()
     gone = "door_2026-01-01_10-00-00+0000_approach_9s"
     (old / (gone + ".mp4")).write_bytes(b"y")
     index = root / "door" / "index.jsonl"
     index.write_text("".join(json.dumps({"clip": c}) + "\n" for c in
-                             ("2025-01-01/door_lost-in-a-crash.mp4", "2026-01-01/%s.mp4" % gone, "2026-10-26/%s.mp4" % keep)))
+                             ("2025-01-01/door_lost-in-a-crash.mp4", "2026-01-01/%s.mp4" % gone, "2026-10-19/%s.mp4" % keep)))
     s = hc.ClipsSettings({"CLIPS_RETENTION_DAYS": "30"})
     s.root = str(root)
     assert hc.apply_retention(s, str(tmp_path / "state"), T0)["removed"] == 1
-    assert [json.loads(l)["clip"] for l in index.read_text().splitlines()] == ["2026-10-26/%s.mp4" % keep]
+    assert [json.loads(l)["clip"] for l in index.read_text().splitlines()] == ["2026-10-19/%s.mp4" % keep]
     assert sorted(os.listdir(day)) == [keep + ".mp4"]
 
 
@@ -1096,9 +1096,9 @@ def test_tc1564_the_cutter_makes_room_before_cutting(tmp_path, monkeypatch):
 def test_tc1553_index_timing_spreads_to_the_next_segment_and_the_cut_is_regenerated_at_that_rate():
     data = ts_bytes(100, broken=True)
     idx = hc.scan_frames(data, False)
-    times, mode = hc.frame_times(idx, 1000.0, 10, next_start=1012.5)          # 8 fps in low light
+    times, mode = hc.frame_times(idx, 1000.0, 10, end=1012.5)          # 8 fps in low light
     assert mode == "index" and times[99] == pytest.approx(1012.375)
-    assert hc.frame_times(idx, 1000.0, 10, next_start=1100.0)[0][99] == pytest.approx(1009.9)  # a restart: nominal
+    assert hc.frame_times(idx, 1000.0, 10, end=1100.0)[0][99] == pytest.approx(1009.9)  # a restart: nominal
     slow = hc.Loaded(Seg("door-x.ts", 1000.0), data, 10, next_start=1012.5)
     plan = hc.plan_window([slow], 1002.0, 1010.0, 10)      # 8 s at 8 fps: 2 s longer than nominal would say
     assert plan.rate == pytest.approx(8.0) and plan.regenerate
@@ -1127,15 +1127,15 @@ def test_tc1562_a_kept_encode_records_the_hash_of_the_copy(tmp_path, monkeypatch
 
 def test_tc1563_a_dirty_index_is_rebuilt_from_the_sidecars(tmp_path):
     root = tmp_path / "clips"
-    stem = "door_2026-10-26_10-00-00+0000_approach_9s"
-    clip_files(root, "2026-10-26", stem, 10, T0)
+    stem = "door_2026-10-19_10-00-00+0000_approach_9s"
+    clip_files(root, "2026-10-19", stem, 10, T0)
     (root / "door" / "index.jsonl").write_text(json.dumps({"clip": "2026-01-01/gone.mp4"}) + "\n")  # the clip's line lost
     hc.mark_index_dirty(str(root / "door"))
     s = hc.ClipsSettings({})
     s.root = str(root)
     hc.apply_retention(s, str(tmp_path / "state"), T0)
     lines = [json.loads(l) for l in (root / "door" / "index.jsonl").read_text().splitlines()]
-    assert [l["clip"] for l in lines] == ["2026-10-26/%s.mp4" % stem] and lines[0]["event_utc_ms"] == T0 + 3000
+    assert [l["clip"] for l in lines] == ["2026-10-19/%s.mp4" % stem] and lines[0]["event_utc_ms"] == T0 + 3000
     assert not (root / "door" / hc.INDEX_DIRTY).exists()
 
 
@@ -1197,10 +1197,10 @@ class FakeTrialFfmpeg:
 
 def trial_day(tmp_path):
     root = tmp_path / "clips"
-    day = root / "door" / "2026-10-26"
+    day = root / "door" / "2026-10-19"
     day.mkdir(parents=True)
-    stems = ["door_2026-10-26_12-00-00+0000_approach_20s", "door_2026-10-26_13-00-00+0000_road-stop_29s",
-             "door_2026-10-26_22-00-00+0000_approach_12s", "door_2026-10-26_02-00-00+0000_approach_31s"]
+    stems = ["door_2026-10-19_12-00-00+0000_approach_20s", "door_2026-10-19_13-00-00+0000_road-stop_29s",
+             "door_2026-10-19_22-00-00+0000_approach_12s", "door_2026-10-19_02-00-00+0000_approach_31s"]
     for stem in stems:
         (day / (stem + ".mp4")).write_bytes(b"c" * 10000)
         (day / (stem + ".json")).write_text("{}")
@@ -1223,11 +1223,11 @@ def test_tc1575_every_combination_is_measured_one_sample_each_kept_and_no_clip_t
     before = {p.name: p.read_bytes() for p in day.iterdir()}
     fake = FakeTrialFfmpeg()
     probe = lambda c, d, n: {"frames": 300, "width": 1536, "height": 1536, "duration": 30.0}  # noqa: E731
-    report = hc.encode_trial(s, "door", "2026-10-26", 2, runner=fake, prober=probe)
+    report = hc.encode_trial(s, "door", "2026-10-19", 2, runner=fake, prober=probe)
     assert {p.name: p.read_bytes() for p in day.iterdir()} == before            # nothing replaced or removed
     names = [hc.combo_name(c) for c in hc.TRIAL_COMBOS]
     assert len(names) == 9 and "hevc_1024sq_200k" in names and "h264_native_300k_5fps" in names
-    trial = root / hc.TRIAL_DIR / "door-2026-10-26"
+    trial = root / hc.TRIAL_DIR / "door-2026-10-19"
     kept = sorted(p.name for p in trial.iterdir() if p.suffix == ".mp4")
     assert kept == sorted("%s_%s.mp4" % (n, stems[0]) for n in names)          # one sample per combination
     assert not [p for p in trial.iterdir() if p.name.endswith(".part")]
@@ -1252,13 +1252,13 @@ def test_tc1575_a_failure_a_full_area_a_time_budget_and_clean(tmp_path, monkeypa
     monkeypatch.setattr(hc.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, b"", b""))
     s, root, day, stems = trial_day(tmp_path)
     probe = lambda c, d, n: {"width": 1536, "height": 1536}  # noqa: E731
-    report = hc.encode_trial(s, "door", "2026-10-26", 1, runner=FakeTrialFfmpeg(fail="hevc"), prober=probe)
+    report = hc.encode_trial(s, "door", "2026-10-19", 1, runner=FakeTrialFfmpeg(fail="hevc"), prober=probe)
     assert sum(1 for r in report["rows"] if "failed" in r) == 4 and "FAILED hevc" in hc.trial_table(report)
     with pytest.raises(hc.QuotaStop, match="no clip is ever removed"):
-        hc.encode_trial(s, "door", "2026-10-26", 1, runner=FakeTrialFfmpeg(), prober=probe,
+        hc.encode_trial(s, "door", "2026-10-19", 1, runner=FakeTrialFfmpeg(), prober=probe,
                         quota_fn=lambda: (900, 1000))
     ticks = iter(range(0, 10 ** 6, hc.TRIAL_RUN_SEC // 2 + 1))
-    cut = hc.encode_trial(s, "door", "2026-10-26", 1, runner=FakeTrialFfmpeg(), prober=probe, clock=lambda: next(ticks))
+    cut = hc.encode_trial(s, "door", "2026-10-19", 1, runner=FakeTrialFfmpeg(), prober=probe, clock=lambda: next(ticks))
     assert cut["stopped_early"] and len(cut["rows"]) < 9
     assert hc.clean_trials(str(root)) > 0 and not (root / hc.TRIAL_DIR).exists()
     assert sorted(p.name for p in day.iterdir()) == sorted([x + ".mp4" for x in stems] + [x + ".json" for x in stems])
@@ -1311,7 +1311,7 @@ def test_tc1575_the_trial_refuses_a_camera_that_is_not_a_name(tmp_path):
     s, _root, _day, _stems = trial_day(tmp_path)
     for camera in ("../../x", "door/..", ""):
         with pytest.raises(hc.Invalid, match="camera name"):
-            hc.encode_trial(s, camera, "2026-10-26", 1, runner=pytest.fail)
+            hc.encode_trial(s, camera, "2026-10-19", 1, runner=pytest.fail)
 
 
 def test_tc1575_the_trial_reserves_its_real_peak_and_keeps_no_broken_sample(tmp_path, monkeypatch):
@@ -1327,9 +1327,123 @@ def test_tc1575_the_trial_reserves_its_real_peak_and_keeps_no_broken_sample(tmp_
                 return subprocess.CompletedProcess(argv, 1, b"", b"Error")
             return FakeTrialFfmpeg.__call__(self, argv, stdout, stderr, timeout)
     # four 10000-byte clips: the old reserve (9 x the whole sample, 360 kB) would not fit under 90 % of 200 kB
-    report = hc.encode_trial(s, "door", "2026-10-26", 4, runner=Partial(), prober=lambda c, d, n: {},
+    report = hc.encode_trial(s, "door", "2026-10-19", 4, runner=Partial(), prober=lambda c, d, n: {},
                              quota_fn=lambda: (0, 200000))
-    trial = root / hc.TRIAL_DIR / "door-2026-10-26"
+    trial = root / hc.TRIAL_DIR / "door-2026-10-19"
     assert not [p for p in trial.iterdir() if p.name.startswith("hevc")]
     assert all("ssim_failed" in r for r in report["rows"] if "bytes" in r)
     assert "SSIM missing for" in hc.trial_table(report)
+
+
+# ── the Opus confirmation's fixes (2026-10-27) ───────────────────────────────
+
+
+def test_tc1553_an_index_timed_open_part_is_timed_by_its_own_last_write(tmp_path):
+    # 7 fps in the dark, 300 s into the open segment: 2100 whole frames, the file last written at start + 300
+    data = ts_bytes(2101, broken=True)
+    seg = Seg("door-x.ts.part", 1000.0, part=True)
+    slow = hc.Loaded(seg, data, 10, mtime=1300.0)
+    assert slow.timing == "index" and slow.times[-1] == pytest.approx(1000.0 + 2099 * 300.0 / 2100, abs=0.01)
+    plan = hc.plan_window([slow], 1250.0, 1290.0, 10)
+    assert plan.end_covered and plan.frames == pytest.approx(40 * 7, abs=2)        # the right frames, not 400
+    assert plan.rate == pytest.approx(7.0, abs=0.05)
+    nominal = hc.Loaded(seg, data, 10)                                              # what the cutter did before
+    assert hc.plan_window([nominal], 1250.0, 1290.0, 10) is None   # nominal fps put these frames at 1000..1210
+
+
+def test_tc1553_load_segment_reads_the_last_write_of_a_real_part(tmp_path):
+    path = tmp_path / "door-20261019T195000Z.ts.part"
+    path.write_bytes(ts_bytes(701, broken=True))
+    os.utime(str(path), (1000.0 + 100.0, 1000.0 + 100.0))
+    got = hc.load_segment(Seg(str(path), 1000.0, part=True), 10, {})
+    assert got.times[-1] == pytest.approx(1000.0 + 699 * 100.0 / 700, abs=0.01)
+
+
+def test_tc1553_a_finished_segment_is_anchored_to_the_earlier_of_its_last_write_and_the_next_start():
+    data = ts_bytes(100, broken=True)
+    # the recorder stopped at 1012.5 (last write) and came back at 1020: the outage is not spread
+    seg = hc.Loaded(Seg("door-x.ts", 1000.0), data, 10, next_start=1020.0, mtime=1012.5)
+    assert seg.times[99] == pytest.approx(1012.375)
+
+
+def test_tc1575_batch_containers_are_capped_and_the_manual_command_drops_the_capability(tmp_path, monkeypatch, capsys):
+    s = hc.ClipsSettings({})
+    for argv in (hc.encode_command(s, "door", "/d", "a.mp4", "p"),
+                 hc.trial_encode_command(s, "door", "/d", "/o", "x", hc.TRIAL_COMBOS[0], "o.mp4"),
+                 hc.trial_ssim_command("door", "/d", "/o", "x", "o.mp4", 1536, 1536, 0)):
+        assert argv[argv.index("--cpus") + 1] == "0.4" and argv[argv.index("--cpu-shares") + 1] == "2"
+    cut = hc.cut_command("door", "/d", "p", None)
+    assert cut[cut.index("--cpus") + 1] == "1"
+    assert "-p CapabilityBoundingSet=~CAP_SYS_RESOURCE" in hc.MANUAL_RUN and "-p Nice=19" in hc.MANUAL_RUN
+    readme = (STACK / "clips" / "README.md").read_text(encoding="utf-8")
+    assert hc.MANUAL_RUN + " encode-trial" in readme and hc.MANUAL_RUN + " encode-trial --clean" in readme
+    assert "sudo python3 /opt/homehub/stack/clips/homehub_clips.py encode-trial" not in readme
+    monkeypatch.setattr(hc, "guard", lambda settings: (False, "this process holds CAP_SYS_RESOURCE, which ignores"))
+    env = tmp_path / "env"
+    env.write_text("CLIPS_ENABLED=true\n")
+    assert hc.main(["--env-file", str(env), "--state-dir", str(tmp_path / "st"), "encode-trial", "--clean"]) == hc.EXIT_GUARD
+    assert hc.MANUAL_RUN in capsys.readouterr().out
+
+
+def test_tc1564_room_is_never_made_by_halves_and_the_trial_goes_first(tmp_path):
+    root = tmp_path / "clips"
+    s = hc.ClipsSettings({})
+    s.root = str(root)
+    for i in range(2):
+        clip_files(root, "2026-10-1%d" % i, "door_2026-10-1%d_10-00-00+0000_approach_9s" % i, 1000, T0)
+    trial = root / hc.TRIAL_DIR / "door-2026-10-10"
+    trial.mkdir(parents=True)
+    (trial / "h264_native_300k_x.mp4").write_bytes(b"t" * 3000)
+
+    def size():
+        return sum(p.stat().st_size for p in root.rglob("*") if p.is_file())
+    other = {"v": 0}
+    quota = lambda: (size() + other["v"], 10000)  # noqa: E731
+    other["v"] = 9000 - size()
+    assert hc.make_room(s, str(tmp_path), T0, 2000, quota) > 0
+    assert not trial.exists() and len(list(root.rglob("*.mp4"))) == 2           # the trial went, no clip did
+    other["v"] = 9990 - size()
+    with pytest.raises(hc.QuotaStop, match="none was removed"):
+        hc.make_room(s, str(tmp_path), T0, 5000, quota)
+    assert len(list(root.rglob("*.mp4"))) == 2
+
+
+def test_tc1563_retention_sweeps_stale_parts_in_the_trial_folder(tmp_path):
+    root = tmp_path / "clips"
+    s = hc.ClipsSettings({})
+    s.root = str(root)
+    trial = root / hc.TRIAL_DIR / "door-2026-10-10"
+    trial.mkdir(parents=True)
+    (trial / ".x.mp4.part").write_bytes(b"p")
+    os.utime(str(trial / ".x.mp4.part"), (0, 0))
+    (trial / "kept.mp4").write_bytes(b"k")
+    assert hc.apply_retention(s, str(tmp_path / "state"), T0)["stale_parts"] == 1
+    assert sorted(p.name for p in trial.iterdir()) == ["kept.mp4"]
+
+
+def test_tc1560_a_segment_that_never_opens_is_lost_and_alerted_after_max_waits(tmp_path, monkeypatch):
+    state, seg_dir = str(tmp_path / "state"), str(tmp_path / "segs")
+    settings = hc.ClipsSettings({"CAMERA_DOOR_SEGMENT_DIR": seg_dir})
+    write_segment(seg_dir, T0 / 1000.0 - 60, 1200)
+    ev.append(state, rec(1, "approach", "event", T0))
+    monkeypatch.setattr(hc, "load_segment", lambda *a, **k: None)
+    alerts = []
+    for _ in range(hc.MAX_WAITS - 1):
+        assert hc.cut_camera(settings, settings.cameras[0], state, T0 + 600000)["waiting"] == 1
+    counts = hc.cut_camera(settings, settings.cameras[0], state, T0 + 600000, alert=lambda *a: alerts.append(a))
+    assert counts["lost"] == 1 and alerts and alerts[0][0] == "clips-lost-door"
+    ledger = json.load(open(hc.ledger_path(state, "door")))
+    assert ledger["episodes"]["hub-motion:r.1"]["status"] == "lost" and ledger["waits"] == {}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows; runs under Linux/WSL")
+def test_tc1563_no_listing_descends_through_a_symlink(tmp_path):
+    root = tmp_path / "clips"
+    outside = tmp_path / "elsewhere" / "2026-10-10"
+    outside.mkdir(parents=True)
+    (outside / "door_2026-10-10_10-00-00+0000_approach_9s.mp4").write_bytes(b"x")
+    (root / "door").mkdir(parents=True)
+    os.symlink(str(outside), str(root / "door" / "2026-10-10"))
+    os.symlink(str(tmp_path / "elsewhere"), str(root / "garage"))
+    assert hc.camera_dirs(str(root)) == ["door"] and hc._days(str(root / "door")) == []
+    assert hc.list_clips(str(root)) == []

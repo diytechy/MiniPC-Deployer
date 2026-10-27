@@ -107,6 +107,14 @@ MAX_SIDECAR_RECORDS = 200
 GAP_SEC = 2.0
 MAX_SNAP_SEC = 5.0         # how far back the cut may start for a keyframe
 STALE_PART_SEC = 3600
+LOW_CPUS = "0.4"           # the batch containers' ceiling (the detector's decoder has the same)
+MAX_WAITS = 10             # passes an episode may wait on a listed segment that cannot be opened
+# How a person runs a verb that writes the clips area by hand: as the units do,
+# without CAP_SYS_RESOURCE (the quota is no wall for a process that holds it,
+# so the guard refuses one), at the lowest priority.
+MANUAL_RUN = ("sudo systemd-run --wait --pipe --quiet -p CapabilityBoundingSet=~CAP_SYS_RESOURCE "
+              "-p NoNewPrivileges=yes -p Nice=19 -p IOSchedulingClass=idle -p CPUQuota=25% "
+              "/usr/bin/python3 /opt/homehub/stack/clips/homehub_clips.py")
 CUT_TIMEOUT_SEC = 300
 ENCODE_LOOKBACK_DAYS = 7   # the encode batch looks at this many days of clips
 ENCODE_RUN_SEC = 600       # and stops starting new encodes after this long
@@ -303,14 +311,16 @@ def scan_frames(data: bytes, part: bool) -> FrameIndex:
 
 
 def frame_times(idx: FrameIndex, start: float, fps: int,
-                next_start: Optional[float] = None) -> Tuple[List[float], str]:
+                end: Optional[float] = None) -> Tuple[List[float], str]:
     """Wall time of each frame: the segment's start plus its PTS offset, or,
     when the PTS cannot be believed, its index spread evenly from this
-    segment's start to the NEXT segment's start (the camera drops its frame
-    rate in low light and infrared, so the nominal rate would drift by seconds
-    over ten minutes) - at the nominal rate only for the open .part, or when the
-    next start implies a rate above nominal or under half of it (a recorder
-    restart lies between them). PTS is
+    segment's start to `end`, where its frames really end (the camera drops its
+    frame rate in low light and infrared, so the nominal rate would drift by
+    seconds over ten minutes). The caller passes, for a finished segment, the
+    earlier of the NEXT segment's start and the file's last write (a short
+    recorder outage after it must not stretch it), and for the open .part its
+    last write. The nominal rate is used only when there is no anchor, or when
+    the anchor implies a rate above nominal or under half of it. PTS is
     believed when every frame has one, every step is forward and under 60 s
     (a hole the recorder rode out without ending the segment), and the whole
     span is at least half what the frame count implies and at most twice that
@@ -328,8 +338,8 @@ def frame_times(idx: FrameIndex, start: float, fps: int,
             base = pts[0]
             return [start + ((p - base) % PTS_WRAP) / 90000.0 for p in pts], "pts"  # type: ignore[operator]
     period = 1.0 / fps
-    if next_start is not None and n > 1:
-        measured = (next_start - start) / float(n)
+    if end is not None and n > 1:
+        measured = (end - start) / float(n)
         if 0.95 / fps <= measured <= 2.0 / fps:
             period = measured
     return [start + i * period for i in range(n)], "index"
@@ -339,11 +349,17 @@ class Loaded:
     """One segment, read once into memory and indexed, so a prune or a rename
     by the recorder cannot pull the bytes from under a cut."""
 
-    def __init__(self, seg: Segment, data: bytes, fps: int, next_start: Optional[float] = None):
+    def __init__(self, seg: Segment, data: bytes, fps: int, next_start: Optional[float] = None,
+                 mtime: Optional[float] = None):
         self.seg = seg
         self.data = data
         self.idx = scan_frames(data, seg.part)
-        self.times, self.timing = frame_times(self.idx, seg.start, fps, None if seg.part else next_start)
+        if seg.part:
+            end = mtime                      # the open segment: its frames end at its last write
+        else:
+            anchors = [t for t in (next_start, mtime) if t is not None]
+            end = min(anchors) if anchors else None
+        self.times, self.timing = frame_times(self.idx, seg.start, fps, end)
         n = len(self.times)
         # The segment's own frame period: what its frames were actually spaced at.
         self.period = (self.times[-1] - self.times[0]) / (n - 1) if n > 1 and self.times[-1] > self.times[0] \
@@ -361,14 +377,15 @@ def load_segment(seg: Segment, fps: int, cache: Dict[tuple, "Loaded"],
     recorder renamed or pruned it since it was listed)."""
     try:
         with open(seg.path, "rb") as handle:
-            size = os.fstat(handle.fileno()).st_size
+            st = os.fstat(handle.fileno())
+            size = st.st_size
             key = (seg.path, size, next_start)
             if key in cache:
                 return cache[key]
             data = handle.read(size)
     except OSError:
         return None
-    loaded = Loaded(seg, data, fps, next_start)
+    loaded = Loaded(seg, data, fps, next_start, st.st_mtime)
     cache[key] = loaded
     return loaded
 
@@ -646,14 +663,17 @@ def prune_ledger(ledger: Dict[str, object], now_ms: int) -> None:
 
 
 def docker_base(name: str, out_dir: str, read_only_out: bool = False, shares: int = 256,
-                device: Optional[str] = None, stdin: bool = False) -> List[str]:
+                device: Optional[str] = None, stdin: bool = False, cpus: str = "1") -> List[str]:
     """A throwaway container of the pinned image: no network, read-only root,
     no capabilities (so no CAP_SYS_RESOURCE: the quota holds for its writes),
-    out_dir bound at /out. CPU weight `shares` against docker's default 1024."""
+    out_dir bound at /out. CPU weight `shares` against docker's default 1024,
+    and a ceiling of `cpus` (the batch work - encode, trial, SSIM - LOW_CPUS).
+    The container runs in docker's cgroup, so its unit's Nice/CPUQuota never
+    reach it: these flags are its priority."""
     argv = ["docker", "run", "--rm"] + (["-i"] if stdin else []) + [
             "--name", name, "--network", "none", "--read-only",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--log-driver", "none",
-            "--pids-limit", "64", "--memory", "384m", "--cpus", "1", "--cpu-shares", str(shares),
+            "--pids-limit", "64", "--memory", "384m", "--cpus", cpus, "--cpu-shares", str(shares),
             "-v", "%s:/out%s" % (out_dir, ":ro" if read_only_out else "")]
     if device:
         argv += ["--device", device]
@@ -707,7 +727,7 @@ def encode_command(settings: ClipsSettings, camera: str, out_dir: str, src: str,
     """VA-API encode of one clip, the container at the lowest CPU weight. VBR
     around CLIPS_ENCODE_KBPS (peak twice that), at CLIPS_ENCODE_SIZE and
     CLIPS_ENCODE_FPS when set (0 = unchanged). Implements: LLR-1374."""
-    argv = docker_base("homehub-clips-encode-%s" % camera, out_dir, shares=2, device=settings.device)
+    argv = docker_base("homehub-clips-encode-%s" % camera, out_dir, shares=2, device=settings.device, cpus=LOW_CPUS)
     argv += ["--entrypoint", "ffmpeg", door_relay.image_ref()]
     argv += vaapi_encode_args(settings.device, "/out/" + src, settings.codec, settings.kbps,
                               settings.encode_size, settings.encode_fps)
@@ -997,11 +1017,26 @@ def cut_camera(settings: ClipsSettings, cam: CameraSettings, state_dir: str, now
                 for key in [k for k in cache if k[0] not in keep]:
                     del cache[key]
                 got = [(s, load_segment(s, cam.fps, cache, nxt)) for s, nxt in needed]
+                waits = ledger.setdefault("waits", {})  # type: ignore[union-attr]
                 if any(x is None for _s, x in got):
                     # Renamed (.part -> .ts) or pruned since it was listed: the
-                    # next pass lists the tree as it is then.
-                    counts["waiting"] += 1
+                    # next pass lists the tree as it is then. One that still
+                    # cannot be opened after MAX_WAITS passes is unreadable.
+                    waits[ep.id] = int(waits.get(ep.id, 0)) + 1  # type: ignore[union-attr,index]
+                    if waits[ep.id] < MAX_WAITS:  # type: ignore[index]
+                        counts["waiting"] += 1
+                        continue
+                    del waits[ep.id]  # type: ignore[union-attr]
+                    entry = {"start_ms": ws, "event_ms": ep.start_ms, "end_ms": we, "at_ms": now_ms,
+                             "cause": ep.cause, "status": "lost",
+                             "why": "a segment it needs could not be opened in %d passes" % MAX_WAITS}
+                    ledger["episodes"][ep.id] = entry  # type: ignore[index]
+                    counts["lost"] += 1
+                    when = time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(ep.event_ms / 1000.0))
+                    lost_new.append(when)
+                    mc.log("clips [%s]: %s at %s LOST - %s" % (cam.camera, ep.cause, when, entry["why"]), warning=True)
                     continue
+                waits.pop(ep.id, None)  # type: ignore[union-attr]
                 loaded = [x for _s, x in got if x is not None and x.times]
                 plan = plan_window(loaded, ws / 1000.0, we / 1000.0, cam.fps) if loaded else None
             state = readiness(now_ms, ep, plan, oldest)
@@ -1114,10 +1149,19 @@ def _listdir(path: str) -> List[str]:
         return []
 
 
+def _real_dir(path: str) -> bool:
+    """A directory itself, never a symlink to one (lstat): nothing here
+    descends through a link out of the clips area."""
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
 def _days(cam_dir: str) -> List[str]:
     try:
         return [d for d in os.listdir(cam_dir) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d)
-                and os.path.isdir(os.path.join(cam_dir, d))]
+                and _real_dir(os.path.join(cam_dir, d))]
     except OSError:
         return []
 
@@ -1253,7 +1297,7 @@ def trial_sample(day_dir: str, max_clips: int) -> List[Tuple[str, str]]:
 
 def trial_encode_command(settings: ClipsSettings, camera: str, day_dir: str, out_dir: str, stem: str,
                          combo: Dict[str, object], out_name: str) -> List[str]:
-    argv = docker_base("homehub-clips-trial-%s" % camera, out_dir, shares=2, device=settings.device)
+    argv = docker_base("homehub-clips-trial-%s" % camera, out_dir, shares=2, device=settings.device, cpus=LOW_CPUS)
     argv += ["-v", "%s:/src:ro" % day_dir, "--entrypoint", "ffmpeg", door_relay.image_ref()]
     args = vaapi_encode_args(settings.device, "/src/%s.mp4" % stem, str(combo["codec"]), int(combo["kbps"]),
                              int(combo["size"]), int(combo["fps"]), loglevel="info")
@@ -1267,7 +1311,7 @@ def trial_ssim_command(camera: str, day_dir: str, out_dir: str, stem: str, out_n
     encode's rate when that was changed."""
     ref = "fps=%d" % fps if fps else "null"
     graph = "[0:v]scale=%d:%d:flags=bicubic[a];[1:v]%s[b];[a][b]ssim" % (width, height, ref)
-    argv = docker_base("homehub-clips-ssim-%s" % camera, out_dir, read_only_out=True, shares=2)
+    argv = docker_base("homehub-clips-ssim-%s" % camera, out_dir, read_only_out=True, shares=2, cpus=LOW_CPUS)
     return argv + ["-v", "%s:/src:ro" % day_dir, "--entrypoint", "ffmpeg", door_relay.image_ref(),
                    "-nostdin", "-hide_banner", "-loglevel", "info", "-nostats", "-i", "/out/" + out_name,
                    "-i", "/src/%s.mp4" % stem, "-lavfi", graph, "-f", "null", "-"]
@@ -1412,15 +1456,35 @@ def trial_table(report: Dict[str, object]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def clean_trials(root: str) -> int:
-    """Remove the trial folder (only it). Returns the files removed."""
+def trial_bytes(root: str) -> int:
+    """Bytes the encode trial's folder holds (it counts against the quota)."""
     base = os.path.join(root, TRIAL_DIR)
-    removed = 0
+    total = 0
+    for top in _listdir(base):
+        for name in _listdir(os.path.join(base, top)):
+            try:
+                total += os.lstat(os.path.join(base, top, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def clean_trials(root: str, count_bytes: bool = False) -> int:
+    """Remove the trial folder (only it). Returns the files removed, or with
+    count_bytes the bytes freed."""
+    base = os.path.join(root, TRIAL_DIR)
+    removed = freed = 0
     for top in sorted(_listdir(base)):
         folder = os.path.join(base, top)
         for name in _listdir(folder):
-            if _remove(os.path.join(folder, name)):
+            path = os.path.join(folder, name)
+            try:
+                size = os.lstat(path).st_size
+            except OSError:
+                size = 0
+            if _remove(path):
                 removed += 1
+                freed += size
         try:
             os.rmdir(folder)
         except OSError:
@@ -1429,7 +1493,7 @@ def clean_trials(root: str) -> int:
         os.rmdir(base)
     except OSError:
         pass
-    return removed
+    return freed if count_bytes else removed
 
 
 # ── retention ────────────────────────────────────────────────────────────────
@@ -1460,7 +1524,7 @@ def camera_dirs(root: str) -> List[str]:
     """Every camera folder under the clips root - configured or not, so a
     camera dropped from CAMERAS still ages out and still counts."""
     try:
-        return sorted(d for d in os.listdir(root) if ev.CAMERA_RE.fullmatch(d) and os.path.isdir(os.path.join(root, d)))
+        return sorted(d for d in os.listdir(root) if ev.CAMERA_RE.fullmatch(d) and _real_dir(os.path.join(root, d)))
     except OSError:
         return []
 
@@ -1569,6 +1633,16 @@ def apply_retention(settings: ClipsSettings, state_dir: str, now_ms: int,
                             stale += 1
                     except OSError:
                         pass
+    trial = os.path.join(settings.root, TRIAL_DIR)
+    for top in _listdir(trial):
+        for name in _listdir(os.path.join(trial, top)):
+            path = os.path.join(trial, top, name)
+            try:
+                if name.endswith(".part") and now_ms / 1000.0 - os.lstat(path).st_mtime > STALE_PART_SEC:
+                    _remove(path)
+                    stale += 1
+            except OSError:
+                pass
     used, limit = quota_fn()
     clips = list_clips(settings.root, cameras)
     doomed = retention_plan(clips, now_ms, settings.retention_days, settings.cap_mib * MIB,
@@ -1647,23 +1721,35 @@ def make_room(settings: ClipsSettings, state_dir: str, now_ms: int, need: int,
     ceiling = limit * settings.quota_high_pct // 100
     if used + need <= ceiling:
         return 0
+    # The encode trial's samples are disposable next to real footage: they go
+    # first, so no clip is removed to make room for them.
+    trial_freed = clean_trials(settings.root, count_bytes=True) if trial_bytes(settings.root) else 0
+    used -= trial_freed
+    if used + need <= ceiling:
+        mc.log("clips: made room for %.1f MiB by removing the encode trial's samples" % (need / MIB))
+        return trial_freed
     clips = [c for c in list_clips(settings.root) if (c[1], c[2]) not in (keep or set())]
+    # Feasibility FIRST: if removing every candidate would still not fit, nothing is removed.
+    if used + need - sum(c[3] for c in clips) > limit:
+        raise QuotaStop("the clips area (%d MiB) cannot hold %.1f MiB more even after removing all %d older "
+                        "clip(s); none was removed" % (limit // MIB, need / MIB, len(clips)))
+    target = ceiling if used + need - sum(c[3] for c in clips) <= ceiling else limit
     rules = retention_plan(clips, now_ms, settings.retention_days, settings.cap_mib * MIB)
     doomed = list(rules)
     projected = used + need - sum(c[3] for c in doomed)
     chosen = {id(c) for c in doomed}
     for c in clips:  # oldest first
-        if projected <= ceiling:
+        if projected <= target:
             break
         if id(c) not in chosen:
             doomed.append(c)
             projected -= c[3]
     _gone, freed = remove_clips(settings, doomed)
     mc.log("clips: made room for %.1f MiB: removed %d clip(s), %.1f MiB" % (need / MIB, len(_gone), freed / MIB))
-    if used + need - freed > limit:
-        raise QuotaStop("the clips area (%d MiB) cannot hold %.1f MiB more even after removing %d older clip(s)"
+    if used + need - freed > limit:  # a removal failed (it is logged): still too full
+        raise QuotaStop("the clips area (%d MiB) cannot hold %.1f MiB more after removing %d older clip(s)"
                         % (limit // MIB, need / MIB, len(_gone)))
-    return freed
+    return freed + trial_freed
 
 
 def index_line_from_sidecar(day: str, stem: str, side: Dict[str, object]) -> Optional[Dict[str, object]]:
@@ -1809,6 +1895,8 @@ def run_encode_trial(settings: ClipsSettings, args) -> int:
             ok, reason = guard(settings)
             if not ok:
                 mc.log("clips: trial clean skipped - guard: %s" % reason, warning=True)
+                if "CAP_SYS_RESOURCE" in reason:
+                    mc.log("clips: run it as `%s encode-trial --clean`" % MANUAL_RUN, warning=True)
                 return EXIT_GUARD
             print("removed %d trial file(s)" % clean_trials(settings.root))
             return 0
@@ -1824,6 +1912,8 @@ def run_encode_trial(settings: ClipsSettings, args) -> int:
                                   quota_fn=lambda: clips_quota(settings))
         except (Invalid, QuotaStop, GuardStop) as exc:
             mc.log("clips: encode-trial REFUSED - %s" % exc, warning=True)
+            if "CAP_SYS_RESOURCE" in str(exc):
+                mc.log("clips: run it as `%s encode-trial ...`" % MANUAL_RUN, warning=True)
             return 2
         sys.stdout.write(trial_table(report))
         return 0

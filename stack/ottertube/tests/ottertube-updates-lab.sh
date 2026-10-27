@@ -6,8 +6,10 @@
 # A LABELLED LAB SUITE: needs docker and the local caddy-cloudflare image
 # (CADDY_IMAGE_TAG in stack/.env.example), nothing from the network, no root
 # beyond what docker needs. Meant for WSL Ubuntu on the dev PC or a lab VM -
-# never the hub. Everything it makes is under one temp directory and two
-# containers named ottertube-updates-lab-*, all removed at the end.
+# never the hub. Everything it makes is under one temp directory and one
+# container, ottertube-updates-lab-caddy (started afresh for each check that
+# needs other settings), all removed at the end; check 8 starts none (it only
+# runs `docker compose config`).
 #
 #   bash stack/ottertube/tests/ottertube-updates-lab.sh
 #
@@ -166,6 +168,13 @@ for v in false True "" 'tr"ue' unset; do
     if [ "$c1$c2$c3$c4" = 404404404404 ]; then ok "6 OTTERTUBE_SITE_ENABLED='$v': update.json, the exe, the web build and / all 404"
     else bad "6 knob '$v': update=$c1 exe=$c2 web=$c3 root=$c4"; fi
 done
+# the gate comes BEFORE @lan: a client off the LAN with the site off gets the
+# gate's 404, not @lan's 403
+if start_caddy "10.255.255.0/24" -e OTTERTUBE_SITE_ENABLED=false; then
+    c1="$(code "$U/ottertube/update.json")"; c4="$(code "$U/")"
+    if [ "$c1$c4" = 404404 ]; then ok "6 the site off, a client off the LAN: 404 (the gate answers before @lan's 403)"
+    else bad "6 site off + off-LAN: update=$c1 root=$c4 (want 404 404)"; fi
+else bad "6 caddy did not start (site off, off-LAN)"; fi
 
 # 7 off the LAN: 403 (the site on)
 if start_caddy "10.255.255.0/24" -e OTTERTUBE_SITE_ENABLED=true; then

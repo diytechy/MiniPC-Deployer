@@ -656,16 +656,19 @@ hub.** The materialised `.env` is written from it, so a value edited only in
    timer is off rather than assume it (`systemctl is-enabled
    homehub-library-backup.timer` says `disabled`, and `systemctl list-timers
    --all` does not list it as armed; open-items E13), and `systemctl disable
-   --now` it if not. Read the deployed image's stamp (`docker image inspect
+   --now` it if not. And confirm no backup is running at all:
+   `systemctl is-active homehub-library-backup.service` is not `active` or
+   `activating`, and `docker ps --filter label=com.docker.compose.service=filebackup`
+   lists nothing. Read the deployed image's stamp (`docker image inspect
    filebackup:local`), `docker tag filebackup:local filebackup:kit12`, then load
-   the new one as `filebackup:local`. From here the legacy layout no longer
-   runs, which is why the timer must be off.
+   the new one as `filebackup:local`. From here no backup may run until step 8:
+   the legacy layout cannot use the new image.
 4. **Deliver this stack and install the config:**
    `install -m0644 -o root -g root /opt/homehub/stack/backup/filebackup-store.json /etc/homehub-backup/filebackup-store.json`.
 5. **The dry check, BEFORE anything is set aside:**
    `sudo /opt/homehub/stack/backup/library-backup.sh --layout single --preflight-only`.
-   It runs the one-mount preflight over the still-legacy knob and creates
-   nothing. It must get past the lock, the **image contract (step 1b)** and
+   It runs the one-mount preflight over the still-legacy knob, creates
+   nothing and starts no container, so it is not a backup run. It must get past the lock, the **image contract (step 1b)** and
    the mount checks, and then stop at **step 2b** ("the old three-mount store
    is still in place"): that refusal is the expected end. A stop anywhere
    earlier (no image, a wrong label, a mount) is a stop for the cutover.
@@ -687,7 +690,9 @@ hub.** The materialised `.env` is written from it, so a value edited only in
    On a store the Owner wrote beforehand this run continues it; a full first
    backup takes days.
 9. **Size the limit and turn the timer on:** `FILEBACKUP_MEM_LIMIT` at about
-   twice that peak, in `config.homehub.psd1` again, then
+   twice that peak, in `config.homehub.psd1` again; materialise, ship the
+   `.env`, and check `docker compose --profile filebackup config
+   filebackup-store` shows the new `mem_limit` and `memswap_limit`; then
    `systemctl enable --now homehub-library-backup.timer`. The timer runs the
    weekly verify by itself; with `7a6a80a` that is the C43 memory risk named
    in step 1, bounded by the cap (an OOM kill of the container, not the box).
@@ -698,9 +703,13 @@ hub.** The materialised `.env` is written from it, so a value edited only in
 
 - **Up to step 5** (nothing set aside): `FILEBACKUP_LAYOUT='legacy'` in
   `config.homehub.psd1` (materialise, ship) and `docker tag filebackup:kit12
-  filebackup:local`. Nothing else changed.
+  filebackup:local`. The installed `filebackup-store.json` may stay: only the
+  `filebackup-store` service binds it, and the legacy layout never runs that.
 - **After step 6** (the old store set aside): **the timer stays OFF until the
-  set-aside renames are reversed.** A knob-only rollback is NOT valid here: the
+  set-aside renames are reversed**, and no one-mount run may still be going:
+  `systemctl stop library-backup-first` if the step-8 run is, and confirm
+  `docker ps --filter label=com.docker.compose.service=filebackup-store` lists
+  nothing before anything is renamed. A knob-only rollback is NOT valid here: the
   legacy wrapper pre-creates its bind paths, so it would create an empty
   `library/` and `library-changes/` where the old store used to be, and the
   kit-12 engine would then run against them with its stale `/state` record —
@@ -784,12 +793,16 @@ and the original is the Owner's to keep or remove.
 **Set the old store aside** — the timer off (cutover step 3), then:
 
 ```bash
-cd /mnt/backup-drive && findmnt -T .                  # the backup drive itself, mounted
+mountpoint -q /mnt/backup-drive || echo "STOP: the backup drive is not mounted"
+cd /mnt/backup-drive
+# FILEBACKUP_STORE must be neither of the two folders below nor inside one: the
+# renames would carry the new store away with them.
+ls -d library library-changes 2>&1                    # each that exists holds the old store
 sudo mkdir old-library-store
 stat -c '%d %n' . old-library-store library library-changes 2>/dev/null
 #   every line must show the SAME device number: then each mv below is a rename.
 #   A different number means another filesystem, where mv would copy terabytes - stop.
-# One mv per folder that EXISTS; skip a line whose source is absent.
+# One mv per folder that EXISTS (the ls above); skip a line whose source is absent.
 sudo mv -T library         old-library-store/library
 sudo mv -T library-changes old-library-store/library-changes
 # NEVER move library-store here when it is the new store.
@@ -816,8 +829,10 @@ Also worth knowing:
 
 - **Space.** The set-aside store stays on the drive beside the new one. The
   capacity floor (step 3 of the wrapper) is checked before each run only; a
-  drive that fills during one stops it with **4** and the next runs resume.
-  Where the set-aside store ends up is the Owner's call, never this stack's.
+  drive that fills during one stops it with **4**, and every later run then
+  refuses at that floor until space is made — nothing here makes it. Where the
+  space comes from (the set-aside store moved off this drive, or removed once
+  the new store has history) is the Owner's call, never this stack's.
 - **Restoring from the set-aside store** uses the kit inside it
   (`bash/reconstruct.sh` in its latest state or a snapshot). Its folders have
   moved, so pass its roots explicitly as that kit's `--help` describes.

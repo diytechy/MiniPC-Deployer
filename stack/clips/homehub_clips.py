@@ -1057,28 +1057,39 @@ def reconcile_encodes(root: str, camera: str, now: Optional[float] = None) -> in
     for day in sorted(d for d in _days(cam_dir) if d >= since):
         day_dir = os.path.join(cam_dir, day)
         for name in sorted(_listdir(day_dir)):
-            if not name.endswith(".json"):
-                continue
-            side_path = os.path.join(day_dir, name)
-            side = mc.load_json(side_path, {})
-            enc = side.get("encode") if isinstance(side.get("encode"), dict) else None
-            try:
-                size = os.path.getsize(side_path[:-5] + ".mp4")
-            except OSError:
-                continue
-            if enc and enc.get("kept") and size != side.get("bytes") and size == enc.get("bytes_copy"):
-                side["bytes"], side["sha256"] = size, enc.get("sha256_copy")
-                enc.update(kept=False, failed="the encoded file never replaced the copy")
-                write_json_atomic(side_path, side)
-                fixed += 1
+            if name.endswith(".json"):
+                side_path = os.path.join(day_dir, name)
+                fixed += reconcile_record(side_path, mc.load_json(side_path, {}))
     return fixed
 
 
-def encode_candidates(root: str, camera: str, now: Optional[float] = None) -> List[Tuple[str, str]]:
+def reconcile_record(side_path: str, side: Dict[str, object]) -> int:
+    """Put one sidecar back to its copy when its encode's replace never
+    happened (the file on disk has the copy's size); 1 when it did."""
+    enc = side.get("encode") if isinstance(side.get("encode"), dict) else None
+    if not enc or not enc.get("kept"):
+        return 0
+    try:
+        size = os.path.getsize(side_path[:-5] + ".mp4")
+    except OSError:
+        return 0
+    if size != side.get("bytes") and size == enc.get("bytes_copy"):
+        side["bytes"], side["sha256"] = size, enc.get("sha256_copy")
+        enc.update(kept=False, failed="the encoded file never replaced the copy")
+        write_json_atomic(side_path, side)
+        return 1
+    return 0
+
+
+def encode_candidates(root: str, camera: str, now: Optional[float] = None,
+                      reconcile: bool = False) -> List[Tuple[str, str]]:
     """(day dir, stem) of clips whose sidecar has no encode result yet, oldest
     first - looking only at the last ENCODE_LOOKBACK_DAYS day folders, so the
     batch does not read every sidecar of a year of clips each quarter hour
-    (older copies, from before the encode was switched on, stay as cut)."""
+    (older copies, from before the encode was switched on, stay as cut).
+    With `reconcile` (the batch, behind the guard) the same scan also puts back
+    a record whose replace never happened (reconcile_record): one pass over the
+    sidecars, not two."""
     out = []
     cam_dir = os.path.join(root, camera)
     since = time.strftime("%Y-%m-%d", time.localtime((now or time.time()) - ENCODE_LOOKBACK_DAYS * 86400))
@@ -1086,7 +1097,10 @@ def encode_candidates(root: str, camera: str, now: Optional[float] = None) -> Li
         day_dir = os.path.join(cam_dir, day)
         for name in sorted(_listdir(day_dir)):
             if name.endswith(".json") and os.path.exists(os.path.join(day_dir, name[:-5] + ".mp4")):
-                side = mc.load_json(os.path.join(day_dir, name), {})
+                side_path = os.path.join(day_dir, name)
+                side = mc.load_json(side_path, {})
+                if reconcile:
+                    reconcile_record(side_path, side)
                 if side.get("v") == 1 and side.get("encode") is None:
                     out.append((day_dir, name[:-5]))
     return out
@@ -1120,7 +1134,7 @@ def encode_clip(settings: ClipsSettings, camera: str, day_dir: str, stem: str,
     src = os.path.join(day_dir, stem + ".mp4")
     side_path = os.path.join(day_dir, stem + ".json")
     if quota_fn is not None:  # the encoded file is written beside the copy
-        make_room(settings, "", int(time.time() * 1000), os.path.getsize(src), quota_fn)
+        make_room(settings, "", int(time.time() * 1000), os.path.getsize(src), quota_fn, keep={(day_dir, stem)})
     side = mc.load_json(side_path, {})
     part = stem + ".enc.mp4.part"
     part_path = os.path.join(day_dir, part)
@@ -1270,6 +1284,8 @@ def encode_trial(settings: ClipsSettings, camera: str, day: str, max_clips: int,
                  clock=time.monotonic) -> Dict[str, object]:
     """Run the trial; returns the report (also written as trial.json and
     trial.txt in the trial folder). Implements: LLR-1374."""
+    if not ev.CAMERA_RE.fullmatch(camera or "") or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day or ""):
+        raise Invalid("--camera must be a camera name and --day YYYY-MM-DD")
     ok, reason = guard(settings)
     if not ok:
         raise GuardStop(reason)
@@ -1280,18 +1296,21 @@ def encode_trial(settings: ClipsSettings, camera: str, day: str, max_clips: int,
     out_dir = os.path.join(settings.root, TRIAL_DIR, "%s-%s" % (camera, day))
     copies = {stem: os.path.getsize(os.path.join(day_dir, stem + ".mp4")) for stem, _k in sample}
     used, limit = quota_fn()
-    need = sum(copies.values()) * len(TRIAL_COMBOS)
+    # The peak the trial holds: one kept encode per combination (of the first
+    # clip, at most its copy's size) plus the one in flight.
+    need = copies[sample[0][0]] * len(TRIAL_COMBOS) + max(copies.values())
     if limit and used is not None and used + need > limit * settings.quota_high_pct // 100:
         raise QuotaStop("the trial needs up to %.0f MiB and the clips area is too full for it; nothing was "
                         "written (no clip is ever removed for a trial)" % (need / MIB))
     os.makedirs(out_dir, mode=0o750, exist_ok=True)
-    started = clock()
+    deadline = clock() + TRIAL_RUN_SEC
     rows: List[Dict[str, object]] = []
     stopped_early = False
     for combo in TRIAL_COMBOS:
         name = combo_name(combo)
         for index, (stem, kind) in enumerate(sample):
-            if clock() - started > TRIAL_RUN_SEC:
+            left = deadline - clock()
+            if left <= 0:
                 stopped_early = True
                 break
             # The first sample of each combination is kept for viewing; the rest are measured and removed.
@@ -1300,7 +1319,7 @@ def encode_trial(settings: ClipsSettings, camera: str, day: str, max_clips: int,
             docker_remove("homehub-clips-trial-%s" % camera)
             try:
                 done = runner(trial_encode_command(settings, camera, day_dir, out_dir, stem, combo, out_name),
-                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=900)
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=max(1, min(900, left)))
                 err, rc = _text(done), done.returncode
             except subprocess.TimeoutExpired:
                 docker_remove("homehub-clips-trial-%s" % camera)
@@ -1309,6 +1328,7 @@ def encode_trial(settings: ClipsSettings, camera: str, day: str, max_clips: int,
             bench = BENCH_RE.search(err)
             if rc or not os.path.exists(out_path):
                 row["failed"] = "ffmpeg exited %s: %s" % (rc, err.strip()[-200:])
+                _remove(out_path)  # a broken sample is never kept for viewing
             else:
                 size = os.path.getsize(out_path)
                 row.update(bytes=size, pct_of_copy=round(100.0 * size / max(1, copies[stem]), 1))
@@ -1321,12 +1341,18 @@ def encode_trial(settings: ClipsSettings, camera: str, day: str, max_clips: int,
                     try:
                         sd = runner(trial_ssim_command(camera, day_dir, out_dir, stem, out_name, int(ref["width"]),
                                                        int(ref["height"]), int(combo["fps"])),
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=900)
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                    timeout=max(1, min(900, deadline - clock())))
                         m = SSIM_RE.search(_text(sd))
                         if m:
                             row["ssim"] = float(m.group(1))
+                        else:
+                            row["ssim_failed"] = "rc %s" % sd.returncode
                     except subprocess.TimeoutExpired:
                         docker_remove("homehub-clips-ssim-%s" % camera)
+                        row["ssim_failed"] = "timed out"
+                else:
+                    row["ssim_failed"] = "the copy could not be probed"
             if index != 0:
                 _remove(out_path)
             rows.append(row)
@@ -1378,6 +1404,10 @@ def trial_table(report: Dict[str, object]) -> str:
     failed = [r for r in report["rows"] if "failed" in r]  # type: ignore[union-attr]
     for r in failed:
         lines.append("FAILED %s on %s: %s" % (r["combo"], r["clip"], r["failed"]))
+    no_ssim = [r for r in report["rows"] if "ssim_failed" in r]  # type: ignore[union-attr]
+    if no_ssim:
+        lines.append("SSIM missing for %d encode(s) (the means above leave them out): %s"
+                     % (len(no_ssim), ", ".join("%s on %s" % (r["combo"], r["clip"]) for r in no_ssim[:6])))
     lines.append("samples to compare side by side: %s" % report["folder"])
     return "\n".join(lines) + "\n"
 
@@ -1602,20 +1632,22 @@ def remove_clips(settings: ClipsSettings, doomed: Sequence[Tuple[int, str, str, 
 
 
 def make_room(settings: ClipsSettings, state_dir: str, now_ms: int, need: int,
-              quota_fn: Callable[[], Tuple[Optional[int], Optional[int]]]) -> int:
+              quota_fn: Callable[[], Tuple[Optional[int], Optional[int]]],
+              keep: Optional[set] = None) -> int:
     """Before a write of `need` bytes: when the clips project would pass
     CLIPS_QUOTA_HIGH_PCT, remove clips by the retention rules first - those
     past their age or the cap, then the oldest - until it fits. On the 5 GiB
     scratch area this, not the hourly retention, is the normal cycle; a full
     quota stays an alert only when retention cannot free enough (QuotaStop).
-    Returns the bytes freed. Implements: LLR-1377."""
+    `keep` holds (day dir, stem) pairs never removed here - the clip an encode
+    is working on. Returns the bytes freed. Implements: LLR-1377."""
     used, limit = quota_fn()
     if not limit or used is None:
         return 0
     ceiling = limit * settings.quota_high_pct // 100
     if used + need <= ceiling:
         return 0
-    clips = list_clips(settings.root)
+    clips = [c for c in list_clips(settings.root) if (c[1], c[2]) not in (keep or set())]
     rules = retention_plan(clips, now_ms, settings.retention_days, settings.cap_mib * MIB)
     doomed = list(rules)
     projected = used + need - sum(c[3] for c in doomed)
@@ -1894,15 +1926,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 done = 0
                 started = time.monotonic()
                 spent = lambda: done >= settings.max_per_run or time.monotonic() - started > ENCODE_RUN_SEC  # noqa: E731
+                ok, reason = guard(settings)  # the reconcile below writes sidecars
+                if not ok:
+                    raise GuardStop(reason)
                 for cam in settings.cameras:
                     if spent():
                         break
-                    reconcile_encodes(settings.root, cam.camera)
-                    for day_dir, stem in encode_candidates(settings.root, cam.camera):
+                    for day_dir, stem in encode_candidates(settings.root, cam.camera, reconcile=True):
                         # Bounded in count AND time: the batch shares the pipeline lock
                         # with the cut, which must not wait long behind it.
                         if spent():
                             break
+                        if not os.path.exists(os.path.join(day_dir, stem + ".mp4")):
+                            continue  # removed since the scan (room made for an earlier encode)
                         encode_clip(settings, cam.camera, day_dir, stem, quota_fn=lambda: clips_quota(settings))
                         done += 1
                 return 0

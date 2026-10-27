@@ -1292,3 +1292,44 @@ def test_tc1575_a_5_fps_encode_of_a_clip_with_no_span_is_judged_by_its_frames_ex
     s2.encode_fps = 5
     res = hc.encode_clip(s2, "door", day2, "c", runner=enc_runner(400), prober=lambda c, d, n: {"frames": 0})
     assert res["kept"] is False
+
+
+# ── delta review (DeepSeek) regressions ──────────────────────────────────────
+
+
+def test_tc1562_making_room_for_an_encode_never_removes_the_clip_being_encoded(tmp_path, monkeypatch):
+    s, day = encode_setup(tmp_path, monkeypatch)       # the area holds only this clip
+    s.root = str(tmp_path)                             # make_room must SEE it, and still not take it
+    assert hc.list_clips(s.root)
+    with pytest.raises(hc.QuotaStop):
+        hc.encode_clip(s, "door", day, "c", runner=enc_runner(400), prober=lambda c, d, n: {"frames": 300},
+                       quota_fn=lambda: (10 ** 6, 10 ** 6))
+    assert os.path.exists(os.path.join(day, "c.mp4")) and os.path.exists(os.path.join(day, "c.json"))
+
+
+def test_tc1575_the_trial_refuses_a_camera_that_is_not_a_name(tmp_path):
+    s, _root, _day, _stems = trial_day(tmp_path)
+    for camera in ("../../x", "door/..", ""):
+        with pytest.raises(hc.Invalid, match="camera name"):
+            hc.encode_trial(s, camera, "2026-10-26", 1, runner=pytest.fail)
+
+
+def test_tc1575_the_trial_reserves_its_real_peak_and_keeps_no_broken_sample(tmp_path, monkeypatch):
+    monkeypatch.setattr(hc.time, "localtime", time.gmtime)
+    monkeypatch.setattr(hc.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, b"", b""))
+    s, root, _day, _stems = trial_day(tmp_path)
+
+    class Partial(FakeTrialFfmpeg):
+        def __call__(self, argv, stdout=None, stderr=None, timeout=None):
+            if argv[-1] != "-" and "hevc" in argv[-1]:       # a failing encoder that leaves half a file
+                bind = argv[argv.index("-v") + 1].split(":/out")[0]
+                open(os.path.join(bind, argv[-1][len("/out/"):]), "wb").write(b"half")
+                return subprocess.CompletedProcess(argv, 1, b"", b"Error")
+            return FakeTrialFfmpeg.__call__(self, argv, stdout, stderr, timeout)
+    # four 10000-byte clips: the old reserve (9 x the whole sample, 360 kB) would not fit under 90 % of 200 kB
+    report = hc.encode_trial(s, "door", "2026-10-26", 4, runner=Partial(), prober=lambda c, d, n: {},
+                             quota_fn=lambda: (0, 200000))
+    trial = root / hc.TRIAL_DIR / "door-2026-10-26"
+    assert not [p for p in trial.iterdir() if p.name.startswith("hevc")]
+    assert all("ssim_failed" in r for r in report["rows"] if "bytes" in r)
+    assert "SSIM missing for" in hc.trial_table(report)

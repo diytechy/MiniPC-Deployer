@@ -915,6 +915,10 @@ def test_tc1510_review_round2_a_record_that_cannot_be_encoded_is_refused(tmp_pat
     assert line["nonfinite"] == ["host", "panel"] and line["ok"] == 2
     ok, why = mc.append_jsonl(str(tmp_path / "y.jsonl"), {"v": object()}, 10 ** 6)
     assert not ok and "encoded" in why and not (tmp_path / "y.jsonl").exists()
+    cycle = {"a": []}
+    cycle["a"].append(cycle)
+    ok, why = mc.append_jsonl(str(tmp_path / "z.jsonl"), cycle, 10 ** 6)
+    assert not ok and "encoded" in why and not (tmp_path / "z.jsonl").exists()
     out = hm.collect_units(hm.Deadline(60), Runner())
     assert out["ok"] is False and "--state=failed" in out["error"]
 
@@ -951,6 +955,11 @@ def test_tc1509_opus_the_copy_leaves_a_status_the_snapshot_carries(tmp_path):
     assert status["last_skip"] == 1793000000
     mon = hm.collect_monitors(args.monitor_dir, args.meetings_status, 1793000700.0, args.data_dir)
     assert mon["copy"]["last_success"] == 1793000600 and mon["copy"]["last_result"] == "ok"
+    assert hm.cmd_copy(args, mounts_text="", now=1793000900.0) == 0
+    status = json.loads((Path(args.data_dir) / "copy-status.json").read_text())
+    assert status["last_result"] == "skipped" and "written" not in status and status["last_success"] == 1793000600
+    fresh = hm.collect_monitors(args.monitor_dir, args.meetings_status, 1.0, str(tmp_path / "nothing"))
+    assert fresh["copy"] == {"last_result": "never"}
 
 
 def test_tc1508_the_plan_skips_today_unsettled_and_unchanged_files():

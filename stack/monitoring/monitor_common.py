@@ -878,11 +878,14 @@ def append_jsonl(path: str, record: dict, cap_bytes: int) -> Tuple[bool, str]:
     except ValueError:
         # One non-finite float must not cost the whole line: it becomes null,
         # and the line names the top-level blocks that carried one.
-        blocks = sorted(k for k, v in record.items() if _has_nonfinite(v)) if isinstance(record, dict) else []
-        record = dict(_finite(record), nonfinite=blocks) if isinstance(record, dict) else _finite(record)
+        try:
+            blocks = sorted(k for k, v in record.items() if _has_nonfinite(v)) if isinstance(record, dict) else []
+            record = dict(_finite(record), nonfinite=blocks) if isinstance(record, dict) else _finite(record)
+        except RecursionError:
+            return False, "the record could not be encoded (a cycle); not appending"
         try:
             line = json.dumps(record, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, RecursionError) as exc:   # a cycle is ValueError too
             return False, "the record could not be encoded (%s); not appending" % type(exc).__name__
     except TypeError as exc:
         return False, "the record could not be encoded (%s); not appending" % type(exc).__name__

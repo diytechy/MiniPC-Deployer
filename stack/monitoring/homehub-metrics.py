@@ -512,9 +512,10 @@ def collect_monitors(monitor_dir: str, meetings_status: str, now: float, data_di
                              read("liveness-status.json"), _read_bounded_json(meetings_status, 65536, {}), now)
     if data_dir:
         copy = _read_bounded_json(os.path.join(data_dir, "copy-status.json"), 65536, {})
-        if copy:
-            out["copy"] = {k: copy.get(k) for k in ("last_run", "last_result", "last_success", "last_skip",
-                                                    "last_skip_reason", "written", "failed") if k in copy}
+        # Present in every snapshot: "never" until the first weekly run writes one.
+        out["copy"] = {k: copy.get(k) for k in ("last_run", "last_result", "last_success", "last_skip",
+                                                "last_skip_reason", "written", "failed") if k in copy} \
+            if copy else {"last_result": "never"}
     return out
 
 
@@ -1025,7 +1026,9 @@ def _copy_one(src: str, dest_root: str, rel: str, pack: bool, library_root: Opti
         raise PermissionError("REFUSED: %r is not a plain relative path" % rel)
     # First, so a source that cannot be read costs no temp file; O_NOFOLLOW and
     # a regular-file check on the OPEN file, so what was listed is what is read.
-    sfd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    # O_NONBLOCK: a FIFO swapped in for a day file cannot hold the open.
+    sfd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                  | getattr(os, "O_BINARY", 0))
     if not stat.S_ISREG(os.fstat(sfd).st_mode):
         os.close(sfd)
         raise PermissionError("REFUSED: %s is not a regular file" % src)
@@ -1160,7 +1163,10 @@ def cmd_copy(args, mounts_text: Optional[str] = None, now: Optional[float] = Non
     if dest is None:
         mc.log("metrics: weekly copy SKIPPED - %s" % refusal, warning=bool(knobs.get("HOMEHUB_METRICS_COPY_DIR")))
         status.update({"last_result": "skipped", "last_skip": int(now), "last_skip_reason": refusal[:200]})
-        mc.save_json_atomic(status_path, status)
+        status.pop("written", None)
+        status.pop("failed", None)
+        if not mc.save_json_atomic(status_path, status):
+            mc.log("metrics: WARN could not save %s" % status_path, True)
         return 0
     today = time.strftime("%Y%m%d", time.gmtime(now))
 

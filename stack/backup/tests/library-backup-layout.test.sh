@@ -13,7 +13,8 @@
 #            suite against it through the dispatcher's default.)
 #   TC-1585  compose: `filebackup` keeps the three mounts and filebackup.json
 #            stays ConfigVersion 2; `filebackup-store` is the single-store
-#            service; both stay behind the `filebackup` profile. (TC-1588,
+#            service (ConfigVersion 2, BackupPath /store/backup, ChangePath
+#            /store/changes: BoundedRebuild as it is); both stay behind the `filebackup` profile. (TC-1588,
 #            tests/test_filebackup_layouts.py, holds the rest of their keys equal.)
 #   TC-1586  frame-freshness reads the NEWER of the single-store copy and the
 #            legacy /state record, and keeps the legacy row-count witness
@@ -150,8 +151,9 @@ if [ "$(_mounts "$legacy_block")" = "$_want_legacy" ] \
    && printf '%s\n' "$store_block"  | grep -qF 'profiles: ["filebackup"]' \
    && grep -qF '"ConfigVersion": 2,' "$FBJ" && grep -qF '"BackupPath": "/backup",' "$FBJ" \
    && grep -qF '"ChangePath": "/changes",' "$FBJ" && ! grep -qF StorePath "$FBJ" \
-   && grep -qF '"ConfigVersion": 3,' "$FBS" && grep -qF '"StorePath": "/store",' "$FBS"; then
-    pass "TC-1585 filebackup keeps the three-mount binds and a ConfigVersion 2 config; filebackup-store binds one /store with ConfigVersion 3"
+   && grep -qF '"ConfigVersion": 2,' "$FBS" && grep -qF '"BackupPath": "/store/backup",' "$FBS" \
+   && grep -qF '"ChangePath": "/store/changes",' "$FBS" && ! grep -qE 'StorePath|SourceStatePath' "$FBS"; then
+    pass "TC-1585 filebackup keeps the three-mount binds and a ConfigVersion 2 config; filebackup-store binds one /store with a ConfigVersion 2 config naming /store/backup and /store/changes"
 else
     fail "TC-1585 the layout services drifted: legacy=[$(_mounts "$legacy_block" | tr '\n' '|')] store=[$(_mounts "$store_block" | tr '\n' '|')]"
 fi

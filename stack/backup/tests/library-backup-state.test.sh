@@ -4,11 +4,10 @@
 # script under test remains library-backup.sh, so the order after preflight,
 # backup and optional restore verification cannot drift unobserved.
 #
-# The wrapper is written for a FileBackup image built from BoundedRebuild with
-# its single-store layout (plan call C44): one /store mount that is the whole
-# store (Latest/, Snapshot_*/ and the run files side by side), backup exits
-# 0/1/2/4, verify exits 0/1/2. The cases below pin that contract
-# (TC-1576..TC-1582) as well as the state-update boundary.
+# The wrapper is written for a FileBackup image built from its bounded-run-loop
+# work (BoundedRebuild): one /store mount, backup exits 0/1/2/4, verify exits
+# 0/1/2. The cases below pin that contract (TC-1576..TC-1581) as well as the
+# state-update boundary.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,28 +22,26 @@ TMP="$(mktemp -d)"
 KEEP_TMP="${KEEP_TMP:-0}"
 cleanup() { [ "$KEEP_TMP" = 1 ] && { printf 'tmp kept: %s\n' "$TMP"; return; }; rm -rf "$TMP"; }
 trap cleanup EXIT
-# store/ is the ONE writable bind and the whole single-store layout (FileBackup
-# C44): Latest/, the Snapshot_* folders and the run files side by side. Latest/
-# exists here as on an established store; the wrapper never creates it.
-# old-backup, old-changes and state are where a hub's three-mount store lived.
-mkdir -p "$TMP/bin" "$TMP/src" "$TMP/store/Latest" "$TMP/state" "$TMP/logs"
+# store/ is the ONE writable bind (holding backup/ and changes/); old-backup,
+# old-changes and state are where a hub's three-mount store lived (set aside, never migrated).
+mkdir -p "$TMP/bin" "$TMP/src" "$TMP/store/backup" "$TMP/store/changes" "$TMP/state" "$TMP/logs"
 : >"$TMP/filebackup.json"
 # The latest manifest the (mocked) container leaves behind; the wrapper copies
 # it to the system disk for frame-freshness after every completed run.
-printf 'RelativePath,LastWriteTimeStr\nShared/a.jpg,2026-10-01T00:00:00Z\n' >"$TMP/store/Latest/MANIFEST.csv"
+printf 'RelativePath,LastWriteTimeStr\nShared/a.jpg,2026-10-01T00:00:00Z\n' >"$TMP/store/backup/MANIFEST.csv"
 
 # The actual wrapper asks findmnt two subtly different questions: the exact
-# source mount must remain its own mountpoint, while Latest/ must be on the same
-# enclosing mount as the store.  This mock models both facts.
-# MOCK_SPLIT_LATEST=1 models a second mount under the store at Latest/.
+# source mount must remain its own mountpoint, while backup/ and changes/ must
+# be on the same enclosing mount as the store.  This mock models both facts.
+# MOCK_SPLIT_CHANGES=1 models a second mount under the store at changes/.
 cat >"$TMP/bin/findmnt" <<'EOF'
 #!/usr/bin/env bash
 last=""; for arg in "$@"; do last="$arg"; done
 if [[ " $* " == *" --target "* ]]; then
     case "$last" in
         "$FILEBACKUP_SOURCE") printf '%s\n' "$FILEBACKUP_SOURCE" ;;
-        "$FILEBACKUP_STORE/Latest")
-            if [ "${MOCK_SPLIT_LATEST:-0}" = 1 ]; then printf '%s\n' "$FILEBACKUP_STORE/Latest"
+        "$FILEBACKUP_STORE/changes")
+            if [ "${MOCK_SPLIT_CHANGES:-0}" = 1 ]; then printf '%s\n' "$FILEBACKUP_STORE/changes"
             else printf '%s\n' "$FILEBACKUP_STORE"; fi ;;
         "$FILEBACKUP_STORE"|"$FILEBACKUP_STORE"/*) printf '%s\n' "$FILEBACKUP_STORE" ;;
         *) printf '%s\n' "$last" ;;
@@ -317,24 +314,24 @@ fi
 # file in use: the message counts them, names Verify/, and does not claim that
 # nothing stored was lost. The (mocked) container does not touch backup.log, so
 # the log written here stands for the one the run leaves.
-cat >"$TMP/store/backup.log" <<'EOF'
+cat >"$TMP/store/changes/backup.log" <<'EOF'
 2026-10-27 03:00:01.000 [INFO] Backup set 'library' starting
-2026-10-27 03:00:02.000 [WARN] [DamagedObject] '/store/Latest/aaaa.jpg' is damaged (empty), as a power loss can leave it; moved it to '/store/Verify/Latest/aaaa.jpg' and it is not reused.
-2026-10-27 03:00:02.100 [WARN] [DamagedObject] '/store/Snapshot_2026_10_01_03_00_00/bbbb.mp4' is damaged (length), as a power loss can leave it; moved it to '/store/Verify/Snapshot_2026_10_01_03_00_00/bbbb.mp4' and it is not reused.
+2026-10-27 03:00:02.000 [WARN] [DamagedObject] '/store/backup/aaaa.jpg' is damaged (empty), as a power loss can leave it; moved it to '/store/changes/Verify/backup/aaaa.jpg' and it is not reused.
+2026-10-27 03:00:02.100 [WARN] [DamagedObject] '/store/changes/Snapshot_2026_10_01_03_00_00/bbbb.mp4' is damaged (length), as a power loss can leave it; moved it to '/store/changes/Verify/Snapshot_2026_10_01_03_00_00/bbbb.mp4' and it is not reused.
 EOF
 run_wrapper damaged "$TMP/good.env" shallow 1 0 200
 if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/damaged.capture")" = 0 ] \
    && grep -q '^docker:verify$' "$TMP/damaged.events" \
    && grep -qF 'AND 2 STORED OBJECT(S) WERE FOUND DAMAGED' "$TMP/damaged.out" \
    && grep -qF 'COMPLETED BUT FOUND 2 DAMAGED STORED OBJECT(S) (container exit 1; verify=shallow ok)' "$TMP/damaged.out" \
-   && grep -qF "moved into $TMP/store/Verify/" "$TMP/damaged.out" \
+   && grep -qF "moved into $TMP/store/changes/Verify/" "$TMP/damaged.out" \
    && ! grep -qF 'nothing already stored was lost' "$TMP/damaged.out"; then
     pass "TC-1581 an exit 1 whose set log names damaged objects counts them, names Verify/, and claims no loss-free run"
 else
     fail "TC-1581 damaged rc=$RUN_RC: $(grep -i 'damaged' "$TMP/damaged.out" | head -2 | tr '\n' '|')"
 fi
 # A set log with no such line keeps the files-not-captured reading.
-printf '2026-10-27 03:00:01.000 [WARN] could not read /source/locked.db\n' >"$TMP/store/backup.log"
+printf '2026-10-27 03:00:01.000 [WARN] could not read /source/locked.db\n' >"$TMP/store/changes/backup.log"
 run_wrapper not-damaged "$TMP/good.env" none 1 0 200
 if [ "$RUN_RC" != 0 ] && grep -qF 'COMPLETED WITH FILES NOT CAPTURED (container exit 1; verify=skipped)' "$TMP/not-damaged.out" \
    && ! grep -qF 'DAMAGED' "$TMP/not-damaged.out"; then
@@ -342,38 +339,36 @@ if [ "$RUN_RC" != 0 ] && grep -qF 'COMPLETED WITH FILES NOT CAPTURED (container 
 else
     fail "TC-1581 not-damaged rc=$RUN_RC: $(grep -i 'exit 1' "$TMP/not-damaged.out" | head -2 | tr '\n' '|')"
 fi
-rm -f "$TMP/store/backup.log"
+rm -f "$TMP/store/changes/backup.log"
 
 # ── the one-mount store (TC-1577) ────────────────────────────────────────────
-# A second mount under the store at Latest/ would make FileBackup's rename test
+# A second mount under the store at changes/ would make FileBackup's rename test
 # fail inside the container (exit 2). The wrapper refuses first, before docker.
-MOCK_SPLIT_LATEST=1 run_wrapper split-mount "$TMP/good.env" none 0 0 200
+MOCK_SPLIT_CHANGES=1 run_wrapper split-mount "$TMP/good.env" none 0 0 200
 if [ "$RUN_RC" != 0 ] && ! grep -q '^docker:' "$TMP/split-mount.events" \
    && [ "$(success_count "$TMP/split-mount.capture")" = 0 ] \
-   && grep -qF "Latest/ and the snapshots beside it must be ONE mount" "$TMP/split-mount.out"; then
-    pass "TC-1577 a store whose Latest/ is a separate mount is refused before the container"
+   && grep -qF "backup/ and changes/ must be ONE mount" "$TMP/split-mount.out"; then
+    pass "TC-1577 a store whose changes/ is a separate mount is refused before the container"
 else
     fail "TC-1577 split mount rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/split-mount.events")"
 fi
 
 # The compose binding and the container config that go with the wrapper: ONE
-# writable /store, no /state, and a ConfigVersion 3 config naming only
-# StorePath=/store (FileBackup L1: BackupPath and ChangePath are gone, and an
-# image with the single-store layout refuses a config that still names them),
-# with no SourceStatePath (ignored with a warning every run). In the
-# single-store layout that is the `filebackup-store` service and
-# filebackup-store.json (SR-133: the legacy `filebackup` service keeps the
-# three-mount layout, which library-backup-layout.test.sh pins).
+# writable /store, no /state, BackupPath/ChangePath under /store, and no
+# SourceStatePath (the bounded engine ignores it with a warning every run).
 COMPOSE="$ROOT/stack/docker-compose.yml"
+# The one-mount layout is the `filebackup-store` service and filebackup-store.json
+# (SR-133: the legacy `filebackup` service keeps the three-mount layout,
+# which library-backup-layout.test.sh pins).
 FBJSON="$ROOT/stack/backup/filebackup-store.json"
 fb_block="$(awk '/^  filebackup-store:/{on=1; next} on && /^  [a-z]/{exit} on' "$COMPOSE")"
 # shellcheck disable=SC2016  # the ${...} is compose's own interpolation, matched literally
 if printf '%s\n' "$fb_block" | grep -qF -- '- ${FILEBACKUP_STORE:-/mnt/backup-drive/library-store}:/store' \
    && ! printf '%s\n' "$fb_block" | grep -Eq -- '^ *- .*:/(state|backup|changes)$' \
-   && grep -qF '"ConfigVersion": 3,' "$FBJSON" \
-   && grep -qF '"StorePath": "/store",' "$FBJSON" \
-   && ! grep -Eq '"(BackupPath|ChangePath|SourceStatePath)"' "$FBJSON"; then
-    pass "TC-1577 filebackup-store binds one /store and no /state; filebackup-store.json is ConfigVersion 3 with StorePath /store only"
+   && grep -qF '"BackupPath": "/store/backup"' "$FBJSON" \
+   && grep -qF '"ChangePath": "/store/changes"' "$FBJSON" \
+   && ! grep -q 'SourceStatePath' "$FBJSON"; then
+    pass "TC-1577 compose binds one /store and no /state; filebackup.json keeps both roots under /store"
 else
     fail "TC-1577 the compose/config contract drifted: $(printf '%s\n' "$fb_block" | grep -E ':/' | tr '\n' '|')"
 fi
@@ -516,9 +511,9 @@ fi
 # event: Temp predates two recovery events; the one that names the backup is
 # chosen over the later one that does not, and an event older than Temp is
 # ignored by its MTIME even though its name sorts last.
-mkdir -p "$TMP/store/Temp" "$TMP/events"
-printf 'staged\n' >"$TMP/store/Temp/only-copy"
-touch -d '2026-10-01 00:00:00' "$TMP/store/Temp"
+mkdir -p "$TMP/store/changes/Temp" "$TMP/events"
+printf 'staged\n' >"$TMP/store/changes/Temp/only-copy"
+touch -d '2026-10-01 00:00:00' "$TMP/store/changes/Temp"
 printf '{"action": "kill", "details": {"interrupts_backup": true}}\n' >"$TMP/events/20261005T010203Z-bbbbbbbb-kill.json"
 printf '{"action": "restart-ssh", "details": {}}\n' >"$TMP/events/20261005T020000Z-bbbbbbbb-restart-ssh.json"
 printf '{"action": "reboot", "details": {"interrupts_backup": true}}\n' >"$TMP/events/20261009T000000Z-aaaaaaaa-reboot.json"
@@ -529,7 +524,7 @@ if [ "$RUN_RC" = 0 ] \
    && grep -q '^docker:backup$' "$TMP/staging.events" \
    && [ "$(success_count "$TMP/staging.capture")" = 1 ] \
    && grep -qF 'DEGRADED: old staging' "$TMP/staging.out" \
-   && [ "$(cat "$TMP/store/Temp/only-copy")" = staged ]; then
+   && [ "$(cat "$TMP/store/changes/Temp/only-copy")" = staged ]; then
     pass "TC-1065 an old Temp is a note naming the recovery event that named the backup; the run goes on and Temp is untouched"
 else
     fail "TC-1065 staging note rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/staging.events"): $(grep 'staging' "$TMP/staging.out" | head -2 | tr '\n' '|')"
@@ -541,87 +536,45 @@ if [ "$RUN_RC" = 0 ] \
 else
     fail "TC-1065 no-event note rc=$RUN_RC: $(grep 'staging' "$TMP/staging2.out" | head -1)"
 fi
-rm -rf "$TMP/store/Temp"
+rm -rf "$TMP/store/changes/Temp"
 
 # ── the store-layout guard (TC-1578) ─────────────────────────────────────────
-# No migration into the single-store layout (FileBackup L2): an old store is
-# SET ASIDE by hand. While one still holds data where this stack knows to look,
-# the run refuses before anything is created or started, names the set-aside
-# step, and leaves it exactly as it is.
+# A three-mount store not set aside that still holds data refuses before anything
+# is created or started, names the set-aside step, and is left exactly as it is.
 mkdir -p "$TMP/old-backup" "$TMP/old-changes/Snapshot_2026_10_01_03_00_00"
 printf 'row\n' >"$TMP/old-backup/MANIFEST.csv"
-run_wrapper not-set-aside "$TMP/good.env" none 0 0 200
-if [ "$RUN_RC" != 0 ] && ! grep -q '^docker:' "$TMP/not-set-aside.events" \
-   && [ "$(success_count "$TMP/not-set-aside.capture")" = 0 ] \
-   && [ "$(phases "$TMP/not-set-aside.capture")" = 'starting idle ' ] \
-   && grep -qF 'is not in the single-store layout' "$TMP/not-set-aside.out" \
-   && grep -qF 'Setting the old store aside' "$TMP/not-set-aside.out" \
+run_wrapper unmigrated "$TMP/good.env" none 0 0 200
+if [ "$RUN_RC" != 0 ] && ! grep -q '^docker:' "$TMP/unmigrated.events" \
+   && [ "$(success_count "$TMP/unmigrated.capture")" = 0 ] \
+   && [ "$(phases "$TMP/unmigrated.capture")" = 'starting idle ' ] \
+   && grep -qF 'the old three-mount store is still in place' "$TMP/unmigrated.out" \
+   && grep -qF 'Bringing in a new store' "$TMP/unmigrated.out" \
    && [ "$(cat "$TMP/old-backup/MANIFEST.csv")" = row ] \
    && [ -d "$TMP/old-changes/Snapshot_2026_10_01_03_00_00" ]; then
-    pass "TC-1578 a three-mount store not set aside refuses before docker, names the set-aside step, and is untouched"
+    pass "TC-1578 an old store not set aside refuses before docker, names the set-aside step, and is untouched"
 else
-    fail "TC-1578 not set aside rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/not-set-aside.events"): $(grep 'single-store' "$TMP/not-set-aside.out" | head -1)"
+    fail "TC-1578 unmigrated rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/unmigrated.events"): $(grep 'migrated' "$TMP/unmigrated.out" | head -1)"
 fi
-# Either old folder alone still refuses.
+# The same guard with only the old CHANGES folder left (a migration stopped
+# between its two renames) still refuses.
 rm -rf "$TMP/old-backup"
-run_wrapper old-changes-only "$TMP/good.env" none 0 0 200
-if [ "$RUN_RC" != 0 ] && ! grep -q '^docker:' "$TMP/old-changes-only.events" \
-   && grep -qF "$TMP/old-changes still holds" "$TMP/old-changes-only.out"; then
-    pass "TC-1578 the three-mount snapshots folder alone still refuses"
+run_wrapper half-migrated "$TMP/good.env" none 0 0 200
+if [ "$RUN_RC" != 0 ] && ! grep -q '^docker:' "$TMP/half-migrated.events" \
+   && grep -qF "$TMP/old-changes holds the old engine" "$TMP/half-migrated.out"; then
+    pass "TC-1578 a half-migrated store (old changes/ left) still refuses"
 else
-    fail "TC-1578 old changes only rc=$RUN_RC: $(grep 'single-store' "$TMP/old-changes-only.out" | head -1)"
+    fail "TC-1578 half-migrated rc=$RUN_RC: $(grep 'migrated' "$TMP/half-migrated.out" | head -1)"
 fi
-rm -rf "$TMP/old-changes"
-# The bounded-run-loop layout INSIDE the store (backup/ and changes/) refuses too.
-mkdir -p "$TMP/store/changes/Snapshot_2026_10_01_03_00_00"
-run_wrapper old-in-store "$TMP/good.env" none 0 0 200
-if [ "$RUN_RC" != 0 ] && ! grep -q '^docker:' "$TMP/old-in-store.events" \
-   && grep -qF "$TMP/store/changes still holds the bounded-run-loop layout's snapshots" "$TMP/old-in-store.out" \
-   && [ -d "$TMP/store/changes/Snapshot_2026_10_01_03_00_00" ]; then
-    pass "TC-1578 a store still holding the bounded-run-loop layout's changes/ refuses and is untouched"
-else
-    fail "TC-1578 old layout in store rc=$RUN_RC: $(grep 'single-store' "$TMP/old-in-store.out" | head -1)"
-fi
-rm -rf "$TMP/store/changes"
-# A latest state at the TOP of the store is an older layout's (the three-mount
-# backup folder configured as the store); the single-store layout keeps it in Latest/.
-printf 'row\n' >"$TMP/store/MANIFEST.csv"
-run_wrapper top-manifest "$TMP/good.env" none 0 0 200
-if [ "$RUN_RC" != 0 ] && ! grep -q '^docker:' "$TMP/top-manifest.events" \
-   && grep -qF "$TMP/store/MANIFEST.csv is a latest state at the top of the store" "$TMP/top-manifest.out"; then
-    pass "TC-1578 a manifest at the top of the store refuses as an older layout"
-else
-    fail "TC-1578 top manifest rc=$RUN_RC: $(grep 'single-store' "$TMP/top-manifest.out" | head -1)"
-fi
-rm -f "$TMP/store/MANIFEST.csv"
-# EMPTY old folders hold nothing: a note, and the run goes on.
-mkdir -p "$TMP/old-backup" "$TMP/store/backup"
+# EMPTY old folders hold nothing to migrate: a note, and the run goes on.
+rm -rf "$TMP/old-changes"; mkdir -p "$TMP/old-backup"
 run_wrapper empty-legacy "$TMP/good.env" none 0 0 200
 if [ "$RUN_RC" = 0 ] && [ "$(success_count "$TMP/empty-legacy.capture")" = 1 ] \
-   && grep -qF "an EMPTY folder from an older store layout is still at $TMP/old-backup" "$TMP/empty-legacy.out" \
-   && grep -qF "an EMPTY folder from an older store layout is still at $TMP/store/backup" "$TMP/empty-legacy.out"; then
-    pass "TC-1578 empty old-layout folders are notes and the run goes on"
+   && grep -qF "an EMPTY folder from the old store layout is still at $TMP/old-backup" "$TMP/empty-legacy.out"; then
+    pass "TC-1578 an empty old folder is a note and the run goes on"
 else
-    fail "TC-1578 empty legacy rc=$RUN_RC: $(grep -i 'older store' "$TMP/empty-legacy.out" | head -1)"
+    fail "TC-1578 empty legacy rc=$RUN_RC: $(grep -i 'old store\|migrated' "$TMP/empty-legacy.out" | head -1)"
 fi
-rmdir "$TMP/old-backup" "$TMP/store/backup"
-
-# ── the wrapper never creates Latest/ (TC-1582, FileBackup C44) ──────────────
-# FileBackup refuses (2) a store that holds snapshots but no Latest/, rather than
-# start a fresh full backup beside its history - and can only see that if
-# Latest/ is really missing. The wrapper must leave it missing.
-mv "$TMP/store/Latest" "$TMP/Latest.kept"
-mkdir -p "$TMP/store/Snapshot_2026_10_01_03_00_00"
-run_wrapper no-latest "$TMP/good.env" none 2 0 200
-if [ "$RUN_RC" != 0 ] && grep -q '^docker:backup$' "$TMP/no-latest.events" \
-   && [ ! -e "$TMP/store/Latest" ] \
-   && grep -qF 'a store that holds snapshots but no Latest/' "$TMP/no-latest.out"; then
-    pass "TC-1582 a store with snapshots but no Latest/ reaches FileBackup with Latest/ still missing, and its refusal is explained"
-else
-    fail "TC-1582 no Latest rc=$RUN_RC exists=$([ -e "$TMP/store/Latest" ] && echo yes || echo no): $(grep 'REFUSED' "$TMP/no-latest.out" | head -1)"
-fi
-rmdir "$TMP/store/Snapshot_2026_10_01_03_00_00"
-mv "$TMP/Latest.kept" "$TMP/store/Latest"
+rmdir "$TMP/old-backup"
 
 # The retired source-side record: a verified run says once that it can be
 # deleted by hand, and deletes nothing itself.
@@ -656,13 +609,13 @@ fi
 # Refreshed after a COMPLETED run (exit 0 or 1), whole (published by rename);
 # left as it was after a run that did not complete; a copy that cannot be made
 # is a note, never a backup failure.
-printf 'v-complete\n' >"$TMP/store/Latest/MANIFEST.csv"
+printf 'v-complete\n' >"$TMP/store/backup/MANIFEST.csv"
 run_wrapper copy-complete "$TMP/good.env" none 0 0 200
 c1="$(cat "$TMP/latest/MANIFEST.csv" 2>/dev/null)"
-printf 'v-partial\n' >"$TMP/store/Latest/MANIFEST.csv"
+printf 'v-partial\n' >"$TMP/store/backup/MANIFEST.csv"
 run_wrapper copy-partial "$TMP/good.env" none 1 0 200
 c2="$(cat "$TMP/latest/MANIFEST.csv" 2>/dev/null)"
-printf 'v-refused\n' >"$TMP/store/Latest/MANIFEST.csv"
+printf 'v-refused\n' >"$TMP/store/backup/MANIFEST.csv"
 run_wrapper copy-refused "$TMP/good.env" none 2 0 200
 c3="$(cat "$TMP/latest/MANIFEST.csv" 2>/dev/null)"
 if [ "$c1" = v-complete ] && [ "$c2" = v-partial ] && [ "$c3" = v-partial ] \

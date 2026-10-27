@@ -12,6 +12,37 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-10-27 — FileBackup's 2026-10-26 data-loss review, HomeHub's side (`filebackup-review-contract`: the six `filebackup-bounded-contract` commits and this work, replayed 2026-10-27 onto `IceDrive-DesktopDirection` 6318772 with the ids it introduced renumbered past the 2026-10-26 reservations: SR-122 -> SR-128, LLR-1320..1324 -> LLR-1356..1360, TC-1490..1496 -> TC-1541..1547; that branch, 35f5faf, stays as the record; not merged, not deployed, nothing sent to the hub).**
+Sources of truth (FileBackup, read-only): `docs/plans/bounded-run-loop.md` §13 calls C36–C44, `docs/plans/single-store-layout.md` L1–L6,
+`docs/reviews/2026-10-26-data-loss/consolidated.md` Outcome table. FileBackup's own `docs/interfaces.md` was not treated as final.
+- **Part 1 — FileBackup behaviour that is built or ruled (commits `971d4c2`, `2d67564` and the trace commit; pullable on its own):**
+  the wrapper's exit messages and README carry: exit 4 also = a source empty at the start while the latest state holds rows (C39;
+  FileBackup branch commit `83d0822`, unmerged); exit 1 also = damaged objects set aside into `changes/Verify/` with `[DamagedObject]`
+  lines in `backup.log` (C37; `428d53a`, unmerged), which the wrapper now **counts** after an exit 1, and case-only names (C42, being
+  built); exit 2 also = an unloadable dependency, and prune/snapshots resolve the store read-only without the library, a missing store
+  being 2 (`3756974`, on `BoundedRebuild`); prune `Pruning_<name>` leftovers finished by the next prune (C41; `7f47428`, unmerged);
+  `-RepairStorage` holds the lock and honours `-WhatIf` (`ce068bc`); plain verify reports `DamagedObject` (C37); restore: NUL-torn
+  manifest ≥ 1 (C38; `ba737eb`, unmerged), host problem on a row with a DataPath = 4 (A7, `4fb7689`); kit stays 14. C36 (flush
+  before rename/delete) changes no interface. NagLight mapping unchanged: only backup 0 + passing verify advances `lastSuccess`.
+  Traced: LLR-1356 and TC-1541 amended, **TC-1546** new (damaged-object count).
+- **Before anything here is deployed:** (1) the FileBackup image rebuilt from `BoundedRebuild` **after** the review's fix batches
+  (C36–C42) merge there; (2) **C43's follow-up in that image before any Verify or prune touches the hub's store** — the wrapper's
+  step-8 verify gate runs **automatically** (weekly, `-Deep` monthly) and nothing on this branch stops it (not disabled silently, by
+  instruction). What would gate it: `--verify none` in the unit's `ExecStart`, or a knob step 8 reads, until that image is deployed;
+  `FILEBACKUP_MEM_LIMIT` would turn a runaway into an OOM kill of the container instead of the box. Prune is manual only.
+- **Open questions for the Owner:**
+  (a) prune/snapshots with the **store drive unplugged**: exit 2 as built, or 4 "retry later"? (FileBackup review item B, open there.)
+  (b) **C43 gating**: gate step 8 now (which way), or deploy only once the follow-up is in the image?
+  (c) **C36 / power safety:** both hub drives are USB NTFS through ntfs-3g (FUSE), which journals none of its own writes, so a power
+  cut can damage the filesystem itself, not just the last files; FileBackup's flushes cannot fix that. For the clean start, is the
+  backup drive to be **ext4** (more power-safe), given it would then not be readable on Windows? (Found 2026-10-27;
+  `homehub-backup.timer` is enabled, 03:00 nightly.)
+  (d) HomeHub registers **no `Consumes` IF row for FileBackup's IF-001**; the contract lives in SR-018/SR-128 and the README. Add one
+  (repo-local id, counterpart IF-001)?
+  (e) **Found, not fixed (outside this list):** the bounded-contract wrapper's step 4 pre-creates `<store>/backup/`, so FileBackup's
+  C26 refusal (a *missing* BackupPath beside snapshots, never a fresh full backup) can never fire on the hub. Matters only if Part 1
+  ships without Part 2.
+
 **2026-10-24 — the library backup on FileBackup's bounded-run-loop contract (`filebackup-bounded-contract`, not merged, not deployed).**
 **Requires a FileBackup image built from FileBackup's `BoundedRebuild` work, which is not in a released image yet.**
 - **SR-128 / LLR-1357..1360:** one writable `/store` bind holding `backup/` and `changes/` replaces `/state`,

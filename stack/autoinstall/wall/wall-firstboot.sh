@@ -2617,8 +2617,8 @@ if [ "$WALL_TELEMETRY_ENABLED" = true ]; then
     # changed it (2026-10-26: the latest.json copy for the hub's metrics log)
     # would wait for the next reboot. Restart it when the unit or either .py
     # differs from what the last run started.
-    _tel_sum="$(cat "$PAYLOAD/wall-panel-telemetry.service" "$PAYLOAD/panel-telemetry.py" \
-        "$PAYLOAD/panel_telemetry_core.py" 2>/dev/null | sha256sum | cut -d' ' -f1)"
+    _tel_sum="$(cd "$PAYLOAD" && cat wall-panel-telemetry.service panel-telemetry.py panel_telemetry_core.py \
+        2>/dev/null | sha256sum | cut -d' ' -f1)"
     if [ "$_tel_sum" != "$(cat /opt/wall-panel/.telemetry-payload.sha256 2>/dev/null)" ]; then
         if systemctl restart wall-panel-telemetry.service >/dev/null 2>&1; then
             printf '%s\n' "$_tel_sum" > /opt/wall-panel/.telemetry-payload.sha256 2>/dev/null || :

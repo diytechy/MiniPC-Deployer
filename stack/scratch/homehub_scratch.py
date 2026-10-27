@@ -788,6 +788,11 @@ class Provisioner:
         have_lv = lv_bytes(device) if self.apply or not self.lv_growing else None
         if have_fs is None or have_lv is None or have_lv - have_fs < max(self.extent_bytes, MIB):
             return
+        if not mounted and not self.apply:
+            # ensure mounts it first (step_mount) and then grows it: the plan says so.
+            self.act("grow the ext4 filesystem on %s online from %d to %d MiB once mounted (resize2fs)"
+                     % (device, have_fs // MIB, have_lv // MIB))
+            return
         if not mounted:
             mc.log("scratch: the filesystem (%d MiB) is smaller than its LV (%d MiB) but not mounted; it is grown "
                    "online at the next ensure with it mounted" % (have_fs // MIB, have_lv // MIB), warning=True)

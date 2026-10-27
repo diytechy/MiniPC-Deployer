@@ -392,3 +392,15 @@ def test_tc1574_the_new_defaults_on_the_grown_live_volume():
     # 22 GiB keeps the live volume's measured overhead (18170 of 18432): about 22207 MiB usable
     got = hs.size_quotas(22207 * MIB, s.quota_mib, s.free_floor_mib, s.min_quota_mib)
     assert got == {"door": 8192, "meetings": 2048, "clips": 5120, "ottertube": 22207 - 2048 - 8192 - 2048 - 5120}
+
+
+def test_tc1574_plan_lists_the_resize_an_interrupted_grow_still_owes_while_unmounted(host, monkeypatch):
+    fake, paths = host
+    fake.lv_mib, fake.fs_mib = 22528, 18432
+    monkeypatch.setattr(hs.os.path, "exists", lambda p: True)    # the LV's device node, as on the hub
+    p = hs.Provisioner(hs.Settings({}), False, paths, vg="ubuntu-vg")
+    p.extent_bytes = 4 * MIB
+    p.step_grow_fs("/dev/ubuntu-vg/hub-scratch")
+    assert p.actions == ["grow the ext4 filesystem on /dev/ubuntu-vg/hub-scratch online from 18432 to 22528 MiB "
+                         "once mounted (resize2fs)"]
+    assert not [c for c in fake.ran if c[0] == "resize2fs"]

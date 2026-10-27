@@ -1281,3 +1281,14 @@ def test_tc1575_the_batch_size_and_rate_knobs_default_to_unchanged(tmp_path, mon
     res = hc.encode_clip(s, "door", day, "c", runner=enc_runner(400),
                          prober=lambda c, d, n: {"frames": 151, "duration": 30.0})
     assert res["kept"] is True
+
+
+def test_tc1575_a_5_fps_encode_of_a_clip_with_no_span_is_judged_by_its_frames_existing(tmp_path, monkeypatch):
+    s, day = encode_setup(tmp_path, monkeypatch)       # the sidecar has frames 300 and no actual window
+    s.encode_fps = 5
+    res = hc.encode_clip(s, "door", day, "c", runner=enc_runner(400), prober=lambda c, d, n: {"frames": 1})
+    assert res["kept"] is True
+    s2, day2 = encode_setup(tmp_path / "b", monkeypatch)
+    s2.encode_fps = 5
+    res = hc.encode_clip(s2, "door", day2, "c", runner=enc_runner(400), prober=lambda c, d, n: {"frames": 0})
+    assert res["kept"] is False

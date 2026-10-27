@@ -1151,9 +1151,12 @@ def encode_clip(settings: ClipsSettings, camera: str, day_dir: str, stem: str,
     span = ((actual.get("end_utc_ms", 0) - actual.get("start_utc_ms", 0)) / 1000.0
             if isinstance(actual.get("end_utc_ms"), int) and isinstance(actual.get("start_utc_ms"), int) else None)
     replace = False
-    if settings.encode_fps and isinstance(want, int) and span:
-        want = int(round(span * settings.encode_fps))   # fewer frames by design; the duration must still match
-    if not probed or (isinstance(want, int) and abs(int(probed["frames"]) - want) > (1 if not settings.encode_fps else 2)):
+    if settings.encode_fps:
+        # Fewer frames by design: expected from the clip's span when the record has
+        # one; without it the frame count says nothing, and only frames > 0 is asked.
+        want = int(round(span * settings.encode_fps)) if span else None
+    if not probed or int(probed.get("frames") or 0) <= 0 \
+            or (isinstance(want, int) and abs(int(probed["frames"]) - want) > (1 if not settings.encode_fps else 2)):
         result.update(kept=False, failed=("ffmpeg exited %s: %s" % (rc, err.strip()[-200:]) if rc else
                                           "the encode holds %s frames, not %s" % ((probed or {}).get("frames"), want)))
     elif span is not None and "duration" in probed and abs(float(probed["duration"]) - span) > 1.5:

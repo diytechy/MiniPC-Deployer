@@ -83,7 +83,10 @@ def test_tc1543_the_engine_is_the_pinned_bytes_and_an_edited_copy_is_refused(tmp
     import io
     import tokenize
     assert not [t for t in tokenize.generate_tokens(io.StringIO(text).readline) if t.type == tokenize.COMMENT]
-    assert not re.search(r"20\d\d-\d\d-\d\d|\b\d{1,2}:\d\d\b", text)
+    # dates and clock times in the TEXT the file carries (its strings): code such as a slice is not a time
+    strings = " ".join(t.string for t in tokenize.generate_tokens(io.StringIO(text).readline)
+                       if t.type == tokenize.STRING)
+    assert not re.search(r"20\d\d-\d\d-\d\d|\b\d{1,2}:\d\d(:\d\d)?\b|\b\d{1,2}/\d{1,2}/20\d\d\b", strings)
 
 
 def code_only(source):
@@ -109,7 +112,8 @@ def code_only(source):
     # A removed docstring leaves its NEWLINE behind; drop NEWLINEs that follow a NEWLINE or INDENT.
     collapsed = []
     for tok in tokens:
-        if tok[0] == tokenize.NEWLINE and collapsed and collapsed[-1][0] in (tokenize.NEWLINE, tokenize.INDENT):
+        # (a NEWLINE first in the file is what a removed module docstring leaves)
+        if tok[0] == tokenize.NEWLINE and (not collapsed or collapsed[-1][0] in (tokenize.NEWLINE, tokenize.INDENT)):
             continue
         collapsed.append(tok)
     return ast.dump(tree), collapsed
@@ -445,3 +449,11 @@ def test_tc1548_replay_warms_up_on_earlier_segments_but_reports_only_its_window(
     assert cm.replay(env, "door", since, since + 1.0, None, True, runner=Proc, out=lines.append) == 0
     summary = json.loads(lines[-1])
     assert summary["signals"] == {"approach": 5} and len(lines) == 6   # 5 in-window lines + the summary
+
+
+def test_tc1543_the_code_comparison_sets_docstrings_and_comments_aside_and_nothing_else():
+    doc = chr(34) * 3
+    assert code_only(doc + "doc" + doc + "\nx = 1  # c\n") == code_only("x = 1\n")
+    assert code_only("def f():\n    " + doc + "d" + doc + "\n    return 1\n") == code_only("def f():\n    return 1\n")
+    assert code_only("x = 1\n") != code_only("x = 2\n")
+    assert code_only("y = a[0:16]\n") != code_only("y = a[0:15]\n")

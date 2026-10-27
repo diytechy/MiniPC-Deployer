@@ -924,15 +924,16 @@ services:
       # no staging copy for these sets, which is the NVMe staging bomb that this
       # service's arrival dissolves. Nothing is ever written into it.
       - ${FILEBACKUP_SOURCE:-/srv/library}:/source:ro
-      # THE STORE: ONE writable mount on the backup drive, holding backup/ (the
-      # content-addressed latest state) and changes/ (the Snapshot_<date>
-      # history). ONE, not two, and that is FileBackup's contract, not a style
-      # choice: an image built from its bounded-run-loop work (BoundedRebuild)
-      # moves objects between the two by rename only and refuses (exit 2) a pair
-      # a rename cannot cross — and Linux cannot rename across two bind mounts
-      # even on one filesystem. filebackup.json fixes the children:
-      # BackupPath=/store/backup, ChangePath=/store/changes. There is no /state
-      # mount any more: the latest manifest is FileBackup's only record.
+      # THE STORE: ONE writable mount on the backup drive that IS the library
+      # set's whole store (FileBackup's single-store layout, plan call C44 -
+      # needs an image built from BoundedRebuild with it): Latest/ (the
+      # content-addressed latest state), every Snapshot_<date>/ and the run
+      # files side by side. ONE mount, and that is FileBackup's contract, not a
+      # style choice: it moves objects between Latest/ and the snapshots by
+      # rename only and refuses (exit 2) a store a rename cannot cross — and
+      # Linux cannot rename across two bind mounts even on one filesystem.
+      # filebackup.json says StorePath=/store (ConfigVersion 3). There is no
+      # /state mount: the latest manifest is FileBackup's only record.
       - ${FILEBACKUP_STORE:-/mnt/backup-drive/library-store}:/store
       - ${FILEBACKUP_LOGS:-/var/log/homehub-filebackup}:/logs
     tmpfs:

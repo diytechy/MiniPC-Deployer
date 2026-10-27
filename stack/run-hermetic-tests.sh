@@ -26,8 +26,6 @@ SUITES=(
     "backup/tests/plan-and-retention.test.sh"
     "backup/tests/flat-layout.test.sh"
     "backup/tests/library-backup-state.test.sh"
-    # The one-mount store migration: real renames in a temp tree.
-    "backup/tests/library-store-migrate.test.sh"
     "backup/tests/nightly-success-feed.test.sh"
     "samba/tests/file-share-backup-producer.test.sh"
     "tracker/tests/defs-guard.test.sh"

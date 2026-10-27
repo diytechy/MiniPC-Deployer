@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # common.sh — shared helpers for the AWOW bash backup service (WI-10.10/10.15).
-# Sourced by backup.sh and restore.sh, and by library-backup.sh and
-# library-store-migrate.sh for the drive-power, feed and store-layout helpers.
+# Sourced by backup.sh and restore.sh, and by library-backup.sh for the
+# drive-power, feed and store-layout helpers.
 # Pure bash + coreutils/tar/zstd/rsync/
 # mount.cifs/curl — no PowerShell, no .bat (HOMELAB_TOPOLOGY.md "100% bash").
 # The docker CLI is additionally needed IF the sources table uses volume:
@@ -773,35 +773,42 @@ fstab_mount_for() {
     done
 }
 
-# ── the FileBackup store layout (library-backup.sh, library-store-migrate.sh) ──
+# ── the FileBackup store layout (library-backup.sh) ──────────────────────────
 # filebackup_store_layout : set the library store's HOST paths from the
-# environment (stack/.env, already loaded by the caller). One home for them,
-# because the wrapper and the migration step must agree on every one.
+# environment (stack/.env, already loaded by the caller). One home for them.
 #
 # Contract:
-#   Inputs:  FILEBACKUP_STORE   the ONE writable folder bound at /store
+#   Inputs:  FILEBACKUP_STORE   the ONE writable folder bound at /store, the
+#                               whole of one backup set's store
 #                               (default /mnt/backup-drive/library-store)
 #            FILEBACKUP_BACKUP, FILEBACKUP_CHANGES, FILEBACKUP_STATE: the
-#                               RETIRED keys of the old three-mount layout. Read
-#                               only to find an unmigrated store; a materialised
-#                               .env written before the change still carries them.
-#   Outputs: FB_STORE, FB_BACKUP (= $FB_STORE/backup), FB_CHANGES (= $FB_STORE/changes),
+#                               RETIRED keys of the three-mount layout. Read only
+#                               to find a store that was not set aside; a
+#                               materialised .env written before still carries them.
+#   Outputs: FB_STORE, FB_LATEST (= $FB_STORE/Latest),
+#            FB_OLD_BACKUP (= $FB_STORE/backup), FB_OLD_CHANGES (= $FB_STORE/changes),
 #            FB_LEGACY_BACKUP, FB_LEGACY_CHANGES, FB_LEGACY_STATE
 #
-# WHY ONE MOUNT. A FileBackup image built from its bounded-run-loop work
-# (BoundedRebuild) moves objects between backup/ and changes/ by RENAME only,
-# and refuses (exit 2) a BackupPath/ChangePath pair a rename cannot cross. On
-# Linux a rename between two bind mounts fails even when both are on one
-# filesystem, so the old /backup + /changes pair would be refused on every run.
-# backup/ and changes/ are fixed children of the store because
-# stack/backup/filebackup.json fixes them inside the container
-# (BackupPath=/store/backup, ChangePath=/store/changes).
-# shellcheck disable=SC2034  # every FB_* set here is read by the two callers
+# THE SINGLE-STORE LAYOUT (FileBackup plan C44, rulings L1-L6; REQUIRES an image
+# built from BoundedRebuild with C44). One store folder per backup set:
+# $FB_STORE holds Latest/ (the latest state; the name is exactly that, L1),
+# every Snapshot_<date>/ beside it, View/ (the browse view's default, unused
+# here) and the run files (Temp.lock, backup.log, Incoming/, Building_*,
+# Verify/). From Latest or any snapshot the store is the parent, so a restore
+# needs no path record. filebackup.json says only StorePath=/store.
+#
+# The two layouts before it are named so the wrapper can refuse a store still
+# in them (L2: no migration - the Owner sets the old store aside): the
+# bounded-run-loop layout kept backup/ and changes/ INSIDE the store
+# (FB_OLD_*), and the engine before it used two sibling folders bound
+# separately (FB_LEGACY_*).
+# shellcheck disable=SC2034  # every FB_* set here is read by the caller
 filebackup_store_layout() {
     FB_STORE="${FILEBACKUP_STORE:-/mnt/backup-drive/library-store}"
     FB_STORE="${FB_STORE%/}"
-    FB_BACKUP="$FB_STORE/backup"
-    FB_CHANGES="$FB_STORE/changes"
+    FB_LATEST="$FB_STORE/Latest"
+    FB_OLD_BACKUP="$FB_STORE/backup"
+    FB_OLD_CHANGES="$FB_STORE/changes"
     FB_LEGACY_BACKUP="${FILEBACKUP_BACKUP:-/mnt/backup-drive/library}"
     FB_LEGACY_CHANGES="${FILEBACKUP_CHANGES:-/mnt/backup-drive/library-changes}"
     FB_LEGACY_STATE="${FILEBACKUP_STATE:-/var/lib/homehub-filebackup/state}"

@@ -680,7 +680,8 @@ sudo systemctl start homehub-library-backup.timer
 
 - **Space.** The first clean backup is a full one, beside the set-aside store,
   and takes days. The capacity floor (step 3) is checked before the run only; a
-  drive that fills during it stops it with **4** and the next runs resume. Where
+  drive that fills during it stops it with **4** (nothing stored is lost), and it
+  stays stopped every night until space is made. Where
   the set-aside store ends up — kept on this drive, moved to another, or
   deleted once the new store has history — is the Owner's call
   (docs/status.md), never this stack's.

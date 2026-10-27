@@ -15,7 +15,7 @@ last) — it is the record, not required reading for every pass.
 **2026-10-27 — FileBackup's 2026-10-26 data-loss review, HomeHub's side (`filebackup-review-contract`: the six `filebackup-bounded-contract` commits and this work, replayed 2026-10-27 onto `IceDrive-DesktopDirection` 6318772 with the ids it introduced renumbered past the 2026-10-26 reservations: SR-122 -> SR-128, LLR-1320..1324 -> LLR-1356..1360, TC-1490..1496 -> TC-1541..1547; that branch, 35f5faf, stays as the record; not merged, not deployed, nothing sent to the hub).**
 Sources of truth (FileBackup, read-only): `docs/plans/bounded-run-loop.md` §13 calls C36–C44, `docs/plans/single-store-layout.md` L1–L6,
 `docs/reviews/2026-10-26-data-loss/consolidated.md` Outcome table. FileBackup's own `docs/interfaces.md` was not treated as final.
-- **Part 1 — FileBackup behaviour that is built or ruled (commits `971d4c2`, `2d67564` and the trace commit; pullable on its own):**
+- **Part 1 — FileBackup behaviour that is built or ruled (commits `971d4c2`, `2d67564`, `d5a748d`, `7e86b77`; pullable on its own):**
   the wrapper's exit messages and README carry: exit 4 also = a source empty at the start while the latest state holds rows (C39;
   `BoundedRebuild` `88dc7e1`, with a refinement being merged as this was written); exit 1 also = damaged objects set aside into
   `changes/Verify/` with `[DamagedObject]` lines in `backup.log` (C37; `7228c0b`), which the wrapper now **counts** after an exit 1,
@@ -27,11 +27,28 @@ Sources of truth (FileBackup, read-only): `docs/plans/bounded-run-loop.md` §13 
   interface. NagLight mapping unchanged: only backup 0 + passing verify advances `lastSuccess`. (Hashes are FileBackup
   `BoundedRebuild` as read 2026-10-27, while a merge into it was in progress.)
   Traced: LLR-1356 and TC-1541 amended, **TC-1546** new (damaged-object count).
+- **Part 2 — the single-store layout (C44, L1–L6), NOT YET BUILT in FileBackup (commits `cc642f1`, `de4f14e` and the trace commit
+  after them, each marked "[needs a C44 image]"):** `filebackup.json` is ConfigVersion 3 with `StorePath=/store` (an image without
+  C44 refuses it). The wrapper reads `Latest/` and the run files (`backup.log`, `Temp.lock`, `Verify/`, a prune's `Temp`) at the
+  store's top, refuses a `Latest/` mounted separately (L4), and **never creates `Latest/`**, so FileBackup's refusal of a store with
+  snapshots but no `Latest/` can fire (this also removes the trap in (e) below). Step 2b refuses, naming README "Setting the old
+  store aside", while an older layout sits where this stack looks: the three-mount folders holding data, `backup/` or `changes/`
+  inside the store, or a `MANIFEST.csv` at its top. No migration (L2, L5): `library-store-migrate.sh` and its test are removed and
+  replaced by a short README procedure only (stop the timer, `stat` one device, rename the old folders into one folder on the same
+  drive, deploy, start the clean backup). Restore: no root arguments, no `RECONSTRUCT.paths.json`. Traced: SR-128, LLR-1357, LLR-1358,
+  LLR-1360, TC-1542, TC-1543 amended; **TC-1547** new (Latest/ left missing); LLR-1359 and TC-1544 set to Status `Retired`, their
+  text marked RETIRED (IF-003's precedent; Status is an open column).
 - **Before anything here is deployed:** (1) the FileBackup image rebuilt from `BoundedRebuild` **after** the review's fix batches
   (C36–C42) merge there; (2) **C43's follow-up in that image before any Verify or prune touches the hub's store** — the wrapper's
   step-8 verify gate runs **automatically** (weekly, `-Deep` monthly) and nothing on this branch stops it (not disabled silently, by
   instruction). What would gate it: `--verify none` in the unit's `ExecStart`, or a knob step 8 reads, until that image is deployed;
   `FILEBACKUP_MEM_LIMIT` would turn a runaway into an OOM kill of the container instead of the box. Prune is manual only.
+  For Part 2 also: (3) FileBackup's C44 work package built, independently reviewed (L6) and merged, and the image rebuilt from it;
+  (4) the Owner sets the old store aside (README procedure) before the first run, and HomeHub's materialiser drops
+  `FILEBACKUP_STATE`/`_BACKUP`/`_CHANGES`.
+- **Proven here / not proven:** `library-backup-state.test.sh` (mocked docker, findmnt, curl) and the check harness, below. NOT
+  proven: any FileBackup image, the C44 image's exact messages (the wrapper names its causes from the rulings, not from built
+  code), the README set-aside procedure, the restore commands, anything on the hub.
 - **Open questions for the Owner:**
   (a) prune/snapshots with the **store drive unplugged**: exit 2 as built, or 4 "retry later"? (FileBackup review item B, open there.)
   (b) **C43 gating**: gate step 8 now (which way), or deploy only once the follow-up is in the image?
@@ -43,7 +60,15 @@ Sources of truth (FileBackup, read-only): `docs/plans/bounded-run-loop.md` §13 
   (repo-local id, counterpart IF-001)?
   (e) **Found, not fixed (outside this list):** the bounded-contract wrapper's step 4 pre-creates `<store>/backup/`, so FileBackup's
   C26 refusal (a *missing* BackupPath beside snapshots, never a fresh full backup) can never fire on the hub. Matters only if Part 1
-  ships without Part 2.
+  ships without Part 2 (Part 2 never creates `Latest/`).
+  (f) **Set aside, in place or moved?** Part 2's guard keeps refusing while the old three-mount folders hold data at their default
+  places, so "set aside" means renaming them out of those places (the README procedure). Confirm, or should the guard accept an old
+  store left in place as a note?
+  (g) **Space for the clean start:** the first clean backup is a full one, beside the set-aside store. Is there room on the backup
+  drive, or does the old store move to another drive (or go) first? Nothing here decides that.
+  (h) **Registry:** `Retired` as the Status of LLR-1359/TC-1544 (no precedent for that value) — keep, or another convention?
+  (i) **Found, out of scope:** `stack/recovery/README.md` "The backup" still says an interrupted run's `Temp` makes the next run
+  refuse; that changed with the bounded-contract branch (a note, not a refusal) and was not updated there.
 
 **2026-10-24 — the library backup on FileBackup's bounded-run-loop contract (`filebackup-bounded-contract`, not merged, not deployed).**
 **Requires a FileBackup image built from FileBackup's `BoundedRebuild` work, which is not in a released image yet.**

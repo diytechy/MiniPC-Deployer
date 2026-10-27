@@ -689,6 +689,21 @@ if [ "$RUN_RC" = 0 ] && grep -q '^docker:backup$' "$TMP/linux-manifest.events"; 
 else
     fail "TC-1592 linux manifest rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/linux-manifest.events")"
 fi
+# Fails closed: a manifest the check cannot read refuses (real permissions, so
+# not as root, who reads everything).
+if [ "$(command id -u)" = 0 ]; then
+    printf 'SKIP  TC-1592 an unreadable manifest (root reads everything)\n'
+else
+    chmod 000 "$TMP/store/backup/MANIFEST.csv"
+    run_wrapper unreadable-manifest "$TMP/good.env" none 0 0 200
+    chmod 644 "$TMP/store/backup/MANIFEST.csv"
+    if [ "$RUN_RC" != 0 ] && ! grep -q '^docker:' "$TMP/unreadable-manifest.events" \
+       && grep -qF 'to check its paths (awk failed)' "$TMP/unreadable-manifest.out"; then
+        pass "TC-1592 a manifest the check cannot read refuses rather than pass as clean"
+    else
+        fail "TC-1592 unreadable manifest rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/unreadable-manifest.events")"
+    fi
+fi
 cp "$TMP/manifest.keep" "$TMP/store/backup/MANIFEST.csv"
 
 # ── a new store: the wrapper never creates backup/ or changes/ (TC-1590) ─────

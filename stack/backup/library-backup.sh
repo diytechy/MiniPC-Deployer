@@ -617,7 +617,10 @@ legacy_store_guard "$FB_LEGACY_CHANGES" "$FB_CHANGES"
 # exact for the two columns read. A new store has no manifest yet: nothing to
 # read.
 if [ -f "$FB_BACKUP/MANIFEST.csv" ]; then
-    _bs_line="$(LC_ALL=C awk -F'","' 'NR > 1 && index($1 FS $2, "\\") { print NR; exit }' "$FB_BACKUP/MANIFEST.csv" 2>/dev/null || true)"
+    # Fails CLOSED: a manifest awk cannot read is not a manifest that passed.
+    if ! _bs_line="$(LC_ALL=C awk -F'","' 'NR > 1 && index($1 FS $2, "\\") { print NR; exit }' "$FB_BACKUP/MANIFEST.csv")"; then
+        refuse "cannot read $FB_BACKUP/MANIFEST.csv to check its paths (awk failed) - refusing rather than treating 'could not ask' as 'clean'."
+    fi
     if [ -n "$_bs_line" ]; then
         refuse "$FB_BACKUP/MANIFEST.csv was written on Windows: line $_bs_line has a backslash in a path column." \
                "This container finds files by their exact Linux path, so continuing it would treat every file as new." \

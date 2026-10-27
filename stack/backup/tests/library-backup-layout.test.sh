@@ -48,7 +48,7 @@ exit 42
 EOF
 cat >"$TMP/bin/flock" <<'EOF'
 #!/usr/bin/env bash
-exit 1
+printf 'flock %s\n' "$*" >>"$CALLS"; exit 1
 EOF
 cat >"$TMP/bin/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -60,7 +60,7 @@ printf 'curl %s\n' "$*" >>"$CALLS"; printf 200
 EOF
 chmod +x "$TMP/bin"/*
 cat >"$TMP/backup.env" <<EOF
-LIBRARY_BACKUP_LOCK=$TMP/lock
+LIBRARY_BACKUP_LOCK="$TMP/lock"
 FILE_SHARE_BACKUP_STATE_URL=http://mock.invalid/api/backup-state
 EOF
 
@@ -68,7 +68,9 @@ run_dispatch() {   # NAME LAYOUT-LINE ARGS...
     local name="$1" line="$2"; shift 2
     if [ -n "$line" ]; then printf '%s\n' "$line" >"$STK/.env"; else rm -f "$STK/.env"; fi
     : >"$TMP/$name.stub"; : >"$TMP/$name.calls"
-    PATH="$TMP/bin:$PATH" STUB_LOG="$TMP/$name.stub" CALLS="$TMP/$name.calls" \
+    # env -u: a FILEBACKUP_LAYOUT exported in the caller's shell must not stand
+    # in for the one under test (it would hide a broken default).
+    env -u FILEBACKUP_LAYOUT PATH="$TMP/bin:$PATH" STUB_LOG="$TMP/$name.stub" CALLS="$TMP/$name.calls" \
         bash "$STK/backup/library-backup.sh" --config "$TMP/backup.env" "$@" >"$TMP/$name.out" 2>&1
     RC=$?
 }
@@ -92,7 +94,8 @@ else
 fi
 
 run_dispatch single "FILEBACKUP_LAYOUT=single" --verify none
-if [ "$RC" != 42 ] && [ ! -s "$TMP/single.stub" ] \
+if [ "$RC" = 1 ] && [ ! -s "$TMP/single.stub" ] \
+   && [ "$(cut -d' ' -f1 "$TMP/single.calls" | tr '\n' ' ')" = "flock " ] \
    && grep -qF 'ANOTHER LIBRARY BACKUP IS ALREADY RUNNING' "$TMP/single.out" \
    && ! grep -qF 'handing the run' "$TMP/single.out"; then
     pass "TC-1583 FILEBACKUP_LAYOUT=single runs the single-store wrapper itself (stopped here at its step-1 lock)"

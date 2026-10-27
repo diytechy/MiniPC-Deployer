@@ -239,7 +239,7 @@ def test_tc1556_readiness_waits_settles_and_names_a_loss():
     assert not short.end_covered
     assert hc.readiness(we + hc.SETTLE_MS, ep, short, 0) == "wait"
     assert hc.readiness(we + hc.COVER_WAIT_MS, ep, short, 0) == "ready"
-    assert hc.readiness(we + hc.SETTLE_MS, ep, None, T0 / 1000.0 + 60) == "lost: segments pruned"
+    assert hc.readiness(we + hc.SETTLE_MS, ep, None, T0 / 1000.0 + 60) == "lost: the recording no longer covers the window"
     assert hc.readiness(we + hc.SETTLE_MS, ep, None, T0 / 1000.0 - 100) == "wait"
     assert hc.readiness(we + hc.COVER_WAIT_MS, ep, None, T0 / 1000.0 - 100) == "lost: no recording covers the window"
 
@@ -321,6 +321,8 @@ class FakeFfmpeg:
             stdin = _In()
 
             def communicate(self, timeout=None):
+                if hasattr(stderr, "write"):  # the cutter hands ffmpeg a file, not a pipe
+                    stderr.write(fake.stderr)
                 if fake.write and fake.rc == 0:
                     bind = argv[argv.index("-v") + 1].split(":/out")[0]
                     with open(os.path.join(bind, argv[-1][len("/out/"):]), "wb") as handle:
@@ -592,6 +594,7 @@ def test_tc1564_a_quota_stop_holds_the_cutter_until_retention_makes_room(tmp_pat
     env.write_text("CLIPS_ENABLED=true\nCAMERA_DOOR_SEGMENT_DIR=%s\n" % (tmp_path / "segs"))
     hc.set_quota_stop(state, "Disk quota exceeded", T0)
     monkeypatch.setattr(hc, "cut_camera", lambda *a, **k: pytest.fail("the cutter ran while stopped"))
+    monkeypatch.setattr(hc, "guard", lambda settings: (True, "ok"))
     assert hc.main(["--env-file", str(env), "--state-dir", state, "cut"]) == hc.EXIT_QUOTA
     monkeypatch.setattr(hc, "clips_quota", lambda settings: (95 * MIB, 100 * MIB))
     monkeypatch.setattr(hc, "apply_retention", lambda *a, **k: {"removed": 0})
@@ -631,6 +634,8 @@ def test_tc1565_clips_is_a_scratch_writer_sized_before_ottertube():
     assert tight == {"door": 8192, "meetings": 2048, "clips": 612, "ottertube": 512}
     s = hs.Settings({})
     assert s.quota_mib["clips"] == 1024
+    with pytest.raises(ValueError, match="clips"):  # a writer left out is refused, not unlimited
+        hs.size_quotas(18170 * MIB, {"door": 8192, "meetings": 2048, "ottertube": 6144}, 2048, 512)
 
 
 # ── TC-1566 the units, firstboot, the template ───────────────────────────────
@@ -697,14 +702,15 @@ def test_tc1568_status_reports_events_clips_backlog_and_the_detector(tmp_path, m
     ev.append(str(state), rec(1, "approach", "event", T0 - 1000))
     day = root / "door" / "2026-10-26"
     day.mkdir(parents=True)
-    (day / "c.mp4").write_bytes(b"x" * 100)
-    (day / "c.json").write_text(json.dumps({"v": 1, "actual": {"start_utc_ms": T0 - 60000}, "encode": None}))
+    stem = "door_2026-10-26_14-49-00-0500_approach_10s"   # 19:49:00Z, a minute before T0
+    (day / (stem + ".mp4")).write_bytes(b"x" * 100)
+    (day / (stem + ".json")).write_text(json.dumps({"v": 1, "encode": None}))
     import monitor_common as mc
     mc.save_json_atomic(str(state / "motion" / "door.json"), {"frames": 5})
     out = hc.status(s, str(state), T0)
     door = out["cameras"]["door"]
     assert out["quota"] == {"used_mib": 10, "limit_mib": 1024} and out["clips"] == 1
-    assert door["events_24h"] == 1 and door["last_clip"] == "2026-10-26/c.mp4" and door["last_clip_age_min"] == 1.0
+    assert door["events_24h"] == 1 and door["last_clip"] == "2026-10-26/%s.mp4" % stem and door["last_clip_age_min"] == 1.0
     assert door["encode_backlog"] == 1 and door["detector"] == {"frames": 5}
 
 
@@ -752,3 +758,104 @@ def test_tc1569_real_segments_cut_into_clips_that_decode_with_the_planned_frames
         assert done.returncode == 0 and not done.stderr.strip(), done.stderr[-300:]
         assert data["sha256"] == hc.sha256_file(str(mp4))
         assert 10 <= data["frames"] <= 130
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="bash absent")
+def test_tc1566_the_firstboot_block_executed_follows_the_last_assignment_and_installs_opencv_first(tmp_path):
+    fb = (STACK / "autoinstall" / "firstboot.sh").read_text(encoding="utf-8")
+    block = fb[fb.index("# BEGIN camera-clips"):fb.index("# END camera-clips")]
+    stack = tmp_path / "stack"
+    for sub in ("camera-motion", "clips"):
+        (stack / sub).mkdir(parents=True)
+    # Re-assigned knobs, as a deploy that appends would leave them: the LAST must win.
+    (stack / ".env").write_bytes("CAMERAS=garage\nCAMERAS=door\nCAMERA_DOOR_MOTION_ENABLED=false\n"
+                                "CAMERA_DOOR_MOTION_ENABLED=true\nCLIPS_ENABLED=false\nCLIPS_ENABLED=\"true\"\n"
+                                "CLIPS_ENCODE_ENABLED=false\n".encode("utf-8"))
+    calls = tmp_path / "calls"
+    prelude = ("STACK_DIR=%s\nCALLS=%s\n" % (stack.as_posix(), calls.as_posix()) + r'''
+log() { echo "LOG $*" >> "$CALLS"; }
+_env_val() { sed -n "s/^$1=//p" "$STACK_DIR/.env" | head -1; }
+install() { :; }
+systemctl() { echo "systemctl $*" >> "$CALLS"; }
+python3() { echo "python3 $*" >> "$CALLS"; return 1; }
+apt-get() { echo "apt-get $*" >> "$CALLS"; }
+''')
+    script = tmp_path / "block.sh"
+    script.write_bytes((prelude + block).encode("utf-8"))
+    done = subprocess.run(["bash", str(script)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    assert done.returncode == 0, done.stderr
+    lines = calls.read_text(encoding="utf-8").splitlines()
+    apt = next(i for i, l in enumerate(lines) if l.startswith("apt-get install -y --no-install-recommends python3-opencv"))
+    enable = next(i for i, l in enumerate(lines) if l == "systemctl enable homehub-camera-motion@door.service")
+    assert apt < enable
+    assert not any("camera-motion@garage" in l for l in lines)
+    assert "systemctl enable homehub-clips-cut.timer homehub-clips-retention.timer" in lines
+    assert "systemctl disable --now homehub-clips-encode.timer" in lines
+
+
+# ── review round 1 (DeepSeek) regressions ────────────────────────────────────
+
+
+def test_tc1555_a_hole_at_the_window_end_is_a_gap_not_full_coverage():
+    a = loaded(1000.0, 50)                          # 1000.0 .. 1005.0, then the recorder is down
+    b = loaded(1030.0, 50, start_pts=5)              # back at 1030
+    plan = hc.plan_window([a, b], 1002.0, 1010.0, 10)
+    assert plan.end_covered and plan.actual[1] == pytest.approx(1005.0)
+    assert plan.gaps == [{"after_utc_ms": 1005000, "seconds": 5.0}] and plan.coverage == "partial"
+
+
+def test_tc1552_a_name_that_is_not_a_time_is_not_a_segment(tmp_path):
+    day = tmp_path / "2026-10-26"
+    day.mkdir()
+    (day / "door-20261399T999999Z.ts").write_bytes(b"")
+    (day / "door-20261026T195000Z.ts").write_bytes(b"")
+    assert [s.name for s in hc.list_segments(str(tmp_path), "door")] == ["door-20261026T195000Z.ts"]
+
+
+def test_tc1559_a_cut_that_plays_in_an_instant_is_refused(tmp_path, monkeypatch):
+    settings, cam, _seg, root = cut_setup(tmp_path, monkeypatch)
+    dawn = loaded(T0 / 1000.0 - 10, 200, broken=True)
+    ep = hc.build_episodes([rec(1, "approach", "event", T0)], cam.causes, 3000, 5000, 600000)[0][0]
+    plan = hc.plan_window([dawn], ep.window[0] / 1000.0, ep.window[1] / 1000.0, 10)
+    res = hc.cut_episode(settings, cam, ep, plan, str(tmp_path), runner=FakeFfmpeg(),
+                         prober=lambda c, d, n: {"frames": plan.frames, "duration": 0.07})
+    assert res["status"] == "failed" and "lasts 0.07 s" in res["why"]
+    assert [p for p in root.rglob("*") if p.is_file()] == []
+
+
+def test_tc1559_the_guard_is_asked_again_before_the_record_and_nothing_half_written_stays(tmp_path, monkeypatch):
+    settings, cam, seg, root = cut_setup(tmp_path, monkeypatch)
+    answers = iter([(True, "ok"), (False, "unmounted between the cut and its record")])
+    monkeypatch.setattr(hc, "guard", lambda s: next(answers))
+    ep = hc.build_episodes([rec(1, "approach", "event", T0)], cam.causes, 3000, 5000, 600000)[0][0]
+    plan = hc.plan_window([seg], ep.window[0] / 1000.0, ep.window[1] / 1000.0, 10)
+    with pytest.raises(hc.GuardStop):
+        hc.cut_episode(settings, cam, ep, plan, str(tmp_path), runner=FakeFfmpeg(),
+                       prober=lambda c, d, n: {"frames": plan.frames})
+    assert [p for p in root.rglob("*") if p.is_file()] == []
+
+
+def test_tc1563_stale_parts_go_before_the_quota_is_read_and_unconfigured_cameras_count(tmp_path):
+    root = tmp_path / "clips"
+    s = hc.ClipsSettings({"CLIPS_RETENTION_DAYS": "3650"})
+    s.root = str(root)
+    old_cam = root / "garage" / "2026-10-20"     # a camera no longer in CAMERAS
+    old_cam.mkdir(parents=True)
+    stem = "garage_2026-10-20_10-00-00+0000_approach_10s"
+    (old_cam / (stem + ".mp4")).write_bytes(b"x" * 10)
+    part = root / "garage" / "2026-10-20" / "x.mp4.part"
+    part.write_bytes(b"p")
+    os.utime(part, (0, 0))
+    seen = []
+
+    def quota():
+        seen.append(part.exists())
+        return 95, 100                            # past 90 %: the oldest clip must go
+    result = hc.apply_retention(s, str(tmp_path / "state"), T0, quota)
+    assert seen == [False] and result["removed"] == 1 and not old_cam.exists()
+
+
+def test_tc1557_a_names_time_reads_back_to_utc():
+    assert hc.stem_utc_ms("door_2026-10-26_14-51-01-0500_road-stop_29s") == T0 + 61000
+    assert hc.stem_utc_ms("door_2026-10-26_19-51-01+0000_approach_9s-2") == T0 + 61000
+    assert hc.stem_utc_ms("c") is None

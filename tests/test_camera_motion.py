@@ -325,3 +325,85 @@ def test_tc1567_no_private_zone_is_anywhere_in_this_public_repository():
             hit = subprocess.run(["git", "-C", str(ROOT), "grep", "-l", "-F", "-e", probe, "--", "."],
                                  stdout=subprocess.PIPE, universal_newlines=True, timeout=60)
             assert hit.stdout.strip() == "", "a private zone is in the public tree (file names only): " + hit.stdout
+
+
+# ── review round 1 (DeepSeek) regressions ────────────────────────────────────
+
+
+def test_tc1550_a_bad_other_knob_reaches_the_run_and_its_alert_not_a_silent_skip(tmp_path):
+    env = write_env(tmp_path, CAMERA_DOOR_MOTION_DECODE="vaap", CAMERA_MOTION_BUDGET_PCT="25%")
+    assert cm.main(["--env-file", env, "condition", "--camera", "door"]) == 0
+    with pytest.raises(cm.Invalid, match="MOTION_DECODE"):
+        cm.prepare(env, "door")
+
+
+def test_tc1543_a_missing_engine_is_a_refusal_not_a_crash(tmp_path, monkeypatch):
+    monkeypatch.setattr(cm, "ENGINE_FILE", str(tmp_path / "gone.py"))
+    with pytest.raises(cm.Invalid, match="cannot be loaded"):
+        cm.prepare(write_env(tmp_path), "door")
+
+
+@needs_cv
+def test_tc1548_a_failed_decode_fails_the_replay_and_a_non_integer_rate_is_refused(tmp_path):
+    seg_dir = tmp_path / "segs" / "2026-10-26"
+    seg_dir.mkdir(parents=True)
+    (seg_dir / "door-20261026T195000Z.ts").write_bytes(b"")
+    env = write_env(tmp_path, CAMERA_DOOR_SEGMENT_DIR=str(tmp_path / "segs").replace("\\", "/"))
+
+    class Proc:
+        def __init__(self, argv, stdout=None, stderr=None):
+            self.stdout = __import__("io").BytesIO(b"\x00" * (256 * 256 * 3))
+            stderr.write(b"/seg.ts: Invalid data found when processing input")
+            self.returncode = None
+
+        def kill(self):
+            pass
+
+        def wait(self):
+            self.returncode = 183
+    lines = []
+    rc = cm.replay(env, "door", 1793044200.0, 1793044800.0, None, False, runner=Proc, out=lines.append)
+    summary = json.loads(lines[-1])
+    assert rc == 1 and summary["frames"] == 3 and "Invalid data" in summary["failed_segments"][0]
+    with pytest.raises(cm.Invalid, match="whole multiple"):
+        cm.replay(write_env(tmp_path, CAMERA_DOOR_MOTION_SAMPLE_FPS="4"), "door", 0, 1, None, False, runner=Proc,
+                  out=lines.append)
+
+
+def test_tc1548_replay_warms_up_on_earlier_segments_but_reports_only_its_window(tmp_path, monkeypatch):
+    since = 1793044200.0                              # 19:50:00Z
+    seg_dir = tmp_path / "segs" / "2026-10-26"
+    seg_dir.mkdir(parents=True)
+    for name in ("door-20261026T194000Z.ts", "door-20261026T195000Z.ts"):
+        (seg_dir / name).write_bytes(b"")
+    env = write_env(tmp_path, CAMERA_DOOR_SEGMENT_DIR=str(tmp_path / "segs").replace("\\", "/"))
+
+    class Config:
+        eligible, sample_fps = True, 5.0
+
+    class Engine:
+        def __init__(self, config):
+            self.cause = "approach"
+
+        def process(self, frame, now):
+            return True, None
+
+    class Module:
+        motion_config = staticmethod(lambda values: Config())
+        MotionEngine = Engine
+    monkeypatch.setattr(cm, "load_engine", lambda *a: Module)
+
+    class Proc:
+        def __init__(self, argv, stdout=None, stderr=None):
+            self.stdout = __import__("io").BytesIO(b"\x00" * (256 * 256 * 10))
+            self.returncode = 0
+
+        def kill(self):
+            pass
+
+        def wait(self):
+            pass
+    lines = []
+    assert cm.replay(env, "door", since, since + 1.0, None, True, runner=Proc, out=lines.append) == 0
+    summary = json.loads(lines[-1])
+    assert summary["signals"] == {"approach": 5} and len(lines) == 6   # 5 in-window lines + the summary

@@ -3103,16 +3103,20 @@ if [ -d "$STACK_DIR/camera-motion" ] && [ -d "$STACK_DIR/clips" ]; then
         install -m 0644 "$STACK_DIR/clips/$__u" "/etc/systemd/system/$__u" || log "WARN: could not install $__u"
     done
     systemctl daemon-reload || log "WARN: systemctl daemon-reload failed"
+    # The LAST assignment wins, as for every reader of these knobs (the python
+    # units, 1b-scratch): _env_val takes the first, and a deploy that appends a
+    # changed knob would otherwise converge on the old value.
+    __last() { sed -n "s/^$1=//p" "$STACK_DIR/.env" 2>/dev/null | tail -n1 | tr -d "\"'\r"; }
     __cams=""
     __motion_any=false
-    for __c in $(_env_val CAMERAS | tr -d "\"'"); do
+    for __c in $(__last CAMERAS); do
         case "$__c" in
             [a-z]*) case "$__c" in *[!a-z0-9]*) log "WARN: CAMERAS holds '$__c', not a camera name - skipped"; continue ;; esac ;;
             *) log "WARN: CAMERAS holds '$__c', not a camera name - skipped"; continue ;;
         esac
         __cams="$__cams $__c"
         __C="$(printf '%s' "$__c" | tr 'a-z' 'A-Z')"
-        [ "$(_env_val "CAMERA_${__C}_MOTION_ENABLED" | tr -d "\"'")" = true ] && __motion_any=true
+        [ "$(__last "CAMERA_${__C}_MOTION_ENABLED")" = true ] && __motion_any=true
     done
     if [ "$__motion_any" = true ] && ! python3 -c 'import cv2' >/dev/null 2>&1; then
         log "camera motion is on and python3-opencv is missing - installing it (the panel's engine runtime)"
@@ -3128,10 +3132,10 @@ if [ -d "$STACK_DIR/camera-motion" ] && [ -d "$STACK_DIR/clips" ]; then
             || log "WARN: could not enable homehub-camera-motion@$__c.service"
         systemctl start --no-block "homehub-camera-motion@$__c.service" >/dev/null 2>&1 \
             || log "WARN: could not queue homehub-camera-motion@$__c.service"
-        log "camera $__c: motion detector unit enabled (CAMERA_${__C}_MOTION_ENABLED=$(_env_val "CAMERA_${__C}_MOTION_ENABLED"))"
+        log "camera $__c: motion detector unit enabled (CAMERA_${__C}_MOTION_ENABLED=$(__last "CAMERA_${__C}_MOTION_ENABLED"))"
     done
-    __clips_on="$(_env_val CLIPS_ENABLED | tr -d "\"'")"
-    __enc_on="$(_env_val CLIPS_ENCODE_ENABLED | tr -d "\"'")"
+    __clips_on="$(__last CLIPS_ENABLED)"
+    __enc_on="$(__last CLIPS_ENCODE_ENABLED)"
     case "${__clips_on:-false}" in
         true)
             if systemctl enable homehub-clips-cut.timer homehub-clips-retention.timer >/dev/null 2>&1 \
@@ -3155,6 +3159,7 @@ if [ -d "$STACK_DIR/camera-motion" ] && [ -d "$STACK_DIR/clips" ]; then
         *)  log "WARN: CLIPS_ENABLED='$__clips_on' is not true or false - the clip timers are left as they were" ;;
     esac
     unset __u __c __C __cams __motion_any __clips_on __enc_on
+    unset -f __last
 else
     log "WARN: no $STACK_DIR/camera-motion or $STACK_DIR/clips on the payload - no camera motion detector or clips"
 fi

@@ -76,6 +76,7 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -105,6 +106,8 @@ MAX_SIDECAR_RECORDS = 200
 GAP_SEC = 2.0
 MAX_SNAP_SEC = 5.0         # how far back the cut may start for a keyframe
 STALE_PART_SEC = 3600
+ENCODE_LOOKBACK_DAYS = 7   # the encode batch looks at this many days of clips
+ENCODE_RUN_SEC = 600       # and stops starting new encodes after this long
 MAX_ATTEMPTS = 3
 QUOTA_WORDS = ("Disk quota exceeded", "No space left on device")
 
@@ -220,9 +223,13 @@ def list_segments(seg_dir: str, camera: str) -> List[Segment]:
             continue
         for name in names:
             m = pattern.match(name)
-            if m:
+            if not m:
+                continue
+            try:
                 start = float(calendar.timegm(time.strptime(m.group(1), "%Y%m%dT%H%M%S")))
-                out.append(Segment(os.path.join(seg_dir, day, name), name, start, bool(m.group(2))))
+            except (ValueError, OverflowError):
+                continue  # a name that is not a time is not a segment
+            out.append(Segment(os.path.join(seg_dir, day, name), name, start, bool(m.group(2))))
     out.sort(key=lambda s: (s.start, s.name))
     return out
 
@@ -248,10 +255,11 @@ class FrameIndex:
 def scan_frames(data: bytes, part: bool) -> FrameIndex:
     """Index the video frames in a segment's bytes (pure)."""
     idx = FrameIndex()
-    n = len(data) - len(data) % TS
+    n = len(data)
     pmt_pid = video_pid = None
     pat = pmt = b""
     i = 0
+    packets_end = 0  # where the last whole packet ends (alignment may restart mid-file)
     while i + TS <= n:
         if data[i] != rec.SYNC:
             i += 1  # a torn file: search for the next packet start
@@ -273,13 +281,14 @@ def scan_frames(data: bytes, part: bool) -> FrameIndex:
                 if found is not None:
                     video_pid, pmt = found, bytes(data[i:i + TS])
         i += TS
+        packets_end = i
     idx.header = pat + pmt if pat and pmt else b""
     if part and idx.offsets:
         idx.end = idx.offsets.pop()
         idx.keys.pop()
         idx.pts.pop()
     else:
-        idx.end = n
+        idx.end = packets_end
     return idx
 
 
@@ -304,8 +313,8 @@ def frame_times(idx: FrameIndex, start: float, fps: int) -> Tuple[List[float], s
 
 
 class Loaded:
-    """One segment, opened once and indexed: the fd stays open, so a prune or
-    a rename by the recorder cannot pull the bytes from under a cut."""
+    """One segment, read once into memory and indexed, so a prune or a rename
+    by the recorder cannot pull the bytes from under a cut."""
 
     def __init__(self, seg: Segment, data: bytes, fps: int):
         self.seg = seg
@@ -453,6 +462,11 @@ def plan_window(loaded: Sequence[Loaded], ws: float, we: float, fps: int) -> Opt
     plan.frames = last - first + 1
     fps_period = 1.0 / fps
     plan.actual = (flat[first][2], flat[last][2] + fps_period)
+    if plan.end_covered and flat[last + 1][2] - plan.actual[1] > GAP_SEC:
+        # The recording passes the window's end only after a hole (a recorder
+        # restart): waiting cannot fill it, and the clip must not claim it.
+        plan.gaps.append({"after_utc_ms": int(plan.actual[1] * 1000),
+                          "seconds": round(we - plan.actual[1], 1)})
     # Group the chosen frames by segment into byte ranges.
     pos = first
     previous: Optional[Loaded] = None
@@ -487,14 +501,16 @@ def plan_window(loaded: Sequence[Loaded], ws: float, we: float, fps: int) -> Opt
 
 
 def readiness(now_ms: int, ep: Episode, plan: Optional[Plan], oldest_start: Optional[float]) -> str:
-    """"wait", "ready" or "lost: <why>" for an episode (pure).
+    """"wait", "ready" or "lost: <why>" for an episode (pure). A window that
+    ended before the oldest segment is gone (pruned, or before the recording
+    began); one nothing covers 180 s after its end was never recorded.
     Implements: LLR-1368."""
     ws, we = ep.window
     if now_ms < we + SETTLE_MS:
         return "wait"
     if plan is None:
         if oldest_start is not None and we <= oldest_start * 1000:
-            return "lost: segments pruned"
+            return "lost: the recording no longer covers the window"
         if now_ms - we >= COVER_WAIT_MS:
             return "lost: no recording covers the window"
         return "wait"
@@ -642,10 +658,22 @@ def encode_command(settings: ClipsSettings, camera: str, out_dir: str, src: str,
 
 
 def run_probe(camera: str, out_dir: str, name: str, runner=subprocess.run) -> Optional[Dict[str, object]]:
-    """{frames, duration, codec} of a file in out_dir, or None."""
+    """{frames, duration, codec} of a file in out_dir, or None. The named
+    container is removed before the probe and after a timeout (killing the
+    docker client does not stop it, and a leftover would refuse every later
+    probe by name)."""
+    container = "homehub-clips-probe-%s" % camera
+
+    def remove():
+        subprocess.run(["docker", "rm", "-f", container], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=60)
+    remove()
     try:
         done = runner(probe_command(camera, out_dir, name), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                       timeout=300)
+    except subprocess.TimeoutExpired:
+        remove()
+        return None
     except (OSError, subprocess.SubprocessError):
         return None
     if done.returncode != 0:
@@ -718,40 +746,63 @@ def cut_episode(settings: ClipsSettings, cam: CameraSettings, ep: Episode, plan:
     argv = cut_command(cam.camera, day_dir, part, cam.fps if plan.regenerate else None)
     subprocess.run(["docker", "rm", "-f", "homehub-clips-cut-%s" % cam.camera], stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL, timeout=60)
-    proc = runner(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    try:
-        write_pieces(proc.stdin, plan)
-    except (BrokenPipeError, OSError):
-        pass  # ffmpeg died early: its exit status and stderr say why
-    finally:
+    # stderr into a file, not a pipe: an ffmpeg complaining at length about a
+    # damaged segment must not block on a full pipe while we block feeding it.
+    with tempfile.TemporaryFile() as err_file:
+        proc = runner(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err_file)
         try:
-            proc.stdin.close()
-        except OSError:
-            pass
-        proc.stdin = None  # communicate() must not flush a closed pipe
-    try:
-        _out, err = proc.communicate(timeout=300)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        _out, err = proc.communicate()
-    err_text = (err or b"").decode("utf-8", "replace") if isinstance(err, bytes) else (err or "")
+            write_pieces(proc.stdin, plan)
+        except (BrokenPipeError, OSError):
+            pass  # ffmpeg died early: its exit status and stderr say why
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+            proc.stdin = None  # communicate() must not flush a closed pipe
+        try:
+            proc.communicate(timeout=300)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+        err_file.seek(0)
+        err_text = err_file.read(1 << 16).decode("utf-8", "replace")
     part_path = os.path.join(day_dir, part)
     if quota_hit(err_text):
         _remove(part_path)
         raise QuotaStop(err_text.strip().splitlines()[-1] if err_text.strip() else "quota")
     probed = prober(cam.camera, day_dir, part) if proc.returncode == 0 and os.path.exists(part_path) else None
-    if not probed or probed.get("frames") != plan.frames:
+    why = None
+    if proc.returncode:
+        why = "ffmpeg exited %s: %s" % (proc.returncode, err_text.strip()[-200:])
+    elif not probed or probed.get("frames") != plan.frames:
+        why = "the cut holds %s frames, not the %d planned" % ((probed or {}).get("frames"), plan.frames)
+    elif "duration" in probed and not duration_plausible(float(probed["duration"]), plan, cam.fps):
+        why = "the cut lasts %.2f s for %d frames" % (float(probed["duration"]), plan.frames)
+    if why:
         _remove(part_path)
-        why = ("ffmpeg exited %s: %s" % (proc.returncode, err_text.strip()[-200:]) if proc.returncode
-               else "the cut holds %s frames, not the %d planned" % ((probed or {}).get("frames"), plan.frames))
         mc.log("clips [%s]: cut FAILED for %s - %s" % (cam.camera, ep.id, why), warning=True)
         return {"status": "failed", "why": why}
     final = os.path.join(day_dir, stem + ".mp4")
-    os.rename(part_path, final)
-    size = os.path.getsize(final)
-    sidecar = sidecar_record(cam, ep, plan, stem + ".mp4", size, sha256_file(final))
+    side_path = os.path.join(day_dir, stem + ".json")
+    size = os.path.getsize(part_path)
+    sidecar = sidecar_record(cam, ep, plan, stem + ".mp4", size, sha256_file(part_path))
+    # The guard again before the next files, and the sidecar BEFORE the clip's
+    # final name: a clip never appears without its record.
+    ok, reason = guard(settings)
+    if not ok:
+        _remove(part_path)
+        raise GuardStop(reason)
     try:
-        write_json_atomic(os.path.join(day_dir, stem + ".json"), sidecar)
+        write_json_atomic(side_path, sidecar)
+        os.rename(part_path, final)
+    except OSError as exc:
+        _remove(part_path)
+        _remove(side_path)
+        if exc.errno in (getattr(errno, "EDQUOT", -1), errno.ENOSPC):
+            raise QuotaStop(str(exc))
+        raise
+    try:
         index_line = {"v": 1, "clip": "%s/%s.mp4" % (day, stem), "camera": cam.camera, "cause": ep.cause,
                       "event_utc_ms": ep.event_ms, "start_utc_ms": int(plan.actual[0] * 1000),
                       "end_utc_ms": int(plan.actual[1] * 1000), "seconds": round(seconds, 1),
@@ -767,6 +818,16 @@ def cut_episode(settings: ClipsSettings, cam: CameraSettings, ep: Episode, plan:
            % (cam.camera, day, stem, seconds, plan.coverage, size / MIB, plan.timing,
               ", timestamps regenerated" if plan.regenerate else ""))
     return {"status": "cut", "clip": "%s/%s.mp4" % (day, stem)}
+
+
+def duration_plausible(duration: float, plan: Plan, fps: int) -> bool:
+    """The MP4's duration agrees with its frames: within 1 s of frames / fps
+    when the timestamps were regenerated, and never under half of it (a cut of
+    broken-PTS frames whose timestamps were NOT restored plays in an instant)."""
+    expected = plan.frames / float(fps)
+    if duration < 0.5 * expected:
+        return False
+    return not plan.regenerate or abs(duration - expected) <= 1.0
 
 
 def sidecar_record(cam: CameraSettings, ep: Episode, plan: Plan, clip: str, size: int, sha: str) -> Dict[str, object]:
@@ -823,6 +884,10 @@ def cut_camera(settings: ClipsSettings, cam: CameraSettings, state_dir: str, now
             if now_ms >= we + SETTLE_MS:
                 needed = [s for i, s in enumerate(segs)
                           if s.start * 1000 < we and (i + 1 == len(segs) or segs[i + 1].start * 1000 > ws - 2000)]
+                # Only this episode's segments stay in memory (each is ~50 MB).
+                keep = {s.path for s in needed}
+                for key in [k for k in cache if k[0] not in keep]:
+                    del cache[key]
                 loaded = [x for x in (load_segment(s, cam.fps, cache) for s in needed) if x and x.times]
                 plan = plan_window(loaded, ws / 1000.0, we / 1000.0, cam.fps) if loaded else None
             state = readiness(now_ms, ep, plan, oldest)
@@ -852,6 +917,8 @@ def cut_camera(settings: ClipsSettings, cam: CameraSettings, state_dir: str, now
                 counts["cut"] += 1
             entry.update(result, attempts=attempts)
             ledger["episodes"][ep.id] = entry  # type: ignore[index]
+            # Saved after every cut: a pass killed later must not cut this one again.
+            mc.save_json_atomic(ledger_path(state_dir, cam.camera), ledger)
     finally:
         prune_ledger(ledger, now_ms)
         mc.save_json_atomic(ledger_path(state_dir, cam.camera), ledger)
@@ -864,11 +931,15 @@ def cut_camera(settings: ClipsSettings, cam: CameraSettings, state_dir: str, now
 # ── the encode batch ─────────────────────────────────────────────────────────
 
 
-def encode_candidates(root: str, camera: str) -> List[Tuple[str, str]]:
-    """(day dir, stem) of clips whose sidecar has no encode result yet, oldest first."""
+def encode_candidates(root: str, camera: str, now: Optional[float] = None) -> List[Tuple[str, str]]:
+    """(day dir, stem) of clips whose sidecar has no encode result yet, oldest
+    first - looking only at the last ENCODE_LOOKBACK_DAYS day folders, so the
+    batch does not read every sidecar of a year of clips each quarter hour
+    (older copies, from before the encode was switched on, stay as cut)."""
     out = []
     cam_dir = os.path.join(root, camera)
-    for day in sorted(_days(cam_dir)):
+    since = time.strftime("%Y-%m-%d", time.localtime((now or time.time()) - ENCODE_LOOKBACK_DAYS * 86400))
+    for day in sorted(d for d in _days(cam_dir) if d >= since):
         day_dir = os.path.join(cam_dir, day)
         for name in sorted(os.listdir(day_dir)):
             if name.endswith(".json") and os.path.exists(os.path.join(day_dir, name[:-5] + ".mp4")):
@@ -947,10 +1018,38 @@ def encode_clip(settings: ClipsSettings, camera: str, day_dir: str, stem: str,
 # ── retention ────────────────────────────────────────────────────────────────
 
 
-def list_clips(root: str, cameras: Sequence[str]) -> List[Tuple[int, str, str, int]]:
-    """(start utc ms, day dir, stem, bytes of mp4 + json) of every clip, oldest first."""
+STEM_TIME_RE = re.compile(r"[a-z][a-z0-9]{0,15}_(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})([+-])(\d{2})(\d{2})_")
+
+
+def stem_utc_ms(stem: str) -> Optional[int]:
+    """The UTC time a clip's name says (its local time and offset), or None."""
+    m = STEM_TIME_RE.match(stem)
+    if not m:
+        return None
+    y, mo, d, h, mi, se = (int(x) for x in m.groups()[:6])
+    offset = (int(m.group(8)) * 3600 + int(m.group(9)) * 60) * (1 if m.group(7) == "+" else -1)
+    try:
+        return (calendar.timegm((y, mo, d, h, mi, se, 0, 0, 0)) - offset) * 1000
+    except (ValueError, OverflowError):
+        return None
+
+
+def camera_dirs(root: str) -> List[str]:
+    """Every camera folder under the clips root - configured or not, so a
+    camera dropped from CAMERAS still ages out and still counts."""
+    try:
+        return sorted(d for d in os.listdir(root) if ev.CAMERA_RE.fullmatch(d) and os.path.isdir(os.path.join(root, d)))
+    except OSError:
+        return []
+
+
+def list_clips(root: str, cameras: Optional[Sequence[str]] = None) -> List[Tuple[int, str, str, int]]:
+    """(time utc ms, day dir, stem, bytes of mp4 + json) of every clip, oldest
+    first. The time is the name's (the first event's), read without opening the
+    sidecar; a name that does not parse falls back to the file's mtime.
+    `cameras` None = every camera folder under the root."""
     out = []
-    for camera in cameras:
+    for camera in (camera_dirs(root) if cameras is None else cameras):
         cam_dir = os.path.join(root, camera)
         for day in _days(cam_dir):
             day_dir = os.path.join(cam_dir, day)
@@ -958,9 +1057,8 @@ def list_clips(root: str, cameras: Sequence[str]) -> List[Tuple[int, str, str, i
                 if not name.endswith(".mp4"):
                     continue
                 stem = name[:-4]
-                side = mc.load_json(os.path.join(day_dir, stem + ".json"), {})
-                start = side.get("actual", {}).get("start_utc_ms") if isinstance(side.get("actual"), dict) else None
-                if not isinstance(start, int):
+                start = stem_utc_ms(stem)
+                if start is None:
                     try:
                         start = int(os.path.getmtime(os.path.join(day_dir, name)) * 1000)
                     except OSError:
@@ -983,8 +1081,9 @@ def retention_plan(clips: Sequence[Tuple[int, str, str, int]], now_ms: int, keep
     first, until the total is within cap_bytes; then, while the quota project
     is past high_pct of its limit, until it is 5 points under. The cap wins
     over the age (the Owner, 2026-10-26). Implements: LLR-1376."""
-    doomed = [c for c in clips if now_ms - c[0] > keep_days * 86400 * 1000]
-    rest = [c for c in clips if c not in doomed]
+    old = [now_ms - c[0] > keep_days * 86400 * 1000 for c in clips]
+    doomed = [c for c, gone in zip(clips, old) if gone]
+    rest = [c for c, gone in zip(clips, old) if not gone]
     total = sum(c[3] for c in rest)
     used = quota_used
     target = None
@@ -1018,16 +1117,12 @@ def clips_quota(settings: ClipsSettings) -> Tuple[Optional[int], Optional[int]]:
 
 
 def apply_retention(settings: ClipsSettings, state_dir: str, now_ms: int,
-                    quota: Tuple[Optional[int], Optional[int]] = (None, None)) -> Dict[str, object]:
-    cameras = [c.camera for c in settings.cameras]
-    clips = list_clips(settings.root, cameras)
-    doomed = retention_plan(clips, now_ms, settings.retention_days, settings.cap_mib * MIB,
-                            quota[0], quota[1], settings.quota_high_pct)
-    gone = set()
-    for _start, day_dir, stem, _size in doomed:
-        for ext in (".mp4", ".json"):
-            _remove(os.path.join(day_dir, stem + ext))
-        gone.add((os.path.basename(os.path.dirname(day_dir)), "%s/%s.mp4" % (os.path.basename(day_dir), stem)))
+                    quota_fn: Callable[[], Tuple[Optional[int], Optional[int]]] = lambda: (None, None)
+                    ) -> Dict[str, object]:
+    """Stale .part files first (they count against the quota too), then the
+    quota is read, then the plan, then the deletions, empty days and the index.
+    Every camera folder under the root, configured or not. Implements: LLR-1376."""
+    cameras = camera_dirs(settings.root)
     stale = 0
     for camera in cameras:
         cam_dir = os.path.join(settings.root, camera)
@@ -1043,13 +1138,26 @@ def apply_retention(settings: ClipsSettings, state_dir: str, now_ms: int,
                             stale += 1
                     except OSError:
                         pass
+    used, limit = quota_fn()
+    clips = list_clips(settings.root, cameras)
+    doomed = retention_plan(clips, now_ms, settings.retention_days, settings.cap_mib * MIB,
+                            used, limit, settings.quota_high_pct)
+    gone = set()
+    for _start, day_dir, stem, _size in doomed:
+        for ext in (".mp4", ".json"):
+            _remove(os.path.join(day_dir, stem + ext))
+        gone.add((os.path.basename(os.path.dirname(day_dir)), "%s/%s.mp4" % (os.path.basename(day_dir), stem)))
+    for camera in cameras:
+        cam_dir = os.path.join(settings.root, camera)
+        for day in _days(cam_dir):
             try:
-                os.rmdir(day_dir)  # only when empty
+                os.rmdir(os.path.join(cam_dir, day))  # only when empty
             except OSError:
                 pass
         if any(c == camera for c, _clip in gone):
             rewrite_index(os.path.join(cam_dir, "index.jsonl"), {clip for c, clip in gone if c == camera})
-    events_removed = ev.prune_days(state_dir, cameras, settings.event_days, now_ms / 1000.0)
+    events_removed = ev.prune_days(state_dir, sorted(set(cameras) | {c.camera for c in settings.cameras}),
+                                   settings.event_days, now_ms / 1000.0)
     if doomed:
         mc.log("clips: retention removed %d clip(s), %.1f MiB" % (len(doomed), sum(c[3] for c in doomed) / MIB))
     return {"removed": len(doomed), "removed_mib": round(sum(c[3] for c in doomed) / MIB, 1),
@@ -1111,7 +1219,7 @@ def status(settings: ClipsSettings, state_dir: str, now_ms: int) -> Dict[str, ob
             "last_clip_age_min": round((now_ms - mine[-1][0]) / 60000.0, 1) if mine else None,
             "lost_ledger": sum(1 for e in ledger.values() if e.get("status") == "lost"),
             "failed_ledger": sum(1 for e in ledger.values() if e.get("status") == "failed"),
-            "encode_backlog": len(encode_candidates(settings.root, cam.camera)),
+            "encode_backlog": len(encode_candidates(settings.root, cam.camera, now_ms / 1000.0)),
             "detector": mc.load_json(os.path.join(state_dir, "motion", "%s.json" % cam.camera), {}) or None,
         }
     out["cameras"] = cams
@@ -1197,7 +1305,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             mc.log("clips: another clips run holds the lock - skipping this %s" % args.verb)
             return 0
         if args.verb == "retention":
-            result = apply_retention(settings, args.state_dir, now_ms, clips_quota(settings))
+            ok, reason = guard(settings)
+            if not ok:  # nothing is deleted or rewritten on a volume that is not the clips area
+                mc.log("clips: retention skipped - guard: %s" % reason, warning=True)
+                return EXIT_GUARD
+            result = apply_retention(settings, args.state_dir, now_ms, lambda: clips_quota(settings))
             stop = quota_stopped(args.state_dir)
             used, limit = clips_quota(settings)
             if stop and (not limit or (used or 0) * 100 < limit * settings.quota_high_pct):
@@ -1221,9 +1333,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     mc.log("clips: CLIPS_ENCODE_ENABLED is not true - the copies stay as cut")
                     return 0
                 done = 0
+                started = time.monotonic()
                 for cam in settings.cameras:
                     for day_dir, stem in encode_candidates(settings.root, cam.camera):
-                        if done >= settings.max_per_run:
+                        # Bounded in count AND time: the batch shares the pipeline lock
+                        # with the cut, which must not wait long behind it.
+                        if done >= settings.max_per_run or time.monotonic() - started > ENCODE_RUN_SEC:
                             break
                         encode_clip(settings, cam.camera, day_dir, stem)
                         done += 1

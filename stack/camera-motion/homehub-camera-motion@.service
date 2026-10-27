@@ -13,7 +13,7 @@
 # Anything else (the relay restarted, the stream stalled) is retried.
 #
 # CPUQuota bounds the ENGINE (this unit's cgroup); the decoder runs in docker's
-# cgroup, bounded by its own --cpus 1 and weighted low by --cpu-shares 256.
+# cgroup, bounded by its own --cpus 0.4 and weighted low by --cpu-shares 256.
 # `camera_motion.py cost --camera <camera>` measures both.
 [Unit]
 Description=Camera motion detector (%i): the event source for motion clips
@@ -41,7 +41,7 @@ PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
 CPUAccounting=true
-CPUQuota=50%
+CPUQuota=25%
 MemoryAccounting=true
 MemoryMax=256M
 TasksMax=64

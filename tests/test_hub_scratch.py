@@ -51,7 +51,7 @@ def test_tc1370_size_rounds_up_to_whole_extents():
 
 # ── TC-1371 budgets ──────────────────────────────────────────────────────────
 
-WANT = {"door": 8192, "meetings": 2048, "ottertube": 6144}
+WANT = {"door": 8192, "meetings": 2048, "clips": 0, "ottertube": 6144}  # clips asks nothing here
 
 
 def test_tc1371_budgets_that_fit_are_granted_unchanged():
@@ -70,7 +70,7 @@ def test_tc1371_meetings_only_after_ottertube_is_at_its_minimum_and_a_starved_se
     # usable 11752 - floor 2048 = 9704 for 16384 wanted: ottertube down to its
     # 512 minimum first, then meetings gives up what is still over; door untouched.
     got = hs.size_quotas(11752 * MIB, WANT, 2048, 512)
-    assert got == {"door": 8192, "meetings": 1000, "ottertube": 512}
+    assert got == {"door": 8192, "meetings": 1000, "clips": 0, "ottertube": 512}
     with pytest.raises(hs.Stop):
         hs.size_quotas((512 * 3 + 2048 - 1) * MIB, WANT, 2048, 512)
     with pytest.raises(hs.Stop):

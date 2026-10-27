@@ -68,6 +68,7 @@ import select
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -97,8 +98,15 @@ NEW_EVENT_CAUSES = ("approach", "road-stop")
 # window. The last renewal of an episode is always written (tick()).
 LEASE_SEC = 5.0
 THROTTLE_SEC = 3.0
+# The decoder's hard ceiling (docker's cgroup, outside the unit's CPUQuota):
+# about twice the measured 17.7 % of one core, so a runaway decode cannot take a
+# core from the hub's DNS while a normal one never meets it. The unit's
+# CPUQuota bounds the engine the same way. The Owner's budget (25 % for both)
+# is the cost test's verdict, not these ceilings.
+DECODER_CPUS = "0.4"
 EXIT_REFUSED = 78  # EX_CONFIG: refused (pin, config, zones, missing package); no restart
 STATUS_EVERY_SEC = 60.0
+REPLAY_SEGMENT_SEC = 900.0   # one segment's replay decode may take this long, then it is killed
 
 
 class Invalid(ValueError):
@@ -234,7 +242,7 @@ def decoder_command(relay: "door_relay.RelaySettings", settings: MotionSettings,
     (--cpu-shares 256 against docker's default 1024) so the hub's services win
     under contention; one core at most. Implements: LLR-1359."""
     hw: List[str] = []
-    extra = ["--pids-limit", "64", "--memory", "192m", "--cpus", "1", "--cpu-shares", "256"]
+    extra = ["--pids-limit", "64", "--memory", "192m", "--cpus", DECODER_CPUS, "--cpu-shares", "256"]
     if settings.decode == "vaapi":
         hw = hwaccel_args(settings.device)
         extra += ["--device", settings.device]
@@ -314,7 +322,7 @@ class EventWriter:
 
     def __init__(self, state_dir: str, camera: str, clock=time.time):
         boot = re.sub(r"[^0-9a-f]", "", mc.read_boot_id() or "")[:8] or "noboot"
-        self.prefix = "%s.%d" % (boot, int(clock()))
+        self.prefix = "%s.%d.%d" % (boot, int(clock()), os.getpid())
         self.state_dir, self.camera = state_dir, camera
         self.sequence = 0
         self.counts = {"event": 0, "renewal": 0, "failed": 0}
@@ -352,7 +360,11 @@ def prepare(env_file: str, camera: str, preflight: bool = False):
     `run` share, so they cannot disagree. `preflight` (check, before the knob is
     turned on) judges the zones and calibration as if the knob were on."""
     settings = MotionSettings(mc.read_knobs(env_file), camera)
-    engine = load_engine()
+    try:
+        engine = load_engine()
+    except (OSError, ImportError, SyntaxError) as exc:
+        raise Invalid("the pinned engine cannot be loaded (%s): restore stack/camera-motion from the repo"
+                      % type(exc).__name__)
     if preflight:
         settings.engine_values["DOORBELL_MOTION_ENABLED"] = "true"
     config = motion_config(engine, settings)
@@ -514,7 +526,11 @@ def replay(env_file: str, camera: str, since: float, until: float, decode: Optio
     segs = [s for s in clips.list_segments(cam.segment_dir, camera)
             if not s.part and since - 900 <= s.start < until]
     motion = engine.MotionEngine(config)
-    step = max(1, int(round(settings.stream_fps / float(config.sample_fps))))
+    step = settings.stream_fps / float(config.sample_fps)
+    if step < 1 or abs(step - round(step)) > 1e-9:
+        raise Invalid("replay feeds every Nth frame: %s (%d) must be a whole multiple of the sample rate (%g)"
+                      % (knob(camera, "FPS"), settings.stream_fps, config.sample_fps))
+    step = int(round(step))
     period = step / float(settings.stream_fps)
     counts: Dict[str, int] = {}
     frames_total = 0
@@ -522,28 +538,50 @@ def replay(env_file: str, camera: str, since: float, until: float, decode: Optio
     image = door_relay.image_ref()
 
     def on_signal(now: float, cause: str) -> None:
+        # The segments before `since` only warm the engine up; nothing outside
+        # the window is reported or counted.
+        if not since <= now < until:
+            return
         counts[cause] = counts.get(cause, 0) + 1
         if show_all or cause in NEW_EVENT_CAUSES:
             out(json.dumps({"utc": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + ".%dZ" % int(now * 10 % 10),
                             "cause": cause}, sort_keys=True))
 
+    failed: List[str] = []
     for seg in segs:
-        proc = runner(replay_command(seg.path, settings, config.sample_fps, image), stdout=subprocess.PIPE,
-                      stderr=subprocess.DEVNULL)
-        framer = RawFramer(MOTION_SIZE * MOTION_SIZE)
-        index = 0
-        while True:
-            chunk = proc.stdout.read(1 << 18)
-            if not chunk:
-                break
-            frames = framer.feed(chunk)
-            last = replay_frames(motion, frames, seg.start + index * period, period, last, on_signal)
-            index += len(frames)
-        proc.wait()
-        frames_total += index
+        argv = replay_command(seg.path, settings, config.sample_fps, image)
+        with tempfile.TemporaryFile() as err_file:
+            proc = runner(argv, stdout=subprocess.PIPE, stderr=err_file)
+            # A decoder that stops producing is killed: replay must end.
+            watchdog = threading.Timer(REPLAY_SEGMENT_SEC, proc.kill)
+            watchdog.daemon = True
+            watchdog.start()
+            framer = RawFramer(MOTION_SIZE * MOTION_SIZE)
+            index = 0
+            try:
+                while True:
+                    chunk = proc.stdout.read(1 << 18)
+                    if not chunk:
+                        break
+                    frames = framer.feed(chunk)
+                    last = replay_frames(motion, frames, seg.start + index * period, period, last, on_signal)
+                    index += len(frames)
+                    if seg.start + index * period >= until:
+                        proc.kill()  # past the window: the rest of the segment is not needed
+                        break
+            finally:
+                watchdog.cancel()
+                proc.wait()
+            frames_total += index
+            if proc.returncode and seg.start + index * period < until:
+                err_file.seek(0)
+                failed.append("%s: rc %s %s" % (seg.name, proc.returncode,
+                                                 err_file.read(400).decode("utf-8", "replace").strip()))
     out(json.dumps({"camera": camera, "decode": settings.decode, "segments": len(segs), "frames": frames_total,
-                    "signals": counts, "engine": read_pin().get("COMMIT", "?")[:12]}, sort_keys=True))
-    return 0
+                    "signals": counts, "failed_segments": failed,
+                    "engine": read_pin().get("COMMIT", "?")[:12]}, sort_keys=True))
+    # A decode that failed is not "no events": the comparison it feeds would lie.
+    return 1 if failed else 0
 
 
 # ── cost ─────────────────────────────────────────────────────────────────────
@@ -610,8 +648,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     try:
         if args.verb == "condition":
-            s = MotionSettings(mc.read_knobs(args.env_file), args.camera)
-            on = s.enabled and s.listed
+            # Only the knob and the list decide: a malformed OTHER knob must reach
+            # `run`, whose refusal alerts - an ExecCondition failure is a silent skip.
+            camera_name(args.camera)
+            env = mc.read_knobs(args.env_file)
+            on = (mc.knob_bool(env, knob(args.camera, "MOTION_ENABLED"), False)
+                  and args.camera in env.get("CAMERAS", "").split())
             mc.log("camera motion [%s]: %s" % (args.camera, "on - starting" if on else
                    "%s is not true or the camera is not in CAMERAS - clean skip" % knob(args.camera, "MOTION_ENABLED")))
             return 0 if on else 1

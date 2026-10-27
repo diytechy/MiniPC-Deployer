@@ -83,6 +83,10 @@ camera's knob is true and it is missing (the image carries it in
   still matched (the road stop 0.2 s later). Switch only after `replay` agrees
   (deploy step 5). VA-API through the relay's ffconcat stdin input was checked
   on the hub against a recorded file: identical output to a direct input.
+* **Ceilings.** The decoder container is capped at `--cpus 0.4` (about twice
+  the measured decode) and weighted low (`--cpu-shares 256`); the unit's
+  `CPUQuota=25%` bounds the engine. They stop a runaway; the Owner's budget is
+  the cost test's verdict.
 * **Night and infrared are not proven.** The engine's evidence is a 9.37 h
   daytime corpus; its lit-only rule was replayed on one night false positive.
 
@@ -122,7 +126,8 @@ daily). A failed cut is retried on the next two runs, then recorded `failed`.
 **Re-encode**: h264_vaapi (or hevc_vaapi), VBR `CLIPS_ENCODE_KBPS` (300) with a
 peak of twice that; the encoded file replaces the copy only when its frame count
 matches and it is at most `CLIPS_ENCODE_KEEP_PCT` (80 %) of the copy; otherwise
-the copy stays. Measured on the hub 2026-10-27, a 30 s daytime window with
+the copy stays. A batch looks at the last 7 days of clips and starts no new
+encode after 10 minutes (it shares one lock with the cut). Measured on the hub 2026-10-27, a 30 s daytime window with
 movement: copy 2.31 MB, VBR 300 kb/s 1.09 MB, 450 kb/s 1.68 MB (both judged
 visually close to the copy at full size); constant QP 30 was 3.4 MB - larger
 than the copy, because the camera's daylight stream is already lean. A night
@@ -132,7 +137,8 @@ minute of video.
 **Retention**: older than `CLIPS_RETENTION_DAYS` (365), then oldest first over
 `CLIPS_CAP_MIB` (95367 MiB = 100 GB), then oldest first while the clips quota
 project is past `CLIPS_QUOTA_HIGH_PCT` (90 %), down to 5 points under. On the
-1 GiB scratch area the quota rule is the one that acts.
+1 GiB scratch area the quota rule is the one that acts. Every camera folder
+under the root counts, configured or not; stale `.part` files go first.
 
 **Where**: `CLIPS_ROOT=/srv/scratch/clips` - the scratch volume's `clips`
 project 7104, 1 GiB (`HOMEHUB_SCRATCH_QUOTA_CLIPS_MIB`), behind the scratch guard
@@ -178,7 +184,7 @@ to 1024 MiB and ottertube to 4858 MiB. Then `ensure`, and `status` shows
 `clips` with `limit_mib` 1024.
 
 **3. The knobs, still off.** Append the camera block of `.env.example`
-(`CAMERAS` .. `CLIPS_ENCODE_MAX_PER_RUN`) to `/opt/homehub/stack/.env`, with
+(`CAMERAS` .. `CLIPS_ENCODE_MAX_PER_RUN`) to `/opt/homehub/stack/.env` ONCE, with
 `CAMERA_DOOR_MOTION_CALIBRATED=true` and the zones from HomeHub
 `config.homehub.psd1` (quoted as they are there), sent over stdin
 (`ssh hub@<hub> 'sudo tee -a /opt/homehub/stack/.env >/dev/null' < block.env`),
@@ -188,6 +194,11 @@ and `HOMEHUB_SCRATCH_QUOTA_CLIPS_MIB=1024`. Pre-flight:
 sudo python3 /opt/homehub/stack/camera-motion/camera_motion.py check --camera door
 #   {"eligible": true, "enabled": false, "road_zone": true, "decode": "software", "engine": "b6310d1..."}
 ```
+
+Every later knob change edits the line in place (`sudo sed -i
+'s/^CAMERA_DOOR_MOTION_ENABLED=.*/CAMERA_DOOR_MOTION_ENABLED=true/' ...`); every
+reader takes the last assignment, but one line per key is what a reader of the
+file expects.
 
 **4. The measured cost test** (the Owner's budget: at most 25 % of one core for
 the detector, decoder and engine together; PSI cpu within 5 points). Baseline

@@ -197,11 +197,14 @@ def size_quotas(usable_bytes: int, requested_mib: Dict[str, int], floor_mib: int
     if budget <= 0:
         raise Stop("the filesystem has %d MiB usable, not more than the %d MiB free floor"
                    % (usable_bytes // MIB, floor_mib))
-    # Only the writers asked about: a caller that names a subset sizes that subset.
-    names = [name for name in WRITER_NAMES if name in requested_mib]
-    granted = {name: requested_mib[name] for name in names}
+    # Every writer, always: a writer left out would get no project limit at all,
+    # and sizing a subset against the whole budget would hand out the others' room.
+    missing = [name for name in WRITER_NAMES if name not in requested_mib]
+    if missing:
+        raise ValueError("size_quotas needs every writer; missing: %s" % ", ".join(missing))
+    granted = {name: requested_mib[name] for name in WRITER_NAMES}
     excess = sum(granted.values()) - budget
-    for name in reversed(names):
+    for name in reversed(WRITER_NAMES):
         if excess <= 0:
             break
         # Each writer gives up space down to the minimum, never below it: a

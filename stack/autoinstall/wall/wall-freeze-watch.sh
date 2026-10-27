@@ -54,7 +54,7 @@ log() { printf '[freeze-watch] %s\n' "$*"; }
 write_status() {
     local tmp="$STATUS_DIR/.status.$$"
     if printf '{"ts":%s,"result":"%s","draw_s":%s,"fails":%d,"threshold":%d,"captured":%d,"recover":%d}\n' \
-            "$(date +%s)" "$1" "${2:-null}" "$fails" "$FAIL_THRESHOLD" "$captured" "$RECOVER" \
+            "$(date +%s)" "$1" "${2:-null}" "${fails:-0}" "${FAIL_THRESHOLD:-0}" "${captured:-0}" "${RECOVER:-0}" \
             > "$tmp" 2>/dev/null && chmod 0644 "$tmp" 2>/dev/null; then
         mv -f "$tmp" "$STATUS_DIR/status.json" 2>/dev/null || rm -f "$tmp" 2>/dev/null
     else

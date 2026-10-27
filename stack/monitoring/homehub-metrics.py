@@ -462,12 +462,17 @@ def collect_units(deadline: Deadline, run=mc.run_bounded) -> dict:
                deadline.cut(10), 262144)
     names = parse_unit_list(ours.output.decode("utf-8", "replace")) if ours.ok else []
     if not names:
-        out["ok"] = failed.ok
+        # A list that could not be taken is a failure, never "no services" (F5).
+        out["ok"] = failed.ok and ours.ok
         out["services"] = {}
+        if not ours.ok:
+            out["error"] = "systemctl list-units did not answer"
         return out
     shown = run(["systemctl", "show", "--timestamp=unix", "-p", SHOW_PROPS] + names, deadline.cut(10), 1048576)
     out["services"] = parse_show_blocks(shown.output.decode("utf-8", "replace")) if shown.ok else {}
     out["ok"] = failed.ok and shown.ok
+    if not shown.ok:
+        out["error"] = "systemctl show did not answer"
     return out
 
 
@@ -660,22 +665,36 @@ def build_snapshot(args, knobs: Dict[str, str], state: dict, now: float, deadlin
     recorded as {"ok": false, "error": ...} and costs nothing else."""
     tel = _telemetry_module()
     record = {"v": 1, "ts": iso_utc(now), "epoch": round(now, 3), "boot_id": mc.read_boot_id(args.proc_root)}
-    record["gauges"] = collect_gauges(knobs, deadline, fetch)
-    host = {"uptime_s": read_uptime(args.proc_root), "mem": read_meminfo(args.proc_root)}
-    if tel is not None:
-        newest = mc.day_files_between(args.telemetry_dir, "telemetry", now - 86400, now)
-        host["telemetry"] = summarise_telemetry(read_last_line(newest[-1]) if newest else None, now, tel)
-    else:
-        host["telemetry"] = {"ok": False, "error": "homehub-telemetry.py is not on this payload"}
-    record["host"] = host
-    record["containers"] = collect_containers(deadline, run)
-    record["units"] = collect_units(deadline, run)
-    record["monitors"] = collect_monitors(args.monitor_dir, args.meetings_status, now)
-    record["panel"] = collect_panel(knobs, deadline, meetings if meetings is not None else _meetings_module(), run)
+
+    def guarded(collect):
+        # A block's own bug (review round 1, F2) must cost that block only:
+        # the rest of the line is still written. Type only, never a message.
+        try:
+            return collect()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": "unexpected %s" % type(exc).__name__}
+
+    def host_block():
+        host = {"uptime_s": read_uptime(args.proc_root), "mem": read_meminfo(args.proc_root)}
+        if tel is not None:
+            newest = mc.day_files_between(args.telemetry_dir, "telemetry", now - 86400, now)
+            host["telemetry"] = summarise_telemetry(read_last_line(newest[-1]) if newest else None, now, tel)
+        else:
+            host["telemetry"] = {"ok": False, "error": "homehub-telemetry.py is not on this payload"}
+        return host
+
+    record["gauges"] = guarded(lambda: collect_gauges(knobs, deadline, fetch))
+    record["host"] = guarded(host_block)
+    record["containers"] = guarded(lambda: collect_containers(deadline, run))
+    record["units"] = guarded(lambda: collect_units(deadline, run))
+    record["monitors"] = guarded(lambda: collect_monitors(args.monitor_dir, args.meetings_status, now))
+    record["panel"] = guarded(lambda: collect_panel(
+        knobs, deadline, meetings if meetings is not None else _meetings_module(), run))
     last_smart = state.get("smart_epoch")
     if not isinstance(last_smart, (int, float)) or not 0 <= now - last_smart < SMART_EVERY_SEC - 60:
-        record["smart"] = collect_smart(deadline, run)
-        state["smart_epoch"] = int(now)
+        record["smart"] = guarded(lambda: collect_smart(deadline, run))
+        # Marked done by cmd_snapshot only once the line is on disk (F11).
+        state["_smart_due"] = int(now)
     return record
 
 
@@ -688,6 +707,9 @@ def cmd_snapshot(args, fetch=fetch_today, run=mc.run_bounded, meetings=None) -> 
     record = build_snapshot(args, knobs, state, now, deadline, fetch, run, meetings)
     active = mc.day_file_name(SNAPSHOT_PREFIX, now)
     ok, why = mc.append_jsonl(os.path.join(args.data_dir, active), record, DAY_CAP_BYTES)
+    smart_due = state.pop("_smart_due", None)
+    if ok and smart_due is not None:
+        state["smart_epoch"] = smart_due
     gauges = record["gauges"]
     mc.log("metrics: snapshot %s (gauges %s, panel %s)" % (
         why, len(gauges.get("list", [])) if gauges.get("ok") else gauges.get("error"),
@@ -855,10 +877,11 @@ LIBRARY_ROOT = "/srv/library"
 LIBRARY_MARKER = ".homehub-library"
 COPY_SETTLE_SEC = 600            # a day file last written this recently is not closed yet
 COPY_DEADLINE_SEC = 1500
+MTIME_SLACK_SEC = 2.0
 
 
 def copy_target(knobs: Dict[str, str], mounts: List[Dict[str, str]], exists=os.path.exists,
-                realpath=os.path.realpath) -> Tuple[Optional[str], str]:
+                realpath=os.path.realpath, device=None) -> Tuple[Optional[str], str]:
     """(destination, refusal). Pure apart from the injected checks.
 
     The destination is HOMEHUB_METRICS_COPY_DIR (blank: the copy is off). It
@@ -886,6 +909,13 @@ def copy_target(knobs: Dict[str, str], mounts: List[Dict[str, str]], exists=os.p
     parent = os.path.dirname(real)
     if _norm(parent) == root_real or not exists(parent):
         return None, "the folder HOMEHUB_METRICS_COPY_DIR should be in does not exist; nothing copied"
+    # Not a different disk mounted somewhere under the library (review F9).
+    device = device or (lambda path: os.stat(path).st_dev)
+    try:
+        if device(parent) != device(root):
+            return None, "HOMEHUB_METRICS_COPY_DIR is on another filesystem than %s; nothing copied" % root
+    except OSError:
+        return None, "the destination's folder could not be examined; nothing copied"
     return real, ""
 
 
@@ -905,7 +935,8 @@ def copy_plan(sources: List[Tuple[str, str, int, float]], dest_stat, today: str,
       Outputs: [(source path, destination relative path, gzip on the way)].
                A source whose UTC day is today, or last written less than
                COPY_SETTLE_SEC ago, is not copied; one whose destination
-               already has its size and (whole-second) mtime is skipped.
+               already has its size and its mtime (within MTIME_SLACK_SEC, for
+               a filesystem that keeps coarser stamps) is skipped.
     """
     plan = []
     for kind, path, size, mtime in sources:
@@ -925,39 +956,101 @@ def copy_plan(sources: List[Tuple[str, str, int, float]], dest_stat, today: str,
         if pack:
             # The size of the gzip'd form is not known without making it; a
             # closed day's (size, mtime) pair is the mtime alone, so match on it.
-            if have is not None and int(have[1]) == int(mtime):
+            if have is not None and abs(have[1] - mtime) < MTIME_SLACK_SEC:
                 continue
-        elif have is not None and have[0] == size and int(have[1]) == int(mtime):
+        elif have is not None and have[0] == size and abs(have[1] - mtime) < MTIME_SLACK_SEC:
             continue
         plan.append((path, rel, pack))
     return plan
+
+
+# The destination is group-writable for the household (the library mount's
+# gid and umask), and this copy runs as root, so nothing under it is trusted:
+# every hop is opened relative to the one before with O_NOFOLLOW, a component
+# that is a symlink is refused, and the file is created O_EXCL under a temporary
+# name and renamed over the target (a rename replaces a link, never follows it).
+# Review round 1, F1.
+DIR_FD_OPENS = (os.open in getattr(os, "supports_dir_fd", set()) and hasattr(os, "O_DIRECTORY"))
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _open_dir(name: str, parent_fd: Optional[int]) -> int:
+    """Open (creating if absent) directory `name` under `parent_fd`, refusing a link."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW
+    try:
+        os.mkdir(name, 0o775, dir_fd=parent_fd) if parent_fd is not None else os.mkdir(name, 0o775)
+    except FileExistsError:
+        pass
+    return os.open(name, flags, dir_fd=parent_fd) if parent_fd is not None else os.open(name, flags)
 
 
 def _copy_one(src: str, dest_root: str, rel: str, pack: bool) -> None:
     import gzip
     import shutil
 
-    target = os.path.join(dest_root, rel)
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    tmp = os.path.join(os.path.dirname(target), "." + os.path.basename(target) + ".part")
+    parts = rel.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        raise PermissionError("REFUSED: %r is not a plain relative path" % rel)
     stamp = os.stat(src).st_mtime
-    try:
-        with open(src, "rb") as raw, open(tmp, "wb") as out:
-            if pack:
-                with gzip.GzipFile(filename="", mode="wb", compresslevel=6, fileobj=out, mtime=0) as packed:
-                    shutil.copyfileobj(raw, packed, 65536)
-            else:
-                shutil.copyfileobj(raw, out, 65536)
-            out.flush()
-            os.fsync(out.fileno())
-        os.utime(tmp, (stamp, stamp))
-        os.replace(tmp, target)
-    except BaseException:
+    leaf, tmp = parts[-1], "." + parts[-1] + ".part"
+    if not DIR_FD_OPENS:                      # pragma: no cover - the Windows dev PC
+        walked = dest_root
+        for name in [""] + parts[:-1]:
+            walked = os.path.join(walked, name) if name else walked
+            if os.path.islink(walked):
+                raise PermissionError("REFUSED: %s is a symlink" % walked)
+            os.makedirs(walked, exist_ok=True)
+        target, tmp_path = os.path.join(walked, leaf), os.path.join(walked, tmp)
+        for path in (target, tmp_path):
+            if os.path.islink(path):
+                raise PermissionError("REFUSED: %s is a symlink" % path)
         try:
-            os.unlink(tmp)
-        except OSError:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
             pass
-        raise
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o664)
+        dir_fd = None
+    else:
+        head, base = os.path.split(dest_root.rstrip("/"))
+        dir_fd = os.open(head, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for name in [base] + parts[:-1]:
+                hop = _open_dir(name, dir_fd)
+                os.close(dir_fd)
+                dir_fd = hop
+            try:
+                os.unlink(tmp, dir_fd=dir_fd)      # never follows: a planted link is removed, not its target
+            except FileNotFoundError:
+                pass
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o664, dir_fd=dir_fd)
+        except BaseException:
+            os.close(dir_fd)
+            raise
+    try:
+        try:
+            with open(src, "rb") as raw, os.fdopen(fd, "wb") as out:
+                if pack:
+                    with gzip.GzipFile(filename="", mode="wb", compresslevel=6, fileobj=out, mtime=0) as packed:
+                        shutil.copyfileobj(raw, packed, 65536)
+                else:
+                    shutil.copyfileobj(raw, out, 65536)
+                out.flush()
+                os.fsync(out.fileno())
+            if dir_fd is not None:
+                os.utime(tmp, (stamp, stamp), dir_fd=dir_fd, follow_symlinks=False)
+                os.replace(tmp, leaf, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            else:                              # pragma: no cover - the Windows dev PC
+                os.utime(tmp_path, (stamp, stamp))
+                os.replace(tmp_path, target)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=dir_fd) if dir_fd is not None else os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
 
 
 def copy_sources(data_dir: str, raw_dir: str) -> List[Tuple[str, str, int, float]]:

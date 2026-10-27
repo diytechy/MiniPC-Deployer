@@ -873,16 +873,17 @@ def enforce_day_files(
 def append_jsonl(path: str, record: dict, cap_bytes: int) -> Tuple[bool, str]:
     """Append one compact JSON line to `path`, refusing past `cap_bytes`. (ok, why)."""
     line = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+    size = len(line.encode("utf-8"))      # bytes, not characters: the cap is on disk
     try:
         os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
         current = os.path.getsize(path) if os.path.exists(path) else 0
-        if current + len(line) > cap_bytes:
+        if current + size > cap_bytes:
             return False, "%s has reached its %d-byte cap; not appending" % (os.path.basename(path), cap_bytes)
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(line)
     except OSError as exc:
         return False, "could not append to %s: %s" % (path, exc)
-    return True, "recorded %d bytes" % len(line)
+    return True, "recorded %d bytes" % size
 
 
 def iter_jsonl(path: str):

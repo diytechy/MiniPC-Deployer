@@ -314,10 +314,39 @@ def test_tc1496_smart_is_hourly_and_reads_the_nvme_log_only(tmp_path):
     rec = hm.build_snapshot(args, {}, state, 1793000000.0, hm.Deadline(60), run=run, meetings=False)
     assert rec["smart"] == {"ok": True, "passed": True, "temperature": 41, "percentage_used": 3, "media_errors": 0}
     assert [c for c in run.calls if c[0] == "smartctl"] == [["smartctl", "-j", "-H", "-A", "/dev/nvme0"]]
+    # Only a written line marks SMART done (review round 1, F11): unsaved, it is asked again.
+    assert "smart_epoch" not in state
     rec = hm.build_snapshot(args, {}, state, 1793000300.0, hm.Deadline(60), run=run, meetings=False)
-    assert "smart" not in rec
-    rec = hm.build_snapshot(args, {}, state, 1793000000.0 + hm.SMART_EVERY_SEC, hm.Deadline(60), run=run, meetings=False)
     assert "smart" in rec
+    state["smart_epoch"] = state.pop("_smart_due")
+    rec = hm.build_snapshot(args, {}, state, 1793000600.0, hm.Deadline(60), run=run, meetings=False)
+    assert "smart" not in rec
+    rec = hm.build_snapshot(args, {}, state, 1793000300.0 + hm.SMART_EVERY_SEC, hm.Deadline(60), run=run, meetings=False)
+    assert "smart" in rec
+
+
+def test_tc1496_review_round1_a_block_that_raises_costs_that_block_only(tmp_path):
+    class Broken:
+        @staticmethod
+        def settings_from(knobs):
+            raise KeyError("boom")
+
+    args = _args(tmp_path)
+    rec = hm.build_snapshot(args, {}, {}, 1793000000.0, hm.Deadline(60), run=Runner(), meetings=Broken)
+    assert rec["panel"] == {"ok": False, "error": "unexpected KeyError"}
+    assert rec["host"]["uptime_s"] == 1234 and "gauges" in rec and "units" in rec
+
+
+def test_tc1496_review_round1_a_unit_list_that_fails_is_a_failure():
+    run = Runner({("systemctl", "list-units", "--state=failed"): Done(output=b"")})
+    out = hm.collect_units(hm.Deadline(60), run)
+    assert out["ok"] is False and "list-units" in out["error"]
+
+
+def test_tc1494_review_round1_the_cap_counts_bytes(tmp_path):
+    path = str(tmp_path / "x.jsonl")
+    assert not mc.append_jsonl(path, {"u": "°" * 40}, 60)[0]
+    assert mc.append_jsonl(path, {"u": "a" * 40}, 60)[0]
 
 
 def _args(tmp_path):
@@ -427,6 +456,13 @@ def test_tc1499_the_local_day_holds_across_dst_and_utc_midnight():
     assert hm.due_kinds(L(11, 1, 9, 59), CT, [])[1] == []
     # 20:00 local is already the next UTC day; the night is still the local one.
     assert hm.due_kinds(L(10, 26, 20, 0), CT, [])[0] == "2026-10-26"
+
+
+@pytest.mark.skipif(sys.version_info < (3, 9), reason="zoneinfo is 3.9+ (the hub runs 3.12)")
+def test_tc1499_the_real_zone_agrees_with_the_hand_written_one():
+    zone = hm._zone()
+    for when in (L(10, 26, 10, 0), L(11, 1, 10, 0), L(1, 15, 14, 5), L(3, 8, 10, 0)):
+        assert hm.due_kinds(when, zone, []) == hm.due_kinds(when, CT, [])
 
 
 def test_tc1499_the_timer_carries_the_codes_zone_and_times():
@@ -606,6 +642,8 @@ def test_tc1503_rows_keep_what_was_served_and_never_the_account_path():
     assert rows[0] == {"epoch": T0, "t": rows[0]["t"], "utc_offset": "-18000s", "bpm": 78, "device": "FFit",
                        "form": "WATCH", "platform": "HEALTH_CONNECT", "method": "ACTIVELY_MEASURED"}
     assert rows[1]["bpm"] is None and rows[1]["bpm_raw"] == "0x" and len(rows) == 2
+    # A value served as a JSON number is the same reading (review round 1, F4).
+    assert feeder.raw_heart_rate_rows({"dataPoints": [_hr_point(T0, bpm=77)]})[0]["bpm"] == 77
     sleep = feeder.raw_sleep_rows({"dataPoints": [_sleep_point(T0, T0 + 4 * 3600)]})
     assert sleep[0]["stages"] == [[T0, T0 + 600, "LIGHT"]]
     assert sleep[0]["summary"] == {"minutesAsleep": 241, "stagesSummary": [{"type": "LIGHT", "minutes": 166}]}
@@ -772,6 +810,30 @@ def test_tc1507_no_mount_no_marker_no_parent_or_a_path_outside_is_a_skip(tmp_pat
         assert word in hm.copy_target(dict(knobs, HOMEHUB_METRICS_COPY_DIR=bad), mounts, realpath=real)[1], bad
     assert "does not exist" in hm.copy_target(dict(knobs, HOMEHUB_METRICS_COPY_DIR=(root / "m").as_posix()),
                                               mounts, realpath=real)[1]
+
+
+def test_tc1507_review_round1_another_filesystem_under_the_library_is_a_skip(tmp_path):
+    root, mounts, knobs = _lib(tmp_path)
+    parent = os.path.dirname(knobs["HOMEHUB_METRICS_COPY_DIR"])
+    dev = lambda p: 2 if p == parent else 1  # noqa: E731
+    assert "another filesystem" in hm.copy_target(knobs, mounts, realpath=lambda p: p, device=dev)[1]
+
+
+def test_tc1509_review_round1_a_planted_link_under_the_destination_is_refused(tmp_path):
+    dest = tmp_path / "dest"
+    outside = tmp_path / "outside"
+    dest.mkdir()
+    outside.mkdir()
+    src = _w(tmp_path / "hr-20201001.jsonl", "{}\n")
+    try:
+        os.symlink(str(outside), str(dest / "watch-raw"), target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this host cannot make a symlink")
+    with pytest.raises(OSError):
+        hm._copy_one(str(src), str(dest), "watch-raw/hr-20201001.jsonl", False)
+    assert list(outside.iterdir()) == []
+    with pytest.raises(PermissionError):
+        hm._copy_one(str(src), str(dest), "../x.jsonl", False)
 
 
 def test_tc1508_the_plan_skips_today_unsettled_and_unchanged_files():

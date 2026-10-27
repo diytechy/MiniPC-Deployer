@@ -32,7 +32,7 @@ needs_bash = pytest.mark.skipif(BASH is None, reason="needs bash")
 # metrics log. The live copy read 4e4e70803616bb7113c53b3200bb148ded5302e14b9b943653a253698dd0f39f
 # before that; this is the payload's new hash, live once the paired release ships it.
 LIVE_SHA256 = {
-    "wall-freeze-watch.sh": "3c186674f317b2a4c1c1a98090652b3f8dc376a35e81a7a195bedecb50bd1392",
+    "wall-freeze-watch.sh": "11e2e1e509c2cebf810a0a55995a67e5eea44eff082fa592bf817fbcb2923e60",
     "wall-freeze-watch.service": "cf070193ebf4735815039b20b27904176a11a1862f8ca8cd6d6379df113746b6",
     "wall-freeze-watch.env": "b2a6ae4c2c5cf822bba292fe25e04541bf764659b3570e367f2603b4e9f243f3",
 }

@@ -150,8 +150,11 @@ async function fetchGz(path) {
   const r = await fetch(path, { cache: "no-store" });
   if (r.status === 404) return null;
   if (!r.ok) throw new Error(path + ": HTTP " + r.status);
+  const bytes = new Uint8Array(await r.arrayBuffer());
+  // A proxy that already decoded it (Content-Encoding) hands over plain JSONL.
+  if (bytes[0] !== 0x1f || bytes[1] !== 0x8b) return parseLines(new TextDecoder().decode(bytes));
   if (typeof DecompressionStream === "undefined") throw new Error("this browser cannot read .gz day files");
-  const stream = r.body.pipeThrough(new DecompressionStream("gzip"));
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
   return parseLines(await new Response(stream).text());
 }
 async function dayFile(dir, prefix, day) {
@@ -278,7 +281,16 @@ function chart(title, unit, points, opts) {
     const w = document.createElement("div");
     w.className = "tablewrap";
     const tbl = document.createElement("table");
-    tbl.innerHTML = "<thead><tr><th>When</th><th>" + (unit || "Value") + "</th></tr></thead>";
+    // Built with textContent: a unit comes from the log, and this page sits in
+    // the admin cookie zone, so nothing read from a file is ever parsed as HTML.
+    const head = document.createElement("thead"), hr = document.createElement("tr");
+    for (const label of ["When", unit || "Value"]) {
+      const th = document.createElement("th");
+      th.textContent = label;
+      hr.appendChild(th);
+    }
+    head.appendChild(hr);
+    tbl.appendChild(head);
     const body = document.createElement("tbody");
     for (const p of points.slice().reverse().slice(0, 2000)) {
       const tr = document.createElement("tr");

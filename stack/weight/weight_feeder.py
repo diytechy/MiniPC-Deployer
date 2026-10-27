@@ -5733,6 +5733,8 @@ def raw_heart_rate_rows(payload):
         raw = member.get(HEART_BPM_KEY)
         if isinstance(raw, str) and re.fullmatch(r"[0-9]{1,4}", raw):
             row["bpm"] = int(raw)
+        elif isinstance(raw, int) and not isinstance(raw, bool) and 0 <= raw <= 9999:
+            row["bpm"] = raw              # served as a number: the same reading
         else:
             row["bpm"] = None
             row["bpm_raw"] = _raw_text(raw) if isinstance(raw, str) else _raw_text(json.dumps(raw))

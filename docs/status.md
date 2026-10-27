@@ -12,6 +12,92 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-10-27 — FileBackup's 2026-10-26 data-loss review, HomeHub's side (`filebackup-review-contract`: the six `filebackup-bounded-contract` commits and this work, replayed 2026-10-27 onto `IceDrive-DesktopDirection` 6318772 with the ids it introduced renumbered past the 2026-10-26 reservations: SR-122 -> SR-128, LLR-1320..1324 -> LLR-1356..1360, TC-1490..1496 -> TC-1541..1547; that branch, 35f5faf, stays as the record; not merged, not deployed, nothing sent to the hub).**
+Sources of truth (FileBackup, read-only): `docs/plans/bounded-run-loop.md` §13 calls C36–C44, `docs/plans/single-store-layout.md` L1–L6,
+`docs/reviews/2026-10-26-data-loss/consolidated.md` Outcome table. FileBackup's own `docs/interfaces.md` was not treated as final.
+- **Part 1 — FileBackup behaviour that is built or ruled (commits `971d4c2`, `2d67564`, `d5a748d`, `7e86b77`; pullable on its own):**
+  the wrapper's exit messages and README carry: exit 4 also = a source empty at the start while the latest state holds rows (C39;
+  `BoundedRebuild` `88dc7e1`, with a refinement being merged as this was written); exit 1 also = damaged objects set aside into
+  `changes/Verify/` with `[DamagedObject]` lines in `backup.log` (C37; `7228c0b`), which the wrapper now **counts** after an exit 1,
+  and case-only names (C42, not built yet); exit 2 also = an unloadable dependency, and prune/snapshots resolve the store read-only
+  without the library, a missing store being 2 (`3756974`); prune `Pruning_<name>` leftovers finished by the next prune, right after
+  its lock and before any check, never under `-WhatIf` (C41; `f74d80a`, `25d7a2d`); `-RepairStorage` holds the lock and honours
+  `-WhatIf` (`ce068bc`); plain verify reports `DamagedObject` (C37); restore: NUL-torn manifest ≥ 1 (C38; `5b0a986`), host problem on
+  a row with a DataPath = 4 (A7, `4fb7689`); kit stays 14. C36 (flush before rename/delete; `8ec15a1`, `3a5f5ac`) changes no
+  interface. NagLight mapping unchanged: only backup 0 + passing verify advances `lastSuccess`. (Hashes are FileBackup
+  `BoundedRebuild` as read 2026-10-27, while a merge into it was in progress.)
+  Traced: LLR-1356 and TC-1541 amended, **TC-1546** new (damaged-object count).
+- **Part 2 — the single-store layout (C44, L1–L6), NOT YET BUILT in FileBackup (commits `cc642f1`, `de4f14e` and the trace commit
+  after them, each marked "[needs a C44 image]"):** `filebackup.json` is ConfigVersion 3 with `StorePath=/store` (an image without
+  C44 refuses it). The wrapper reads `Latest/` and the run files (`backup.log`, `Temp.lock`, `Verify/`, a prune's `Temp`) at the
+  store's top, refuses a `Latest/` mounted separately (L4), and **never creates `Latest/`**, so FileBackup's refusal of a store with
+  snapshots but no `Latest/` can fire (this also removes the trap in (e) below). Step 2b refuses, naming README "Setting the old
+  store aside", while an older layout sits where this stack looks: the three-mount folders holding data, `backup/` or `changes/`
+  inside the store, or a `MANIFEST.csv` at its top. No migration (L2, L5): `library-store-migrate.sh` and its test are removed and
+  replaced by a short README procedure only (stop the timer, `stat` one device, rename the old folders into one folder on the same
+  drive, deploy, start the clean backup). Restore: no root arguments, no `RECONSTRUCT.paths.json`. Traced: SR-128, LLR-1357, LLR-1358,
+  LLR-1360, TC-1542, TC-1543 amended; **TC-1547** new (Latest/ left missing); LLR-1359 and TC-1544 set to Status `Retired`, their
+  text marked RETIRED (IF-003's precedent; Status is an open column).
+- **Before anything here is deployed:** (1) the FileBackup image rebuilt from `BoundedRebuild` **after** the review's fix batches
+  (C36–C42) merge there; (2) **C43's follow-up in that image before any Verify or prune touches the hub's store** — the wrapper's
+  step-8 verify gate runs **automatically** (weekly, `-Deep` monthly) and nothing on this branch stops it (not disabled silently, by
+  instruction). What would gate it: `--verify none` in the unit's `ExecStart`, or a knob step 8 reads, until that image is deployed;
+  `FILEBACKUP_MEM_LIMIT` would turn a runaway into an OOM kill of the container instead of the box. Prune is manual only.
+  For Part 2 also: (3) FileBackup's C44 work package built, independently reviewed (L6) and merged, and the image rebuilt from it;
+  (4) the Owner sets the old store aside (README procedure) before the first run, and HomeHub's materialiser drops
+  `FILEBACKUP_STATE`/`_BACKUP`/`_CHANGES`.
+- **Proven here / not proven:** `library-backup-state.test.sh` (mocked docker, findmnt, curl) and the check harness, below. NOT
+  proven: any FileBackup image, the C44 image's exact messages (the wrapper names its causes from the rulings, not from built
+  code), the README set-aside procedure, the restore commands, anything on the hub.
+- **Open questions for the Owner:**
+  (a) prune/snapshots with the **store drive unplugged**: exit 2 as built, or 4 "retry later"? (FileBackup review item B, open there.)
+  (b) **C43 gating**: gate step 8 now (which way), or deploy only once the follow-up is in the image?
+  (c) **C36 / power safety:** both hub drives are USB NTFS through ntfs-3g (FUSE), which journals none of its own writes, so a power
+  cut can damage the filesystem itself, not just the last files; FileBackup's flushes cannot fix that. For the clean start, is the
+  backup drive to be **ext4** (more power-safe), given it would then not be readable on Windows? (Found 2026-10-27;
+  `homehub-backup.timer` is enabled, 03:00 nightly.)
+  (d) HomeHub registers **no `Consumes` IF row for FileBackup's IF-001**; the contract lives in SR-018/SR-128 and the README. Add one
+  (repo-local id, counterpart IF-001)?
+  (e) **Found, not fixed (outside this list):** the bounded-contract wrapper's step 4 pre-creates `<store>/backup/`, so FileBackup's
+  C26 refusal (a *missing* BackupPath beside snapshots, never a fresh full backup) can never fire on the hub. Matters only if Part 1
+  ships without Part 2 (Part 2 never creates `Latest/`).
+  (f) **Set aside, in place or moved?** Part 2's guard keeps refusing while the old three-mount folders hold data at their default
+  places, so "set aside" means renaming them out of those places (the README procedure). Confirm, or should the guard accept an old
+  store left in place as a note?
+  (g) **Space for the clean start:** the first clean backup is a full one, beside the set-aside store. Is there room on the backup
+  drive, or does the old store move to another drive (or go) first? Nothing here decides that.
+  (h) **Registry:** `Retired` as the Status of LLR-1359/TC-1544 (no precedent for that value) — keep, or another convention?
+  (i) **Found, out of scope:** `stack/recovery/README.md` "The backup" still says an interrupted run's `Temp` makes the next run
+  refuse; that changed with the bounded-contract branch (a note, not a refusal) and was not updated there.
+
+**2026-10-24 — the library backup on FileBackup's bounded-run-loop contract (`filebackup-bounded-contract`, not merged, not deployed).**
+**Requires a FileBackup image built from FileBackup's `BoundedRebuild` work, which is not in a released image yet.**
+- **SR-128 / LLR-1357..1360:** one writable `/store` bind holding `backup/` and `changes/` replaces `/state`,
+  `/backup` and `/changes`; `filebackup.json` drops `SourceStatePath`. The wrapper refuses while backup/ or changes/
+  is a separate mount, or while the old three-mount store still holds data (step 2b). `library-store-migrate.sh`
+  is the explicit migration: two `rename(2)` calls, never a copy or a delete, refusing other filesystems or
+  mounts, two stores, symlinks, the root filesystem, a held lock or a running container; idempotent. After every
+  completed run the wrapper publishes a system-disk copy of the latest manifest, which `frame-freshness.sh` (IF-035)
+  now reads instead of the retired `/state` record. TC-1542..1545.
+- **SR-018 amended / LLR-1356:** backup exits 0/1/2/4 and verify 0/1/2. **Only backup exit 0 plus a passing
+  verify advances `lastSuccess`;** exit 1 ("completed, files not captured") still runs the verify gate, then fails
+  the unit. A 3 is reported as an older image. TC-1541.
+- **SR-049 amended / LLR-1004, TC-1065:** an old engine's `Temp` is a note naming the recovery event, not a
+  refusal (the bounded engine never stages in Temp; refusing would block every backup).
+- **Fixed in passing:** the documented prune dry run (`FILEBACKUP_DRY_RUN=1 docker compose run …`) ran the real
+  prune — compose does not pass a host variable into the container (measured). It is `-e` now (TC-1542 guard).
+- **Assumptions to confirm (decided unattended):** (a) branch cut from `IceDrive-DesktopDirection`, the
+  integration branch, not `main` (803 commits behind, no FileBackup integration); (b) exit 1 is not a verified
+  success, and the verify gate still runs after it; (c) exit 4 is retried by the next timer run, no extra
+  retry; (d) the weekly verify stays report-only, so `DuplicateObject` findings left by the old engine fail
+  verify nights until someone runs the one-time `-e FILEBACKUP_REPAIR=1 … verify` (README "Verify findings");
+  (e) store default `/mnt/backup-drive/library-store`; (f) SR-128 is traced to SN-014 for want of an SN for the
+  library backup itself; (g) IF-006 cannot show warn vs error for the library lane, so 1, 2 and 4 all show as the
+  age growing; (h) comment-only drift in `autoinstall/user-data` (5c, "/state, /backup, /changes") and
+  `firstboot.sh` (C61, "stale Temp refuses later backups") left alone, per the 2026-10-19 no-drift precedent.
+- **Not proven:** the image, a migration on the hub, frame-freshness on the hub. Cross-repo: HomeHub's
+  materialiser/FieldSchema should emit `FILEBACKUP_STORE` and drop the three retired keys (the defaults match).
+
 **2026-10-23 — nightly backup into the unified lane (`nightly-backup-feed`).** `sim/mini-serv-sim/run-ingest-sim.sh`, `run-volume-sim.sh` and `run-drivepower-sim.sh` were retargeted from the retired `/api/feed` `ok` bodies to `nightlySuccess` (success: a post; failure: none; each has a positive success scenario) but were never executed, only `bash -n`-checked. The hermetic `stack/backup/tests/nightly-success-feed.test.sh` is what proves the behaviour.
 
 **2026-10-22 — HomeHub plan W3b, on `w3b-recorder-scratch-watches` (not merged, not deployed).**
@@ -77,7 +163,7 @@ shuts down. Branch `w5-power-button`, NOT merged, NOT deployed.**
   dark screen and a real press are the installed checks and the Owner's acceptance.
 
 **2026-10-22 — SN-048 specified and built on `w3a-hub-monitoring` (HomeHub plan W3a); NOT deployed.**
-SR-085..SR-091: the shared alert helper (`stack/monitoring/homehub-alert.sh`, now also rustdesk-check's
+SR-085..SR-91: the shared alert helper (`stack/monitoring/homehub-alert.sh`, now also rustdesk-check's
 transport), the 30 s telemetry record with thermal/throttle/frequency alarms, the 15 min NVMe-only
 low-disk alarm, the 5 min watch table, the 60 s liveness probe with one evidence bundle per incident,
 firstboot step 6h with one knob per component (unset = on), and the panel's freeze watchdog taken into
@@ -166,7 +252,7 @@ sh body for bus/trigger/panel/absent. BUILT, NOT DEPLOYED: reaches the panel onl
 release. NOT PROVEN: never run on the panel; FOLLOWUPS B3's "enabled" claim is unverified against
 the live panel (`systemctl is-enabled wall-line-in` is the next read).
 
-**2026-10-05 — Draft, built and hermetically tested, NOTHING deployed or enabled: the hub recovery capability (SN-046, SR-049..SR-051; LLR-994..1018; TC-1048..1086), branch `hub-recovery-watchdog`. Owner D11 (quarantine) ACCEPTED. Updated 2026-10-10 for a second review round (three MAJORs, below) and merged up to `IceDrive-DesktopDirection`; still NOT merged into it (Owner decision 4 gates that).** Implements HomeHub `docs/design/HUB_HANG_WATCHDOG_DESIGN_2026-10-05.md` rev 3 in [stack/recovery/](../stack/recovery/README.md). Branched after merging GitHub's admin-portal and exit-node work into the base (7fc16ca).
+**2026-10-05 — Draft, built and hermetically tested, NOTHING deployed or enabled: the hub recovery capability (SN-046, SR-049..SR-51; LLR-994..1018; TC-1048..1086), branch `hub-recovery-watchdog`. Owner D11 (quarantine) ACCEPTED. Updated 2026-10-10 for a second review round (three MAJORs, below) and merged up to `IceDrive-DesktopDirection`; still NOT merged into it (Owner decision 4 gates that).** Implements HomeHub `docs/design/HUB_HANG_WATCHDOG_DESIGN_2026-10-05.md` rev 3 in [stack/recovery/](../stack/recovery/README.md). Branched after merging GitHub's admin-portal and exit-node work into the base (7fc16ca).
 
 * **Always on, record-only:** the 30 s `hub-pressure` sample (C1), the late-shutdown stamp and the five-class boot classifier with atomic commits and the brake (C5), a persistent journal pinned at 4G and `hung_task_warnings=-1` (C6), and the library backup in its own `homehub-filebackup.slice` with its `memory.peak` logged after every run (C4). firstboot step 6g installs them every boot.
 * **Opt-in, OFF:** `HUB_WATCHDOG_ENABLED=false`. `HUB_WD_TIERS=contain` (P3) gives the measured-pressure early kill, Docker reconciliation, quarantine and the sshd restart; `full` (P4) adds the graceful reboot, the hardware watchdog with its 300 s shutdown hand-off and `kernel.panic=10`. `setup-recovery.sh` converges on or off; any change to a running supervisor (off, full -> contain, a different device) goes through the VERIFIED disarm first, and a disarm that cannot be proven changes nothing.
@@ -328,7 +414,7 @@ also means history is not frozen; same-day daily replacement/ordinary retention
 can remove prior ledger archives. Preserve a verified archive/key before long
 term disablement. Running dump or Docker query failures remain fatal.
 
-Spine stays Draft: SR-060..066, LLR-1040..1046, TC-1100..1117, IF-030..034;
+Spine stays Draft: SR-060..66, LLR-1040..1046, TC-1100..1117, IF-030..034;
 review adds TC-1115..1117 for missing/stopped/query-failure boundaries. CSV
 prose corrected line by line; TC-1114 placed in order and edited rows re-read.
 Original full WSL hermetic attempts were NOT green (unrelated unchanged suites; corrected attempt hit240s). That

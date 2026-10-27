@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # common.sh — shared helpers for the AWOW bash backup service (WI-10.10/10.15).
-# Sourced by backup.sh and restore.sh. Pure bash + coreutils/tar/zstd/rsync/
+# Sourced by backup.sh and restore.sh, and by library-backup.sh for the
+# drive-power, feed and store-layout helpers.
+# Pure bash + coreutils/tar/zstd/rsync/
 # mount.cifs/curl — no PowerShell, no .bat (HOMELAB_TOPOLOGY.md "100% bash").
 # The docker CLI is additionally needed IF the sources table uses volume:
 # specs (SR-013) — a given on the AWOW, where docker runs the stack anyway.
@@ -769,6 +771,59 @@ fstab_mount_for() {
         case "$p" in /) return 1 ;; esac
         p="${p%/*}"; [ -n "$p" ] || p=/
     done
+}
+
+# ── the FileBackup store layout (library-backup.sh) ──────────────────────────
+# filebackup_store_layout : set the library store's HOST paths from the
+# environment (stack/.env, already loaded by the caller). One home for them.
+#
+# Contract:
+#   Inputs:  FILEBACKUP_STORE   the ONE writable folder bound at /store, the
+#                               whole of one backup set's store
+#                               (default /mnt/backup-drive/library-store)
+#            FILEBACKUP_BACKUP, FILEBACKUP_CHANGES, FILEBACKUP_STATE: the
+#                               RETIRED keys of the three-mount layout. Read only
+#                               to find a store that was not set aside; a
+#                               materialised .env written before still carries them.
+#   Outputs: FB_STORE, FB_LATEST (= $FB_STORE/Latest),
+#            FB_OLD_BACKUP (= $FB_STORE/backup), FB_OLD_CHANGES (= $FB_STORE/changes),
+#            FB_LEGACY_BACKUP, FB_LEGACY_CHANGES, FB_LEGACY_STATE
+#
+# THE SINGLE-STORE LAYOUT (FileBackup plan C44, rulings L1-L6; REQUIRES an image
+# built from BoundedRebuild with C44). One store folder per backup set:
+# $FB_STORE holds Latest/ (the latest state; the name is exactly that, L1),
+# every Snapshot_<date>/ beside it, View/ (the browse view's default, unused
+# here) and the run files (Temp.lock, backup.log, Incoming/, Building_*,
+# Verify/). From Latest or any snapshot the store is the parent, so a restore
+# needs no path record. filebackup.json says only StorePath=/store.
+#
+# The two layouts before it are named so the wrapper can refuse a store still
+# in them (L2: no migration - the Owner sets the old store aside): the
+# bounded-run-loop layout kept backup/ and changes/ INSIDE the store
+# (FB_OLD_*), and the engine before it used two sibling folders bound
+# separately (FB_LEGACY_*).
+# shellcheck disable=SC2034  # every FB_* set here is read by the caller
+filebackup_store_layout() {
+    FB_STORE="${FILEBACKUP_STORE:-/mnt/backup-drive/library-store}"
+    FB_STORE="${FB_STORE%/}"
+    FB_LATEST="$FB_STORE/Latest"
+    FB_OLD_BACKUP="$FB_STORE/backup"
+    FB_OLD_CHANGES="$FB_STORE/changes"
+    FB_LEGACY_BACKUP="${FILEBACKUP_BACKUP:-/mnt/backup-drive/library}"
+    FB_LEGACY_CHANGES="${FILEBACKUP_CHANGES:-/mnt/backup-drive/library-changes}"
+    FB_LEGACY_STATE="${FILEBACKUP_STATE:-/var/lib/homehub-filebackup/state}"
+    FB_LEGACY_BACKUP="${FB_LEGACY_BACKUP%/}"
+    FB_LEGACY_CHANGES="${FB_LEGACY_CHANGES%/}"
+}
+
+# dir_has_entries DIR : true when DIR holds anything at all (a file, a folder, a
+# dot-file). `|| true` inside the substitution because callers run under
+# errtrace, where a failing find would otherwise fire the ERR trap from the
+# subshell; empty output is the signal.
+dir_has_entries() {
+    local first
+    first="$(find "$1" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)"
+    [ -n "$first" ]
 }
 
 # ── NagLight /api/backup-state reporting (step 6): nightlySuccess ─────────────

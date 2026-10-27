@@ -23,5 +23,6 @@ truth for what each id means.
 | 2026-10-25 | heart gauge from 5-minute samples (HEART_SOURCE=samples) | LLR-1314..1319; TC-1486..1492 (used: all; SR-073 amended) |
 | 2026-10-25 | myAir usage minutes kept by the sleep feeder (not posted) | LLR-1313; TC-1485 (used: LLR-1313, TC-1485; SR-070 and LLR-1085 amended) |
 | 2026-10-23 | nightly backup into the unified lane | SR-121; LLR-1300; TC-1470..1479 (used: SR-121, LLR-1300, TC-1470..1475; SR-018, IF-003, IF-006 amended) |
+| 2026-10-26 | Hub metrics log: 5-min snapshot, 10:00/14:05 daily row, raw watch samples, chart page (HomeHub open-items A79) | SR-122..124; LLR-1321..1340; TC-1494..1520; IF-074 |
 
 The plan is HomeHub `docs/archive/2026-10-23/IMPLEMENTATION_PLAN_2026-10-22.md`.

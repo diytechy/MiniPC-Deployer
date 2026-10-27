@@ -913,3 +913,78 @@ def test_tc1563_the_index_loses_lines_of_clips_that_are_already_gone_and_orphan_
     assert hc.apply_retention(s, str(tmp_path / "state"), T0)["removed"] == 1
     assert [json.loads(l)["clip"] for l in index.read_text().splitlines()] == ["2026-10-26/%s.mp4" % keep]
     assert sorted(os.listdir(day)) == [keep + ".mp4"]
+
+
+# ── review round 3 (DeepSeek) regressions ────────────────────────────────────
+
+
+def test_tc1559_a_quota_word_at_the_end_of_a_long_stderr_still_stops(tmp_path, monkeypatch):
+    settings, cam, seg, root = cut_setup(tmp_path, monkeypatch)
+    ep = hc.build_episodes([rec(1, "approach", "event", T0)], cam.causes, 3000, 5000, 600000)[0][0]
+    plan = hc.plan_window([seg], ep.window[0] / 1000.0, ep.window[1] / 1000.0, 10)
+    noisy = b"[h264] error while decoding MB\n" * 4000 + b"/out/x.mp4.part: Disk quota exceeded\n"
+    with pytest.raises(hc.QuotaStop):
+        hc.cut_episode(settings, cam, ep, plan, str(tmp_path), runner=FakeFfmpeg(rc=1, stderr=noisy), prober=None)
+
+
+def test_tc1562_the_record_is_written_before_the_encoded_file_replaces_the_copy(tmp_path, monkeypatch):
+    s, day = encode_setup(tmp_path, monkeypatch)
+
+    def full(path, data):
+        raise OSError(errno.ENOSPC, "No space left on device")
+    monkeypatch.setattr(hc, "write_json_atomic", full)
+    with pytest.raises(hc.QuotaStop):
+        hc.encode_clip(s, "door", day, "c", runner=enc_runner(400), prober=lambda c, d, n: {"frames": 300})
+    assert open(os.path.join(day, "c.mp4"), "rb").read() == b"c" * 1000      # the copy, untouched
+    assert not [n for n in os.listdir(day) if n.endswith(".part")]
+
+
+def test_tc1562_an_encode_of_the_wrong_length_keeps_the_copy(tmp_path, monkeypatch):
+    s, day = encode_setup(tmp_path, monkeypatch)
+    side = json.load(open(os.path.join(day, "c.json")))
+    side["actual"] = {"start_utc_ms": T0, "end_utc_ms": T0 + 30000}
+    open(os.path.join(day, "c.json"), "w").write(json.dumps(side))
+    res = hc.encode_clip(s, "door", day, "c", runner=enc_runner(400),
+                         prober=lambda c, d, n: {"frames": 300, "duration": 3.0})
+    assert res["kept"] is False and "lasts 3.00 s" in res["failed"]
+    assert open(os.path.join(day, "c.mp4"), "rb").read() == b"c" * 1000
+
+
+def test_tc1563_a_clip_that_cannot_be_removed_keeps_its_index_line_and_a_killed_pass_is_repaired(tmp_path, monkeypatch):
+    root = tmp_path / "clips"
+    day = root / "door" / "2026-01-01"
+    day.mkdir(parents=True)
+    stem = "door_2026-01-01_10-00-00+0000_approach_9s"
+    (day / (stem + ".mp4")).write_bytes(b"x")
+    index = root / "door" / "index.jsonl"
+    index.write_text(json.dumps({"clip": "2026-01-01/%s.mp4" % stem}) + "\n" + "[]\n" + json.dumps({"clip": []}) + "\n")
+    s = hc.ClipsSettings({"CLIPS_RETENTION_DAYS": "30"})
+    s.root = str(root)
+    real_unlink = os.unlink
+
+    def stuck(path, *a, **k):
+        if str(path).endswith(".mp4"):
+            raise PermissionError(13, "immutable")
+        return real_unlink(path, *a, **k)
+    monkeypatch.setattr(hc.os, "unlink", stuck)
+    hc.apply_retention(s, str(tmp_path / "state"), T0)
+    assert [json.loads(l).get("clip") for l in index.read_text().splitlines()] == ["2026-01-01/%s.mp4" % stem]
+    monkeypatch.setattr(hc.os, "unlink", real_unlink)
+    # a pass killed after deleting, before its rewrite: the marker makes the next one repair the index
+    real_unlink(str(day / (stem + ".mp4")))
+    hc.mark_index_dirty(str(root / "door"))
+    hc.apply_retention(s, str(tmp_path / "state"), T0)
+    assert index.read_text() == "" and not (root / "door" / hc.INDEX_DIRTY).exists()
+
+
+def test_tc1564_a_guard_refusal_during_retention_alerts_and_exits_76(tmp_path, monkeypatch):
+    env = tmp_path / "env"
+    env.write_text("CLIPS_ENABLED=true\n")
+    sent = []
+    monkeypatch.setattr(hc, "make_alert", lambda env_file: lambda *a: sent.append(a))
+
+    def refused(*a, **k):
+        raise hc.GuardStop("unmounted mid-pass")
+    monkeypatch.setattr(hc, "apply_retention", refused)
+    assert hc.main(["--env-file", str(env), "--state-dir", str(tmp_path / "state"), "retention"]) == hc.EXIT_GUARD
+    assert sent[0][0] == "clips-guard"

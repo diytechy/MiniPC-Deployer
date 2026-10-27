@@ -77,6 +77,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -106,6 +107,7 @@ MAX_SIDECAR_RECORDS = 200
 GAP_SEC = 2.0
 MAX_SNAP_SEC = 5.0         # how far back the cut may start for a keyframe
 STALE_PART_SEC = 3600
+CUT_TIMEOUT_SEC = 300
 ENCODE_LOOKBACK_DAYS = 7   # the encode batch looks at this many days of clips
 ENCODE_RUN_SEC = 600       # and stops starting new encodes after this long
 MAX_ATTEMPTS = 3
@@ -698,6 +700,14 @@ def sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
+def read_tail(handle, limit: int = 1 << 16) -> str:
+    """The last `limit` bytes of a stderr file: the error that ended ffmpeg is
+    at the end, after whatever it said about a damaged input first."""
+    handle.seek(0, os.SEEK_END)
+    handle.seek(max(0, handle.tell() - limit))
+    return handle.read(limit).decode("utf-8", "replace")
+
+
 def docker_remove(name: str) -> None:
     """`docker rm -f NAME`, best effort: a slow or restarting daemon must not
     turn a cleanup into the failure of the whole pass."""
@@ -761,23 +771,28 @@ def cut_episode(settings: ClipsSettings, cam: CameraSettings, ep: Episode, plan:
     # damaged segment must not block on a full pipe while we block feeding it.
     with tempfile.TemporaryFile() as err_file:
         proc = runner(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err_file)
+        # A cut that stops reading its input is killed after CUT_TIMEOUT_SEC,
+        # feeding included, and its container removed with it.
+        watchdog = threading.Timer(CUT_TIMEOUT_SEC, proc.kill)
+        watchdog.daemon = True
+        watchdog.start()
         try:
-            write_pieces(proc.stdin, plan)
-        except (BrokenPipeError, OSError):
-            pass  # ffmpeg died early: its exit status and stderr say why
-        finally:
             try:
-                proc.stdin.close()
-            except OSError:
-                pass
-            proc.stdin = None  # communicate() must not flush a closed pipe
-        try:
-            proc.communicate(timeout=300)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+                write_pieces(proc.stdin, plan)
+            except (BrokenPipeError, OSError, ValueError):
+                pass  # ffmpeg died early (or was killed): its exit status and stderr say why
+            finally:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+                proc.stdin = None  # communicate() must not flush a closed pipe
             proc.communicate()
-        err_file.seek(0)
-        err_text = err_file.read(1 << 16).decode("utf-8", "replace")
+        finally:
+            watchdog.cancel()
+        if proc.returncode and proc.returncode < 0:
+            docker_remove("homehub-clips-cut-%s" % cam.camera)
+        err_text = read_tail(err_file)
     part_path = os.path.join(day_dir, part)
     if quota_hit(err_text):
         _remove(part_path)
@@ -818,8 +833,10 @@ def cut_episode(settings: ClipsSettings, cam: CameraSettings, ep: Episode, plan:
                       "event_utc_ms": ep.event_ms, "start_utc_ms": int(plan.actual[0] * 1000),
                       "end_utc_ms": int(plan.actual[1] * 1000), "seconds": round(seconds, 1),
                       "coverage": plan.coverage}
-        ok, why = mc.append_jsonl(os.path.join(cam_dir, "index.jsonl"), index_line, 64 * MIB)
-        if not ok:
+        ok, why = guard(settings)
+        if ok:
+            ok, why = mc.append_jsonl(os.path.join(cam_dir, "index.jsonl"), index_line, 64 * MIB)
+        if not ok:  # the clip and its record exist; retention's index repair is not needed for a missing line
             mc.log("clips [%s]: index not updated: %s" % (cam.camera, why), warning=True)
     except OSError as exc:
         if exc.errno in (getattr(errno, "EDQUOT", -1), errno.ENOSPC):
@@ -867,9 +884,24 @@ def write_json_atomic(path: str, data: Dict[str, object]) -> None:
     os.replace(tmp, path)
 
 
-def _remove(path: str) -> None:
+def _remove(path: str) -> bool:
+    """Unlink; True when the path is gone afterwards (it may never have existed)."""
     try:
         os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+    return True
+
+
+INDEX_DIRTY = ".index-dirty"
+
+
+def mark_index_dirty(cam_dir: str) -> None:
+    try:
+        with open(os.path.join(cam_dir, INDEX_DIRTY), "w"):
+            pass
     except OSError:
         pass
 
@@ -1001,6 +1033,7 @@ def encode_clip(settings: ClipsSettings, camera: str, day_dir: str, stem: str,
         rc = done.returncode
     except subprocess.TimeoutExpired:
         err, rc = "timed out after 900 s", -1
+        docker_remove("homehub-clips-encode-%s" % camera)  # killing the client leaves the container
     result["seconds"] = round(time.monotonic() - t0, 1)
     if quota_hit(err):
         _remove(part_path)
@@ -1011,28 +1044,38 @@ def encode_clip(settings: ClipsSettings, camera: str, day_dir: str, stem: str,
         raise GuardStop(reason)
     probed = prober(camera, day_dir, part) if rc == 0 and os.path.exists(part_path) else None
     want = side.get("frames")
+    actual = side.get("actual") if isinstance(side.get("actual"), dict) else {}
+    span = ((actual.get("end_utc_ms", 0) - actual.get("start_utc_ms", 0)) / 1000.0
+            if isinstance(actual.get("end_utc_ms"), int) and isinstance(actual.get("start_utc_ms"), int) else None)
+    replace = False
     if not probed or (isinstance(want, int) and abs(int(probed["frames"]) - want) > 1):
-        _remove(part_path)
         result.update(kept=False, failed=("ffmpeg exited %s: %s" % (rc, err.strip()[-200:]) if rc else
                                           "the encode holds %s frames, not %s" % ((probed or {}).get("frames"), want)))
+    elif span is not None and "duration" in probed and abs(float(probed["duration"]) - span) > 1.5:
+        result.update(kept=False, failed="the encode lasts %.2f s, the clip %.2f s" % (float(probed["duration"]), span))
     else:
         after = os.path.getsize(part_path)
         result["bytes_encoded"] = after
-        if after * 100 <= before * settings.keep_pct:
-            os.replace(part_path, src)
-            result["kept"] = True
+        replace = after * 100 <= before * settings.keep_pct
+        result["kept"] = replace
+        if replace:
             side["bytes"] = after
-            side["sha256"] = sha256_file(src)
-        else:
-            _remove(part_path)
-            result["kept"] = False
+            side["sha256"] = sha256_file(part_path)
     side["encode"] = result
+    # The record first, then the file it describes: a failure between them
+    # leaves the copy in place, never an encoded clip with no encode record
+    # (which the next batch would encode a second time).
     try:
         write_json_atomic(side_path, side)
+        if replace:
+            os.replace(part_path, src)
     except OSError as exc:
+        _remove(part_path)
         if exc.errno in (getattr(errno, "EDQUOT", -1), errno.ENOSPC):
             raise QuotaStop(str(exc))
         raise
+    if not replace:
+        _remove(part_path)
     mc.log("clips [%s]: encode %s: %s" % (camera, stem, json.dumps(result, sort_keys=True)))
     return result
 
@@ -1171,11 +1214,19 @@ def apply_retention(settings: ClipsSettings, state_dir: str, now_ms: int,
     clips = list_clips(settings.root, cameras)
     doomed = retention_plan(clips, now_ms, settings.retention_days, settings.cap_mib * MIB,
                             used, limit, settings.quota_high_pct)
+    if doomed:
+        ok, reason = guard(settings)  # the scan took a while: is this still the clips area?
+        if not ok:
+            raise GuardStop(reason)
     gone = set()
+    for camera in {os.path.basename(os.path.dirname(c[1])) for c in doomed}:
+        mark_index_dirty(os.path.join(settings.root, camera))
     for _start, day_dir, stem, _size in doomed:
-        for ext in (".mp4", ".json"):
-            _remove(os.path.join(day_dir, stem + ext))
-        gone.add((os.path.basename(os.path.dirname(day_dir)), "%s/%s.mp4" % (os.path.basename(day_dir), stem)))
+        if _remove(os.path.join(day_dir, stem + ".mp4")):
+            _remove(os.path.join(day_dir, stem + ".json"))
+            gone.add((os.path.basename(os.path.dirname(day_dir)), "%s/%s.mp4" % (os.path.basename(day_dir), stem)))
+        else:
+            mc.log("clips: could not remove %s/%s.mp4 - its index line stays" % (day_dir, stem), warning=True)
     for camera in cameras:
         cam_dir = os.path.join(settings.root, camera)
         for day in _days(cam_dir):
@@ -1183,11 +1234,14 @@ def apply_retention(settings: ClipsSettings, state_dir: str, now_ms: int,
                 os.rmdir(os.path.join(cam_dir, day))  # only when empty
             except OSError:
                 pass
-        if any(c == camera for c, _clip in gone):
+        # Rewritten after deletions, and on any later pass while a pass that
+        # deleted was killed before it got here (the dirty marker).
+        if any(c == camera for c, _clip in gone) or os.path.exists(os.path.join(cam_dir, INDEX_DIRTY)):
             ok, reason = guard(settings)  # the deletions took a while: the index is a write
             if not ok:
                 raise GuardStop(reason)
-            rewrite_index(os.path.join(cam_dir, "index.jsonl"), {clip for c, clip in gone if c == camera})
+            if rewrite_index(os.path.join(cam_dir, "index.jsonl"), {clip for c, clip in gone if c == camera}):
+                _remove(os.path.join(cam_dir, INDEX_DIRTY))
     events_removed = ev.prune_days(state_dir, sorted(set(cameras) | {c.camera for c in settings.cameras}),
                                    settings.event_days, now_ms / 1000.0)
     if doomed:
@@ -1205,8 +1259,8 @@ def rewrite_index(path: str, gone: set) -> bool:
     try:
         with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
             for r in mc.iter_jsonl(path):
-                clip = r.get("clip")
-                if clip in gone or not isinstance(clip, str) or not os.path.exists(os.path.join(cam_dir, clip)):
+                clip = r.get("clip") if isinstance(r, dict) else None
+                if not isinstance(clip, str) or clip in gone or not os.path.exists(os.path.join(cam_dir, clip)):
                     continue
                 handle.write(json.dumps(r, sort_keys=True, separators=(",", ":")) + "\n")
         os.replace(tmp, path)
@@ -1243,7 +1297,7 @@ def status(settings: ClipsSettings, state_dir: str, now_ms: int) -> Dict[str, ob
                               "quota_stopped": quota_stopped(state_dir)}
     used, limit = clips_quota(settings)
     out["quota"] = {"used_mib": used // MIB, "limit_mib": limit // MIB} if limit else None
-    clips = list_clips(settings.root, [c.camera for c in settings.cameras])
+    clips = list_clips(settings.root)  # every camera folder: the quota counts them all
     out["clips"] = len(clips)
     out["clips_mib"] = round(sum(c[3] for c in clips) / MIB, 1)
     cams = {}
@@ -1351,7 +1405,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not ok:  # nothing is deleted or rewritten on a volume that is not the clips area
                 mc.log("clips: retention skipped - guard: %s" % reason, warning=True)
                 return EXIT_GUARD
-            result = apply_retention(settings, args.state_dir, now_ms, lambda: clips_quota(settings))
+            try:
+                result = apply_retention(settings, args.state_dir, now_ms, lambda: clips_quota(settings))
+            except GuardStop as exc:
+                mc.log("clips: retention STOPPED - guard: %s" % exc, warning=True)
+                alert("clips-guard", "HomeHub: motion clips retention stopped (clips area)", str(exc))
+                return EXIT_GUARD
             stop = quota_stopped(args.state_dir)
             used, limit = clips_quota(settings)
             if stop and (not limit or (used or 0) * 100 < limit * settings.quota_high_pct):

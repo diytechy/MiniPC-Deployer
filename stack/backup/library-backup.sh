@@ -982,7 +982,7 @@ if [ "$VERIFY_RUN" != none ]; then
            FAIL_NOTE="verify exit 1 — FINDINGS: the store disagrees with its manifests somewhere. Read the [Class] lines in $FB_LOGS/Backup_Global.log. PoolUnresolvable is a row with no bytes anywhere (not restorable until the next backup re-stores it from the source); DuplicateObject is a second copy of one object (harmless, costs space — expected once after a store from the old engine); DamagedObject is an object whose length its name rules out (empty, or a raw object of another length — any verify) or, under -Deep, whose bytes do not hash to its name. Moving duplicates and damaged objects aside into $FB_STORE/Verify/ (never deleted) is a person's call: README \"Verify findings\"$PARTIAL_SUFFIX"
            false ;;
         2) VERIFY_NOTE="$VERIFY_RUN REFUSED (precondition)"
-           FAIL_NOTE="verify exit 2 — precondition failure: the verify could not run at all (no backup root, no manifest to verify, -Deep without 7-Zip, or a host problem that stopped it). Retrying unchanged will not help. Read $FB_LOGS/Backup_Global.log"
+           FAIL_NOTE="verify exit 2 — precondition failure: the verify could not run at all (no Latest/ in the store, no manifest to verify, -Deep without 7-Zip, or a host problem that stopped it). Retrying unchanged will not help. Read $FB_LOGS/Backup_Global.log"
            false ;;
         3|4) VERIFY_NOTE="$VERIFY_RUN exit $VERIFY_RC"
            FAIL_NOTE="verify exited $VERIFY_RC, which a bounded-run-loop FileBackup never returns from verify (no witness; host problems are 2). This is almost certainly an OLDER image: rebuild it from FileBackup's BoundedRebuild work"

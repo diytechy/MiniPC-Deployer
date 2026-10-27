@@ -652,23 +652,31 @@ image is kept under its own tag at step 2 below.
    the deployed image for the rollback: read its stamp
    (`docker image inspect filebackup:local`) and
    `docker tag filebackup:local filebackup:kit12`. Then load the new one as
-   `filebackup:local`. From here the legacy layout no longer runs; nothing runs
-   meanwhile (the timer is off, open-items E13).
+   `filebackup:local`. From here the legacy layout no longer runs, so nothing
+   may run meanwhile: confirm the timer is off rather than assume it
+   (`systemctl is-enabled homehub-library-backup.timer` says `disabled`, and
+   `systemctl list-timers --all` does not list it as armed; open-items E13),
+   and `systemctl disable --now` it if not.
 3. **Deliver this stack and install the config:**
    `install -m0644 -o root -g root /opt/homehub/stack/backup/filebackup-store.json /etc/homehub-backup/filebackup-store.json`.
 4. **Set the old store aside** — there is no migration (FileBackup L2, L5):
    [Setting the old store aside](#setting-the-old-store-aside). A store already
    made by hand to be the new baseline must be in the single-store layout at
-   `FILEBACKUP_STORE` (`Latest/` and `Snapshot_*` side by side); one in another
-   layout is refused by step 2b like any old store.
-5. **Switch the knob:** `FILEBACKUP_LAYOUT='single'` in HomeHub's
-   `config.homehub.psd1`, materialise, ship the `.env`. Then
+   `FILEBACKUP_STORE` (`Latest/` and `Snapshot_*` side by side; one in another
+   layout is refused by the wrapper's step 2b like any old store), and then the
+   set-aside renames must **not** move `library-store`: skip that line.
+5. **Switch the knob, with the cap:** `FILEBACKUP_LAYOUT='single'` **and**
+   `FILEBACKUP_MEM_LIMIT='4g'` in HomeHub's `config.homehub.psd1`, in the same
+   change, so the `.env` that turns the single layout on never runs uncapped
+   (compose sets the equal `memswap_limit` itself); materialise, ship the
+   `.env`. Then
    `sudo /opt/homehub/stack/backup/library-backup.sh --preflight-only` must
    pass (it creates nothing and starts no container).
-6. **The first run, by hand, under a protective cap** (E13's return
-   conditions): `FILEBACKUP_MEM_LIMIT=4g` in the `.env` (compose sets the equal
-   `memswap_limit` itself), never uncapped; start it so an SSH drop cannot kill
-   it — `sudo systemd-run --unit=library-backup-first --property=TimeoutStartSec=infinity /opt/homehub/stack/backup/library-backup.sh --verify none`
+6. **The first run, by hand, under that cap** (E13's return conditions; never
+   uncapped): check `docker compose --profile filebackup config filebackup-store`
+   shows `mem_limit` and `memswap_limit` at 4g, then start it so an SSH drop
+   cannot kill it —
+   `sudo systemd-run --unit=library-backup-first /opt/homehub/stack/backup/library-backup.sh --verify none`
    — and poll the run container's `memory.peak` every 10 s while it runs (it
    is `--rm`; the slice's peak, which the wrapper logs, is an upper bound).
    Expect days: it is a full first backup.
@@ -680,6 +688,10 @@ image is kept under its own tag at step 2 below.
 - **Before step 4** (the old store still in its places): set
   `FILEBACKUP_LAYOUT=legacy` again and `docker tag filebackup:kit12
   filebackup:local`. Nothing else changed.
+- **Either way**, remove the single layout's manifest copy
+  (`/var/lib/homehub-filebackup/latest/MANIFEST.csv`) if a single-store run
+  made one: frame-freshness reads the newer of it and the legacy `/state`
+  record, and would read the abandoned copy until the next legacy run.
 - **After step 4:** the same, plus the set-aside renames reversed (the old
   folders back to `library` and `library-changes`), with the new store moved
   aside in its turn. Not verified; treat it as the Owner's decision.
@@ -762,7 +774,8 @@ sudo mkdir old-library-store
 stat -c '%d %n' . old-library-store library library-changes library-store 2>/dev/null
 #   every line must show the SAME device number: then each mv below is a rename.
 #   A different number means another filesystem, where mv would copy terabytes - stop.
-sudo mv -T library         old-library-store/library           # whichever of these exist
+# One mv per folder that EXISTS; skip a line whose source is absent.
+sudo mv -T library         old-library-store/library
 sudo mv -T library-changes old-library-store/library-changes
 sudo mv -T library-store   old-library-store/library-store
 # Then go on with the cutover (the layout knob, steps 5-7): the knob, the
@@ -780,9 +793,11 @@ sudo mv -T library-store   old-library-store/library-store
   (`bash/reconstruct.sh` in its latest state or a snapshot). Its folders have
   moved, so pass its roots explicitly as that kit's `--help` describes.
 - **`stack/.env`:** keep `FILEBACKUP_STATE`, `FILEBACKUP_BACKUP` and
-  `FILEBACKUP_CHANGES` until the legacy layout is retired: they are its paths
-  (the rollback), and in the single layout they are read only to find an old
-  store, which after the renames they no longer name.
+  `FILEBACKUP_CHANGES` until the legacy layout is retired: they are the legacy
+  layout's paths (the rollback). In the single layout `FILEBACKUP_BACKUP` and
+  `FILEBACKUP_CHANGES` are read only to find an old store (step 2b refuses
+  while either holds data), which after the renames they no longer name;
+  `FILEBACKUP_STATE` is never a refusal, only the retired-record note below.
 - **The old source-side record**, `/var/lib/homehub-filebackup/state/MANIFEST.csv`,
   belongs to the old store; the wrapper names it after each verified run until
   you delete it.

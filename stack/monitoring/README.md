@@ -184,7 +184,10 @@ and for debugging by the Owner and agents. **Record only: no alert, no action.**
   table and carries `.homehub-library` (root is not stopped by the bare
   mountpoint's mode 000), and unless the folder's parent already exists. It
   never copies today's file and never deletes at the destination; a file whose
-  size and mtime already match is skipped.
+  size and mtime already match is skipped. Each run leaves
+  `/var/lib/homehub-metrics/copy-status.json` (last run, result, last success,
+  last skip and why), and every snapshot carries it as `monitors.copy`, so a
+  skipped week shows without the journal.
 - **Charts:** `https://metrics.admin.<domain>/` (Caddy, behind the admin login,
   `stack/monitoring/metrics-site/`): nightly rows, recent snapshots, and a night's
   raw heart rate with its sleep sessions shaded. Static files only.

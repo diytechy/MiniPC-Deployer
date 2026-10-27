@@ -875,7 +875,16 @@ def append_jsonl(path: str, record: dict, cap_bytes: int) -> Tuple[bool, str]:
     try:
         # allow_nan=False: a NaN would make the line unreadable JSON for every reader.
         line = json.dumps(record, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
-    except (TypeError, ValueError) as exc:
+    except ValueError:
+        # One non-finite float must not cost the whole line: it becomes null,
+        # and the line names the top-level blocks that carried one.
+        blocks = sorted(k for k, v in record.items() if _has_nonfinite(v)) if isinstance(record, dict) else []
+        record = dict(_finite(record), nonfinite=blocks) if isinstance(record, dict) else _finite(record)
+        try:
+            line = json.dumps(record, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+        except (TypeError, ValueError) as exc:
+            return False, "the record could not be encoded (%s); not appending" % type(exc).__name__
+    except TypeError as exc:
         return False, "the record could not be encoded (%s); not appending" % type(exc).__name__
     size = len(line.encode("utf-8"))      # bytes, not characters: the cap is on disk
     try:
@@ -888,6 +897,27 @@ def append_jsonl(path: str, record: dict, cap_bytes: int) -> Tuple[bool, str]:
     except OSError as exc:
         return False, "could not append to %s: %s" % (path, exc)
     return True, "recorded %d bytes" % size
+
+
+def _has_nonfinite(value) -> bool:
+    if isinstance(value, float):
+        return value != value or value in (float("inf"), float("-inf"))
+    if isinstance(value, dict):
+        return any(_has_nonfinite(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_has_nonfinite(v) for v in value)
+    return False
+
+
+def _finite(value):
+    """`value` with every NaN/inf float replaced by None (containers copied)."""
+    if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+        return None
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite(v) for v in value]
+    return value
 
 
 def iter_jsonl(path: str):

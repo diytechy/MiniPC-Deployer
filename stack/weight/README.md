@@ -1503,8 +1503,12 @@ sources; sleep from heart rate is not built).
   directory with `O_NOFOLLOW`, and a file stops at 32 MiB.
 - **Off switch:** `HEART_RAW_RECORD=false`. Anything but `true`/`false` (or
   unset) is one failure line and nothing recorded.
-- **Failure isolation:** a record that cannot be written is one failure line
-  (the unit goes red); the gauge is posted exactly as before.
+- **Failure isolation:** the gauge's page parser runs first and the raw
+  extraction after it, guarded; a record that cannot be written or a page that
+  cannot be read into raw rows is one failure line (the unit goes red); the gauge
+  is posted exactly as before. A unit not yet re-installed with the second
+  `StateDirectory=` (re-run `setup-weight.sh`) is a WARNING line only, so the
+  unit stays green: red there would read as a sign-in failure.
 - **Not backed up on the hub** (not in the config backups); copied weekly into
   the Owner's Docs folder on the library by `homehub-metrics-copy`
   (`stack/monitoring/README.md`), which the library backup covers.

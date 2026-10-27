@@ -17,6 +17,9 @@ After=local-fs.target homehub-backup.service homehub-library-backup.service
 Type=oneshot
 ExecStart=/usr/bin/python3 /opt/homehub/stack/monitoring/homehub-metrics.py copy
 SyslogIdentifier=homehub-metrics
+# Its status file (copy-status.json) sits beside the log it copies.
+StateDirectory=homehub-metrics
+StateDirectoryMode=0700
 # The library mount fixes owner and mode itself (ntfs-3g uid=0,gid=household,
 # umask=0002): what lands there is readable through the Owner's share.
 UMask=0002

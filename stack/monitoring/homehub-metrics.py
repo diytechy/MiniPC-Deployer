@@ -78,6 +78,7 @@ import importlib.util
 import json
 import os
 import re
+import stat
 import sys
 import time
 import urllib.error
@@ -503,12 +504,18 @@ def summarise_monitors(watch: dict, disk: dict, liveness: dict, meetings: dict, 
     return out
 
 
-def collect_monitors(monitor_dir: str, meetings_status: str, now: float) -> dict:
+def collect_monitors(monitor_dir: str, meetings_status: str, now: float, data_dir: Optional[str] = None) -> dict:
     def read(name):
         return _read_bounded_json(os.path.join(monitor_dir, name), 1048576, {})
 
-    return summarise_monitors(read("watch-status.json"), read("disk-status.json"),
-                              read("liveness-status.json"), _read_bounded_json(meetings_status, 65536, {}), now)
+    out = summarise_monitors(read("watch-status.json"), read("disk-status.json"),
+                             read("liveness-status.json"), _read_bounded_json(meetings_status, 65536, {}), now)
+    if data_dir:
+        copy = _read_bounded_json(os.path.join(data_dir, "copy-status.json"), 65536, {})
+        if copy:
+            out["copy"] = {k: copy.get(k) for k in ("last_run", "last_result", "last_success", "last_skip",
+                                                    "last_skip_reason", "written", "failed") if k in copy}
+    return out
 
 
 # ── the panel's status, over the meeting pull's key (LLR-1324) ──────────────
@@ -582,7 +589,11 @@ def summarise_panel(doc: dict) -> dict:
             "kiosk": {k.get("name"): [_num(k.get("cpu_pct"), 1), k.get("rss_kb")]
                       for k in tele.get("kiosk") or [] if isinstance(k, dict) and isinstance(k.get("name"), str)},
             "presentation": _short(pres.get("status"), 16),
-            "mode": _short(payload.get("mode"), 32),
+            # The payload's own names (OfficeWallNaglight electron/presentation-ipc.cjs).
+            "display_mode": _short(payload.get("displayMode"), 16),
+            "selected_tab": _short(payload.get("selectedTab"), 32),
+            "display_power": _short(payload.get("displayPower"), 16),
+            "music_active": payload.get("musicActive") if isinstance(payload.get("musicActive"), bool) else None,
         }
     elif isinstance(tele, dict):
         out["telemetry"] = {"error": _short(tele.get("error"), 80)}
@@ -689,7 +700,7 @@ def build_snapshot(args, knobs: Dict[str, str], state: dict, now: float, deadlin
     record["host"] = guarded(host_block)
     record["containers"] = guarded(lambda: collect_containers(deadline, run))
     record["units"] = guarded(lambda: collect_units(deadline, run))
-    record["monitors"] = guarded(lambda: collect_monitors(args.monitor_dir, args.meetings_status, now))
+    record["monitors"] = guarded(lambda: collect_monitors(args.monitor_dir, args.meetings_status, now, args.data_dir))
     record["panel"] = guarded(lambda: collect_panel(
         knobs, deadline, meetings if meetings is not None else _meetings_module(), run))
     last_smart = state.get("smart_epoch")
@@ -882,6 +893,9 @@ def cmd_daily(args, fetch=fetch_today, run=mc.run_bounded, zone=None, now=None) 
 # deterministic gzip) - so the destination holds one file per day either way.
 
 LIBRARY_ROOT = "/srv/library"
+# The copy's own record, beside the log, carried in every snapshot (monitors.copy):
+# a skipped week is visible without the journal.
+COPY_STATUS_FILE = "copy-status.json"
 LIBRARY_MARKER = ".homehub-library"
 COPY_SETTLE_SEC = 600            # a day file last written this recently is not closed yet
 COPY_DEADLINE_SEC = 1500
@@ -1009,7 +1023,13 @@ def _copy_one(src: str, dest_root: str, rel: str, pack: bool, library_root: Opti
     parts = rel.split("/")
     if any(p in ("", ".", "..") for p in parts):
         raise PermissionError("REFUSED: %r is not a plain relative path" % rel)
-    raw = open(src, "rb")                     # first: a source that cannot be read costs no temp file
+    # First, so a source that cannot be read costs no temp file; O_NOFOLLOW and
+    # a regular-file check on the OPEN file, so what was listed is what is read.
+    sfd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    if not stat.S_ISREG(os.fstat(sfd).st_mode):
+        os.close(sfd)
+        raise PermissionError("REFUSED: %s is not a regular file" % src)
+    raw = os.fdopen(sfd, "rb")
     try:
         _copy_from(raw, os.fstat(raw.fileno()).st_mtime, dest_root, parts, pack, library_root, gzip, shutil)
     finally:
@@ -1133,10 +1153,15 @@ def cmd_copy(args, mounts_text: Optional[str] = None, now: Optional[float] = Non
             mounts_text = ""
     dest, refusal = copy_target(knobs, mc.parse_mountinfo(mounts_text))
     library_root = os.path.realpath((knobs.get("HOMEHUB_METRICS_COPY_ROOT") or LIBRARY_ROOT).rstrip("/") or "/")
+    now = time.time() if now is None else now
+    status_path = os.path.join(args.data_dir, COPY_STATUS_FILE)
+    status = mc.load_json(status_path, {})
+    status["last_run"] = int(now)
     if dest is None:
         mc.log("metrics: weekly copy SKIPPED - %s" % refusal, warning=bool(knobs.get("HOMEHUB_METRICS_COPY_DIR")))
+        status.update({"last_result": "skipped", "last_skip": int(now), "last_skip_reason": refusal[:200]})
+        mc.save_json_atomic(status_path, status)
         return 0
-    now = time.time() if now is None else now
     today = time.strftime("%Y%m%d", time.gmtime(now))
 
     def dest_stat(rel):
@@ -1160,6 +1185,11 @@ def cmd_copy(args, mounts_text: Optional[str] = None, now: Optional[float] = Non
             mc.log("metrics: weekly copy could not write %s (%s)" % (rel, type(exc).__name__), True)
     mc.log("metrics: weekly copy to the library: %d written, %d skipped (already there, or still open), %d failed"
            % (written, len(copy_sources(args.data_dir, args.raw_dir)) - len(plan), failed), warning=bool(failed))
+    status.update({"last_result": "failed" if failed else "ok", "written": written, "failed": failed})
+    if not failed:
+        status["last_success"] = int(now)
+    if not mc.save_json_atomic(status_path, status):
+        mc.log("metrics: WARN could not save %s" % status_path, True)
     return 1 if failed else 0
 
 

@@ -5878,13 +5878,22 @@ def record_raw_cycle(env, raw, now):
         return ["raw record: %s - nothing recorded" % exc]
     root = resolve_raw_root(env)
     if root is None:
-        return ["raw record: the unit declares no StateDirectory=%s - nothing recorded" % RAW_ROOT_NAME]
+        # A unit not yet re-installed with the second StateDirectory= (setup-weight.sh
+        # does that) is a WARNING, never a red unit: red reads as a sign-in failure.
+        print("heart: WARNING raw record skipped - the unit declares no StateDirectory=%s yet "
+              "(re-run setup-weight.sh)" % RAW_ROOT_NAME)
+        return []
+    failures = []
+    if raw.get("error"):
+        failures.append("raw record: a page could not be read into raw rows (%s) - the rest is recorded"
+                        % raw["error"])
     try:
         counts = record_raw(root, raw, now)
     except Exception as exc:
-        return ["raw record: could not write (%s) - nothing more recorded this cycle" % type(exc).__name__]
+        return failures + ["raw record: could not write (%s) - nothing more recorded this cycle"
+                           % type(exc).__name__]
     print("heart: raw record +%d heart-rate samples, +%d sleep sessions" % (counts["hr"], counts["sleep"]))
-    return []
+    return failures
 
 
 def walk_all_data_points(access_token, timeout, base, query, parser, what):
@@ -5951,8 +5960,12 @@ def read_google_health_heart_samples(env, heart_rate_url=None, sleep_url=None,
 
     def tee(parser, extractor, sink):
         def both(payload):
-            sink.extend(extractor(payload))
-            return parser(payload)
+            parsed = parser(payload)          # the gauge's read first, and unguarded as before
+            try:
+                sink.extend(extractor(payload))
+            except Exception as exc:          # the raw record never costs the gauge
+                raw["error"] = type(exc).__name__
+            return parsed
         return both
 
     samples = walk_all_data_points(

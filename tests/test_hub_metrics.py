@@ -375,7 +375,10 @@ PANEL_DOC = {"v": 1, "now": 1793064000, "uptime_s": 999,
              "telemetry": {"ts_utc": "2026-10-27T01:20:00Z", "cpu_pct": 23.456,
                            "sensors": [{"deg_c": 48.0, "canonical": True}, {"deg_c": 99, "canonical": False}],
                            "cpufreq_mhz": [800, 1800], "kiosk": [{"name": "electron", "cpu_pct": 10.0, "rss_kb": 5}],
-                           "presentation": {"status": "ok", "payload": {"mode": "FULLSCREEN"}}}}
+                           "presentation": {"status": "ok", "payload": {
+                               "displayMode": "FULL", "selectedTab": "music", "fullscreenOwner": "music",
+                               "mediaPreference": None, "visualizerStatus": None, "displayPower": "on",
+                               "musicActive": True, "revision": 41, "monotonicMs": 123456.0}}}}
 
 
 def test_tc1497_the_argv_is_the_pulls_own_with_host_keys_never_accepted(tmp_path, monkeypatch):
@@ -402,7 +405,9 @@ def test_tc1497_the_answer_is_summarised_and_failures_are_one_line(tmp_path, mon
     assert out["ok"] and out["disk"]["free_pct"] == {"root": 50.0}
     assert out["freeze"] == {"ts": 1793063990, "result": "ok", "draw_s": 0.29, "fails": 0, "captured": 0,
                              "bundles": 20, "newest_bundle": "20261022-172726"}
-    assert out["telemetry"]["cpu_c"] == 48.0 and out["telemetry"]["mode"] == "FULLSCREEN"
+    assert out["telemetry"]["cpu_c"] == 48.0 and out["telemetry"]["display_mode"] == "FULL"
+    assert out["telemetry"]["selected_tab"] == "music" and out["telemetry"]["display_power"] == "on"
+    assert out["telemetry"]["music_active"] is True and "mode" not in out["telemetry"]
     assert out["telemetry"]["kiosk"] == {"electron": [10.0, 5]}
     for done, word in ((Done(timed_out=True), "did not answer"), (Done(rc=255), "exited 255"),
                        (Done(output=b"garbage"), "not JSON")):
@@ -695,12 +700,50 @@ def test_tc1505_off_unset_root_and_a_write_failure_never_reach_the_gauge(tmp_pat
     env["HEART_RAW_RECORD"] = "yes"
     assert "true or false" in feeder.record_raw_cycle(env, {"hr": []}, T0)[0]
     env = {"STATE_DIRECTORY": str(tmp_path / "homehub-weight")}
-    assert "StateDirectory=homehub-health-raw" in feeder.record_raw_cycle(env, {"hr": []}, T0)[0]
+    assert feeder.record_raw_cycle(env, {"hr": []}, T0) == []
     env, raw = _raw_env(tmp_path)
     monkeypatch.setattr(feeder, "record_raw", lambda *a: (_ for _ in ()).throw(OSError("full")))
     assert feeder.record_raw_cycle(env, {"hr": []}, T0) == [
         "raw record: could not write (OSError) - nothing more recorded this cycle"]
     assert feeder.record_raw_cycle(env, None, T0) == []
+
+
+def test_tc1505_opus_a_missing_raw_directory_is_a_warning_not_a_red_unit(tmp_path, capsys):
+    env = {"STATE_DIRECTORY": str(tmp_path / "homehub-weight")}
+    assert feeder.record_raw_cycle(env, {"hr": [{"epoch": T0, "bpm": 1}]}, T0) == []
+    out = capsys.readouterr().out
+    assert "WARNING raw record skipped" in out and "setup-weight.sh" in out
+
+
+def test_tc1505_opus_a_raw_extractor_that_raises_never_costs_the_gauge(tmp_path, monkeypatch):
+    token = tmp_path / "t.json"
+    token.write_text(json.dumps({"refresh_token": "R"}), encoding="utf-8")
+    env = {"WEIGHT_TOKEN_FILE": str(token), "OAUTH2_PROXY_CLIENT_ID": "i", "OAUTH2_PROXY_CLIENT_SECRET": "s",
+           "WEIGHT_TIMEOUT_SECONDS": "10", "_now": T0 + 3600}
+
+    def respond(handler):
+        path = handler.path.partition("?")[0]
+        payload = {"access_token": "A"} if path == "/token" else (
+            {"dataPoints": [_hr_point(T0)]} if path == "/hr" else {"dataPoints": [_sleep_point(T0, T0 + 60)]})
+        body = json.dumps(payload).encode()
+        handler.send_response(200)
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    def boom(payload):
+        raise RuntimeError("extractor bug")
+
+    monkeypatch.setattr(feeder, "raw_heart_rate_rows", boom)
+    with loopback_server(respond) as (base, _):
+        samples, sessions, raw = feeder.read_google_health_heart_samples(
+            env, heart_rate_url=base + "/hr", sleep_url=base + "/sleep", token_endpoint=base + "/token")
+    assert samples == [(T0, 78, "FFit")] and len(sessions) == 1
+    assert raw["error"] == "RuntimeError" and raw["hr"] == [] and len(raw["sleep"]) == 1
+    env2, rawdir = _raw_env(tmp_path)
+    lines = feeder.record_raw_cycle(env2, raw, T0 + 3600)
+    assert len(lines) == 1 and "RuntimeError" in lines[0] and "the rest is recorded" in lines[0]
+    assert (rawdir / "sleep-20261025.jsonl").exists()
 
 
 def test_tc1505_only_record_file_names_are_opened_and_a_linked_root_is_refused(tmp_path):
@@ -863,10 +906,51 @@ def test_tc1509_review_round2_the_walk_starts_at_the_library_and_stays_on_its_de
 
 
 def test_tc1510_review_round2_a_record_that_cannot_be_encoded_is_refused(tmp_path):
-    ok, why = mc.append_jsonl(str(tmp_path / "x.jsonl"), {"v": float("nan")}, 10 ** 6)
-    assert not ok and "encoded" in why and not (tmp_path / "x.jsonl").exists()
+    path = tmp_path / "x.jsonl"
+    rec = {"v": 1, "panel": {"freeze": {"draw_s": float("nan")}}, "host": {"load": [float("inf"), 1.0]}, "ok": 2}
+    ok, why = mc.append_jsonl(str(path), rec, 10 ** 6)
+    assert ok, why
+    line = json.loads(path.read_text())
+    assert line["panel"]["freeze"]["draw_s"] is None and line["host"]["load"] == [None, 1.0]
+    assert line["nonfinite"] == ["host", "panel"] and line["ok"] == 2
+    ok, why = mc.append_jsonl(str(tmp_path / "y.jsonl"), {"v": object()}, 10 ** 6)
+    assert not ok and "encoded" in why and not (tmp_path / "y.jsonl").exists()
     out = hm.collect_units(hm.Deadline(60), Runner())
     assert out["ok"] is False and "--state=failed" in out["error"]
+
+
+def test_tc1509_opus_a_source_that_is_not_a_regular_file_is_refused(tmp_path):
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    with pytest.raises(PermissionError):
+        hm._copy_one(str(tmp_path), str(dest), "watch-raw/hr-20201001.jsonl", False)
+    real = _w(tmp_path / "real.jsonl", "{}\n")
+    link = tmp_path / "hr-20201001.jsonl"
+    try:
+        os.symlink(str(real), str(link))
+    except (OSError, NotImplementedError):
+        pytest.skip("this host cannot make a symlink")
+    if os.name == "posix":
+        with pytest.raises(OSError):
+            hm._copy_one(str(link), str(dest), "watch-raw/hr-20201001.jsonl", False)
+        assert not (dest / "watch-raw" / "hr-20201001.jsonl").exists()
+
+
+def test_tc1509_opus_the_copy_leaves_a_status_the_snapshot_carries(tmp_path):
+    root, mounts, knobs = _lib(tmp_path)
+    args = _args(tmp_path)
+    _w(args.env_file, "".join("%s=%s\n" % kv for kv in knobs.items()))
+    assert hm.cmd_copy(args, mounts_text="", now=1793000000.0) == 0
+    status = json.loads((Path(args.data_dir) / "copy-status.json").read_text())
+    assert status["last_result"] == "skipped" and "not mounted" in status["last_skip_reason"]
+    assert "last_success" not in status
+    text = LIB_MOUNT.replace("/srv/library", root.as_posix())
+    assert hm.cmd_copy(args, mounts_text=text, now=1793000600.0) == 0
+    status = json.loads((Path(args.data_dir) / "copy-status.json").read_text())
+    assert status["last_result"] == "ok" and status["last_success"] == 1793000600
+    assert status["last_skip"] == 1793000000
+    mon = hm.collect_monitors(args.monitor_dir, args.meetings_status, 1793000700.0, args.data_dir)
+    assert mon["copy"]["last_success"] == 1793000600 and mon["copy"]["last_result"] == "ok"
 
 
 def test_tc1508_the_plan_skips_today_unsettled_and_unchanged_files():

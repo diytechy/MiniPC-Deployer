@@ -1547,8 +1547,8 @@ def test_tc1563_nothing_under_the_trial_or_a_named_camera_is_followed_through_a_
 @pytest.mark.skipif(not (SEGMENTS and os.path.isdir(SEGMENTS) and os.name == "posix" and docker_ok()),
                     reason="set HOMEHUB_CLIPS_SEGMENTS to a door segment tree on a Linux docker host (WSL)")
 def test_tc1569_real_segments_with_the_recorders_mtimes_cut_the_planned_frames(tmp_path, monkeypatch):
-    """The real segments copied with the mtimes the recorder leaves (a finished
-    segment last written at its rotation, the next one's start), so the last-
+    """The real segments copied with the mtimes the recorder leaves (a rotated
+    segment's last write lands ~0.6 s after the next one's start), so the last-
     write anchor is exercised on real bytes."""
     monkeypatch.setattr(hc, "guard", lambda settings: (True, "ok"))
     real = [x for x in hc.list_segments(SEGMENTS, "door") if not x.part]
@@ -1559,7 +1559,7 @@ def test_tc1569_real_segments_with_the_recorders_mtimes_cut_the_planned_frames(t
         dst = seg_dir / day / seg.name
         shutil.copyfile(seg.path, str(dst))
         nxt = real[i + 1].start if i + 1 < len(real) and real[i + 1].start - seg.start <= 600 else seg.start + 600
-        os.utime(str(dst), (nxt - 0.05, nxt - 0.05))
+        os.utime(str(dst), (nxt + 0.6, nxt + 0.6))   # what the recorder leaves: just after the next start
     root = tmp_path / "clips"
     root.mkdir()
     state = str(tmp_path / "state")
@@ -1574,3 +1574,55 @@ def test_tc1569_real_segments_with_the_recorders_mtimes_cut_the_planned_frames(t
     for side in root.rglob("*.json"):
         data = json.loads(side.read_text())
         assert data["coverage"] == "full" and 100 <= data["frames"] <= 130, data
+
+
+# ── the Opus check of 3ef0ceb (2026-10-27) ───────────────────────────────────
+
+
+def test_tc1553_a_rotated_3_fps_segment_whose_mtime_lands_just_after_the_next_start_is_timed_by_it():
+    data = ts_bytes(901, broken=True)
+    # the recorder writes the last bytes, then opens the next file at floor(now): mtime 0.6 s after it
+    night = hc.Loaded(Seg("door-x.ts", 1000.0), data, 10, next_start=1300.0, mtime=1300.6)
+    n = len(night.times)
+    assert night.period == pytest.approx(300.0 / n) and night.times[-1] < 1300.0
+    # touched long after the rotation: only the next start is known, and under half the nominal is nominal
+    touched = hc.Loaded(Seg("door-x.ts", 1000.0), data, 10, next_start=1300.0, mtime=1400.0)
+    assert touched.period == pytest.approx(0.1)
+
+
+def test_tc1553_the_newest_finished_segment_is_not_stretched_by_a_copied_mtime():
+    data = ts_bytes(901, broken=True)
+    copied = hc.Loaded(Seg("door-x.ts", 1000.0), data, 10, mtime=1000.0 + 5000, segment_sec=600)
+    assert copied.times[-1] < 1000.0 + 600 + hc.ROTATION_SLACK_SEC
+    assert hc.ClipsSettings({"DOOR_RECORDER_SEGMENT_SEC": "300"}).segment_sec == 300
+
+
+def test_tc1553_an_anchor_above_the_nominal_rate_is_a_bound_the_frames_never_pass():
+    data = ts_bytes(100, broken=True)
+    idx = hc.scan_frames(data, False)
+    times, _mode = hc.frame_times(idx, 1000.0, 10, end=1005.0)        # 100 frames before a start 5 s later
+    assert times[-1] < 1005.0 and times == sorted(times)
+    a = hc.Loaded(Seg("door-a.ts", 1000.0), data, 10, next_start=1005.0)
+    b = hc.Loaded(Seg("door-b.ts", 1005.0), data, 10, next_start=1015.0)
+    flat = a.times + b.times
+    assert all(x < y for x, y in zip(flat, flat[1:]))
+    assert hc.frame_times(idx, 1000.0, 10, end=990.0)[0][-1] == pytest.approx(1009.9)   # a clock step back: nominal
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows; runs under Linux/WSL")
+def test_tc1563_the_stale_sweep_reads_links_themselves_not_their_targets(tmp_path, monkeypatch):
+    monkeypatch.setattr(hc, "guard", lambda settings: (True, "ok"))
+    root = tmp_path / "clips"
+    day = root / "door" / "2026-10-19"
+    day.mkdir(parents=True)
+    old = tmp_path / "old-target"
+    old.write_bytes(b"o")
+    os.utime(str(old), (0, 0))
+    os.symlink(str(old), str(day / "door_x.mp4.part"))           # a new link to an old file: not stale
+    (day / "door_y.json").write_text("{}")
+    os.utime(str(day / "door_y.json"), (0, 0))
+    os.symlink(str(tmp_path / "gone"), str(day / "door_y.mp4"))   # its clip is a (dangling) link: not an orphan
+    s = hc.ClipsSettings({"CLIPS_RETENTION_DAYS": "3650"})
+    s.root = str(root)
+    hc.apply_retention(s, str(tmp_path / "state"), int(time.time() * 1000))
+    assert os.path.lexists(str(day / "door_x.mp4.part")) and (day / "door_y.json").exists() and old.exists()

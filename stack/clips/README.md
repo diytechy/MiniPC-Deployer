@@ -110,11 +110,16 @@ first frame at or after its end. Frames are timed by the segment's name plus PTS
 0.07 s of PTS), by index, spread evenly from the segment's start to where its
 frames end: the open `.part`'s last write (its mtime), and for a finished
 segment the earlier of its last write and the next segment's start (the camera
-slows down in low light and infrared). Anchored by its own last write, a slow
-rate is trusted down to 0.5 fps; anchored by the next segment's start, a rate
-under half the nominal may hide a recorder restart, so the nominal
-`CAMERA_<C>_FPS` is used then - as it is with no anchor, or above the nominal
-rate. The recorder keeps a cut-back segment's mtime at its last write. The
+slows down in low light and infrared). A rotated segment's mtime lands just
+after the next start (the recorder opens the next file first; 0.6-2.6 s measured),
+so an mtime up to 5 s past the next start still counts as its last write; the
+newest finished segment is bounded at `DOOR_RECORDER_SEGMENT_SEC` + 5 s. Anchored
+by its own last write, a slow rate is trusted down to 0.5 fps; anchored only by
+the next segment's start (its mtime later than that), a rate under half the
+nominal may hide a recorder restart, so the nominal `CAMERA_<C>_FPS` is used then
+- as it is with no anchor. An anchor implying a rate above the nominal shrinks the
+period to fit, so a segment never overlaps the next. The recorder keeps a
+cut-back segment's mtime at its last write. The
 segments are listed
 again for every episode, and a segment that was listed but can no longer be
 opened (rotated, pruned) makes the episode wait for the next pass - never lost,
@@ -285,7 +290,11 @@ sudo python3 .../camera_motion.py replay --camera door --since <UTC> --until <UT
 The same new events within a second: set `CAMERA_DOOR_MOTION_DECODE=vaapi`,
 restart the unit, and repeat step 4.
 
-**6. Clips on.** `CLIPS_ENABLED=true`, then
+**6. Clips on - not before 27 h after step 1.** A segment the old recorder cut
+back after a stall carries the stall's time as its mtime, which would stretch its
+night-time frame timing; the recorder delivered in step 1 keeps the last write.
+Wait one full rotation of the NVMe segments (about 27 h at the 7.5 GiB cap) so
+every segment left was written by it. Then `CLIPS_ENABLED=true`, then
 `sudo systemctl enable --now homehub-clips-cut.timer homehub-clips-retention.timer`.
 After the next visitor: `sudo python3 /opt/homehub/stack/clips/homehub_clips.py episodes --camera door`
 and `status`, and the clip under `/srv/scratch/clips/door/<day>/` plays.

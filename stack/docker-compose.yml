@@ -171,9 +171,17 @@ services:
       GAME_HOST: ${GAME_HOST}
       GAME_WS_SECRET: ${GAME_WS_SECRET}
       # The OtterTube site (SN-051): LAN-only, one name, the web build plus the
-      # catalogue and media proxied to homehub-ottertube-media. A Technitium
-      # pinpoint record exists for it only while OTTERTUBE_ENABLED=true.
+      # catalogue and media proxied to homehub-ottertube-media, and the update
+      # channel (SR-125). A Technitium pinpoint record exists for it only while
+      # the site knob is on.
       OTTERTUBE_HOST: ${OTTERTUBE_SUBDOMAIN:-ottertube}.${DOMAIN}
+      # THE SITE KNOB, RESOLVED HERE (SR-126): OTTERTUBE_SITE_ENABLED, and when
+      # that is empty or unset the library knob OTTERTUBE_ENABLED - the reading
+      # provision-technitium.sh makes too. A hub whose .env predates the split
+      # has only OTTERTUBE_ENABLED, so it keeps the site exactly as before.
+      # The Caddyfile accepts exactly `true`. Fixed at create time: recreate
+      # caddy after changing either knob.
+      OTTERTUBE_SITE_ENABLED: ${OTTERTUBE_SITE_ENABLED:-${OTTERTUBE_ENABLED:-false}}
     # THREE NETWORKS, and ALL must be named explicitly. Naming any network at
     # all opts a service OUT of the implicit `default`, so omitting `default`
     # here would cut Caddy off from tracker, actual and oauth2-proxy in one edit
@@ -207,6 +215,18 @@ services:
       - ./monitoring/metrics-site:/srv/metrics/site:ro
       - /var/lib/homehub-metrics:/srv/metrics/data:ro
       - /var/lib/homehub-health-raw:/srv/metrics/raw:ro
+      # OtterTube's update channel (SR-125): update.json, update.json.sig and
+      # the OtterTube-<commit7>.exe they name, read-only. A folder of its own
+      # because web/ is replaced by `rsync --delete` on every web-build
+      # delivery. Ships with a README only; HomeHub's
+      # Publish-OtterTubeUpdate.ps1 writes INTO it (never replace the folder:
+      # that detaches this mount). Not backed up: re-send the last release
+      # after a rebuild.
+      - ./ottertube/updates:/srv/ottertube/updates:ro
+      # Its landing page at the site's root (SR-125): static and tracked in this
+      # repository, so it arrives with the stack and no web-build delivery
+      # touches it.
+      - ./ottertube/landing:/srv/ottertube/landing:ro
       # THE ACCESS LOG fail2ban READS, and it is a BIND MOUNT rather than a
       # named volume on purpose: fail2ban runs on the HOST and has to be able to
       # tail the file. Only the admin sign-in host and the LLM gateway log here

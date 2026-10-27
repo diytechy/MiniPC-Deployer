@@ -61,6 +61,7 @@ only the Contract cell's opening words; the CSV holds the contract.
 | **IF-072** | Consumes | HomeHub (private deploy config) | Implemented | v1 | SR-114, SR-115 | v1 OtterTube curated list (SR-114). One JSON file, HomeHub scripts/deploy/ottertube/list.json, installed as … |
 | **IF-073** | Provides | OtterTube (browser build and desktop app) | Implemented | v1 | SR-117 | v1 OtterTube site (SR-117). https://&lt;OTTERTUBE_SUBDOMAIN>.&lt;DOMAIN>/ottertube/ on the LAN only (403 elsewhere … |
 | **IF-074** | Provides | HomeHub (the Owner and agents: charts, debugging, later analysis) | Implemented | v1 | SR-122, SR-123, SR-124 | v1 hub metrics log (SR-122..SR-124), all JSONL, one object per line, UTC epochs. … |
+| **IF-075** | Provides | OtterTube (desktop app's update check) and HomeHub (the publisher) | Implemented | v1 | SR-125, SR-126, SR-127 | v1 OtterTube update channel (SR-125..SR-127). On the OtterTube site (IF-073; LAN only, the site knob … |
 <!-- END GENERATED IF INDEX -->
 
 ## Notes on selected interfaces (hand-written)

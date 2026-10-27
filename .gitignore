@@ -89,3 +89,7 @@ stack/ottertube/config/
 stack/ottertube/indexer/
 stack/ottertube/web/*
 !stack/ottertube/web/README.md
+# The update channel's files (SR-125) are published to the hub by HomeHub's
+# Publish-OtterTubeUpdate.ps1, never committed here.
+stack/ottertube/updates/*
+!stack/ottertube/updates/README.md

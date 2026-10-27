@@ -1,0 +1,44 @@
+<!doctype html>
+<!-- OtterTube's landing page at the site's root (SR-125; HomeHub open-items A77,
+     the Owner 2026-10-27). Static and git-tracked: it ships with the stack, so a
+     web-build delivery (rsync --delete into web/) never touches it. landing.js
+     reads the published /ottertube/update.json and offers the exe it names; every
+     value from the manifest is inserted as text (textContent), never as markup. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>OtterTube</title>
+<link rel="stylesheet" href="/landing.css">
+<script src="/landing.js" defer></script>
+</head>
+<body data-ottertube-landing="1">
+<main>
+  <h1>OtterTube</h1>
+  <p class="lede">The kids' app for this household's Windows computers.</p>
+
+  <section id="release" aria-live="polite">
+    <p id="status">Looking for the current release...</p>
+    <p><a id="download" class="button" hidden>Download OtterTube</a></p>
+    <p id="details" class="details" hidden></p>
+  </section>
+
+  <section>
+    <h2>Installing on Windows</h2>
+    <ol>
+      <li>Download the file and keep it in a folder of its own on this computer (not on a network drive).
+        It is a portable app: running it is the installation.</li>
+      <li>Windows may say <strong>"Windows protected your PC"</strong>. OtterTube is not signed with a
+        Microsoft Authenticode certificate, so SmartScreen does not recognise it. Choose
+        <strong>More info</strong>, then <strong>Run anyway</strong>. Do this only for a file downloaded from
+        this page, on your home network.</li>
+      <li>From then on OtterTube updates itself from this hub when it starts, and takes only an update
+        signed with the household's update key.</li>
+    </ol>
+  </section>
+
+  <p class="other"><a href="/ottertube/">Open OtterTube in this browser instead</a></p>
+</main>
+</body>
+</html>

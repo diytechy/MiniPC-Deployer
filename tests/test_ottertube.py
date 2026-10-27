@@ -1007,8 +1007,12 @@ def test_tc1446_the_private_list_rides_the_site_payload_optionally():
 
 
 def test_tc1446_the_dns_record_exists_only_with_the_knob():
+    # Since the split (SR-126) the record follows the SITE knob, empty falling
+    # back to OTTERTUBE_ENABLED; tests/test_ottertube_updates.py (TC-1526) runs
+    # these lines over every case.
     text = (STACK / "provision" / "provision-technitium.sh").read_text(encoding="utf-8")
-    assert re.search(r'if \[ "\$\{OTTERTUBE_ENABLED:-\}" = true \]; then\s+add_a "\$TOKEN" "\$\{OTTERTUBE_SUBDOMAIN:-ottertube\}\.\$\{DOMAIN\}" "\$LAN_IP"', text)
+    assert re.search(r'local __ot_site="\$\{OTTERTUBE_SITE_ENABLED:-\$\{OTTERTUBE_ENABLED:-\}\}"\s+'
+                     r'if \[ "\$__ot_site" = true \]; then\s+add_a "\$TOKEN" "\$\{OTTERTUBE_SUBDOMAIN:-ottertube\}\.\$\{DOMAIN\}" "\$LAN_IP"', text)
     assert "*." not in re.sub(r"#.*", "", text.split("OTTERTUBE (SN-051")[1].split("fi")[0])
 
 

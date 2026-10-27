@@ -1,0 +1,16 @@
+/* OtterTube landing page (stack/ottertube/landing). No external resources: the
+   page's Content-Security-Policy allows only this origin. */
+:root { color-scheme: light dark; --accent: #16807a; --text: #1d2a2a; --bg: #f7f4ec; --muted: #5b6767; }
+@media (prefers-color-scheme: dark) { :root { --text: #e8ece9; --bg: #142020; --muted: #a3b0ad; --accent: #4fc2b9; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.5 system-ui, "Segoe UI", sans-serif; }
+main { max-width: 40rem; margin: 0 auto; padding: 2rem 1rem 3rem; }
+h1 { font-size: 2.2rem; margin: 0 0 .25rem; color: var(--accent); }
+h2 { font-size: 1.2rem; margin-top: 2rem; }
+.lede { margin-top: 0; color: var(--muted); }
+#release { margin: 1.5rem 0; padding: 1rem 1.25rem; border-radius: .75rem; border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); }
+.button { display: inline-block; padding: .7rem 1.4rem; border-radius: .6rem; background: var(--accent); color: #fff; font-weight: 600; text-decoration: none; }
+.button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
+.details { font-size: .9rem; color: var(--muted); overflow-wrap: anywhere; }
+.other a { color: var(--accent); }
+li { margin-bottom: .6rem; }

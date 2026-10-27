@@ -40,7 +40,7 @@ and the update files keep serving; the catalogue and media then 502.
 | `homehub-ottertube-media.service` | the read-only media and catalogue server (`homehub-ottertube-media`, the hub's caddy-cloudflare image, `caddy file-server` on :8080), bound to the mount |
 | compose `ottertube-ytdl-sub` | ytdl-sub, pinned; started by `ottertube.py` ONCE PER ITEM with a one-item subscription file |
 | compose `ottertube-indexer` | node, pinned; runs OtterTube's `tools/catalog/build-catalog.mjs` from `indexer/`, no network |
-| Caddy `{$OTTERTUBE_HOST}` | the site: `/ottertube/` the web build (`web/`), `/ottertube/catalog.json`, `/ottertube/media/...` proxied to the media server, and `/ottertube/update.json`, `update.json.sig`, `OtterTube-<commit7>.exe` from `updates/` |
+| Caddy `{$OTTERTUBE_HOST}` | the site: `/` the landing page (`landing/`), `/ottertube/` the web build (`web/`), `/ottertube/catalog.json`, `/ottertube/media/...` proxied to the media server, and `/ottertube/update.json`, `update.json.sig`, `OtterTube-<commit7>.exe` from `updates/` |
 
 Every run container has a fixed `--name`, and it belongs to the docker daemon,
 not to the client the runner bounds: after any non-zero client exit (a timeout
@@ -118,6 +118,19 @@ a text tool (a BOM, a CRLF or a re-format makes every copy refuse the update).
 **Nothing published** is a normal state: the app gets 404, logs `not-found` and
 starts as it is.
 
+**The landing page** (the Owner, 2026-10-27): the site's root `/` serves
+`landing/` (`index.html`, `landing.js`, `landing.css`; tracked here, mounted
+read-only, so a web-build delivery never touches it). Its script reads
+`/ottertube/update.json` and offers a **Download OtterTube** link to the exe it
+names, with the version and build date (every manifest value inserted as text;
+a manifest OtterTube would refuse shows a message and no link), says **No
+release published yet** on a 404, and carries the SmartScreen note: the exe has
+no Authenticode signature, so Windows says "Windows protected your PC" (More
+info, Run anyway). The page's CSP allows only same-origin script, style and
+fetch. It replaced a 302 from `/` to `/ottertube/`, and links there. It does
+not check the signature (a browser has no key); the installed app checks every
+update it takes.
+
 ## Coordinator procedures
 
 **Deploying the web build and the indexer** (from ONE recorded OtterTube
@@ -190,8 +203,8 @@ release's index digest against ghcr.io, update `ottertube-images.pin` and the
   SKIPS on WSL2 (no ext4 quota support).
 * `tests/ottertube-lab.sh` (root + docker + network; TC-1441..TC-1443): the
   pinned images, one public-domain NASA clip, the real Caddy block. Never on the hub.
-* `tests/ottertube-updates-lab.sh` (docker only, no network; TC-1531..TC-1536):
-  the update channel's routes and the site knob against the real Caddy block in
+* `tests/ottertube-updates-lab.sh` (docker only, no network; TC-1531..TC-1536, TC-1539):
+  the update channel's routes, the landing page and the site knob against the real Caddy block in
   the hub's Caddy image, and compose's fallback for the knob. Never on the hub.
 
 ## What was measured (2026-10-22, dev PC WSL + QEMU with the hub's 6.8.0-147 kernel)

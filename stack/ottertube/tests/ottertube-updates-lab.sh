@@ -81,7 +81,7 @@ start_caddy() {  # LAN_CIDR, then -e flags for OTTERTUBE_SITE_ENABLED (none: uns
     local cidr="$1"; shift
     docker rm -f "$NAME" >/dev/null 2>&1
     docker run -d --name "$NAME" -p "127.0.0.1:$PORT:443" -e OTTERTUBE_HOST=ottertube.lab.test -e LAN_CIDR="$cidr" "$@" \
-        -v "$W/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" -v "$W/web:/srv/ottertube/web:ro" -v "$W/updates:/srv/ottertube/updates:ro" \
+        -v "$W/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" -v "$W/web:/srv/ottertube/web:ro" -v "$W/updates:/srv/ottertube/updates:ro" -v "$STACK/ottertube/landing:/srv/ottertube/landing:ro" \
         "$IMAGE" >/dev/null || return 1
     for _ in $(seq 1 40); do
         curl -sk -o /dev/null --resolve "ottertube.lab.test:$PORT:127.0.0.1" "https://ottertube.lab.test:$PORT/" && return 0
@@ -141,6 +141,20 @@ if start_caddy "0.0.0.0/0" -e OTTERTUBE_SITE_ENABLED=true; then
 else
     bad "1-5 caddy did not start with the real block"
 fi
+
+# 9 the landing page at the root: 200, the tracked page, its strict CSP, its script
+if start_caddy "0.0.0.0/0" -e OTTERTUBE_SITE_ENABLED=true; then
+    h="$(lab -D - -o /dev/null "$U/" | tr -d '\r' | tr 'A-Z' 'a-z')"
+    page_sha="$(lab "$U/" | sha256sum | cut -d' ' -f1)"
+    js="$(code "$U/landing.js")"; css="$(code "$U/landing.css")"; other="$(code "$U/landing.html")"
+    # the catalogue still goes to the media server (none in this lab: 502), never the page
+    cat="$(code "$U/ottertube/catalog.json")"
+    if [[ "$h" == "http/"*" 200"* ]] && [ "$page_sha" = "$(file_sha "$STACK/ottertube/landing/index.html")" ] \
+        && [[ "$(hval "$h" content-security-policy)" == "default-src 'none'; script-src 'self';"* ]] \
+        && [ "$js$css$other" = 200200404 ] && [ "$cat" = 502 ]; then
+        ok "9 /: 200, the tracked landing page byte for byte, CSP default-src 'none'; landing.js and .css 200, another name 404; catalog.json still proxied (502 here)"
+    else bad "9 landing: js=$js css=$css other=$other catalog=$cat $(printf '%s' "$h" | head -3 | tr '\n' ' ')"; fi
+else bad "9 caddy did not start"; fi
 
 # 6 the site knob: anything but exactly `true` is a 404 for the whole block
 for v in false True "" unset; do

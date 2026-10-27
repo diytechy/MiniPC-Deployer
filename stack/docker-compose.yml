@@ -214,6 +214,10 @@ services:
       # that detaches this mount). Not backed up: re-send the last release
       # after a rebuild.
       - ./ottertube/updates:/srv/ottertube/updates:ro
+      # Its landing page at the site's root (SR-125): static and tracked in this
+      # repository, so it arrives with the stack and no web-build delivery
+      # touches it.
+      - ./ottertube/landing:/srv/ottertube/landing:ro
       # THE ACCESS LOG fail2ban READS, and it is a BIND MOUNT rather than a
       # named volume on purpose: fail2ban runs on the HOST and has to be able to
       # tail the file. Only the admin sign-in host and the LLM gateway log here

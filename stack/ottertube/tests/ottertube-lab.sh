@@ -20,7 +20,7 @@
 # server and Caddy's OtterTube site block (the real one, TLS switched to
 # `internal`) serve it: the catalogue revalidated, the video with RANGE
 # (206), CORS for the app's two origins only, no info.json or dot file
-# reachable, 403 off the LAN, / redirected; and on a filesystem too small for
+# reachable, 403 off the LAN, / the landing page; and on a filesystem too small for
 # the clip the real ytdl-sub fails with ENOSPC and the run stops cleanly
 # (exit 75, work emptied). The mount guard is stubbed here (no project quota
 # on WSL); its refusals are proven by ottertube-quota.root-test.sh.
@@ -132,8 +132,12 @@ docker network create ottertube-lab >/dev/null
 docker network connect ottertube-lab homehub-ottertube-media
 start_caddy() {  # LAN_CIDR
     docker rm -f ottertube-lab-caddy >/dev/null 2>&1
+    # OTTERTUBE_SITE_ENABLED=true: compose resolves the site knob into caddy's
+    # environment (SR-126); without it the block answers 404 to everything.
     docker run -d --name ottertube-lab-caddy --network ottertube-lab -e OTTERTUBE_HOST=ottertube.lab.test -e LAN_CIDR="$1" \
+        -e OTTERTUBE_SITE_ENABLED=true \
         -v "$P/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" -v "$P/ottertube/web:/srv/ottertube/web:ro" \
+        -v "$STACK/ottertube/landing:/srv/ottertube/landing:ro" \
         "caddy-cloudflare:$CADDY_TAG" >/dev/null
     sleep 3
 }
@@ -154,7 +158,7 @@ if [[ "$range_h" == *" 206"* && "${range_h,,}" == *"content-range: bytes 0-99/"*
 else bad "4b range: $(echo "$range_h" | head -8)"; fi
 if [[ "$cors_app" == *"app://ottertube"* ]] && [ "$cors_bad" = 0 ]; then ok "4c CORS: app://ottertube allowed, another origin not"; else bad "4c CORS: app=[$cors_app] other=$cors_bad"; fi
 if [ "$info_code" = 404 ] && [ "$dot_code" = 404 ]; then ok "4d an info.json and the indexer's dot file: 404"; else bad "4d info=$info_code dot=$dot_code"; fi
-if [[ "$root_h" == *" 302"* && "$root_h" == *"/ottertube/"* ]] && [ "$web_code" = 200 ]; then ok "4e / redirects to /ottertube/, the web build answers 200"; else bad "4e root=$(echo "$root_h" | head -3) web=$web_code"; fi
+if [[ "$root_h" == *" 200"* && "${root_h,,}" == *"content-security-policy: default-src 'none'"* ]] && [ "$web_code" = 200 ]; then ok "4e / is the landing page (200, its CSP; SR-125), the web build answers 200"; else bad "4e root=$(echo "$root_h" | head -3) web=$web_code"; fi
 start_caddy "10.255.255.0/24"
 lan_code="$(lab_curl -o /dev/null -w '%{http_code}' https://ottertube.lab.test/ottertube/catalog.json)"
 [ "$lan_code" = 403 ] && ok "4f a client outside LAN_CIDR: 403" || bad "4f off-LAN: $lan_code"

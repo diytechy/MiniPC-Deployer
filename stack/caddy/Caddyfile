@@ -893,6 +893,10 @@ ntfy.{$DOMAIN} {
 #                               RESERVED for later platforms (linux|darwin|
 #                               windows, x64|arm64); update.json stays the
 #                               Windows schema-1 file for good.
+#   /  (/landing.js, /landing.css)
+#                               the landing page: the current release's download
+#                               link and install note, from
+#                               /opt/homehub/stack/ottertube/landing (tracked)
 #   /ottertube/catalog.json     the catalogue the indexer last wrote
 #   /ottertube/media/<kind>/<id>.<ext>
 #                               the PUBLICATION only (hard links the indexer made
@@ -998,8 +1002,20 @@ ntfy.{$DOMAIN} {
             encode zstd gzip
             file_server
         }
-        handle / {
-            redir * /ottertube/ 302
+        # THE LANDING PAGE at the root (SR-125; the Owner, 2026-10-27): a
+        # static page from ./ottertube/landing (git-tracked, so a web-build
+        # delivery never wipes it) whose script reads update.json and offers
+        # the exe it names. Three exact names; the page loads nothing from
+        # elsewhere, and its CSP says so. It replaced a 302 to /ottertube/
+        # (the page links there).
+        @ot_landing path / /landing.js /landing.css
+        handle @ot_landing {
+            header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+            header X-Content-Type-Options nosniff
+            header Referrer-Policy no-referrer
+            header >Cache-Control "no-cache"
+            root * /srv/ottertube/landing
+            file_server
         }
         handle {
             respond 404

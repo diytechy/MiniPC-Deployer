@@ -270,3 +270,111 @@ def test_tc1530_the_routes_are_the_names_the_app_asks_for():
     readme = read(OTTERTUBE / "desktop" / "README.md")
     assert "the exe first, then `update.json.sig` and `update.json`" in readme
     assert "the exe first, then `update.json.sig`, then\n`update.json`" in read(OT_DIR / "updates" / "README.md")
+
+
+# ── TC-1537 the landing page's route: the root, from a tracked folder ────────
+
+
+def test_tc1537_the_root_is_the_landing_page_from_its_own_tracked_folder():
+    block = caddy_block()
+    assert "@ot_landing path / /landing.js /landing.css\n" in block
+    body = handle_body(block, "@ot_landing")
+    assert "root * /srv/ottertube/landing" in body and "file_server" in body and "browse" not in body
+    assert "Content-Security-Policy \"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self';" in body
+    assert "X-Content-Type-Options nosniff" in body
+    assert "redir" not in block, "the old 302 to /ottertube/ is gone"
+    assert "./ottertube/landing:/srv/ottertube/landing:ro" in compose()["services"]["caddy"]["volumes"]
+    landing = OT_DIR / "landing"
+    for name in ("index.html", "landing.js", "landing.css"):
+        assert (landing / name).is_file(), name
+    # tracked, so a web-build delivery (rsync --delete into web/) never touches it
+    git = shutil.which("git")
+    if git and (ROOT / ".git").exists():
+        for name in ("index.html", "landing.js", "landing.css"):
+            assert subprocess.run([git, "check-ignore", "-q", "stack/ottertube/landing/" + name], cwd=ROOT).returncode != 0
+    page = read(landing / "index.html")
+    assert '<script src="/landing.js" defer></script>' in page and "<script>" not in page, "no inline script under the CSP"
+    assert "/ottertube/" in page, "the page still leads to the web build"
+    for phrase in ("Windows protected your PC", "More info", "Run anyway"):
+        assert phrase in page, phrase
+
+
+# ── TC-1538 the landing script, under node: text only, the current release ──
+
+
+LANDING_HARNESS = r"""
+const lp = require(process.argv[1]);
+const cases = JSON.parse(process.argv[2]);
+function el() { return { textContent: '', hidden: true, attrs: {}, setAttribute(k, v) { this.attrs[k] = String(v); },
+  set innerHTML(v) { throw new Error('innerHTML used'); } }; }
+(async () => {
+  const out = [];
+  for (const c of cases) {
+    const doc = { els: { status: el(), download: el(), details: el() }, getElementById(id) { return this.els[id]; } };
+    const fetchFn = async (url, opts) => {
+      if (c.throws) throw new Error('offline');
+      return { status: c.status, text: async () => c.text, _url: url, _opts: opts };
+    };
+    let seen = null;
+    const r = await lp.load(doc, async (u, o) => { seen = { u, o }; return fetchFn(u, o); });
+    out.push({ kind: r.kind, status: doc.els.status.textContent, hidden: doc.els.download.hidden,
+               href: doc.els.download.attrs.href || null, download: doc.els.download.attrs.download || null,
+               link: doc.els.download.textContent, details: doc.els.details.textContent, asked: seen && seen.u, opts: seen && seen.o });
+  }
+  console.log(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(3); });
+"""
+
+
+def good_manifest(**over):
+    m = {"schema": 1, "product": "OtterTube", "version": "0.2.0", "commit": "abcdef1" + "2" * 33, "dirty": False,
+         "builtAt": "2026-10-27T09:30:00.000Z", "file": "OtterTube-abcdef1.exe", "size": 120 * 1048576, "sha256": "c" * 64}
+    m.update(over)
+    return json.dumps(m, indent=2) + "\n"
+
+
+def run_landing(cases):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("needs node")
+    js = str(OT_DIR / "landing" / "landing.js")
+    out = subprocess.run([node, "-e", LANDING_HARNESS, js, json.dumps(cases)], capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
+def test_tc1538_the_landing_script_offers_exactly_the_published_build_as_text():
+    r = run_landing([{"status": 200, "text": good_manifest()}])[0]
+    assert r["kind"] == "release" and r["hidden"] is False
+    assert r["href"] == "/ottertube/OtterTube-abcdef1.exe" and r["download"] == "OtterTube-abcdef1.exe"
+    assert r["link"] == "Download OtterTube 0.2.0"
+    assert r["status"] == "OtterTube 0.2.0, built 2026-10-27."
+    assert "SHA-256 " + "c" * 64 in r["details"] and "commit abcdef1" in r["details"]
+    assert r["asked"] == "/ottertube/update.json"
+    assert r["opts"] == {"cache": "no-store", "credentials": "omit", "redirect": "error"}
+
+
+@pytest.mark.parametrize("case, kind, says", [
+    ({"status": 404, "text": ""}, "none", "No release published yet."),
+    ({"status": 502, "text": ""}, "error", "HTTP 502"),
+    ({"throws": True}, "error", "could not be reached"),
+    ({"status": 200, "text": "<html>"}, "error", "could not be read"),
+    ({"status": 200, "text": good_manifest(schema=2)}, "error", "not one OtterTube would read"),
+    ({"status": 200, "text": good_manifest(file="javascript:alert(1)")}, "error", "not one OtterTube would read"),
+    ({"status": 200, "text": good_manifest(file="../../etc/OtterTube-abcdef1.exe")}, "error", "not one OtterTube would read"),
+    ({"status": 200, "text": good_manifest(version="<img src=x onerror=alert(1)>")}, "error", "not one OtterTube would read"),
+    ({"status": 200, "text": good_manifest(builtAt="2026-99-99T99:99:99Z")}, "error", "not one OtterTube would read"),
+    ({"status": 200, "text": good_manifest(dirty="false")}, "error", "not one OtterTube would read"),
+])
+def test_tc1538_no_release_or_a_bad_one_never_shows_a_link(case, kind, says):
+    r = run_landing([case])[0]
+    assert r["kind"] == kind and says in r["status"]
+    assert r["hidden"] is True and r["href"] is None
+
+
+def test_tc1538_the_script_has_no_markup_sink():
+    js = read(OT_DIR / "landing" / "landing.js")
+    code = "\n".join(l for l in js.splitlines() if not l.lstrip().startswith("//"))
+    for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", "srcdoc"):
+        assert sink not in code, sink
+    assert "textContent" in code

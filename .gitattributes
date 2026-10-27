@@ -34,3 +34,9 @@ tests/fixtures/wall-sync-frame.timer.d-10-cadence.conf -text
 # The frozen IF-020 PCM frame fixture. Byte-identical in OfficeWallNaglight, so
 # a line-ending rewrite here would be a silent, cross-repository contract change.
 *.bin binary
+
+# OtterTube's update channel (SR-125): the signature covers update.json's exact
+# bytes. The folder is git-ignored; should a copy ever be tracked, it must
+# never be line-ending-normalised.
+stack/ottertube/updates/update*.json binary
+stack/ottertube/updates/update*.json.sig binary

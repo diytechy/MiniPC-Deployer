@@ -36,6 +36,7 @@
 #   {$GAME_HOST} {$GAME_WS_SECRET}
 #   {$LLM_GATEWAY_HOST}
 #   {$OTTERTUBE_HOST}
+#   {$OTTERTUBE_SITE_ENABLED}
 
 {
     # WHERE rate_limit SITS IN THE CHAIN, and it is the whole point of the
@@ -882,6 +883,16 @@ ntfy.{$DOMAIN} {
 #
 #   /ottertube/                 the web build (npm run build -> dist/web),
 #                               /opt/homehub/stack/ottertube/web, read-only
+#   /ottertube/update.json      THE UPDATE CHANNEL (SR-125, IF-075): the signed
+#   /ottertube/update.json.sig  manifest, its ed25519 signature and the portable
+#   /ottertube/OtterTube-<commit7>.exe   exe it names, from
+#                               /opt/homehub/stack/ottertube/updates, read-only.
+#                               A separate folder because the web build's
+#                               delivery is `rsync --delete` into web/.
+#   /ottertube/update-<os>-<arch>.json(.sig)
+#                               RESERVED for later platforms (linux|darwin|
+#                               windows, x64|arm64); update.json stays the
+#                               Windows schema-1 file for good.
 #   /ottertube/catalog.json     the catalogue the indexer last wrote
 #   /ottertube/media/<kind>/<id>.<ext>
 #                               the PUBLICATION only (hard links the indexer made
@@ -894,12 +905,28 @@ ntfy.{$DOMAIN} {
 # videos yet"). Range requests pass through reverse_proxy to its file_server,
 # which answers them (206), so a <video> seeks.
 #
-# The Technitium record exists only while OTTERTUBE_ENABLED=true
-# (provision-technitium.sh); with it off this site still holds its certificate
-# and answers nothing useful, like every other site whose service is off.
+# TWO KNOBS (SR-126). OTTERTUBE_SITE_ENABLED is the SITE AND THE UPDATE
+# CHANNEL: this block's content and the Technitium record
+# (provision-technitium.sh). OTTERTUBE_ENABLED is the VIDEO LIBRARY: the
+# download and media units (stack/ottertube). An EMPTY site knob follows the
+# library knob, which is what every hub that predates the split has, so the
+# split changes nothing on delivery. Compose resolves that fallback into this
+# container's OTTERTUBE_SITE_ENABLED; anything but exactly `true` is off.
+# With the site off the block still holds its certificate and answers 404 to
+# every LAN request (the web build and the update files included), and the
+# name has no record. With the library off the catalogue and media 502 (no
+# media server) while the web build and the update files still serve.
 {$OTTERTUBE_HOST} {
     import acme_cloudflare
     @lan remote_ip {$LAN_CIDR}
+    # The site knob, read at parse time ({$...} is substituted before the
+    # expression is compiled). A named, non-path matcher, so it keeps its place
+    # FIRST among the handles below (Caddy sorts handles by path specificity,
+    # and keeps written order among named matchers).
+    @ot_site_off expression `"{$OTTERTUBE_SITE_ENABLED}" != "true"`
+    handle @ot_site_off {
+        respond "ottertube: site off" 404
+    }
     handle @lan {
         # CORS for the two origins the app runs from, on every response (the
         # app routes media through Web Audio for the parent's volume cap, which
@@ -919,6 +946,37 @@ ntfy.{$DOMAIN} {
             header >Cache-Control "no-cache"
             rewrite * /catalog/catalog.json
             reverse_proxy homehub-ottertube-media:8080
+        }
+        # THE UPDATE CHANNEL (SR-125; OtterTube desktop/src/main/update.ts).
+        # Exact names only, from the updates folder, and NO `encode`: the app
+        # checks Content-Length against the manifest's size and hashes the
+        # bytes, and the signature covers update.json's exact bytes. The
+        # manifest and its signature are always revalidated; the exe is named
+        # by its commit, so it never changes under its name. `handle` sorts
+        # ahead of every `handle_path` below, so the web build's catch-all can
+        # never answer these names. Anything else in the folder (its README, a
+        # publish's .tmp) has no route.
+        @ot_update path /ottertube/update.json /ottertube/update.json.sig
+        handle @ot_update {
+            header >Cache-Control "no-cache"
+            root * /srv/ottertube/updates
+            uri strip_prefix /ottertube
+            file_server
+        }
+        # Reserved for later platforms (decision 5.6): served once published,
+        # 404 until then; nothing writes them yet.
+        @ot_update_os path_regexp ^/ottertube/update-(linux|darwin|windows)-(x64|arm64)\.json(\.sig)?$
+        handle @ot_update_os {
+            header >Cache-Control "no-cache"
+            root * /srv/ottertube/updates
+            uri strip_prefix /ottertube
+            file_server
+        }
+        @ot_update_exe path_regexp ^/ottertube/OtterTube-[0-9a-f]{7}\.exe$
+        handle @ot_update_exe {
+            root * /srv/ottertube/updates
+            uri strip_prefix /ottertube
+            file_server
         }
         # Media: the publication only, media and image types only. A name never
         # changes between runs and a changed download is replaced by rename, so

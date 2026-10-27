@@ -913,8 +913,8 @@ ntfy.{$DOMAIN} {
 # split changes nothing on delivery. Compose resolves that fallback into this
 # container's OTTERTUBE_SITE_ENABLED; anything but exactly `true` is off.
 # With the site off the block still holds its certificate and answers 404 to
-# every LAN request (the web build and the update files included), and the
-# name has no record. With the library off the catalogue and media 502 (no
+# every request, on the LAN or off it (the gate comes before the @lan one; the
+# web build and the update files included), and the name has no record. With the library off the catalogue and media 502 (no
 # media server) while the web build and the update files still serve.
 {$OTTERTUBE_HOST} {
     import acme_cloudflare

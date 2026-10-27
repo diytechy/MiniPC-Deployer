@@ -1,0 +1,39 @@
+# homehub-clips-cut - cut motion clips from the rolling camera recording
+# (SR-129, SR-131; stack/clips/README.md). Every minute, from the IF-076 event
+# store: an episode is cut once its display window has closed and the recording
+# has reached its end. Copy-only (ffmpeg in the relay's pinned image).
+#
+# A CLIPS WRITER, so the writer pattern (stack/scratch/README.md): the guard
+# for CLIPS_ROOT runs before EVERY file, and the unit drops CAP_SYS_RESOURCE,
+# without which the kernel ignores the quota (fs/quota/dquot.c). No BindsTo= a
+# mount: CLIPS_ROOT is a knob (the scratch volume now, the media drive later),
+# so the guard - not a static mount dependency - is what refuses to write when
+# the area is absent. 75 = the area is full (stopped until retention makes
+# room), 76 = the guard refused: both alert; the unit shows failed.
+[Unit]
+Description=Motion clips: cut episodes from the rolling camera recording
+Documentation=file:///opt/homehub/stack/clips/README.md
+Wants=docker.service
+After=docker.service homehub-firstboot.service
+AssertPathExists=/opt/homehub/stack/clips/homehub_clips.py
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/homehub/stack
+ExecStart=/usr/bin/python3 /opt/homehub/stack/clips/homehub_clips.py cut
+SyslogIdentifier=homehub-clips
+StateDirectory=homehub-clips
+StateDirectoryMode=0750
+UMask=0027
+CapabilityBoundingSet=~CAP_SYS_RESOURCE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+TimeoutStartSec=15min
+Nice=10
+CPUAccounting=true
+CPUQuota=50%
+MemoryAccounting=true
+MemoryMax=768M
+TasksMax=32

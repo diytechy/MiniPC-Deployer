@@ -1,0 +1,37 @@
+# motion-engine.pin - the hub's copy of the panel's door motion engine, by commit AND hash.
+#
+# Implements: SR-128, LLR-1357
+#
+# motion_engine.py beside this file is OfficeWallNaglight doorstream/motion.py at
+# COMMIT with every comment removed and two docstrings (the module's and
+# MotionEngine's) rewritten in neutral terms: this repository is public, and the
+# source's comments record dated observations of a household (the Owner's ruling,
+# 2026-10-27). The CODE is the panel's: the replay-validated detector the panel
+# runs (WSN-023, WSN-106, WSN-107), so one detector, not two, decides what is
+# motion at the door (HomeHub open-items A78: "pin it, don't fork it").
+#
+# Two checks hold that:
+#   * camera_motion.py refuses to start when the file's sha256 is not SHA256 below
+#     (the scrubbed file is what is pinned);
+#   * tests/test_camera_motion.py TC-1543 compares the abstract syntax tree of this
+#     file with `git show COMMIT:PATH` from the sibling OfficeWallNaglight checkout,
+#     docstrings set aside: any change to the logic fails it.
+#
+# The file carries NO zones: its defaults are the whole image and no road band,
+# which MotionConfig.eligible refuses. The real polygons are private (HomeHub
+# scripts/deploy/config.homehub.psd1, T1) and reach the hub only in its .env.
+#
+# TO MOVE IT: take doorstream/motion.py from CameraOpt at a commit, scrub it the
+# same way (comments out, the two docstrings neutral, no dates and no household
+# detail), run TC-1543 against the new COMMIT, update COMMIT, LAST_CHANGE, SHA256
+# and PINNED together, run a `camera_motion.py replay` over recorded segments, and
+# commit them in one change.
+
+SOURCE_REPO=OfficeWallNaglight
+BRANCH=CameraOpt
+COMMIT=b6310d1eed5dfece312b12a1d2831d54409fbf06
+PATH=doorstream/motion.py
+LAST_CHANGE=182f0f6483585a83782eeaad3ff5b233ebc454d9
+SHA256=e5805b18a8a1eab8a0f3f09fc010f0357d24e3ebc714d92ce7142c7ac5b7bde5
+SCRUBBED=comments removed; module and MotionEngine docstrings rewritten
+PINNED=2026-10-27

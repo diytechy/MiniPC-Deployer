@@ -25,6 +25,6 @@ truth for what each id means.
 | 2026-10-23 | nightly backup into the unified lane | SR-121; LLR-1300; TC-1470..1479 (used: SR-121, LLR-1300, TC-1470..1475; SR-018, IF-003, IF-006 amended) |
 | 2026-10-26 | Hub metrics log: 5-min snapshot, 10:00/14:05 daily row, raw watch samples, chart page (HomeHub open-items A79) | SR-122..124; LLR-1321..1340; TC-1494..1520; IF-074 (used: SR-122..124, LLR-1321..1332, TC-1494..1510, IF-074; LLR-1330 also refs SR-073) |
 | 2026-10-26 | OtterTube update channel on the hub: updates folder, Caddy routes, site/library knob split (HomeHub open-items A77) | SR-125..127; LLR-1341..1355; TC-1521..1540; IF-075 (used: SR-125..127, LLR-1341..1350, TC-1521..1540, IF-075; SR-117, LLR-1277, IF-073, TC-1442 and TC-1446's test amended) |
-| 2026-10-27 | Hub door detector and motion clips: camera-generic event source, clip cutter, re-encode batch (HomeHub open-items A78) | SR-128..131; LLR-1356..1380; TC-1541..1575; IF-076..077 |
+| 2026-10-27 | Hub door detector and motion clips: camera-generic event source, clip cutter, re-encode batch (HomeHub open-items A78) | SR-128..131; LLR-1356..1380; TC-1541..1575; IF-076..077 (used: all of them - SR-128..131, LLR-1356..1380, TC-1541..1575, IF-076, IF-077; IF-071 amended for the scratch `clips` writer; the online scratch grow lives in LLR-1380, the encode trial in LLR-1374) |
 
 The plan is HomeHub `docs/archive/2026-10-23/IMPLEMENTATION_PLAN_2026-10-22.md`.

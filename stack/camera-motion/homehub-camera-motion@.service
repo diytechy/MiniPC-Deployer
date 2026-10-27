@@ -1,0 +1,51 @@
+# homehub-camera-motion@<camera> - the hub's motion detector for one relayed
+# camera (SR-128; stack/clips/README.md): the event source for motion clips.
+# One instance per camera named in CAMERAS (firstboot enables them). The knob is
+# CAMERA_<CAMERA>_MOTION_ENABLED in the stack .env, read by ExecCondition: an
+# instance with it off is enabled, inert and green (a clean skip). It SHIPS OFF:
+# the deploy step is a measured cost test first (stack/clips/README.md).
+#
+# Root, like the recorder: its decoder is a docker container (a consumer of the
+# door relay, the credential only on its stdin). It writes only IF-076 records
+# into /var/lib/homehub-clips/events/<camera>/ and its status file. 78 = refused
+# (the engine is not the pinned bytes, the zones are the public placeholder, a
+# knob is malformed, python3-opencv is missing): an alert, and no restart loop.
+# Anything else (the relay restarted, the stream stalled) is retried.
+#
+# CPUQuota bounds the ENGINE (this unit's cgroup); the decoder runs in docker's
+# cgroup, bounded by its own --cpus 0.4 and weighted low by --cpu-shares 256.
+# `camera_motion.py cost --camera <camera>` measures both.
+[Unit]
+Description=Camera motion detector (%i): the event source for motion clips
+Documentation=file:///opt/homehub/stack/clips/README.md
+# Wants=+After=, deliberately NOT Requires=docker.service (validate_config 5b).
+Wants=docker.service network-online.target homehub-door-relay.service
+After=docker.service network-online.target homehub-door-relay.service homehub-firstboot.service
+AssertPathExists=/opt/homehub/stack/camera-motion/camera_motion.py
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/homehub/stack
+ExecCondition=/usr/bin/python3 /opt/homehub/stack/camera-motion/camera_motion.py condition --camera %i
+ExecStart=/usr/bin/python3 /opt/homehub/stack/camera-motion/camera_motion.py run --camera %i
+ExecStopPost=-/usr/bin/docker rm -f homehub-camera-motion-%i
+SyslogIdentifier=homehub-camera-motion
+StateDirectory=homehub-clips
+StateDirectoryMode=0750
+Restart=on-failure
+RestartSec=15
+RestartPreventExitStatus=78
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+CPUAccounting=true
+CPUQuota=25%
+MemoryAccounting=true
+MemoryMax=256M
+TasksMax=64
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

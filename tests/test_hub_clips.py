@@ -1447,3 +1447,46 @@ def test_tc1563_no_listing_descends_through_a_symlink(tmp_path):
     os.symlink(str(tmp_path / "elsewhere"), str(root / "garage"))
     assert hc.camera_dirs(str(root)) == ["door"] and hc._days(str(root / "door")) == []
     assert hc.list_clips(str(root)) == []
+
+
+@pytest.mark.release
+@pytest.mark.skipif(not (SEGMENTS and os.path.isdir(SEGMENTS) and os.name == "posix" and docker_ok()),
+                    reason="set HOMEHUB_CLIPS_SEGMENTS to a door segment tree on a Linux docker host (WSL)")
+def test_tc1569_an_open_part_cut_from_a_real_segment_has_the_planned_frames(tmp_path, monkeypatch):
+    """The usual case for a cut: the window ends in the segment still being
+    written. A real segment is cut back to its first half (at a packet edge),
+    renamed .part and given the last-write time the recorder would have left
+    (its start + its frames' span), and a visit is cut from inside it."""
+    monkeypatch.setattr(hc, "guard", lambda settings: (True, "ok"))
+    real = [x for x in hc.list_segments(SEGMENTS, "door") if not x.part]
+    assert real, "no segments"
+    src = real[0]
+    data = open(src.path, "rb").read()
+    whole = hc.Loaded(src, data, 10)
+    half = whole.idx.offsets[len(whole.idx.offsets) // 2]
+    seg_dir = tmp_path / "segs"
+    day = time.strftime("%Y-%m-%d", time.gmtime(src.start))
+    (seg_dir / day).mkdir(parents=True)
+    part = seg_dir / day / (src.name + ".part")
+    part.write_bytes(data[:half])
+    frames = len(whole.idx.offsets) // 2
+    span = frames / 10.0 if whole.timing == "index" else whole.times[frames - 1] - whole.times[0] + 0.1
+    os.utime(str(part), (src.start + span, src.start + span))
+    root = tmp_path / "clips"
+    root.mkdir()
+    state = str(tmp_path / "state")
+    s = hc.ClipsSettings({"CAMERA_DOOR_SEGMENT_DIR": str(seg_dir)})
+    s.root = str(root)
+    event = int((src.start + span * 0.6) * 1000)
+    ev.append(state, rec(1, "approach", "event", event))
+    ev.append(state, rec(2, "visitor", "renewal", event + 3000))
+    counts = hc.cut_camera(s, s.cameras[0], state, event + 60000)
+    assert counts["cut"] == 1 and counts["failed"] == 0, counts
+    side_path = next(root.rglob("*.json"))
+    side = json.loads(side_path.read_text())
+    assert side["coverage"] == "full" and 100 <= side["frames"] <= 130, side
+    mp4 = side_path.with_suffix(".mp4")
+    done = subprocess.run(["docker", "run", "--rm", "--network", "none", "-v", "%s:/c.mp4:ro" % mp4,
+                           "--entrypoint", "ffmpeg", hc.door_relay.image_ref(), "-v", "error", "-i", "/c.mp4",
+                           "-f", "null", "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+    assert done.returncode == 0 and not done.stderr.strip(), done.stderr[-300:]

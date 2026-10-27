@@ -108,6 +108,11 @@ GAP_SEC = 2.0
 MAX_SNAP_SEC = 5.0         # how far back the cut may start for a keyframe
 STALE_PART_SEC = 3600
 LOW_CPUS = "0.4"           # the batch containers' ceiling (the detector's decoder has the same)
+MIN_INDEX_FPS = 0.5        # the slowest rate an index-timed segment anchored by its last write is given
+# The recorder writes a rotated segment's last bytes, then opens the next one at
+# floor(now): the old file's mtime lands just AFTER the next start (0.58-2.57 s
+# measured on the hub, 2026-10-27). Within this it is still the last write.
+ROTATION_SLACK_SEC = 5.0
 MAX_WAITS = 10             # passes an episode may wait on a listed segment that cannot be opened
 # How a person runs a verb that writes the clips area by hand: as the units do,
 # without CAP_SYS_RESOURCE (the quota is no wall for a process that holds it,
@@ -174,7 +179,9 @@ class ClipsSettings:
                CLIPS_EVENT_DAYS (14), CLIPS_ENCODE_ENABLED (false),
                CLIPS_ENCODE_CODEC (h264|hevc), CLIPS_ENCODE_KBPS (300),
                CLIPS_ENCODE_KEEP_PCT (80), CLIPS_ENCODE_MAX_PER_RUN (20),
-               CAMERA_VAAPI_DEVICE (/dev/dri/renderD128).  [stack/.env]
+               CAMERA_VAAPI_DEVICE (/dev/dri/renderD128), and the recorder's
+               DOOR_RECORDER_SEGMENT_SEC (600), which bounds the newest
+               finished segment's timing.  [stack/.env]
     Implements: LLR-1363.
     """
 
@@ -188,6 +195,8 @@ class ClipsSettings:
         self.cap_mib = mc.knob_int(env, "CLIPS_CAP_MIB", 95367, 64, 1 << 24)
         self.quota_high_pct = mc.knob_int(env, "CLIPS_QUOTA_HIGH_PCT", 90, 50, 99)
         self.event_days = mc.knob_int(env, "CLIPS_EVENT_DAYS", 14, 2, 365)
+        # the recorder's segment length: bounds the newest finished segment's timing
+        self.segment_sec = mc.knob_int(env, "DOOR_RECORDER_SEGMENT_SEC", 600, 10, 3600)
         self.encode = mc.knob_bool(env, "CLIPS_ENCODE_ENABLED", False)
         self.codec = env.get("CLIPS_ENCODE_CODEC", "").strip() or "h264"
         if self.codec not in ("h264", "hevc"):
@@ -311,7 +320,7 @@ def scan_frames(data: bytes, part: bool) -> FrameIndex:
 
 
 def frame_times(idx: FrameIndex, start: float, fps: int,
-                end: Optional[float] = None) -> Tuple[List[float], str]:
+                end: Optional[float] = None, end_is_last_write: bool = False) -> Tuple[List[float], str]:
     """Wall time of each frame: the segment's start plus its PTS offset, or,
     when the PTS cannot be believed, its index spread evenly from this
     segment's start to `end`, where its frames really end (the camera drops its
@@ -319,8 +328,13 @@ def frame_times(idx: FrameIndex, start: float, fps: int,
     seconds over ten minutes). The caller passes, for a finished segment, the
     earlier of the NEXT segment's start and the file's last write (a short
     recorder outage after it must not stretch it), and for the open .part its
-    last write. The nominal rate is used only when there is no anchor, or when
-    the anchor implies a rate above nominal or under half of it. PTS is
+    last write. When the anchor is the next segment's start, a rate under half
+    the nominal may hide a recorder restart between them, so the nominal rate
+    is used then; when it is the file's own last write it cannot hide one, so the
+    measured period is trusted down to MIN_INDEX_FPS (night and infrared go far
+    below half) and clamped there. The anchor is a hard bound (the frames
+    cannot be later than the last write, nor overlap the next segment), so an
+    anchor implying a rate above nominal shrinks the period to fit it. PTS is
     believed when every frame has one, every step is forward and under 60 s
     (a hole the recorder rode out without ending the segment), and the whole
     span is at least half what the frame count implies and at most twice that
@@ -338,9 +352,13 @@ def frame_times(idx: FrameIndex, start: float, fps: int,
             base = pts[0]
             return [start + ((p - base) % PTS_WRAP) / 90000.0 for p in pts], "pts"  # type: ignore[operator]
     period = 1.0 / fps
-    if end is not None and n > 1:
+    if end is not None and n > 1 and end > start:
         measured = (end - start) / float(n)
-        if 0.95 / fps <= measured <= 2.0 / fps:
+        if measured < period:
+            period = measured      # the anchor is a hard bound: never run past it into the next segment
+        elif end_is_last_write:
+            period = min(measured, 1.0 / MIN_INDEX_FPS)
+        elif measured <= 2.0 / fps:
             period = measured
     return [start + i * period for i in range(n)], "index"
 
@@ -350,16 +368,24 @@ class Loaded:
     by the recorder cannot pull the bytes from under a cut."""
 
     def __init__(self, seg: Segment, data: bytes, fps: int, next_start: Optional[float] = None,
-                 mtime: Optional[float] = None):
+                 mtime: Optional[float] = None, segment_sec: int = 600):
         self.seg = seg
         self.data = data
         self.idx = scan_frames(data, seg.part)
+        end = None  # type: Optional[float]
+        last_write = False
         if seg.part:
-            end = mtime                      # the open segment: its frames end at its last write
-        else:
-            anchors = [t for t in (next_start, mtime) if t is not None]
-            end = min(anchors) if anchors else None
-        self.times, self.timing = frame_times(self.idx, seg.start, fps, end)
+            end, last_write = mtime, mtime is not None   # the open segment: its frames end at its last write
+        elif next_start is not None:
+            if mtime is not None and mtime <= next_start + ROTATION_SLACK_SEC:
+                # a rotation (mtime just after the next start) or an earlier stop
+                end, last_write = min(mtime, next_start), True
+            else:
+                end = next_start          # touched since: the next start is all there is
+        elif mtime is not None:
+            # the newest finished segment: a copied file's mtime must not stretch it
+            end, last_write = min(mtime, seg.start + segment_sec + ROTATION_SLACK_SEC), True
+        self.times, self.timing = frame_times(self.idx, seg.start, fps, end, last_write)
         n = len(self.times)
         # The segment's own frame period: what its frames were actually spaced at.
         self.period = (self.times[-1] - self.times[0]) / (n - 1) if n > 1 and self.times[-1] > self.times[0] \
@@ -372,7 +398,7 @@ class Loaded:
 
 
 def load_segment(seg: Segment, fps: int, cache: Dict[tuple, "Loaded"],
-                 next_start: Optional[float] = None) -> Optional[Loaded]:
+                 next_start: Optional[float] = None, segment_sec: int = 600) -> Optional[Loaded]:
     """The segment read and indexed, or None when it cannot be opened (the
     recorder renamed or pruned it since it was listed)."""
     try:
@@ -385,7 +411,7 @@ def load_segment(seg: Segment, fps: int, cache: Dict[tuple, "Loaded"],
             data = handle.read(size)
     except OSError:
         return None
-    loaded = Loaded(seg, data, fps, next_start, st.st_mtime)
+    loaded = Loaded(seg, data, fps, next_start, st.st_mtime, segment_sec)
     cache[key] = loaded
     return loaded
 
@@ -1016,7 +1042,7 @@ def cut_camera(settings: ClipsSettings, cam: CameraSettings, state_dir: str, now
                 keep = {s.path for s, _n in needed}
                 for key in [k for k in cache if k[0] not in keep]:
                     del cache[key]
-                got = [(s, load_segment(s, cam.fps, cache, nxt)) for s, nxt in needed]
+                got = [(s, load_segment(s, cam.fps, cache, nxt, settings.segment_sec)) for s, nxt in needed]
                 waits = ledger.setdefault("waits", {})  # type: ignore[union-attr]
                 if any(x is None for _s, x in got):
                     # Renamed (.part -> .ts) or pruned since it was listed: the
@@ -1071,6 +1097,9 @@ def cut_camera(settings: ClipsSettings, cam: CameraSettings, state_dir: str, now
             mc.save_json_atomic(ledger_path(state_dir, cam.camera), ledger)
     finally:
         prune_ledger(ledger, now_ms)
+        live = {ep.id for ep in episodes}
+        for key in [k for k in ledger.get("waits", {}) if k not in live]:  # type: ignore[union-attr]
+            del ledger["waits"][key]  # type: ignore[index]
         mc.save_json_atomic(ledger_path(state_dir, cam.camera), ledger)
     if lost_new and alert:
         alert("clips-lost-%s" % cam.camera, "HomeHub: %d %s motion clip(s) could not be cut" % (len(lost_new), cam.camera),
@@ -1456,14 +1485,21 @@ def trial_table(report: Dict[str, object]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def trial_folders(root: str) -> List[str]:
+    """The trial's per-day folders: real directories only, never through a link."""
+    base = os.path.join(root, TRIAL_DIR)
+    if not _real_dir(base):
+        return []
+    return [os.path.join(base, top) for top in sorted(_listdir(base)) if _real_dir(os.path.join(base, top))]
+
+
 def trial_bytes(root: str) -> int:
     """Bytes the encode trial's folder holds (it counts against the quota)."""
-    base = os.path.join(root, TRIAL_DIR)
     total = 0
-    for top in _listdir(base):
-        for name in _listdir(os.path.join(base, top)):
+    for folder in trial_folders(root):
+        for name in _listdir(folder):
             try:
-                total += os.lstat(os.path.join(base, top, name)).st_size
+                total += os.lstat(os.path.join(folder, name)).st_size
             except OSError:
                 pass
     return total
@@ -1474,8 +1510,14 @@ def clean_trials(root: str, count_bytes: bool = False) -> int:
     count_bytes the bytes freed."""
     base = os.path.join(root, TRIAL_DIR)
     removed = freed = 0
+    if not _real_dir(base):
+        return 0
     for top in sorted(_listdir(base)):
         folder = os.path.join(base, top)
+        if not _real_dir(folder):
+            if _remove(folder):      # a link (or a stray file): the entry itself goes, never its target
+                removed += 1
+            continue
         for name in _listdir(folder):
             path = os.path.join(folder, name)
             try:
@@ -1537,24 +1579,28 @@ def list_clips(root: str, cameras: Optional[Sequence[str]] = None) -> List[Tuple
     out = []
     for camera in (camera_dirs(root) if cameras is None else cameras):
         cam_dir = os.path.join(root, camera)
+        if not _real_dir(cam_dir):
+            continue
         for day in _days(cam_dir):
             day_dir = os.path.join(cam_dir, day)
             for name in _listdir(day_dir):
                 if not name.endswith(".mp4"):
                     continue
+                try:
+                    st = os.lstat(os.path.join(day_dir, name))
+                except OSError:
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    continue      # only clips this pipeline wrote: never a link
                 stem = name[:-4]
                 start = stem_utc_ms(stem)
                 if start is None:
-                    try:
-                        start = int(os.path.getmtime(os.path.join(day_dir, name)) * 1000)
-                    except OSError:
-                        continue
-                size = 0
-                for ext in (".mp4", ".json"):
-                    try:
-                        size += os.path.getsize(os.path.join(day_dir, stem + ext))
-                    except OSError:
-                        pass
+                    start = int(st.st_mtime * 1000)
+                size = st.st_size
+                try:
+                    size += os.lstat(os.path.join(day_dir, stem + ".json")).st_size
+                except OSError:
+                    pass
                 out.append((start, day_dir, stem, size))
     out.sort()
     return out
@@ -1625,18 +1671,17 @@ def apply_retention(settings: ClipsSettings, state_dir: str, now_ms: int,
                 path = os.path.join(day_dir, name)
                 # A crashed cut or encode leaves a .part, or a sidecar whose clip
                 # was never renamed into place; an hour old, neither is in flight.
-                orphan = name.endswith(".json") and not os.path.exists(path[:-len(".json")] + ".mp4")
+                orphan = name.endswith(".json") and not os.path.lexists(path[:-len(".json")] + ".mp4")
                 if name.endswith(".part") or orphan:
                     try:
-                        if now_ms / 1000.0 - os.path.getmtime(path) > STALE_PART_SEC:
+                        if now_ms / 1000.0 - os.lstat(path).st_mtime > STALE_PART_SEC:
                             _remove(path)
                             stale += 1
                     except OSError:
                         pass
-    trial = os.path.join(settings.root, TRIAL_DIR)
-    for top in _listdir(trial):
-        for name in _listdir(os.path.join(trial, top)):
-            path = os.path.join(trial, top, name)
+    for folder in trial_folders(settings.root):
+        for name in _listdir(folder):
+            path = os.path.join(folder, name)
             try:
                 if name.endswith(".part") and now_ms / 1000.0 - os.lstat(path).st_mtime > STALE_PART_SEC:
                     _remove(path)

@@ -833,7 +833,8 @@ case "$BACKUP_RC" in
        if [ "$DAMAGED_SET_ASIDE" -gt 0 ]; then
            log "  AND $DAMAGED_SET_ASIDE STORED OBJECT(S) WERE FOUND DAMAGED ([DamagedObject] in that log): empty, or a raw"
            log "  object of the wrong length, as a power cut can leave one. Each was moved into $FB_CHANGES/Verify/"
-           log "  (never deleted, never reused). Its content is stored again only while a source file still holds it,"
+           log "  or, where that move failed, left in place (its log line says which); never deleted, never reused."
+           log "  Its content is stored again only while a source file still holds it,"
            log "  so a snapshot that needed it may no longer restore that file. README \"Damaged objects\"."
        fi
        log "  Not a verified success." ;;
@@ -964,7 +965,7 @@ fi
 # show it. The data already stored is safe, and the message says so.
 if [ "$BACKUP_PARTIAL" = 1 ]; then
     if [ "$DAMAGED_SET_ASIDE" -gt 0 ]; then
-        FAIL_NOTE="the backup COMPLETED BUT FOUND $DAMAGED_SET_ASIDE DAMAGED STORED OBJECT(S) (container exit 1; verify=$VERIFY_NOTE). Each [DamagedObject] line in $FB_CHANGES/backup.log names an object that was empty or the wrong length — what a power cut can leave — and was moved into $FB_CHANGES/Verify/, never deleted and never reused. Its content is stored again only while a source file still holds it, so a snapshot that needed it may no longer restore that file. Any file not captured is named in the same log. This is not a verified success and lastSuccess is NOT advanced. README \"Damaged objects\""
+        FAIL_NOTE="the backup COMPLETED BUT FOUND $DAMAGED_SET_ASIDE DAMAGED STORED OBJECT(S) (container exit 1; verify=$VERIFY_NOTE). Each [DamagedObject] line in $FB_CHANGES/backup.log names an object that was empty or the wrong length — what a power cut can leave — and was moved into $FB_CHANGES/Verify/ (or, where that move failed, left in place; the line says which), never deleted and never reused. Its content is stored again only while a source file still holds it, so a snapshot that needed it may no longer restore that file. Any file not captured is named in the same log. This is not a verified success and lastSuccess is NOT advanced. README \"Damaged objects\""
     else
         FAIL_NOTE="the backup COMPLETED WITH FILES NOT CAPTURED (container exit 1; verify=$VERIFY_NOTE). Every file it could read is stored and nothing already stored was lost, but at least one file was not captured, so this is not a verified success and lastSuccess is NOT advanced. Each file is named in $FB_CHANGES/backup.log — usually a file in use or unreadable, or a name Windows or Linux cannot restore (paths differing only in letter case count); the next run tries it again"
     fi

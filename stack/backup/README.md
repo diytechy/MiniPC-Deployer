@@ -750,7 +750,8 @@ Since FileBackup's call C37 a backup run lists the store and treats a stored
 object as **damaged** when it is empty while its name records content, or when
 it is a raw object (no 7-Zip signature) whose length differs from the one its
 name records — what a power cut can leave behind a rename. It **moves** each one
-into `<store>/changes/Verify/` (never deletes it, never reuses it), writes one
+into `<store>/changes/Verify/` (never deletes it, never reuses it; one it cannot
+move stays where it is and is still never reused), writes one
 `[DamagedObject]` WARN line per object into the set log, stores the content
 again only when a source file still hashes to that name, and returns **1**. The
 wrapper counts those lines after an exit 1 and says how many; it reads nothing
@@ -879,10 +880,11 @@ C41). The rename to `Pruning_<name>` is the prune's commit point: once it has
 happened the snapshot is gone from every reader and its still-needed bytes are
 already re-homed. If the delete after it fails, the prune still reports the
 removal as done (**0**) with a WARN naming the leftover, and **every later
-prune** (of any name) finishes such leftovers first, inside its own
-transaction. So the space comes back at the next prune; a dry run finishes
-nothing. Leave `Pruning_*` folders to FileBackup rather than deleting them by
-hand.
+prune** (of any name) finishes such leftovers **first**: right after it takes
+the store lock, before any of its checks, so even a prune that is then refused
+(for space, say) clears them and its space counts. A dry run (`-WhatIf`)
+finishes nothing. Leave `Pruning_*` folders to FileBackup rather than deleting
+them by hand.
 
 ### Rollback
 

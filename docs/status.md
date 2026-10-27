@@ -17,13 +17,15 @@ Sources of truth (FileBackup, read-only): `docs/plans/bounded-run-loop.md` §13 
 `docs/reviews/2026-10-26-data-loss/consolidated.md` Outcome table. FileBackup's own `docs/interfaces.md` was not treated as final.
 - **Part 1 — FileBackup behaviour that is built or ruled (commits `971d4c2`, `2d67564` and the trace commit; pullable on its own):**
   the wrapper's exit messages and README carry: exit 4 also = a source empty at the start while the latest state holds rows (C39;
-  FileBackup branch commit `83d0822`, unmerged); exit 1 also = damaged objects set aside into `changes/Verify/` with `[DamagedObject]`
-  lines in `backup.log` (C37; `428d53a`, unmerged), which the wrapper now **counts** after an exit 1, and case-only names (C42, being
-  built); exit 2 also = an unloadable dependency, and prune/snapshots resolve the store read-only without the library, a missing store
-  being 2 (`3756974`, on `BoundedRebuild`); prune `Pruning_<name>` leftovers finished by the next prune (C41; `7f47428`, unmerged);
-  `-RepairStorage` holds the lock and honours `-WhatIf` (`ce068bc`); plain verify reports `DamagedObject` (C37); restore: NUL-torn
-  manifest ≥ 1 (C38; `ba737eb`, unmerged), host problem on a row with a DataPath = 4 (A7, `4fb7689`); kit stays 14. C36 (flush
-  before rename/delete) changes no interface. NagLight mapping unchanged: only backup 0 + passing verify advances `lastSuccess`.
+  `BoundedRebuild` `88dc7e1`, with a refinement being merged as this was written); exit 1 also = damaged objects set aside into
+  `changes/Verify/` with `[DamagedObject]` lines in `backup.log` (C37; `7228c0b`), which the wrapper now **counts** after an exit 1,
+  and case-only names (C42, not built yet); exit 2 also = an unloadable dependency, and prune/snapshots resolve the store read-only
+  without the library, a missing store being 2 (`3756974`); prune `Pruning_<name>` leftovers finished by the next prune, right after
+  its lock and before any check, never under `-WhatIf` (C41; `f74d80a`, `25d7a2d`); `-RepairStorage` holds the lock and honours
+  `-WhatIf` (`ce068bc`); plain verify reports `DamagedObject` (C37); restore: NUL-torn manifest ≥ 1 (C38; `5b0a986`), host problem on
+  a row with a DataPath = 4 (A7, `4fb7689`); kit stays 14. C36 (flush before rename/delete; `8ec15a1`, `3a5f5ac`) changes no
+  interface. NagLight mapping unchanged: only backup 0 + passing verify advances `lastSuccess`. (Hashes are FileBackup
+  `BoundedRebuild` as read 2026-10-27, while a merge into it was in progress.)
   Traced: LLR-1356 and TC-1541 amended, **TC-1546** new (damaged-object count).
 - **Before anything here is deployed:** (1) the FileBackup image rebuilt from `BoundedRebuild` **after** the review's fix batches
   (C36–C42) merge there; (2) **C43's follow-up in that image before any Verify or prune touches the hub's store** — the wrapper's

@@ -1048,9 +1048,15 @@ def _copy_from(raw, stamp, dest_root, parts, pack, library_root, gzip, shutil) -
         # The existing folders down to the destination are opened, never made;
         # only the destination's own folder and its subfolders are created.
         hops = [(name, False) for name in between[:-1]] + [(between[-1], True)] + [(n, True) for n in parts[:-1]]
-        dir_fd = os.open(base_dir, os.O_RDONLY | os.O_DIRECTORY)
-        device = os.fstat(dir_fd).st_dev if library_root else None
+        dir_fd = os.open(base_dir, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW)
         try:
+            device = None
+            if library_root:
+                device = os.fstat(dir_fd).st_dev
+                # The marker again, relative to the directory now held open: a
+                # library unmounted since copy_target looked leaves the bare
+                # mountpoint, which has no marker (review round 3, item 3).
+                os.stat(LIBRARY_MARKER, dir_fd=dir_fd)
             for name, create in hops:
                 hop = _open_dir(name, dir_fd, create, device)
                 os.close(dir_fd)
@@ -1126,7 +1132,7 @@ def cmd_copy(args, mounts_text: Optional[str] = None, now: Optional[float] = Non
         except OSError:
             mounts_text = ""
     dest, refusal = copy_target(knobs, mc.parse_mountinfo(mounts_text))
-    library_root = (knobs.get("HOMEHUB_METRICS_COPY_ROOT") or LIBRARY_ROOT).rstrip("/") or "/"
+    library_root = os.path.realpath((knobs.get("HOMEHUB_METRICS_COPY_ROOT") or LIBRARY_ROOT).rstrip("/") or "/")
     if dest is None:
         mc.log("metrics: weekly copy SKIPPED - %s" % refusal, warning=bool(knobs.get("HOMEHUB_METRICS_COPY_DIR")))
         return 0

@@ -842,6 +842,11 @@ def test_tc1509_review_round2_the_walk_starts_at_the_library_and_stays_on_its_de
     (root / "Private" / "Docs").mkdir(parents=True)
     src = _w(tmp_path / "hr-20201001.jsonl", "{}\n")
     dest = root / "Private" / "Docs" / "m"
+    # No marker under the held-open root (unmounted since the check): refused.
+    with pytest.raises(FileNotFoundError):
+        hm._copy_one(str(src), str(dest), "watch-raw/hr-20201001.jsonl", False, library_root=str(root))
+    assert not dest.exists()
+    _w(root / ".homehub-library", "")
     hm._copy_one(str(src), str(dest), "watch-raw/hr-20201001.jsonl", False, library_root=str(root))
     assert (dest / "watch-raw" / "hr-20201001.jsonl").read_text() == "{}\n"
     # An existing folder on the way is opened, never made.

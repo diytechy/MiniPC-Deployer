@@ -28,6 +28,7 @@
 #
 # Sequence (each step below carries the failure it exists to prevent):
 #   1. single-instance lock          — the first real run is a multi-day job
+#   1b. image contract               — the loaded image must speak this layout
 #   2. mount-identity preflight      — zero disk I/O; refuses BEFORE creating
 #                                      anything (finding H / E2 cross-check 1)
 #   2b. store-layout guard           — refuses while the old three-mount store
@@ -50,12 +51,16 @@
 # Never-silent-green throughout: every refusal and every failure exits non-zero
 # and posts no lastSuccess, so the lane's age grows.
 #
-# Usage: library-backup.sh [--config PATH] [--preflight-only] [--verify MODE]
+# Usage: library-backup.sh [--config PATH] [--preflight-only [--layout L]] [--verify MODE]
 #   --config         backup.env (default /etc/homehub-backup/backup.env, else
 #                    the backup.env beside this script)
 #   --preflight-only steps 1-5 and stop. Nothing is created, no container runs.
 #                    This is TC-H-M21's preflight entry point; the full case
 #                    also proves the combined last_success is unchanged.
+#   --layout L       legacy | single, for THIS --preflight-only only, over the
+#                    FILEBACKUP_LAYOUT knob: the cutover's dry check of the
+#                    one-mount layout before the knob is switched (README "The
+#                    layout knob"). Refused without --preflight-only.
 #   --verify MODE    auto (default) | none | shallow | deep — override step 8's
 #                    calendar gate. `auto` is the weekly/monthly schedule.
 set -uo pipefail
@@ -65,15 +70,18 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STACK_DIR="$(dirname "$HERE")"          # /opt/homehub/stack on the box
 
 CONFIG=""; PREFLIGHT_ONLY=0; VERIFY_MODE=auto; RECONCILE_RUN_STATE=0
-# Kept whole for the legacy hand-off below, which must see exactly these.
-ORIG_ARGS=("$@")
+LAYOUT_OVERRIDE=""
+# The arguments the legacy hand-off below passes on: every one given, minus
+# --layout, which the legacy wrapper does not know.
+FWD_ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
-        --config)         CONFIG="$2"; shift 2 ;;
-        --preflight-only) PREFLIGHT_ONLY=1; shift ;;
-        --verify)         VERIFY_MODE="$2"; shift 2 ;;
-        --reconcile-run-state) RECONCILE_RUN_STATE=1; shift ;;
-        -h|--help)        sed -n '2,60p' "$0"; exit 0 ;;
+        --config)         CONFIG="$2"; FWD_ARGS+=("$1" "$2"); shift 2 ;;
+        --preflight-only) PREFLIGHT_ONLY=1; FWD_ARGS+=("$1"); shift ;;
+        --verify)         VERIFY_MODE="$2"; FWD_ARGS+=("$1" "$2"); shift 2 ;;
+        --reconcile-run-state) RECONCILE_RUN_STATE=1; FWD_ARGS+=("$1"); shift ;;
+        --layout)         LAYOUT_OVERRIDE="${2:-}"; shift 2 ;;
+        -h|--help)        sed -n '2,65p' "$0"; exit 0 ;;
         *) die "unknown arg: $1 (try --help)" ;;
     esac
 done
@@ -81,6 +89,9 @@ case "$VERIFY_MODE" in
     auto|none|shallow|deep) ;;
     *) die "--verify wants auto|none|shallow|deep, got '$VERIFY_MODE'" ;;
 esac
+if [ -n "$LAYOUT_OVERRIDE" ] && [ "$PREFLIGHT_ONLY" != 1 ]; then
+    die "--layout is only for --preflight-only: a real run takes its layout from FILEBACKUP_LAYOUT in stack/.env, never from the command line"
+fi
 
 # ── configuration: TWO files, and which one owns what matters ────────────────
 # The HOST paths come from stack/.env, because that is the file docker compose
@@ -101,6 +112,13 @@ if [ -z "$CONFIG" ]; then
     else die "no config: pass --config or create /etc/homehub-backup/backup.env"; fi
 fi
 load_config "$CONFIG"
+# A stack/.env that EXISTS BUT CANNOT BE READ stops here. load_env_file skips a
+# missing file (a bare checkout), but an unreadable one would leave the knob
+# unset and quietly pick `legacy`, so a non-root preflight after the cutover
+# would report on the wrong layout.
+if [ -e "$STACK_DIR/.env" ] && [ ! -r "$STACK_DIR/.env" ]; then
+    die "$STACK_DIR/.env exists but cannot be read by $(id -un 2>/dev/null || echo this user) - refusing to guess FILEBACKUP_LAYOUT. Run as root."
+fi
 load_env_file "$STACK_DIR/.env"
 
 # ── 0. THE LAYOUT KNOB (SR-133): legacy until the cutover ────────────────────
@@ -115,11 +133,11 @@ load_env_file "$STACK_DIR/.env"
 # keeps exactly what it ran. Invoked through bash because the payload's scripts
 # carry no execute bit (late-command 5c sets it on this file only). A hand-off
 # posts nothing.
-FB_LAYOUT="${FILEBACKUP_LAYOUT:-legacy}"
+FB_LAYOUT="${LAYOUT_OVERRIDE:-${FILEBACKUP_LAYOUT:-legacy}}"
 case "$FB_LAYOUT" in
     legacy)
         log "store layout: FILEBACKUP_LAYOUT=legacy - the three-mount layout; handing the run to library-backup-legacy.sh"
-        exec bash "$HERE/library-backup-legacy.sh" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"} ;;
+        exec bash "$HERE/library-backup-legacy.sh" ${FWD_ARGS[@]+"${FWD_ARGS[@]}"} ;;
     single) ;;
     *) die "config: FILEBACKUP_LAYOUT='$FB_LAYOUT' is neither legacy nor single (stack/.env). Nothing was started and nothing was posted." ;;
 esac
@@ -322,6 +340,29 @@ if [ "$RECONCILE_RUN_STATE" = 1 ]; then
 fi
 
 run_state starting
+
+# ── 1b. THE IMAGE MUST SPEAK THIS LAYOUT (SR-133) ────────────────────────────
+# Before anything on the drives is looked at or created: an image that does not
+# speak the one-mount contract would refuse at best, and the knob cannot tell
+# what is loaded under the tag. scripts/ensure-local-images.sh stamps
+# homehub.filebackup.contract at build time from the FileBackup checkout:
+# `one-mount-v2` only when that commit contains BoundedRebuild 7a6a80a and its
+# engine's ConfigSchemaVersion is 2 (so not FileBackup's later C44, which bumps
+# it). No label - a hand-tagged image, the deployed kit-12 one, anything built
+# before the stamp - is a refusal, as is a docker that cannot be asked.
+FB_IMAGE="filebackup:${FILEBACKUP_IMAGE_TAG:-local}"
+FB_WANT_CONTRACT=one-mount-v2
+_contract=""
+if ! _contract="$(docker image inspect "$FB_IMAGE" --format '{{index .Config.Labels "homehub.filebackup.contract"}}' 2>/dev/null)"; then
+    refuse "cannot inspect the image $FB_IMAGE (not loaded, or docker cannot be asked)." \
+           "FILEBACKUP_LAYOUT=single needs an image built from FileBackup BoundedRebuild by scripts/ensure-local-images.sh --rebuild."
+fi
+case "$_contract" in
+    "$FB_WANT_CONTRACT") log "image: $FB_IMAGE speaks the one-mount contract ($FB_WANT_CONTRACT)" ;;
+    *) _rev="$(docker image inspect "$FB_IMAGE" --format '{{index .Config.Labels "homehub.source.revision"}}' 2>/dev/null || true)"
+       refuse "the image $FB_IMAGE does not speak the one-mount layout: its homehub.filebackup.contract label is '${_contract:-<none>}' (want $FB_WANT_CONTRACT), source revision '${_rev:-<none>}'." \
+              "Build it from a FileBackup commit that contains BoundedRebuild 7a6a80a and not C44 (scripts/ensure-local-images.sh --rebuild), or set FILEBACKUP_LAYOUT=legacy. Nothing was looked at or created." ;;
+esac
 
 # ── 2. MOUNT-IDENTITY PREFLIGHT (E2 cross-check 1 / upstream finding H) ───────
 # Refuses BEFORE anything is created, which is the whole point: with `nofail` in

@@ -186,7 +186,36 @@ ensure_image "finance-auditor:${FINANCE_AUDITOR_IMAGE_TAG:-local}" "Finance-Audi
 #     `localhost/filebackup:local`. Never load it, never hand-tag from it — a
 #     hand-tagged image carries no homehub.source.revision, and the freshness
 #     check in export-images.sh only WARNS on an unstamped image.
-ensure_image "filebackup:${FILEBACKUP_IMAGE_TAG:-local}" "FileBackup" ""
+#
+# THE CONTRACT LABEL (SR-133). stack/backup/library-backup.sh refuses to run
+# the one-mount layout (FILEBACKUP_LAYOUT=single) on an image that does not
+# carry homehub.filebackup.contract=one-mount-v2. It is decided HERE, from the
+# checkout being built, because the hub has no FileBackup history to ask:
+#   one-mount-v2      HEAD contains BoundedRebuild 7a6a80a (the bounded run
+#                     loop with the 2026-10-26 review's fixes) AND the engine's
+#                     ConfigSchemaVersion is 2 - so not FileBackup's later C44
+#                     (StorePath, Latest/), which would bump it and needs its own
+#                     contract change on the hub first;
+#   pre-bounded       HEAD does not contain 7a6a80a (the kit-12 era and older);
+#   configversion-N   it does, but the engine says another ConfigSchemaVersion.
+#   unknown           git could not be asked about the checkout at all.
+# The schema line is read from the WORKING TREE, which is what gets built.
+FILEBACKUP_CONTRACT_BASE=7a6a80acdafad57b48ab78f1dfc143c0ba808b1e
+filebackup_contract() {
+    local fb="$SIBLING_ROOT/FileBackup" v
+    # git that cannot be asked (no checkout, safe.directory) is not an answer.
+    if ! repo_git "$fb" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+        printf 'unknown'; return 0
+    fi
+    if ! repo_git "$fb" merge-base --is-ancestor "$FILEBACKUP_CONTRACT_BASE" HEAD 2>/dev/null; then
+        printf 'pre-bounded'; return 0
+    fi
+    # shellcheck disable=SC2016  # $script: is PowerShell text, matched literally
+    v="$(sed -n 's/^\$script:ConfigSchemaVersion = \([0-9][0-9]*\).*/\1/p' "$fb/Modules/FileBackup.Engine.psm1" 2>/dev/null | head -1)"
+    if [ "$v" = 2 ]; then printf 'one-mount-v2'; else printf 'configversion-%s' "${v:-unknown}"; fi
+}
+ensure_image "filebackup:${FILEBACKUP_IMAGE_TAG:-local}" "FileBackup" "" \
+    --label "homehub.filebackup.contract=$(filebackup_contract)"
 
 # Sure - the Owner's FORK (SURE_IMAGE, default sure-auroleap:local), built from the
 # sibling ../sure by its own script because it builds a NAMED ref via `git archive`

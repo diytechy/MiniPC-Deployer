@@ -87,6 +87,18 @@ if [ "${1:-}" = ps ]; then
     [ -n "${MOCK_FB_RUNNING:-}" ] && printf '%s\n' "$MOCK_FB_RUNNING"
     exit 0
 fi
+# The image check (step 1b) asks for the build's contract label. MOCK_FB_CONTRACT
+# is what the loaded image says (unset = the one-mount build; set empty = an
+# image without the label); MOCK_IMAGE_RC models no image / no daemon. Not an
+# EVENT: the events list stays the container runs.
+if [ "${1:-}" = image ]; then
+    [ "${MOCK_IMAGE_RC:-0}" = 0 ] || exit "${MOCK_IMAGE_RC}"
+    case "$*" in
+        *homehub.filebackup.contract*) printf '%s\n' "${MOCK_FB_CONTRACT-one-mount-v2}" ;;
+        *) printf 'abc123\n' ;;
+    esac
+    exit 0
+fi
 last=""; for arg in "$@"; do last="$arg"; done
 printf '%s\n' "docker:$last" >>"$EVENTS"
 case "$last" in
@@ -635,6 +647,46 @@ if [ "$RUN_RC" = 0 ] && [ "$(success_count "$TMP/copy-fails.capture")" = 1 ] \
 else
     fail "TC-1580 failed copy rc=$RUN_RC: $(grep 'manifest copy' "$TMP/copy-fails.out" | head -1)"
 fi
+
+# ── the image must speak the one-mount contract (TC-1589) ────────────────────
+# Each of: the deployed kit-12 image (no label), a C44-era build, no image at
+# all. Each refuses before any container runs, without creating the store
+# folder, and posts no lastSuccess.
+for _case in nolabel:: c44:configversion-3: noimage::1; do
+    _name="${_case%%:*}"; _rest="${_case#*:}"; _label="${_rest%%:*}"; _rc="${_rest#*:}"
+    write_config "$TMP/img-$_name.env"
+    sed -i "s|^FILEBACKUP_STORE=.*|FILEBACKUP_STORE=$TMP/img-$_name-store|" "$TMP/img-$_name.env"
+    MOCK_FB_CONTRACT="$_label" MOCK_IMAGE_RC="${_rc:-0}" run_wrapper "img-$_name" "$TMP/img-$_name.env" none 0 0 200
+    if [ "$RUN_RC" != 0 ] && ! grep -q '^docker:' "$TMP/img-$_name.events" \
+       && [ "$(success_count "$TMP/img-$_name.capture")" = 0 ] \
+       && [ ! -e "$TMP/img-$_name-store" ] \
+       && grep -qE 'does not speak the one-mount layout|cannot inspect the image' "$TMP/img-$_name.out"; then
+        pass "TC-1589 an image without the one-mount contract ($_name) refuses before any container and creates no store"
+    else
+        fail "TC-1589 image $_name rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/img-$_name.events"): $(grep -i 'image' "$TMP/img-$_name.out" | head -2 | tr '\n' '|')"
+    fi
+done
+
+# ── a new store: the wrapper never creates backup/ or changes/ (TC-1590) ─────
+# FileBackup creates them, and refuses a store whose backup/ is gone while
+# changes/ holds snapshots; it can only see that if backup/ is really missing.
+# The suite's own store (the mocks know its mount) is swapped aside for these.
+mv "$TMP/store" "$TMP/store.keep"
+mkdir -p "$TMP/store/changes/Snapshot_2026_10_01_03_00_00"
+run_wrapper fresh "$TMP/good.env" none 2 0 200
+if grep -q '^docker:backup$' "$TMP/fresh.events" && [ ! -e "$TMP/store/backup" ]    && [ "$(success_count "$TMP/fresh.capture")" = 0 ]; then
+    pass "TC-1590 the wrapper starts FileBackup with backup/ still missing beside snapshots, so its refusal can fire"
+else
+    fail "TC-1590 fresh store rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/fresh.events") backup/=$([ -e "$TMP/store/backup" ] && echo created || echo absent)"
+fi
+rm -rf "$TMP/store"; mkdir -p "$TMP/store"
+run_wrapper fresh-empty "$TMP/good.env" none 0 0 200
+if grep -q '^docker:backup$' "$TMP/fresh-empty.events" && [ ! -e "$TMP/store/backup" ] && [ ! -e "$TMP/store/changes" ]; then
+    pass "TC-1590 an empty new store gets neither backup/ nor changes/ from the wrapper (FileBackup creates them)"
+else
+    fail "TC-1590 empty store: backup/ $([ -e "$TMP/store/backup" ] && echo created || echo absent), changes/ $([ -e "$TMP/store/changes" ] && echo created || echo absent)"
+fi
+rm -rf "$TMP/store"; mv "$TMP/store.keep" "$TMP/store"
 
 printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

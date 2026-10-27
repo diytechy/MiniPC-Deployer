@@ -19,6 +19,9 @@
 #   TC-1586  frame-freshness reads the NEWER of the single-store copy and the
 #            legacy /state record, and keeps the legacy row-count witness
 #            check whenever a .meta sidecar is beside the file it reads.
+#   TC-1591  --layout overrides the knob for a --preflight-only (the cutover
+#            dry check) and is refused on a real run; a stack/.env that exists
+#            but cannot be read stops the run rather than guess legacy.
 # Hermetic: a temp tree, a stub legacy wrapper and a refused probe port.
 set -uo pipefail
 
@@ -111,6 +114,44 @@ if [ "$RC" != 0 ] && [ "$RC" != 42 ] && [ ! -s "$TMP/bogus.stub" ] && [ ! -s "$T
     pass "TC-1583 an unknown FILEBACKUP_LAYOUT refuses before step 1, starts nothing and posts nothing"
 else
     fail "TC-1583 unknown layout rc=$RC calls='$(cat "$TMP/bogus.calls")' out: $(tr '\n' '|' <"$TMP/bogus.out" | cut -c1-300)"
+fi
+
+# ── TC-1591: --layout, the cutover's dry check, and an unreadable .env ───────
+run_dispatch override-run "FILEBACKUP_LAYOUT=legacy" --layout single --verify none
+if [ "$RC" != 0 ] && [ "$RC" != 42 ] && [ ! -s "$TMP/override-run.stub" ] && [ ! -s "$TMP/override-run.calls" ] \
+   && grep -qF -- '--layout is only for --preflight-only' "$TMP/override-run.out"; then
+    pass "TC-1591 --layout without --preflight-only refuses, starting and posting nothing"
+else
+    fail "TC-1591 --layout on a real run rc=$RC calls='$(cat "$TMP/override-run.calls")'"
+fi
+run_dispatch override-single "FILEBACKUP_LAYOUT=legacy" --layout single --preflight-only
+if [ "$RC" = 1 ] && [ ! -s "$TMP/override-single.stub" ] \
+   && [ "$(cut -d' ' -f1 "$TMP/override-single.calls" | tr '\n' ' ')" = "flock " ]; then
+    pass "TC-1591 --layout single --preflight-only checks the one-mount layout over a legacy knob"
+else
+    fail "TC-1591 --layout single preflight rc=$RC stub='$(cat "$TMP/override-single.stub")'"
+fi
+run_dispatch override-legacy "FILEBACKUP_LAYOUT=single" --preflight-only --layout legacy
+if [ "$RC" = 42 ] && [ "$(cat "$TMP/override-legacy.stub")" = "LEGACY-STUB argc=3 [--config] [$TMP/backup.env] [--preflight-only]" ]; then
+    pass "TC-1591 --layout legacy --preflight-only hands off without passing --layout to the legacy wrapper"
+else
+    fail "TC-1591 --layout legacy rc=$RC stub='$(cat "$TMP/override-legacy.stub")'"
+fi
+if [ "$(id -u)" = 0 ]; then
+    printf 'SKIP  TC-1591 an unreadable stack/.env (root reads everything)\n'
+else
+    printf 'FILEBACKUP_LAYOUT=single\n' >"$STK/.env"
+    chmod 000 "$STK/.env"
+    : >"$TMP/unreadable.stub"; : >"$TMP/unreadable.calls"
+    env -u FILEBACKUP_LAYOUT PATH="$TMP/bin:$PATH" STUB_LOG="$TMP/unreadable.stub" CALLS="$TMP/unreadable.calls" \
+        bash "$STK/backup/library-backup.sh" --config "$TMP/backup.env" --preflight-only >"$TMP/unreadable.out" 2>&1
+    RC=$?; chmod 644 "$STK/.env"
+    if [ "$RC" != 0 ] && [ "$RC" != 42 ] && [ ! -s "$TMP/unreadable.stub" ] && [ ! -s "$TMP/unreadable.calls" ] \
+       && grep -qF 'exists but cannot be read' "$TMP/unreadable.out"; then
+        pass "TC-1591 a stack/.env that exists but cannot be read stops the run instead of guessing legacy"
+    else
+        fail "TC-1591 unreadable .env rc=$RC stub='$(cat "$TMP/unreadable.stub")': $(tail -1 "$TMP/unreadable.out")"
+    fi
 fi
 
 # ── TC-1584: the legacy wrapper is frozen ────────────────────────────────────

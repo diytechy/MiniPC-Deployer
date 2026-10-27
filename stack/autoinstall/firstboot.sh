@@ -3106,9 +3106,11 @@ if [ -d "$STACK_DIR/camera-motion" ] && [ -d "$STACK_DIR/clips" ]; then
     # The LAST assignment wins, as for every reader of these knobs (the python
     # units, 1b-scratch): _env_val takes the first, and a deploy that appends a
     # changed knob would otherwise converge on the old value.
-    __last() { sed -n "s/^$1=//p" "$STACK_DIR/.env" 2>/dev/null | tail -n1 | tr -d "\"'\r"; }
+    # ... and like those readers, an unquoted ` # comment` is not part of the value.
+    __last() { sed -n "s/^$1=//p" "$STACK_DIR/.env" 2>/dev/null | tail -n1 | sed 's/[[:space:]]#.*$//' | tr -d "\"'\r"; }
     __cams=""
     __motion_any=false
+    set -f   # a `*` in CAMERAS is a bad name, not a glob of the working directory
     for __c in $(__last CAMERAS); do
         case "$__c" in
             [a-z]*) case "$__c" in *[!a-z0-9]*) log "WARN: CAMERAS holds '$__c', not a camera name - skipped"; continue ;; esac ;;
@@ -3118,6 +3120,7 @@ if [ -d "$STACK_DIR/camera-motion" ] && [ -d "$STACK_DIR/clips" ]; then
         __C="$(printf '%s' "$__c" | tr 'a-z' 'A-Z')"
         [ "$(__last "CAMERA_${__C}_MOTION_ENABLED")" = true ] && __motion_any=true
     done
+    set +f
     if [ "$__motion_any" = true ] && ! python3 -c 'import cv2' >/dev/null 2>&1; then
         log "camera motion is on and python3-opencv is missing - installing it (the panel's engine runtime)"
         if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-opencv >/dev/null 2>&1; then

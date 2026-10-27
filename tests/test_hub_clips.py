@@ -45,6 +45,9 @@ T0 = 1793044200000  # 2026-10-26T19:50:00Z
 @pytest.fixture(autouse=True)
 def no_override(monkeypatch, tmp_path):
     monkeypatch.setenv("HOMEHUB_MONITOR_OVERRIDE_FILE", str(tmp_path / "no-override"))
+    # Every test runs on a machine without the clips area; the guard is stubbed open
+    # here and tests of the guard itself replace this stub or call its parts directly.
+    monkeypatch.setattr(hc, "guard", lambda settings: (True, "ok"))
 
 
 def rec(i, cause, kind, ms, source="hub-motion", camera="door"):
@@ -634,7 +637,7 @@ def test_tc1565_clips_is_a_scratch_writer_sized_before_ottertube():
     assert tight == {"door": 8192, "meetings": 2048, "clips": 612, "ottertube": 512}
     s = hs.Settings({})
     assert s.quota_mib["clips"] == 1024
-    with pytest.raises(ValueError, match="clips"):  # a writer left out is refused, not unlimited
+    with pytest.raises(hs.Stop, match="clips"):  # a writer left out is refused, not unlimited
         hs.size_quotas(18170 * MIB, {"door": 8192, "meetings": 2048, "ottertube": 6144}, 2048, 512)
 
 
@@ -696,7 +699,7 @@ def test_tc1566_the_template_declares_every_knob_off_with_placeholder_zones():
 def test_tc1568_status_reports_events_clips_backlog_and_the_detector(tmp_path, monkeypatch):
     state = tmp_path / "state"
     root = tmp_path / "clips"
-    s = hc.ClipsSettings({"CLIPS_ENABLED": "true"})
+    s = hc.ClipsSettings({"CLIPS_ENABLED": "true", "CLIPS_ENCODE_ENABLED": "true"})
     s.root = str(root)
     monkeypatch.setattr(hc, "clips_quota", lambda settings: (10 * MIB, 1024 * MIB))
     ev.append(str(state), rec(1, "approach", "event", T0 - 1000))
@@ -768,7 +771,7 @@ def test_tc1566_the_firstboot_block_executed_follows_the_last_assignment_and_ins
     for sub in ("camera-motion", "clips"):
         (stack / sub).mkdir(parents=True)
     # Re-assigned knobs, as a deploy that appends would leave them: the LAST must win.
-    (stack / ".env").write_bytes("CAMERAS=garage\nCAMERAS=door\nCAMERA_DOOR_MOTION_ENABLED=false\n"
+    (stack / ".env").write_bytes("CAMERAS=garage\nCAMERAS=door * # the doorbell\nCAMERA_DOOR_MOTION_ENABLED=false\n"
                                 "CAMERA_DOOR_MOTION_ENABLED=true\nCLIPS_ENABLED=false\nCLIPS_ENABLED=\"true\"\n"
                                 "CLIPS_ENCODE_ENABLED=false\n".encode("utf-8"))
     calls = tmp_path / "calls"
@@ -788,7 +791,8 @@ apt-get() { echo "apt-get $*" >> "$CALLS"; }
     apt = next(i for i, l in enumerate(lines) if l.startswith("apt-get install -y --no-install-recommends python3-opencv"))
     enable = next(i for i, l in enumerate(lines) if l == "systemctl enable homehub-camera-motion@door.service")
     assert apt < enable
-    assert not any("camera-motion@garage" in l for l in lines)
+    assert not any("camera-motion@garage" in l or "camera-motion@doorbell" in l for l in lines)
+    assert sum(1 for l in lines if l.startswith("systemctl enable homehub-camera-motion@")) == 1  # no glob
     assert "systemctl enable homehub-clips-cut.timer homehub-clips-retention.timer" in lines
     assert "systemctl disable --now homehub-clips-encode.timer" in lines
 
@@ -859,3 +863,53 @@ def test_tc1557_a_names_time_reads_back_to_utc():
     assert hc.stem_utc_ms("door_2026-10-26_14-51-01-0500_road-stop_29s") == T0 + 61000
     assert hc.stem_utc_ms("door_2026-10-26_19-51-01+0000_approach_9s-2") == T0 + 61000
     assert hc.stem_utc_ms("c") is None
+
+
+# ── review round 2 (DeepSeek) regressions ────────────────────────────────────
+
+
+def test_tc1553_a_hole_inside_a_segment_keeps_pts_timing():
+    pkts = stream(40, start_pts=900000)
+    data = b"".join(pkts) + b"".join(stream(40, start_pts=900000 + 30 * 90000 + 40 * 9000))
+    idx = hc.scan_frames(data, False)
+    times, mode = hc.frame_times(idx, 1000.0, 10)
+    assert mode == "pts" and times[40] == pytest.approx(1034.0)
+
+
+def test_tc1555_a_window_covered_to_its_end_is_full_even_before_a_hole():
+    a = loaded(1000.0, 50)                           # 1000.0 .. 1005.0
+    b = loaded(1030.0, 50, start_pts=5)
+    plan = hc.plan_window([a, b], 1002.0, 1004.95, 10)
+    assert plan.end_covered and plan.gaps == [] and plan.coverage == "full"
+
+
+def test_tc1551_a_lease_as_long_as_the_cap_is_refused():
+    with pytest.raises(hc.Invalid, match="CLIP_LEASE_SEC"):
+        hc.ClipsSettings({"CAMERA_DOOR_CLIP_LEASE_SEC": "60", "CAMERA_DOOR_CLIP_MAX_SEC": "60"})
+
+
+def test_tc1557_a_name_with_an_impossible_time_does_not_read_as_one():
+    assert hc.stem_utc_ms("door_2026-10-32_10-00-00+0000_approach_9s") is None
+    assert hc.stem_utc_ms("door_2026-10-26_10-00-00+9959_approach_9s") is None
+
+
+def test_tc1563_the_index_loses_lines_of_clips_that_are_already_gone_and_orphan_sidecars_go(tmp_path):
+    root = tmp_path / "clips"
+    day = root / "door" / "2026-10-26"
+    day.mkdir(parents=True)
+    keep = "door_2026-10-26_10-00-00+0000_approach_9s"
+    (day / (keep + ".mp4")).write_bytes(b"x")
+    (day / "door_2026-10-26_09-00-00+0000_approach_9s.json").write_text("{}")   # its clip never landed
+    os.utime(day / "door_2026-10-26_09-00-00+0000_approach_9s.json", (0, 0))
+    old = root / "door" / "2026-01-01"
+    old.mkdir()
+    gone = "door_2026-01-01_10-00-00+0000_approach_9s"
+    (old / (gone + ".mp4")).write_bytes(b"y")
+    index = root / "door" / "index.jsonl"
+    index.write_text("".join(json.dumps({"clip": c}) + "\n" for c in
+                             ("2025-01-01/door_lost-in-a-crash.mp4", "2026-01-01/%s.mp4" % gone, "2026-10-26/%s.mp4" % keep)))
+    s = hc.ClipsSettings({"CLIPS_RETENTION_DAYS": "30"})
+    s.root = str(root)
+    assert hc.apply_retention(s, str(tmp_path / "state"), T0)["removed"] == 1
+    assert [json.loads(l)["clip"] for l in index.read_text().splitlines()] == ["2026-10-26/%s.mp4" % keep]
+    assert sorted(os.listdir(day)) == [keep + ".mp4"]

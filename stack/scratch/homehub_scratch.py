@@ -201,7 +201,7 @@ def size_quotas(usable_bytes: int, requested_mib: Dict[str, int], floor_mib: int
     # and sizing a subset against the whole budget would hand out the others' room.
     missing = [name for name in WRITER_NAMES if name not in requested_mib]
     if missing:
-        raise ValueError("size_quotas needs every writer; missing: %s" % ", ".join(missing))
+        raise Stop("size_quotas needs every writer; missing: %s" % ", ".join(missing))
     granted = {name: requested_mib[name] for name in WRITER_NAMES}
     excess = sum(granted.values()) - budget
     for name in reversed(WRITER_NAMES):

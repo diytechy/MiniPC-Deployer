@@ -872,7 +872,11 @@ def enforce_day_files(
 
 def append_jsonl(path: str, record: dict, cap_bytes: int) -> Tuple[bool, str]:
     """Append one compact JSON line to `path`, refusing past `cap_bytes`. (ok, why)."""
-    line = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+    try:
+        # allow_nan=False: a NaN would make the line unreadable JSON for every reader.
+        line = json.dumps(record, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+    except (TypeError, ValueError) as exc:
+        return False, "the record could not be encoded (%s); not appending" % type(exc).__name__
     size = len(line.encode("utf-8"))      # bytes, not characters: the cap is on disk
     try:
         os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)

@@ -458,6 +458,8 @@ def collect_units(deadline: Deadline, run=mc.run_bounded) -> dict:
     failed = run(["systemctl", "list-units", "--state=failed", "--plain", "--no-legend", "--no-pager"],
                  deadline.cut(10), 65536)
     out["failed"] = parse_unit_list(failed.output.decode("utf-8", "replace")) if failed.ok else None
+    if not failed.ok:
+        out["error"] = "systemctl list-units --state=failed did not answer"
     ours = run(["systemctl", "list-units", "--all", "--plain", "--no-legend", "--no-pager", "homehub-*.service"],
                deadline.cut(10), 262144)
     names = parse_unit_list(ours.output.decode("utf-8", "replace")) if ours.ok else []
@@ -466,13 +468,13 @@ def collect_units(deadline: Deadline, run=mc.run_bounded) -> dict:
         out["ok"] = failed.ok and ours.ok
         out["services"] = {}
         if not ours.ok:
-            out["error"] = "systemctl list-units did not answer"
+            out.setdefault("error", "systemctl list-units did not answer")
         return out
     shown = run(["systemctl", "show", "--timestamp=unix", "-p", SHOW_PROPS] + names, deadline.cut(10), 1048576)
     out["services"] = parse_show_blocks(shown.output.decode("utf-8", "replace")) if shown.ok else {}
     out["ok"] = failed.ok and shown.ok
     if not shown.ok:
-        out["error"] = "systemctl show did not answer"
+        out.setdefault("error", "systemctl show did not answer")
     return out
 
 
@@ -834,7 +836,10 @@ def cmd_daily(args, fetch=fetch_today, run=mc.run_bounded, zone=None, now=None) 
     if not due:
         mc.log("metrics: daily row for %s already written (or not due yet); nothing to do" % night)
         return 0
-    gauges = collect_gauges(knobs, deadline, fetch)
+    try:
+        gauges = collect_gauges(knobs, deadline, fetch)
+    except Exception as exc:  # noqa: BLE001 - the row is still written (review round 2, item 6)
+        gauges = {"ok": False, "error": "unexpected %s" % type(exc).__name__}
     weight_state = _read_bounded_json(knobs.get("WEIGHT_STATE_FILE") or WEIGHT_STATE, STATE_MAX_BYTES, {})
     sleep_state = _read_bounded_json(knobs.get("SLEEP_STATE_FILE") or SLEEP_STATE, STATE_MAX_BYTES, {})
     day = _dt.date.fromisoformat(night)
@@ -842,8 +847,11 @@ def cmd_daily(args, fetch=fetch_today, run=mc.run_bounded, zone=None, now=None) 
     end = _local_epoch(day, OVERNIGHT_TO_HOUR, 0, zone)
     tel = _telemetry_module()
     if tel is not None:
-        files = mc.day_files_between(args.telemetry_dir, "telemetry", start, end)
-        overnight = overnight_range((r for f in files for r in mc.iter_jsonl(f)), start, end, tel)
+        try:
+            files = mc.day_files_between(args.telemetry_dir, "telemetry", start, end)
+            overnight = overnight_range((r for f in files for r in mc.iter_jsonl(f)), start, end, tel)
+        except Exception as exc:  # noqa: BLE001
+            overnight = {"error": "unexpected %s" % type(exc).__name__}
     else:
         overnight = {"error": "homehub-telemetry.py is not on this payload"}
     shown = run(["systemctl", "show", "--timestamp=unix", "-p", SHOW_PROPS] + list(BACKUP_UNITS),
@@ -889,8 +897,9 @@ def copy_target(knobs: Dict[str, str], mounts: List[Dict[str, str]], exists=os.p
     the library root must be a mount point in the mount table (the bare
     mountpoint underneath is chmod 000 and must never be written into, and root
     is not stopped by a mode) and must carry the library's marker file (a
-    blank or stand-in disk is mounted, writable and empty). The copy never
-    creates the Owner's folder itself, only its own folder inside it.
+    blank or stand-in disk is mounted, writable and empty), and the folder
+    the destination sits in must be on the library's own filesystem. The copy
+    never creates the Owner's folder itself, only its own folder inside it.
     """
     dest = (knobs.get("HOMEHUB_METRICS_COPY_DIR") or "").strip()
     if not dest:
@@ -974,24 +983,40 @@ DIR_FD_OPENS = (os.open in getattr(os, "supports_dir_fd", set()) and hasattr(os,
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 
-def _open_dir(name: str, parent_fd: Optional[int]) -> int:
-    """Open (creating if absent) directory `name` under `parent_fd`, refusing a link."""
-    flags = os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW
-    try:
-        os.mkdir(name, 0o775, dir_fd=parent_fd) if parent_fd is not None else os.mkdir(name, 0o775)
-    except FileExistsError:
-        pass
-    return os.open(name, flags, dir_fd=parent_fd) if parent_fd is not None else os.open(name, flags)
+def _open_dir(name: str, parent_fd: int, create: bool, device: Optional[int]) -> int:
+    """Open directory `name` under `parent_fd` (creating it when `create`),
+    refusing a link and a directory on another filesystem than `device`."""
+    if create:
+        try:
+            os.mkdir(name, 0o775, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW, dir_fd=parent_fd)
+    if device is not None and os.fstat(fd).st_dev != device:
+        os.close(fd)
+        raise PermissionError("REFUSED: %s is on another filesystem than the library" % name)
+    return fd
 
 
-def _copy_one(src: str, dest_root: str, rel: str, pack: bool) -> None:
+def _copy_one(src: str, dest_root: str, rel: str, pack: bool, library_root: Optional[str] = None) -> None:
+    """Copy one file to `dest_root/rel`. With `library_root` (the trusted mount
+    point) the walk starts THERE, so no component between it and the file is
+    resolved by name: each is opened O_NOFOLLOW relative to the one before and
+    must be on the library's filesystem (review round 2, items 2 and 3)."""
     import gzip
     import shutil
 
     parts = rel.split("/")
     if any(p in ("", ".", "..") for p in parts):
         raise PermissionError("REFUSED: %r is not a plain relative path" % rel)
-    stamp = os.stat(src).st_mtime
+    raw = open(src, "rb")                     # first: a source that cannot be read costs no temp file
+    try:
+        _copy_from(raw, os.fstat(raw.fileno()).st_mtime, dest_root, parts, pack, library_root, gzip, shutil)
+    finally:
+        raw.close()
+
+
+def _copy_from(raw, stamp, dest_root, parts, pack, library_root, gzip, shutil) -> None:
     leaf, tmp = parts[-1], "." + parts[-1] + ".part"
     if not DIR_FD_OPENS:                      # pragma: no cover - the Windows dev PC
         walked = dest_root
@@ -1011,11 +1036,23 @@ def _copy_one(src: str, dest_root: str, rel: str, pack: bool) -> None:
         fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o664)
         dir_fd = None
     else:
-        head, base = os.path.split(dest_root.rstrip("/"))
-        dir_fd = os.open(head, os.O_RDONLY | os.O_DIRECTORY)
+        dest = dest_root.rstrip("/")
+        if library_root:
+            base_dir = library_root.rstrip("/") or "/"
+            between = os.path.relpath(dest, base_dir).split("/")
+            if any(p in ("", ".", "..") for p in between):
+                raise PermissionError("REFUSED: %s is not inside %s" % (dest, base_dir))
+        else:
+            base_dir, last = os.path.split(dest)
+            between = [last]
+        # The existing folders down to the destination are opened, never made;
+        # only the destination's own folder and its subfolders are created.
+        hops = [(name, False) for name in between[:-1]] + [(between[-1], True)] + [(n, True) for n in parts[:-1]]
+        dir_fd = os.open(base_dir, os.O_RDONLY | os.O_DIRECTORY)
+        device = os.fstat(dir_fd).st_dev if library_root else None
         try:
-            for name in [base] + parts[:-1]:
-                hop = _open_dir(name, dir_fd)
+            for name, create in hops:
+                hop = _open_dir(name, dir_fd, create, device)
                 os.close(dir_fd)
                 dir_fd = hop
             try:
@@ -1028,7 +1065,7 @@ def _copy_one(src: str, dest_root: str, rel: str, pack: bool) -> None:
             raise
     try:
         try:
-            with open(src, "rb") as raw, os.fdopen(fd, "wb") as out:
+            with os.fdopen(fd, "wb") as out:
                 if pack:
                     with gzip.GzipFile(filename="", mode="wb", compresslevel=6, fileobj=out, mtime=0) as packed:
                         shutil.copyfileobj(raw, packed, 65536)
@@ -1089,6 +1126,7 @@ def cmd_copy(args, mounts_text: Optional[str] = None, now: Optional[float] = Non
         except OSError:
             mounts_text = ""
     dest, refusal = copy_target(knobs, mc.parse_mountinfo(mounts_text))
+    library_root = (knobs.get("HOMEHUB_METRICS_COPY_ROOT") or LIBRARY_ROOT).rstrip("/") or "/"
     if dest is None:
         mc.log("metrics: weekly copy SKIPPED - %s" % refusal, warning=bool(knobs.get("HOMEHUB_METRICS_COPY_DIR")))
         return 0
@@ -1109,7 +1147,7 @@ def cmd_copy(args, mounts_text: Optional[str] = None, now: Optional[float] = Non
             mc.log("metrics: weekly copy stopped at its deadline; %d left for next week" % (len(plan) - written - failed), True)
             break
         try:
-            _copy_one(src, dest, rel, pack)
+            _copy_one(src, dest, rel, pack, library_root=library_root)
             written += 1
         except OSError as exc:
             failed += 1

@@ -836,6 +836,34 @@ def test_tc1509_review_round1_a_planted_link_under_the_destination_is_refused(tm
         hm._copy_one(str(src), str(dest), "../x.jsonl", False)
 
 
+@pytest.mark.skipif(not hm.DIR_FD_OPENS, reason="the dir-fd walk is the hub's (Linux) path")
+def test_tc1509_review_round2_the_walk_starts_at_the_library_and_stays_on_its_device(tmp_path):
+    root = tmp_path / "library"
+    (root / "Private" / "Docs").mkdir(parents=True)
+    src = _w(tmp_path / "hr-20201001.jsonl", "{}\n")
+    dest = root / "Private" / "Docs" / "m"
+    hm._copy_one(str(src), str(dest), "watch-raw/hr-20201001.jsonl", False, library_root=str(root))
+    assert (dest / "watch-raw" / "hr-20201001.jsonl").read_text() == "{}\n"
+    # An existing folder on the way is opened, never made.
+    with pytest.raises(FileNotFoundError):
+        hm._copy_one(str(src), str(root / "Private" / "Nope" / "m"), "x/hr-20201001.jsonl", False,
+                     library_root=str(root))
+    assert not (root / "Private" / "Nope").exists()
+    parent = os.open(str(root), os.O_RDONLY)
+    try:
+        with pytest.raises(PermissionError):
+            hm._open_dir("Private", parent, False, os.fstat(parent).st_dev + 1)
+    finally:
+        os.close(parent)
+
+
+def test_tc1510_review_round2_a_record_that_cannot_be_encoded_is_refused(tmp_path):
+    ok, why = mc.append_jsonl(str(tmp_path / "x.jsonl"), {"v": float("nan")}, 10 ** 6)
+    assert not ok and "encoded" in why and not (tmp_path / "x.jsonl").exists()
+    out = hm.collect_units(hm.Deadline(60), Runner())
+    assert out["ok"] is False and "--state=failed" in out["error"]
+
+
 def test_tc1508_the_plan_skips_today_unsettled_and_unchanged_files():
     now = L(10, 26, 18, 30)
     srcs = [("snapshot", "/d/snapshot-20261001.jsonl.gz", 50, 100.0),

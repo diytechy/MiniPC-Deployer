@@ -359,6 +359,11 @@ def main():
         "backup/systemd/homehub-library-backup.timer",
         "backup/library-backup.sh",
         "backup/filebackup.json",
+        # The store-layout knob (SR-133): the legacy wrapper library-backup.sh
+        # hands a `legacy` run to, and the single-store config late-command 5c
+        # installs beside filebackup.json.
+        "backup/library-backup-legacy.sh",
+        "backup/filebackup-store.json",
         # The WALL panel variant (SR-016/SR-017): a second image target with its
         # own late-commands, so it needs its own coverage. Every file below is
         # cp'd or enabled by autoinstall/wall/user-data.

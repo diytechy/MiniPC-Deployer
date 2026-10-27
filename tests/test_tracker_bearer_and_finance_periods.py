@@ -47,6 +47,7 @@ NOT_SENDERS = {
     "stack/weight/setup-weight.sh": "installer: validates the feed URL",
     "stack/backup/backup.sh": "comment only; posts through common.sh",
     "stack/backup/library-backup.sh": "comment only; posts through common.sh",
+    "stack/backup/library-backup-legacy.sh": "comment only; posts through common.sh (the legacy layout, SR-133)",
 }
 DISCOVER = re.compile(
     r"api/(feed|backup-state|check|count|catchup|undo)|NAGLIGHT_(TOKEN|FEED_URL)|[A-Z]+_FEED_(TOKEN|URL)")

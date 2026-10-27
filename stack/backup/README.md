@@ -562,9 +562,11 @@ The second service. `library-backup.sh` is a **host** wrapper around exactly one
 `docker compose run`; everything else in it is proof that the run should happen.
 
 ```
-library-backup.sh                        the host side (bash, root, one-shot)
-filebackup.json                          the container's config — TRACKED, installed
+library-backup.sh                        the host side (bash, root, one-shot); the one-mount layout
+library-backup-legacy.sh                 the legacy layout's wrapper, frozen (FILEBACKUP_LAYOUT)
+filebackup.json                          the legacy container config — TRACKED, installed
                                          to /etc/homehub-backup/filebackup.json 0644
+filebackup-store.json                    the one-mount container config, installed beside it
 systemd/homehub-library-backup.service   Type=oneshot, TimeoutStartSec=infinity
 systemd/homehub-library-backup.timer     03:00 box-local (same transaction as the nightly, After= orders it), Persistent=true
 ```
@@ -572,9 +574,285 @@ systemd/homehub-library-backup.timer     03:00 box-local (same transaction as th
 The image is `filebackup:${FILEBACKUP_IMAGE_TAG}`, built from a sibling
 `../FileBackup` checkout by `scripts/ensure-local-images.sh` (**always with
 `--rebuild`** — the resolver skips an image that already exists, and a
-hand-tagged one carries no `homehub.source.revision` stamp) and baked into the
-ISO payload by `vmtest/export-images.sh`, which enables the `filebackup` profile
-unconditionally for the bake.
+hand-tagged one carries no stamp) and baked into the ISO payload by
+`vmtest/export-images.sh`, which enables the `filebackup` profile
+unconditionally for the bake. The build stamps two labels:
+`homehub.source.revision` (the FileBackup commit) and
+`homehub.filebackup.contract`, which is `one-mount-v2` only when that commit
+contains FileBackup `BoundedRebuild` `7a6a80a` and its engine's
+`ConfigSchemaVersion` is 2.
+
+> **Everything from here on is the `single` layout** of
+> [the layout knob](#the-layout-knob--filebackup_layout-legacy-until-the-cutover);
+> the default, `legacy`, runs the deployed image unchanged.
+>
+> **The `single` layout is FileBackup `BoundedRebuild` as it is** (`7a6a80a`,
+> 2026-10-27: the bounded run loop and the fixes of its 2026-10-26 data-loss
+> review). One `/store` mount holding `backup/` and `changes/`, ConfigVersion 2,
+> backup exits 0/1/2/4, verify 0/1/2. The wrapper **refuses an image without
+> the `one-mount-v2` contract label** (step 1b) before it looks at or creates
+> anything, so the deployed kit-12 image, a hand-tagged one and a later build
+> that changed the contract are all stopped there.
+>
+> **FileBackup's single-store call C44** (one `StorePath`, a `Latest/` folder,
+> ConfigVersion 3; ruled 2026-10-27, `docs/plans/single-store-layout.md`) is
+> **not built, and is not this layout**. An image with it would need its own
+> contract change here first: a new config, new paths, a new contract label.
+> Until then, build only from a FileBackup commit without it.
+
+### The layout knob — `FILEBACKUP_LAYOUT` (legacy until the cutover)
+
+Two store layouts are installed side by side, and `FILEBACKUP_LAYOUT` in
+`stack/.env` (SR-133; HomeHub's `config.homehub.psd1` pins it) chooses:
+
+| | `legacy` — **the default**, and what an unset value means | `single` |
+|---|---|---|
+| image | the one the hub runs today (kit 12, `filebackup:local` from FileBackup `4b809d1` — inferred from records, confirm with `docker image inspect`) | one built from FileBackup `BoundedRebuild` `7a6a80a` (or a later commit without C44), label `homehub.filebackup.contract=one-mount-v2` |
+| store | three mounts: `/state` (system disk), `/backup`, `/changes` (`FILEBACKUP_STATE`/`_BACKUP`/`_CHANGES`) | one mount, `/store` (`FILEBACKUP_STORE`), holding `backup/` and `changes/` |
+| compose service | `filebackup` | `filebackup-store` |
+| container config | `filebackup.json` (ConfigVersion 2: `/state`, `/backup`, `/changes`) | `filebackup-store.json` (ConfigVersion 2: `/store/backup`, `/store/changes`) |
+| wrapper | `library-backup-legacy.sh`, which `library-backup.sh` hands the run to with its arguments unchanged | `library-backup.sh` itself (everything below this section) |
+| frame-freshness reads | the `/state` record, with its `.meta` row-count check | the system-disk copy the wrapper publishes |
+
+**A stack delivery changes nothing until the knob is switched.** The legacy
+wrapper is the integration branch's wrapper as it was before this layout
+merged, byte for byte (pinned by `tests/library-backup-layout.test.sh`), and that
+branch's own suite runs against it through the default
+(`tests/library-backup-legacy.test.sh`). The legacy service and config are
+unchanged. `frame-freshness.sh` reads the **newer** of the two system-disk
+manifests, so on a legacy hub, where there is no copy, it reads `/state`
+exactly as before. Neither service is in `COMPOSE_PROFILES`, and a plain
+`docker compose config` (firstboot's bind-source pre-creation) sees neither, so
+nothing creates `library-store/` on the backup drive. What a delivery cannot do
+is make `/etc/homehub-backup/filebackup-store.json` appear: that file comes
+from late-command 5c on a reimage, or from the cutover below. A `stack/.env`
+that exists but cannot be read stops the wrapper instead of letting it guess
+`legacy`.
+
+The knob does **not** protect the legacy layout against the image changing
+under it: a `filebackup:local` built from `BoundedRebuild` and run in the
+legacy layout fails loudly (its three-mount config and mounts are refused).
+That is the build hazard of HomeHub open-items C110, and the reason the old
+image is kept under its own tag at step 3 below.
+
+**Set every knob in HomeHub's `config.homehub.psd1`, never by hand on the
+hub.** The materialised `.env` is written from it, so a value edited only in
+`/opt/homehub/stack/.env` is overwritten at the next materialise — for
+`FILEBACKUP_MEM_LIMIT` that would silently put the backup back to uncapped.
+
+#### The cutover, in this order
+
+1. **FileBackup.** An image from `BoundedRebuild` `7a6a80a`, or from a later
+   commit that contains it and **not** C44. The second half of FileBackup's
+   call C43 (prune and pool-resolve reading one manifest at a time) is not in
+   `7a6a80a`: read
+   [Verify and prune memory](#verify-and-prune-memory-filebackup-c43-not-yet-safe-on-the-hub)
+   before step 9.
+2. **Build the image** (`scripts/ensure-local-images.sh --rebuild`, the sibling
+   checkout on that commit) and confirm the stamp on the build machine:
+   `docker image inspect filebackup:local --format '{{index .Config.Labels "homehub.filebackup.contract"}}'`
+   prints `one-mount-v2`.
+3. **On the hub, keep the deployed image and load the new one.** Confirm the
+   timer is off rather than assume it (`systemctl is-enabled
+   homehub-library-backup.timer` says `disabled`, and `systemctl list-timers
+   --all` does not list it as armed; open-items E13), and `systemctl disable
+   --now` it if not. And confirm no backup is running at all:
+   `systemctl is-active homehub-library-backup.service` is not `active` or
+   `activating`, and `docker ps --filter label=com.docker.compose.service=filebackup`
+   lists nothing. Read the deployed image's stamp (`docker image inspect
+   filebackup:local`), `docker tag filebackup:local filebackup:kit12`, then load
+   the new one as `filebackup:local`. From here no backup may run until step 8:
+   the legacy layout cannot use the new image.
+4. **Deliver this stack and install the config:**
+   `install -m0644 -o root -g root /opt/homehub/stack/backup/filebackup-store.json /etc/homehub-backup/filebackup-store.json`.
+5. **The dry check, BEFORE anything is set aside:**
+   `sudo /opt/homehub/stack/backup/library-backup.sh --layout single --preflight-only`.
+   It runs the one-mount preflight over the still-legacy knob, creates
+   nothing and starts no container, so it is not a backup run. It must get past the lock, the **image contract (step 1b)** and
+   the mount checks, and then stop at **step 2b** ("the old three-mount store
+   is still in place"): that refusal is the expected end. A stop anywhere
+   earlier (no image, a wrong label, a mount) is a stop for the cutover.
+6. **Bring in the new store and set the old one aside:**
+   [Bringing in a new store](#bringing-in-a-new-store).
+7. **Switch the knob, with the cap:** `FILEBACKUP_LAYOUT='single'` **and**
+   `FILEBACKUP_MEM_LIMIT='4g'` in HomeHub's `config.homehub.psd1`, in the same
+   change, so the `.env` that turns the one-mount layout on never runs uncapped
+   (compose sets the equal `memswap_limit` itself); materialise, ship the
+   `.env`. Then `sudo /opt/homehub/stack/backup/library-backup.sh
+   --preflight-only` must pass all the way.
+8. **The first run, by hand, under that cap** (E13's return conditions; never
+   uncapped): check `docker compose --profile filebackup config filebackup-store`
+   shows `mem_limit` and `memswap_limit` at 4g, then start it so an SSH drop
+   cannot kill it —
+   `sudo systemd-run --unit=library-backup-first /opt/homehub/stack/backup/library-backup.sh --verify none`
+   — and poll the run container's `memory.peak` every 10 s while it runs (it
+   is `--rm`; the slice's peak, which the wrapper logs, is an upper bound).
+   On a store the Owner wrote beforehand this run continues it; a full first
+   backup takes days.
+9. **Size the limit and turn the timer on:** `FILEBACKUP_MEM_LIMIT` at about
+   twice that peak, in `config.homehub.psd1` again; materialise, ship the
+   `.env`, and check `docker compose --profile filebackup config
+   filebackup-store` shows the new `mem_limit` and `memswap_limit`; then
+   `systemctl enable --now homehub-library-backup.timer`. The timer runs the
+   weekly verify by itself; with `7a6a80a` that is the C43 memory risk named
+   in step 1, bounded by the cap (an OOM kill of the container, not the box).
+   Whether the timer waits for an image with C43's second half is the Owner's
+   call.
+
+#### Rolling back the cutover
+
+- **Up to step 5** (nothing set aside): `FILEBACKUP_LAYOUT='legacy'` in
+  `config.homehub.psd1` (materialise, ship) and `docker tag filebackup:kit12
+  filebackup:local`. The installed `filebackup-store.json` may stay: only the
+  `filebackup-store` service binds it, and the legacy layout never runs that.
+- **After step 6** (the old store set aside): **the timer stays OFF until the
+  set-aside renames are reversed**, and no one-mount run may still be going:
+  `systemctl stop library-backup-first` if the step-8 run is, and confirm
+  `docker ps --filter label=com.docker.compose.service=filebackup-store` lists
+  nothing before anything is renamed. A knob-only rollback is NOT valid here: the
+  legacy wrapper pre-creates its bind paths, so it would create an empty
+  `library/` and `library-changes/` where the old store used to be, and the
+  kit-12 engine would then run against them with its stale `/state` record —
+  at worst a near-empty backup reported green. So: the timer off, the old
+  folders renamed back to `library` and `library-changes`, the new store left
+  where it is (the legacy layout never reads `FILEBACKUP_STORE`), then the knob
+  and the image as above. The old store was set aside, never written by the new
+  engine, so it is as it was. Not verified; the Owner's decision.
+- **Either way**, remove the one-mount layout's manifest copy
+  (`/var/lib/homehub-filebackup/latest/MANIFEST.csv`) if a one-mount run made
+  one: frame-freshness reads the newer of it and the legacy `/state` record,
+  and would read the abandoned copy until the next legacy run.
+
+#### Retiring the legacy layout
+
+Only once the one-mount store has a verified history: delete
+`library-backup-legacy.sh`, `tests/library-backup-legacy.test.sh`,
+`filebackup.json` and the `filebackup` service (giving `filebackup-store` the
+name back), drop the hand-off, and retire `FILEBACKUP_STATE`/`_BACKUP`/`_CHANGES`
+from HomeHub's config. Until then they are the rollback.
+
+### The one-mount store
+
+The container gets **one writable mount, `/store`**, holding `backup/` (the
+latest state, `BackupPath=/store/backup`) and `changes/` (the `Snapshot_<date>`
+history and the run files — `Temp.lock`, `backup.log`, `Incoming/`,
+`Building_*`, `Verify/` — `ChangePath=/store/changes`). On the host that is
+`FILEBACKUP_STORE`, default `/mnt/backup-drive/library-store`. Why one: the
+bounded engine moves content between the latest state and the snapshots **by
+rename only**, so that an object is in exactly one place before and after every
+move, and it refuses (exit 2) a pair a rename cannot cross. Linux cannot rename
+between two bind mounts **even when both are on one filesystem**, so the old
+separate `/backup` and `/changes` mounts would be refused on every run.
+
+**The wrapper never creates `backup/` or `changes/`.** FileBackup creates them
+on a new store, and refuses (exit 2) a store whose `backup/` is gone while
+`changes/` holds snapshots — one that lost its latest state must not be
+answered with a fresh full backup beside its history — which it can only see if
+`backup/` is really missing.
+
+There is **no `/state` mount.** The latest `MANIFEST.csv` (in `backup/`) is
+FileBackup's only record; `SourceStatePath` is not in `filebackup-store.json`
+(FileBackup still accepts the key but ignores it, with a warning every run). The
+old record at `/var/lib/homehub-filebackup/state/MANIFEST.csv` belongs to the
+old store; the wrapper names it after each verified run, and you delete it by
+hand (nothing here deletes it).
+
+**`stack/tracker/frame-freshness.sh` must never wake a drive**, so it reads a
+system-disk CSV. The wrapper publishes a copy of `backup/MANIFEST.csv` to
+`/var/lib/homehub-filebackup/latest/MANIFEST.csv` (`LIBRARY_MANIFEST_COPY`)
+after every **completed** run, exit 0 or 1, by rename so a reader never sees
+half a file, and frame-freshness reads the newer of that copy and the legacy
+record. A copy that cannot be made is a `DEGRADED` note, never a failed backup.
+
+### Bringing in a new store
+
+**There is no migration** (the Owner, 2026-10-27). The old three-mount store is
+**set aside** — renamed, never copied into the new layout, never deleted — and
+keeps restoring with the kits already inside it. The new store is the one the
+Owner writes with FileBackup `BoundedRebuild` as it is, or the one the first run
+writes on an empty `FILEBACKUP_STORE`.
+
+**Where the new store must sit.** One folder at `FILEBACKUP_STORE` on the
+backup drive (default `/mnt/backup-drive/library-store`) holding `backup/` (its
+`MANIFEST.csv`, the objects, the restore kit) and `changes/` (the
+`Snapshot_<date>` folders and the run files), both on that one filesystem and
+neither a mount of its own:
+
+```
+/mnt/backup-drive/library-store/       FILEBACKUP_STORE, bound at /store
+├── backup/                            BackupPath=/store/backup: MANIFEST.csv, objects, kit
+└── changes/                           ChangePath=/store/changes: Snapshot_*/, Temp.lock, backup.log, ...
+```
+
+A store written somewhere else on **the same drive** is moved there with one
+rename (check `stat -c %d` shows one device for both places, then `mv -T`). One
+on another drive is a supervised copy (`rsync -a`), checked with a `verify`
+against the copy before the original is touched; nothing here automates that,
+and the original is the Owner's to keep or remove.
+
+**Set the old store aside** — the timer off (cutover step 3). `library` and
+`library-changes` below are the defaults of `FILEBACKUP_BACKUP` and
+`FILEBACKUP_CHANGES`; use the values in `/opt/homehub/stack/.env` if they
+differ. Run the lines one at a time, and **stop at the first line if it prints
+STOP**: with the drive unmounted, everything after it would act on the empty
+mountpoint folder on the system disk.
+
+```bash
+mountpoint -q /mnt/backup-drive && cd /mnt/backup-drive || { echo "STOP: the backup drive is not mounted"; false; }
+# FILEBACKUP_STORE must be neither of the two folders below nor inside one: the
+# renames would carry the new store away with them.
+ls -d library library-changes 2>&1                    # each that exists holds the old store
+sudo mkdir old-library-store
+stat -c '%d %n' . old-library-store library library-changes 2>/dev/null
+#   every line must show the SAME device number: then each mv below is a rename.
+#   A different number means another filesystem, where mv would copy terabytes - stop.
+# One mv per folder that EXISTS (the ls above); skip a line whose source is absent.
+sudo mv -T library         old-library-store/library
+sudo mv -T library-changes old-library-store/library-changes
+# NEVER move library-store here when it is the new store.
+```
+
+Then the wrapper's step 2b no longer finds data at `FILEBACKUP_BACKUP` /
+`FILEBACKUP_CHANGES` and the cutover goes on (step 7).
+
+**The rule for a store made elsewhere: it is written by the Linux container,
+with `/source` at the library root — the same root as the hub's
+`/srv/library` — and never by a native Windows run.**
+
+- **Why not Windows.** FileBackup records each row's paths with the separator
+  of the system that wrote it and finds a file again by its exact path; nothing
+  in `7a6a80a` normalises the separator (confirmed from its code). A store
+  written on Windows holds `Shared\a.jpg` where the container computes
+  `Shared/a.jpg`, so the first hub run would treat every file as new and every
+  row as gone, and frame-freshness (which reads `Shared/`) would find no media.
+  The wrapper refuses such a store (step 2c: a backslash in a path column of
+  `backup/MANIFEST.csv`, which a Linux run can never write).
+- **Why the same root.** The rows are relative to the source; a store of a
+  different root (one share rather than the whole library) would not line up
+  with `/source` = `/srv/library`, and nothing can detect that from the
+  manifest alone.
+
+Also worth knowing:
+
+- **Space.** The set-aside store stays on the drive beside the new one. The
+  capacity floor (step 3 of the wrapper) is checked before each run only; a
+  drive that fills during one stops it with **4**, and every later run then
+  refuses at that floor until space is made — nothing here makes it. Where the
+  space comes from (the set-aside store moved off this drive, or removed once
+  the new store has history) is the Owner's call, never this stack's.
+- **Restoring from the set-aside store** uses the kit inside it
+  (`bash/reconstruct.sh` in its latest state or a snapshot). Its folders have
+  moved, so pass its roots explicitly as that kit's `--help` describes.
+- **`stack/.env`:** keep `FILEBACKUP_STATE`, `FILEBACKUP_BACKUP` and
+  `FILEBACKUP_CHANGES` until the legacy layout is retired: they are the legacy
+  layout's paths (the rollback). In the one-mount layout `FILEBACKUP_BACKUP` and
+  `FILEBACKUP_CHANGES` are read only to find an old store (step 2b refuses
+  while either holds data), which after the renames they no longer name;
+  `FILEBACKUP_STATE` is never a refusal, only the retired-record note.
+- **An old engine's `Temp` folder** stays with the set-aside store. One that
+  turns up under the new store's `changes/` (an interrupted prune) gets a note
+  every run until it is recovered by hand per FileBackup's README ("A run
+  refuses because `Temp` exists").
 
 ### The profile is deliberately not in `COMPOSE_PROFILES`
 
@@ -589,33 +867,139 @@ asks for the profile itself.
 
 | Step | Refuses when | Why it exists |
 |---|---|---|
-| 1. `flock` | another run holds the lock | the first real run is a **multi-day** job; the nightly timer would otherwise stack a second container into one `/state` and one `/backup`. A held lock **posts nothing** — the lane belongs to the run that is still going — but exits non-zero |
-| 2. mount identity | `/srv/library` or the backup drive is absent or read-only | `nofail` in the fstab means an absent drive leaves an ordinary empty **directory on the system disk**. Reuses `samba/library-guard.sh`, cross-checked against the generated fstab and `drive-identity.conf`; a **stand-in drive is yellow**, carried into the summary, not a refusal |
-| 3. capacity | free space below `BACKUP_LIBRARY_MIN_FREE_GB` (or the state/logs floor) | there is **no retention** — this floor is the whole space policy |
-| 4. pre-create | — | docker **chowns** a bind source it had to create, and that is `EPERM` on the FAT-family data drives, which takes the *entire* compose command down. The config file and the library source are asserted, never created |
-| 5. write-probe | uid 65532 cannot write `/backup` or `/changes` | NTFS/exFAT ownership is synthesized from mount options, so only the fstab's `uid=65532,gid=65532` grants access (**Q-FB5**). A regression must fail in the first seconds, not at hour eight |
+| 1. `flock` | another run holds the lock | the first real run is a **multi-day** job and the nightly timer fires again while it is going. FileBackup's own lock would stop a second container with exit 4, but only after compose and a drive spin-up; this answers first and names the holder. A held lock **posts nothing** — the lane belongs to the run that is still going — but exits non-zero |
+| 1b. image contract | the image `filebackup:${FILEBACKUP_IMAGE_TAG}` is not loaded, docker cannot be asked, or its `homehub.filebackup.contract` label is not `one-mount-v2` | the knob cannot tell what is loaded under the tag. The deployed kit-12 image, a hand-tagged one and a build whose contract changed (C44) all stop here, before anything on the drives is looked at or created |
+| 2. mount identity | `/srv/library` or the backup drive is absent or read-only, or `backup/` or `changes/` is a separate mount under the store | `nofail` in the fstab means an absent drive leaves an ordinary empty **directory on the system disk**. Reuses `samba/library-guard.sh`, cross-checked against the generated fstab and `drive-identity.conf`; a **stand-in drive is yellow**, carried into the summary, not a refusal. The library-source check answers **first**; behind it, FileBackup itself stops with exit 4 when the source is empty at the start of a run while the latest state holds rows (its call C39), leaving the latest state as it was |
+| 2b. store layout | the old three-mount store (`FILEBACKUP_BACKUP` / `FILEBACKUP_CHANGES`, default `/mnt/backup-drive/library` and `library-changes`) still holds anything | starting the new layout beside it would begin a multi-day first backup into an empty store while the real history sat unused next to it. The refusal names [setting it aside](#bringing-in-a-new-store) (never a migration); an **empty** old folder is only a note |
+| 2c. Windows-written manifest | `backup/MANIFEST.csv` has a backslash in a path column (`DataPath` or `RelativePath`) | the store was written by a native Windows run, whose paths this container cannot match (see [Bringing in a new store](#bringing-in-a-new-store)); a Linux run never writes one. One streaming read of the manifest, stopping at the first hit |
+| 3. capacity | free space below `BACKUP_LIBRARY_MIN_FREE_GB` (or the system-disk floor for `/logs`) | there is **no retention** — this floor is the whole space policy |
+| 4. pre-create | — | docker **chowns** a bind source it had to create, and that is `EPERM` on the FAT-family data drives, which takes the *entire* compose command down. The config file and the library source are asserted, never created; **`backup/` and `changes/` are never created** (FileBackup's, so its refusal of a store that lost `backup/` can fire) |
+| 5. write-probe | uid 65532 cannot write the store, `backup/` or `changes/` (each when present) or `/logs` | NTFS/exFAT ownership is synthesized from mount options, so only the fstab's `uid=65532,gid=65532` grants access (**Q-FB5**). A regression must fail in the first seconds, not at hour eight |
+| 5b. old staging | *(never refuses)* | an old engine's `changes/Temp` (or an interrupted prune's) may hold the only copy of superseded content. The bounded engine leaves it alone and runs, so this is a **note** naming the recovery event that interrupted it, carried into the summary; recover `Temp` by hand per FileBackup's README |
 
 Then it holds the drive awake (`hdparm -S 0`, restored on every exit path),
 runs the container, applies the verify gate, and posts to NagLight.
 
 `library-backup.sh --preflight-only` runs steps 1–5 and stops without creating
-or starting anything.
+or starting anything; `--layout single` with it runs the one-mount preflight
+over a `legacy` knob (cutover step 5), and is refused on a real run.
 
-### Exit codes — two different tables
+### Exit codes — three different tables
 
-The **backup** action (`SR-043`), which has no code 3:
+The **backup** action (FileBackup's bounded-run-loop plan §6). The set log,
+`<store>/changes/backup.log`, names every file; the container's global log is
+`/var/log/homehub-filebackup/Backup_Global.log`.
 
-| | |
-|---|---|
-| **0** | complete |
-| **1** | a set failed — a data/IO problem; read `Backup_Global.log` |
-| **2** | the configuration could not be loaded, or violates the contract. **Retrying will not help** |
+| Exit | Meaning | What the wrapper does |
+|---|---|---|
+| **0** | every file was captured | verify gate; then **lastSuccess** |
+| **1** | the run **completed**, but not fully: some files were not captured (each is named in the set log; their earlier rows are kept), and/or a stored object was found **damaged** and set aside (below). Usually a file in use; an unportable name — including paths that differ only in letter case, which a Windows restore would collapse into one (FileBackup C42) — or an unreadable folder repeats every night until fixed | verify gate still runs (a file locked for weeks must not also stop the weekly proof); then **fails the unit, no lastSuccess**. The message counts any `[DamagedObject]` lines |
+| **2** | refused **before changing anything**; a person must fix it — the config, a required tool or dependency that cannot be loaded (7-Zip, the hashing package; before the 2026-10-26 review this escaped as a 1), the source root missing, the one-mount rename test, or a latest manifest that cannot be read (move it aside to force a rebuild; the snapshots are untouched) | fails now: **do not retry** |
+| **4** | stopped by a **host** problem — the backup drive full or gone; another FileBackup run holds its lock (`changes/Temp.lock`; a manual verify or prune?); or the library source was **empty at the start of the run while the latest state holds rows** (FileBackup C39), which is exactly what an unmounted or failed library drive looks like. The latest state is left as it was | fails now: **retry later**. A stop is no worse than a kill and the next run keeps the progress; the next timer run is the retry. A library that is really meant to be empty is not a supported state for this set (FileBackup's advice is to remove such a set from the configuration) |
 
-The **verify** action uses the restore-side table (`SR-040`), shared with
-`reconstruct.sh` — **0** complete · **1** incomplete (content) · **2** usage or
-precondition · **3** manifest-witness mismatch · **4** incomplete (host,
-retriable); precedence **2 > 3 > 4 > 1**. Each maps to its own message, because
-one generic "backup failed" puts a human in the container log every time.
+**Only 0 is a verified success.** An exit 1 is "partial, no data lost", but
+advancing `lastSuccess` for it would let a file that is never captured hide
+behind a green lane forever. So the lane's age grows and the unit fails
+(`systemctl --failed`, and the hub watch's `library-backup` row) — that *is* the
+warning, and it turns red only if nobody acts for days. A backup **never returns
+3** any more (the manifest witness is gone); the wrapper reports a 3 as an
+**older image**.
+
+#### Damaged objects
+
+Since FileBackup's call C37 a backup run lists the store and treats a stored
+object as **damaged** when it is empty while its name records content, or when
+it is a raw object (no 7-Zip signature) whose length differs from the one its
+name records — what a power cut can leave behind a rename. It **moves** each one
+into `<store>/changes/Verify/` (never deletes it, never reuses it; one it cannot
+move stays where it is and is still never reused), writes one
+`[DamagedObject]` WARN line per object into the set log, stores the content
+again only when a source file still hashes to that name, and returns **1**. The
+wrapper counts those lines after an exit 1 and says how many; it reads nothing
+else out of the log.
+
+Bytes already stored were lost here. If a library file still hashes to that
+name, the same run stores it again and every row naming it resolves as before.
+If none does (the file has since changed or gone), the rows naming that object —
+in the latest state or in a snapshot — can no longer restore that file, and a
+verify reports them as `PoolUnresolvable`. `Verify/` is not part of the pool;
+look at what it holds before emptying it by hand.
+
+The **verify** action: **0** clean · **1** findings · **2** precondition (no
+backup root, no manifest, `-Deep` without 7-Zip, a host problem that stopped
+it, or — for a `-RepairStorage` run — the store lock held by a backup or
+prune). It never returns 3 or 4 any more; the wrapper reports either as an
+older image. See [Verify findings](#verify-findings).
+
+**`prune` and `snapshots`** keep FileBackup's restore-side table — **0** done ·
+**1** batch incomplete, nothing lost · **2** usage or precondition, nothing
+mutated · **3** an old manifest witness disagrees with its manifest, nothing
+mutated · **4** host I/O, retriable; precedence **2 > 3 > 4 > 1**. The wrapper
+never runs either; they are the manual relief valve below. Since FileBackup
+`3756974` both resolve the store **read-only** and no longer need the library:
+with the library drive away they still work (they used to do nothing and exit
+1). A store that is not there — no backup root — is refused with **2** and
+nothing is created inside it. *Open with the Owner (FileBackup review item B):
+whether an unplugged store drive should be 2, as built, or 4 "retry later".*
+Note that compose still binds the host folder `FILEBACKUP_STORE`: if the backup
+drive is not mounted, docker creates that folder **on the system disk** for the
+bind and FileBackup then refuses with 2 — check `findmnt /mnt/backup-drive`
+first, and remove such a stray folder by hand.
+
+NagLight sees all of this as **one** thing: whether `lastSuccess` advanced.
+IF-006 has no warn/error channel for the library wrapper (`shareHealth` belongs
+to the share monitor), so "warn" and "error" differ in the journal and in the
+wrapper's message, not on the wall.
+
+### Verify findings
+
+The weekly gate is **report only**; it never passes `FILEBACKUP_REPAIR`. Each
+finding is a `[Class]` line in `Backup_Global.log` (and a JSON document on the
+container's stdout, in the journal):
+
+| Class | Means | What to do |
+|---|---|---|
+| `PoolUnresolvable` | a manifest row whose bytes are nowhere in the store | the next backup re-stores it if the source still has the file |
+| `DuplicateObject` | one object stored in more than one folder | harmless, costs space. Rare on a store the bounded engine wrote from the start (residue of an interrupted move) |
+| `DamagedObject` | an object whose **length** its name rules out — empty, or a raw object of another length (any verify, since FileBackup C37; a backup run sets these aside itself, see [Damaged objects](#damaged-objects)) — or, under `-Deep` (monthly), one whose bytes do not hash to its name | the next backup re-stores the content if the source still has it |
+
+Moving duplicates and damaged objects aside is a person's call, never the
+timer's. It **moves** them into `<store>/changes/Verify/` — nothing is deleted —
+and re-verifies. Preview it first: `-WhatIf` passes straight through to
+FileBackup and, since FileBackup `ce068bc`, a repair honours it and moves
+nothing:
+
+```bash
+cd /opt/homehub/stack
+docker compose --profile filebackup run --rm -T -e FILEBACKUP_REPAIR=1 filebackup-store verify -WhatIf  # preview: moves nothing
+docker compose --profile filebackup run --rm -T -e FILEBACKUP_REPAIR=1 filebackup-store verify          # duplicates, and objects damaged by length
+docker compose --profile filebackup run --rm -T -e FILEBACKUP_REPAIR=1 filebackup-store verify -Deep    # and objects whose bytes do not hash to their name
+```
+
+`-e` is required: a variable set on the host shell is **not** passed into the
+container (compose forwards only what the service declares). A repair takes the
+store's lock (`changes/Temp.lock`), so it is **refused with 2 while a backup or
+a prune holds it** — run it outside the 03:00 window, or stop
+`homehub-library-backup.timer` for the duration. Empty `changes/Verify/` by hand
+once you are sure you do not want what is in it.
+
+#### Verify and prune memory (FileBackup C43): not yet safe on the hub
+
+Until FileBackup's follow-up to its call C43 lands, **a verify (its
+pool-resolve check) and a prune still hold every snapshot manifest in memory at
+once** — about 420 MB per HomeHub manifest, the mechanism of the 2026-10-04
+outage. FileBackup's storage-form audit no longer does; prune and the
+pool-resolve check are next.
+
+**Neither should run on the hub's store before that follow-up is in the
+deployed image.** The wrapper's verify gate (step 8, weekly, `-Deep` monthly) is
+scheduled by the calendar and **nothing here stops it yet** — disabling it is
+the Owner's call (docs/status.md). What would gate it: run the unit with
+`--verify none` (its `ExecStart`), or a knob the wrapper reads, until such an
+image is deployed; a `FILEBACKUP_MEM_LIMIT` would turn a runaway into an OOM
+kill of this one container instead of the box. Prune is manual only, so the
+same rule is a rule for the person running it. The repair commands above are
+verifies too.
 
 ### Retention: none, by ruling — and the manual prune
 
@@ -636,17 +1020,32 @@ When the Owner does want space back, the procedure is manual and in this order:
 cd /opt/homehub/stack
 # 1. list what exists. The output is line-framed JSON: take exactly the [ .. ]
 #    block by line — never a greedy regex. Empty is `[]`.
-docker compose --profile filebackup run --rm -T filebackup snapshots
-# 2. DRY RUN the removal first.
-FILEBACKUP_DRY_RUN=1 docker compose --profile filebackup run --rm -T filebackup \
+docker compose --profile filebackup run --rm -T filebackup-store snapshots
+# 2. DRY RUN the removal first. `-e` is what makes it a dry run: a variable set
+#    on the host shell (FILEBACKUP_DRY_RUN=1 docker compose …) is NOT passed into
+#    the container, so that form silently runs the REAL prune.
+docker compose --profile filebackup run --rm -T -e FILEBACKUP_DRY_RUN=1 filebackup-store \
     prune -Snapshot Snapshot_2026-08-23
 # 3. then for real.
-docker compose --profile filebackup run --rm -T filebackup prune -Snapshot Snapshot_2026-08-23
+docker compose --profile filebackup run --rm -T filebackup-store prune -Snapshot Snapshot_2026-08-23
 ```
 
 **Never delete a `Snapshot_*` folder by hand.** It is the only copy of the states
 it holds, and the manifests that make the rest reconstructable refer into it.
 These actions use the **restore-side** code table above, not the backup one.
+Read [Verify and prune memory](#verify-and-prune-memory-filebackup-c43-not-yet-safe-on-the-hub)
+before running a prune on the hub.
+
+**A prune that reports 0 can leave a `Pruning_<name>` folder** (FileBackup
+C41). The rename to `Pruning_<name>` is the prune's commit point: once it has
+happened the snapshot is gone from every reader and its still-needed bytes are
+already re-homed. If the delete after it fails, the prune still reports the
+removal as done (**0**) with a WARN naming the leftover, and **every later
+prune** (of any name) finishes such leftovers **first**: right after it takes
+the store lock, before any of its checks, so even a prune that is then refused
+(for space, say) clears them and its space counts. A dry run (`-WhatIf`)
+finishes nothing. Leave `Pruning_*` folders to FileBackup rather than deleting
+them by hand.
 
 ### Rollback
 
@@ -661,9 +1060,9 @@ the data:
    image in place costs a few hundred MB and keeps the rollback reversible. To
    remove it from future ISOs as well, drop `--profile filebackup` from
    `PROFILE_ARGS` in `vmtest/export-images.sh`.
-3. **Reclaim the space by hand.** `rm -rf /mnt/backup-drive/library
-   /mnt/backup-drive/library-changes`. Both trees are self-contained, so deleting
-   them needs no tooling and leaves nothing dangling. The manifest cache at
+3. **Reclaim the space by hand.** `rm -rf /mnt/backup-drive/library-store` (the
+   `FILEBACKUP_STORE`). The store is self-contained, so deleting it needs no
+   tooling and leaves nothing dangling. The retired source-side record at
    `/var/lib/homehub-filebackup/state` and the logs at
    `/var/log/homehub-filebackup` go the same way.
 
@@ -671,10 +1070,18 @@ the data:
    > root is content-addressed, not a browsable mirror (Q-FB1 withdrawn
    > 2026-08-26), so you cannot eyeball what you are about to lose — the file
    > names are opaque hashes. Take an inventory first:
-   > `docker compose --profile filebackup run --rm -T filebackup snapshots`.
+   > `docker compose --profile filebackup run --rm -T filebackup-store snapshots`
+   > (`filebackup` in the legacy layout).
 4. **The bash service is unaffected.** Its sets, its timer, its `backup` lane and
    its retention are all independent of any of the above. What you lose is the
    library coverage, which is what there was before this shipped.
+
+**Going back to the kit-12 image** is the layout knob's
+[rollback](#rolling-back-the-cutover): the legacy layout, the kept
+`filebackup:kit12` image, and — once the old store has been set aside — its
+renames reversed **before** the timer runs again. The old store was never
+written by the bounded engine, so it is as it was. Not verified; the Owner's
+decision, not a routine rollback.
 
 ### The 7-Zip level — `FILEBACKUP_7Z_LEVEL=5`, not the image's 9 (2026-09-01)
 
@@ -693,11 +1100,14 @@ later needs no migration.
 
 ### The config file
 
-`filebackup.json` is **tracked** and installed to
-`/etc/homehub-backup/filebackup.json` at 0644 root by autoinstall late-command
-5c — not through the `site/` payload the secrets take. Every path in it
-(`/source`, `/state`, `/backup`, `/changes`) is a **container-internal mount
-target** fixed by `docker-compose.yml`; it derives from the storage map not at
+Two configs, one per layout, both **tracked** and installed by autoinstall
+late-command 5c at 0644 root — not through the `site/` payload the secrets take:
+`filebackup.json` (legacy: `/source`, `/state`, `/backup`, `/changes`, unchanged
+from before the knob) to `/etc/homehub-backup/filebackup.json`, and
+`filebackup-store.json` (one-mount: `/source`, `/store/backup`, `/store/changes`)
+to `/etc/homehub-backup/filebackup-store.json`. Both are ConfigVersion 2. The
+notes below are the one-mount config's. Every path in them is a
+**container-internal mount target** fixed by `docker-compose.yml`; it derives from the storage map not at
 all and carries no secret, no serial and nothing site-specific. The host paths it
 pairs with are the `FILEBACKUP_*` knobs in `stack/.env`.
 
@@ -724,9 +1134,17 @@ are recorded here instead:
   manager; the manifest is the index and `reconstruct.sh` is the reader. The
   restore kit still ships **inside** the backup, so a rescue machine still needs
   no tooling installed — see "Restoring without the container" below.
-- `AllowEmptySource` is **absent**, and that absence is load-bearing: the default
-  is `false`, which refuses to empty a populated backup when the source comes up
-  empty — the safety net for a library drive that failed to mount.
+- `BackupPath` and `ChangePath` are **children of one mount**, `/store` — see
+  [The one-mount store](#the-one-mount-store). Do not point either outside it.
+- `SourceStatePath` — **REMOVED. Do not add it back.** The bounded engine keeps
+  no source-side record; it still accepts the key but ignores it, with a
+  warning on every run.
+- `AllowEmptySource` is absent, and FileBackup accepts and **ignores** it
+  anyway. Since its call C39 (superseding C2's warning) a source that is empty
+  at the start of a run while the latest state holds rows stops the set with
+  **4** before the latest state is written; a first backup of an empty source
+  still returns 0. The wrapper's step 2 (`/srv/library` must be its own
+  mountpoint) answers first, before a container starts.
 - No `Tools` block: the image sets `FILEBACKUP_7ZIP_PATH=/usr/bin/7z` itself.
 - No `Secrets` block: containerized runs are `-NoMail`, and JSON cannot carry a
   `PSCredential` anyway.
@@ -744,10 +1162,30 @@ but mis-splits silently.
 
 ```bash
 bash reconstruct.sh --target-root /var/tmp/restore --from <snapshot-or-backup-root> \
-    --backup-root /mnt/backup-drive/library --change-root /mnt/backup-drive/library-changes \
-    --require-witness
+    --backup-root /mnt/backup-drive/library-store/backup \
+    --change-root /mnt/backup-drive/library-store/changes
 ```
 
-**`--require-witness` on every restore** — without it a missing manifest sidecar
-only warns. The explicit root flags exist for exactly this split-mount shape; on
-a rescue machine, `cd` onto the drive and pass `--from` alone and it auto-detects.
+**Pass both roots, always.** The kit's auto-detection takes a snapshot's
+grandparent as the backup root, which here is the store folder, not
+`store/backup`; with the wrong root the restore falls back to a slow content
+scan. The kit-14 restorer (the one the bounded engine writes into the latest
+state) reads no witness and **refuses `--require-witness`** as an unknown
+argument; an older snapshot's own older kit still accepts it.
+
+**Its exit codes** are FileBackup's restore table (its README "Restore exit
+codes"): **0** every row restored · **1** content missing — real data loss for
+those rows; everything salvageable was restored · **2** nothing attempted (usage,
+no or unrecognisable manifest, target problems) · **4** a host problem on this
+machine — retriable. Precedence **2 > 4 > 1**. Two meanings are newer than the
+first kit-14 build, and the kit revision is still **14**:
+
+- A manifest **torn into NUL bytes** (what NTFS can leave after a power cut)
+  restores its complete rows before the NULs, logs `[ManifestDamaged]` naming
+  the manifest, and exits **at least 1** — it used to exit 0 with a partial
+  tree (FileBackup C38). The rows after the tear are not recoverable from that
+  state; an older snapshot may still hold them.
+- A **host** problem on a row that carries a `DataPath` (an unreadable pool
+  folder, say) is **4**, retriable, not 1 "content missing" (FileBackup review
+  A7, `4fb7689`). Since nearly every row carries one, a 1 now really means the
+  bytes are gone.

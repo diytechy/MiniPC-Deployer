@@ -64,6 +64,7 @@ only the Contract cell's opening words; the CSV holds the contract.
 | **IF-075** | Provides | OtterTube (desktop app's update check) and HomeHub (the publisher) | Implemented | v1 | SR-125, SR-126, SR-127 | v1 OtterTube update channel (SR-125..SR-127). On the OtterTube site (IF-073; LAN only, the site knob … |
 | **IF-076** | Provides | event sources: the hub detector (stack/camera-motion); later an ONVIF adapter and the panel's spool | Implemented | v1 | SR-128, SR-129 | v1 camera motion-event record and store (SR-128). One compact JSON object per line, at most 512 bytes: {v: 1 … |
 | **IF-077** | Provides | whoever reads motion clips: the Owner over a share (later), Jellyfin never | Implemented | v1 | SR-129, SR-130, SR-131 | v1 motion clips tree (SR-129..SR-131). &lt;CLIPS_ROOT>/&lt;camera>/&lt;local YYYY-MM-DD>/&lt;camera>_&lt;local … |
+| **IF-078** | Consumes | FileBackup (its IF-001, the OCI image contract; ids are repo-local) | Implemented | v1 | SR-018, SR-132, SR-133 | v1 the hub's side of FileBackup's image contract, per store layout (SR-133). legacy (default): compose … |
 <!-- END GENERATED IF INDEX -->
 
 ## Notes on selected interfaces (hand-written)

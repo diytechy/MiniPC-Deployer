@@ -12,6 +12,110 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-10-27 (later) — `single` is FileBackup `BoundedRebuild` AS IT IS, not C44 (the Owner's ruling; `filebackup-contract-integrate`, NOT merged, NOT deployed).** The Owner's fresh library baseline is written with `BoundedRebuild` `7a6a80a` (one `/store` holding `backup/` and `changes/`, ConfigVersion 2), so the hub's one-mount layout targets that. This supersedes the C44 parts of the two entries below.
+- **Reverted on this branch only** (`git revert`; the other session's branches are untouched): `2ddc53e` -> 85bb222, `de4f14e` -> 6ad461a, `cc642f1` -> 3eb5002. Kept: Part 1 through `7e86b77`, including the 2026-10-26 review-contract commits, each checked against `7a6a80a`: one `/store` mount (`Assert-SingleStoreMount`), `BackupPath=/store/backup`, `ChangePath=/store/changes`, run files (`Temp.lock`, `backup.log`, `Incoming/`, `Building_*`, `Verify/`) under ChangePath, the latest manifest at `<BackupPath>/MANIFEST.csv`, backup exits 0/1/2/4 (C37, C39, C42 present), verify 0/1/2.
+- **No migration** (the ruling): `library-store-migrate.sh` is not restored (it renamed the OLD store into the new layout); LLR-1384/TC-1579 stay retired with that reason. README "Bringing in a new store": where the new store sits (`FILEBACKUP_STORE` holding `backup/` and `changes/`, one filesystem, no mount of its own), the set-aside renames (never `library-store` when it is the new store), never a delete.
+- **The Opus review of `a24a9f4` (GO to merge; NO-GO on `single` without an image check), folded in:** step 1b refuses a `single` run unless the loaded image's `homehub.filebackup.contract` label is `one-mount-v2`, stamped by `scripts/ensure-local-images.sh` only when the FileBackup commit contains `7a6a80a` and its engine's ConfigSchemaVersion is 2 (LLR-1389, TC-1589); `--layout single --preflight-only` is the dry check before the set-aside (TC-1591); an unreadable `stack/.env` stops the wrapper; the rollback is knob-only only up to the set-aside, afterwards the timer stays off until the renames are reversed (the legacy wrapper would otherwise create empty `library/` and `library-changes/`); every knob is set in HomeHub's config, never by hand on the hub; the `/state` floor wording; HomeHub's FieldSchema rationale.
+- **Also fixed:** the wrapper no longer pre-creates `backup/` or `changes/`, so FileBackup's refusal of a store that lost `backup/` beside snapshots can fire (open question (e) below; TC-1590).
+- **Review (DeepSeek, the delta, small units):** fixed: a trailing `--layout` looped forever, an empty one slipped past the preflight-only rule, a `.env` that is a directory or a dangling symlink, the cutover's checks for a running backup before the image swap and before a rollback, re-materialising after sizing, the set-aside commands' mount and folder checks, the space caveat. Rejected with reasons in the commits (an ERR-trap claim measured false on bash 5.2, probes "as root", code unchanged by this work). Not reviewed: the contract-label helper in ensure-local-images.sh (empty answer twice; it was run against the real checkout instead).
+- **Final Opus check (GO for merge), its small fixes:** the set-aside block stops when the drive is not mounted; step 2c refuses a `backup/MANIFEST.csv` with a backslash in a path column (a Windows-written store; Opus confirmed from FileBackup's code that change detection is by exact path with no separator normalisation; one streaming awk pass, 0.13 s of CPU for 180k rows; LLR-1390, TC-1592); the README's Windows caveat is now a rule (written by the Linux container with `/source` at the library root); the exit-2 message names a store whose `backup/` is gone beside snapshots and points at the journal; the post-run `df` reads the store's existing ancestor; the label helper says `unknown-history` for a checkout without `7a6a80a`. The Owner's baseline is being written in the Linux container, so step 2c is a guard.
+- **NOT proven:** a real image's label (the stamp logic was run against the real checkout: `one-mount-v2` as root in WSL, `unknown` where git refuses the checkout); bringing in the Owner's store on the hub; whether a baseline written natively on Windows continues under the container (FileBackup records native-separator relative paths and nothing found in `7a6a80a` normalises them; see the README) - to confirm with FileBackup before the first hub run.
+
+**2026-10-27 — the FileBackup single-store contract integrated behind a layout knob (`filebackup-contract-integrate`, cut from `IceDrive-DesktopDirection` 8d87d0b; NOT merged into it, NOT deployed, nothing sent to the hub).** The Owner asked for the contract work to be taken in (2026-10-27). `filebackup-review-contract` (2ddc53e) is merged `--no-ff`; the entry below is its own record.
+- **Ids renumbered** into the 2026-10-27 reservation, because the hub door clips took the branch's: SR-128 -> SR-132, LLR-1356..1360 -> LLR-1381..1385, TC-1541..1547 -> TC-1576..1582. Only lines the branch introduced were renumbered. New here: SR-133, LLR-1386..1388, TC-1583..1588, IF-078 (the hub's `Consumes` row for FileBackup's IF-001, the branch's open question (d)). Amended rows SR-018, SR-049, LLR-1004 and TC-1065 had no IceDrive changes since the branch's base and keep the branch's text; LLR-1004 and TC-1065 now say they are the single layout's. SR-134 is unused.
+- **Checked against FileBackup `BoundedRebuild` 7a6a80a (read-only, code and docs):** it implements the **bounded-run-loop** layout, not C44: ConfigVersion 2 with `BackupPath=/store/backup`, `ChangePath=/store/changes` on ONE `/store` mount (`Assert-SingleStoreMount`, exit 2 when a rename cannot cross); run files (`Temp.lock`, `backup.log`, `Incoming/`, `Building_*`, `Verify/`, an old `Temp`) under ChangePath; the latest manifest at `<BackupPath>/MANIFEST.csv`, no `.meta`, no `/state`. Backup exits 0/1/2/4 match the wrapper. **Verify returns 0/1/2 only** (`Invoke-VerifyAction`: "Code 4 is not produced here"; its IF-001 says the same); 3 and 4 still exist for prune and restore. C44 (`StorePath`, `Latest/`, ConfigVersion 3, run files at the store top) is ruled (`docs/plans/single-store-layout.md`) and **not built**; no FileBackup branch has it. So the branch head, Part 2, needs an image that cannot be built today, and no layout here runs `BoundedRebuild` HEAD's own (Part 1, through 7e86b77, spoke it; L5 supersedes it).
+- **Delivery safety (SR-133):** `FILEBACKUP_LAYOUT=legacy|single` in `stack/.env`, **default and unset = legacy**. Legacy runs what the hub runs today: `library-backup.sh` hands the run, arguments unchanged, to `library-backup-legacy.sh` (IceDrive's wrapper at 8d87d0b, byte for byte, sha256-pinned), the compose service `filebackup` and `filebackup.json` are restored to IceDrive's, and `frame-freshness.sh` reads the newer of the two system-disk manifests, which on a legacy hub is the `/state` record with its witness exactly as before. Single is the branch's work: service `filebackup-store`, config `filebackup-store.json` (installed by late-command 5c beside the legacy one). Without the knob, a routine delivery would have: refused every manual library run at step 2b (the old store holds data), bound `/store` for an image that wants `/state`/`/backup`/`/changes`, and turned frame-freshness yellow on its next timer (the copy it read does not exist). The watch row (`library-backup unit-success`), the metrics units list, the timers and the slice are unaffected either way: the library timer is off (HomeHub E13) and nothing else runs the wrapper. `library-store-migrate.sh` no longer exists (the branch removed it for L2). The cutover order and rollback are in `stack/backup/README.md` "The layout knob".
+- **Fixed in passing:** the branch's own earlier renumbering had shortened three unrelated ranges in this file (SR-085..SR-091, SR-049..SR-051, SR-060..066), restored; its `--help` printed the usage block four lines short.
+- **Proven:** the suites below (hermetic, WSL). **NOT proven:** any image (neither the deployed one's identity, `4b809d1` inferred, nor a C44 one); a delivery, the cutover or the rollback on the hub; that a plain `docker compose config` omits profiled services on the hub's compose version (`vmtest/export-images.sh` relies on the same behaviour and says so); frame-freshness on the hub.
+- **Review (DeepSeek `deepseek-v4.1-flash`, three rounds, small units):** answered for frame-freshness, the README/env docs, the HomeHub side, the dispatcher, the reconcile loop, the store service and the first half of the layout suite; fixed: the legacy record's `manifest_written` (mtime fallback for the copy only), the cutover (timer checked not assumed, the 4g cap set with the knob, a hand-made baseline not renamed aside, rollback removes the copy, `STATE` is never a refusal), the suite (no inherited knob, the single case pinned to exit 1 and flock only, a quoted lock path), HomeHub (`FILEBACKUP_MEM_LIMIT` declared, exact comparisons). Rejected with reasons in the commit messages. NOT reviewed: the second half of the layout suite (pin, compose mounts, frame-freshness case) and the round-1 fix delta: the model returned nothing on them (finish reason `length`) in every attempt.
+- **Open, new:** (j) the Owner is making a fresh baseline by hand: if it is meant to become the hub's store it must be in the C44 layout at `FILEBACKUP_STORE`, or step 2b refuses it like any old store; (k) HomeHub open-items C110 (no image rebuild or bake while the FileBackup checkout is on `BoundedRebuild`) still stands, and the knob does not lift it; (l) HomeHub `scripts/verify/library-*-drill.sh` still use the three-mount paths.
+
+**2026-10-27 — FileBackup's 2026-10-26 data-loss review, HomeHub's side (`filebackup-review-contract`: the six `filebackup-bounded-contract` commits and this work, replayed 2026-10-27 onto `IceDrive-DesktopDirection` 6318772 with the ids it introduced renumbered past the 2026-10-26 reservations: SR-122 -> SR-132, LLR-1320..1324 -> LLR-1381..1385, TC-1490..1496 -> TC-1576..1582 (those are the ids after the SECOND renumbering, 2026-10-27 on `filebackup-contract-integrate`: the branch had first moved them to SR-128, LLR-1356..1360 and TC-1541..1547, which the hub door clips took the same day); that branch, 35f5faf, stays as the record; not merged, not deployed, nothing sent to the hub).**
+Sources of truth (FileBackup, read-only): `docs/plans/bounded-run-loop.md` §13 calls C36–C44, `docs/plans/single-store-layout.md` L1–L6,
+`docs/reviews/2026-10-26-data-loss/consolidated.md` Outcome table. FileBackup's own `docs/interfaces.md` was not treated as final.
+- **Part 1 — FileBackup behaviour that is built or ruled (commits `971d4c2`, `2d67564`, `d5a748d`, `7e86b77`; pullable on its own):**
+  the wrapper's exit messages and README carry: exit 4 also = a source empty at the start while the latest state holds rows (C39;
+  `BoundedRebuild` `88dc7e1`, with a refinement being merged as this was written); exit 1 also = damaged objects set aside into
+  `changes/Verify/` with `[DamagedObject]` lines in `backup.log` (C37; `7228c0b`), which the wrapper now **counts** after an exit 1,
+  and case-only names (C42, not built yet); exit 2 also = an unloadable dependency, and prune/snapshots resolve the store read-only
+  without the library, a missing store being 2 (`3756974`); prune `Pruning_<name>` leftovers finished by the next prune, right after
+  its lock and before any check, never under `-WhatIf` (C41; `f74d80a`, `25d7a2d`); `-RepairStorage` holds the lock and honours
+  `-WhatIf` (`ce068bc`); plain verify reports `DamagedObject` (C37); restore: NUL-torn manifest ≥ 1 (C38; `5b0a986`), host problem on
+  a row with a DataPath = 4 (A7, `4fb7689`); kit stays 14. C36 (flush before rename/delete; `8ec15a1`, `3a5f5ac`) changes no
+  interface. NagLight mapping unchanged: only backup 0 + passing verify advances `lastSuccess`. (Hashes are FileBackup
+  `BoundedRebuild` as read 2026-10-27, while a merge into it was in progress.)
+  Traced: LLR-1381 and TC-1576 amended, **TC-1581** new (damaged-object count).
+- **Part 2 — the single-store layout (C44, L1–L6), NOT YET BUILT in FileBackup (commits `cc642f1`, `de4f14e` and the trace commit
+  after them, each marked "[needs a C44 image]"):** `filebackup.json` is ConfigVersion 3 with `StorePath=/store` (an image without
+  C44 refuses it). The wrapper reads `Latest/` and the run files (`backup.log`, `Temp.lock`, `Verify/`, a prune's `Temp`) at the
+  store's top, refuses a `Latest/` mounted separately (L4), and **never creates `Latest/`**, so FileBackup's refusal of a store with
+  snapshots but no `Latest/` can fire (this also removes the trap in (e) below). Step 2b refuses, naming README "Setting the old
+  store aside", while an older layout sits where this stack looks: the three-mount folders holding data, `backup/` or `changes/`
+  inside the store, or a `MANIFEST.csv` at its top. No migration (L2, L5): `library-store-migrate.sh` and its test are removed and
+  replaced by a short README procedure only (stop the timer, `stat` one device, rename the old folders into one folder on the same
+  drive, deploy, start the clean backup). Restore: no root arguments, no `RECONSTRUCT.paths.json`. Traced: SR-132, LLR-1382, LLR-1383,
+  LLR-1385, TC-1577, TC-1578 amended; **TC-1582** new (Latest/ left missing); LLR-1384 and TC-1579 set to Status `Retired`, their
+  text marked RETIRED (IF-003's precedent; Status is an open column).
+- **Before anything here is deployed:** (1) the FileBackup image rebuilt from `BoundedRebuild` **after** the review's fix batches
+  (C36–C42) merge there; (2) **C43's follow-up in that image before any Verify or prune touches the hub's store** — the wrapper's
+  step-8 verify gate runs **automatically** (weekly, `-Deep` monthly) and nothing on this branch stops it (not disabled silently, by
+  instruction). What would gate it: `--verify none` in the unit's `ExecStart`, or a knob step 8 reads, until that image is deployed;
+  `FILEBACKUP_MEM_LIMIT` would turn a runaway into an OOM kill of the container instead of the box. Prune is manual only.
+  For Part 2 also: (3) FileBackup's C44 work package built, independently reviewed (L6) and merged, and the image rebuilt from it;
+  (4) the Owner sets the old store aside (README procedure) before the first run, and HomeHub's materialiser drops
+  `FILEBACKUP_STATE`/`_BACKUP`/`_CHANGES`.
+- **Proven here / not proven:** `library-backup-state.test.sh` (mocked docker, findmnt, curl) and the check harness, below. NOT
+  proven: any FileBackup image, the C44 image's exact messages (the wrapper names its causes from the rulings, not from built
+  code), the README set-aside procedure, the restore commands, anything on the hub.
+- **Open questions for the Owner:**
+  (a) prune/snapshots with the **store drive unplugged**: exit 2 as built, or 4 "retry later"? (FileBackup review item B, open there.)
+  (b) **C43 gating**: gate step 8 now (which way), or deploy only once the follow-up is in the image?
+  (c) **C36 / power safety:** both hub drives are USB NTFS through ntfs-3g (FUSE), which journals none of its own writes, so a power
+  cut can damage the filesystem itself, not just the last files; FileBackup's flushes cannot fix that. For the clean start, is the
+  backup drive to be **ext4** (more power-safe), given it would then not be readable on Windows? (Found 2026-10-27;
+  `homehub-backup.timer` is enabled, 03:00 nightly.)
+  (d) HomeHub registers **no `Consumes` IF row for FileBackup's IF-001**; the contract lives in SR-018/SR-132 and the README. Add one
+  (repo-local id, counterpart IF-001)?
+  (e) **Found, not fixed (outside this list):** the bounded-contract wrapper's step 4 pre-creates `<store>/backup/`, so FileBackup's
+  C26 refusal (a *missing* BackupPath beside snapshots, never a fresh full backup) can never fire on the hub. Matters only if Part 1
+  ships without Part 2 (Part 2 never creates `Latest/`).
+  (f) **Set aside, in place or moved?** Part 2's guard keeps refusing while the old three-mount folders hold data at their default
+  places, so "set aside" means renaming them out of those places (the README procedure). Confirm, or should the guard accept an old
+  store left in place as a note?
+  (g) **Space for the clean start:** the first clean backup is a full one, beside the set-aside store. Is there room on the backup
+  drive, or does the old store move to another drive (or go) first? Nothing here decides that.
+  (h) **Registry:** `Retired` as the Status of LLR-1384/TC-1579 (no precedent for that value) — keep, or another convention?
+  (i) **Found, out of scope:** `stack/recovery/README.md` "The backup" still says an interrupted run's `Temp` makes the next run
+  refuse; that changed with the bounded-contract branch (a note, not a refusal) and was not updated there.
+
+**2026-10-24 — the library backup on FileBackup's bounded-run-loop contract (`filebackup-bounded-contract`, not merged, not deployed).**
+**Requires a FileBackup image built from FileBackup's `BoundedRebuild` work, which is not in a released image yet.**
+- **SR-132 / LLR-1382..1385:** one writable `/store` bind holding `backup/` and `changes/` replaces `/state`,
+  `/backup` and `/changes`; `filebackup.json` drops `SourceStatePath`. The wrapper refuses while backup/ or changes/
+  is a separate mount, or while the old three-mount store still holds data (step 2b). `library-store-migrate.sh`
+  is the explicit migration: two `rename(2)` calls, never a copy or a delete, refusing other filesystems or
+  mounts, two stores, symlinks, the root filesystem, a held lock or a running container; idempotent. After every
+  completed run the wrapper publishes a system-disk copy of the latest manifest, which `frame-freshness.sh` (IF-035)
+  now reads instead of the retired `/state` record. TC-1577..1580.
+- **SR-018 amended / LLR-1381:** backup exits 0/1/2/4 and verify 0/1/2. **Only backup exit 0 plus a passing
+  verify advances `lastSuccess`;** exit 1 ("completed, files not captured") still runs the verify gate, then fails
+  the unit. A 3 is reported as an older image. TC-1576.
+- **SR-049 amended / LLR-1004, TC-1065:** an old engine's `Temp` is a note naming the recovery event, not a
+  refusal (the bounded engine never stages in Temp; refusing would block every backup).
+- **Fixed in passing:** the documented prune dry run (`FILEBACKUP_DRY_RUN=1 docker compose run …`) ran the real
+  prune — compose does not pass a host variable into the container (measured). It is `-e` now (TC-1577 guard).
+- **Assumptions to confirm (decided unattended):** (a) branch cut from `IceDrive-DesktopDirection`, the
+  integration branch, not `main` (803 commits behind, no FileBackup integration); (b) exit 1 is not a verified
+  success, and the verify gate still runs after it; (c) exit 4 is retried by the next timer run, no extra
+  retry; (d) the weekly verify stays report-only, so `DuplicateObject` findings left by the old engine fail
+  verify nights until someone runs the one-time `-e FILEBACKUP_REPAIR=1 … verify` (README "Verify findings");
+  (e) store default `/mnt/backup-drive/library-store`; (f) SR-132 is traced to SN-014 for want of an SN for the
+  library backup itself; (g) IF-006 cannot show warn vs error for the library lane, so 1, 2 and 4 all show as the
+  age growing; (h) comment-only drift in `autoinstall/user-data` (5c, "/state, /backup, /changes") and
+  `firstboot.sh` (C61, "stale Temp refuses later backups") left alone, per the 2026-10-19 no-drift precedent.
+- **Not proven:** the image, a migration on the hub, frame-freshness on the hub. Cross-repo: HomeHub's
+  materialiser/FieldSchema should emit `FILEBACKUP_STORE` and drop the three retired keys (the defaults match).
+
 **2026-10-23 — nightly backup into the unified lane (`nightly-backup-feed`).** `sim/mini-serv-sim/run-ingest-sim.sh`, `run-volume-sim.sh` and `run-drivepower-sim.sh` were retargeted from the retired `/api/feed` `ok` bodies to `nightlySuccess` (success: a post; failure: none; each has a positive success scenario) but were never executed, only `bash -n`-checked. The hermetic `stack/backup/tests/nightly-success-feed.test.sh` is what proves the behaviour.
 
 **2026-10-22 — HomeHub plan W3b, on `w3b-recorder-scratch-watches` (not merged, not deployed).**

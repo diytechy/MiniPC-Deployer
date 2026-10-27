@@ -26,6 +26,11 @@ SUITES=(
     "backup/tests/plan-and-retention.test.sh"
     "backup/tests/flat-layout.test.sh"
     "backup/tests/library-backup-state.test.sh"
+    # The store-layout knob (SR-133): the dispatcher, the frozen legacy
+    # wrapper, the two compose services and frame-freshness's manifest choice;
+    # then the legacy wrapper's own suite, run through the knob's default.
+    "backup/tests/library-backup-layout.test.sh"
+    "backup/tests/library-backup-legacy.test.sh"
     "backup/tests/nightly-success-feed.test.sh"
     "samba/tests/file-share-backup-producer.test.sh"
     "tracker/tests/defs-guard.test.sh"

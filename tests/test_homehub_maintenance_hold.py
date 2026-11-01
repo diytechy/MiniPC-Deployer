@@ -171,6 +171,16 @@ def test_a_hold_that_outlives_its_limit_turns_the_unit_red_sr137(tmp_path):
     assert "ext4-gparted.service" in done.stdout   # still says WHY it is held
 
 
+def test_the_second_held_sunday_already_turns_red_sr137(tmp_path):
+    # Weekly runs at the same minute see a stamp a few seconds short of 7 and
+    # 14 whole days. The first held Sunday must stay quiet, the second must not:
+    # with a 14-day limit counted in whole days it fired only on the third.
+    first = run(tmp_path, "check", units=GPARTED_UNITS, upgraded_days_ago=6.999)
+    assert first.returncode == 1, first.stdout + first.stderr
+    second = run(tmp_path, "check", units=GPARTED_UNITS, upgraded_days_ago=13.999)
+    assert second.returncode == 255, second.stdout + second.stderr
+
+
 def test_a_recent_upgrade_keeps_an_ordinary_hold_sr137(tmp_path):
     done = run(tmp_path, "check", units=GPARTED_UNITS, upgraded_days_ago=3)
     assert done.returncode == 1, done.stdout + done.stderr

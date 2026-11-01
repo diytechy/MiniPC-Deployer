@@ -1172,10 +1172,10 @@ sequenceDiagram
     T->>S: start
     S->>G: ExecCondition: check
     G->>G: pgrep -x disk tools; systemctl list-units ext4-*, backups; hold files
-    alt held, last upgrade within 14 days
+    alt held, first skipped week (last upgrade within 10 days)
         G-->>S: exit 1 + every reason
         Note over S: skipped (not failed); next Sunday, or start by hand after release
-    else held, last upgrade older than 14 days
+    else held, second skipped week or later (older than 10 days)
         G-->>S: exit 255 + every reason + the age
         Note over S: unit FAILED (red, so monitoring sees it); nothing installed
     else probe cannot answer

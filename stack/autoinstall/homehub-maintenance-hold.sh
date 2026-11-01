@@ -69,6 +69,13 @@
 # someone finishes or releases the hold. Waiting must never become silently
 # not patching (SN-052).
 #
+# WHY 10 AND NOT 14. The run is weekly and the age is whole days, so on the
+# SECOND held Sunday the stamp is 13 days and some hours old - and "-gt 14"
+# would not fire until the THIRD, about 21 days in. 10 lets the first held
+# Sunday (6 days) skip quietly and turns the second one red. The stamp is
+# touched by unattended runs only; a box patched by hand still counts as
+# overdue, and starting the unit as the message says refreshes it.
+#
 # THE TRADE-OFF, STATED SO IT IS A CHOICE: a held week's patch waits for the
 # next Sunday. After a long operation, `sudo systemctl start
 # apt-daily-upgrade.service` runs it at once.
@@ -76,7 +83,7 @@ set -u
 
 HOLD_DIR=${HOMEHUB_MAINTENANCE_HOLD_DIR:-/run/homehub-maintenance-hold}
 UPGRADE_STAMP=${HOMEHUB_MAINTENANCE_HOLD_STAMP:-/var/lib/apt/periodic/upgrade-stamp}
-MAX_DAYS=${HOMEHUB_MAINTENANCE_HOLD_MAX_DAYS:-14}
+MAX_DAYS=${HOMEHUB_MAINTENANCE_HOLD_MAX_DAYS:-10}
 
 # Exact process names (pgrep -x anchors the pattern at both ends), so the name
 # a tool was RUN as is what counts: mke2fs is usually run as mkfs.ext4. Long

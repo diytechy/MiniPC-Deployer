@@ -1825,6 +1825,34 @@ def test_the_mic_route_writes_explicit_zeros_everywhere_else_sr029(applier):
     assert rendered.count("ttable.0.6 1.0000") == rendered.count("ttable.0.7 1.0000")
 
 
+def test_no_ttable_key_is_defined_twice_and_the_last_back_value_wins_llr1421(applier):
+    """ALSA takes the LAST entry for a repeated ttable key.
+
+    A channel that is both routed and listed as silent would render twice
+    (1.0000 then 0.0000) and the Back jack would go quiet while every
+    first-match check still passed.
+    """
+    def entries(text):
+        found = []
+        for line in text.splitlines():
+            parts = line.split("#")[0].split()
+            if len(parts) == 2 and parts[0].startswith("ttable."):
+                found.append((parts[0], float(parts[1])))
+        return found
+
+    speaker = entries(applier.render_trim_conf(dict(applier.TRIM_DEFAULTS)))
+    mic = entries(applier.render_mic_conf(dict(applier.MIC_DEFAULTS)))
+    for name, table in (("speaker", speaker), ("mic", mic)):
+        keys = [key for key, _ in table]
+        assert len(keys) == len(set(keys)), (
+            "%s route repeats a ttable key: %s"
+            % (name, sorted(k for k in set(keys) if keys.count(k) > 1)))
+    last = {}
+    for key, value in speaker:
+        last[key] = value
+    assert last["ttable.0.4"] == 1.0 and last["ttable.1.5"] == 1.0
+
+
 def test_the_two_route_tables_do_not_overlap_sr029(applier):
     """The other direction, and the pair is the whole bargain.
 

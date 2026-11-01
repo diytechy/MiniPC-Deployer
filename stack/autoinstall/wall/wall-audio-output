@@ -1271,7 +1271,7 @@ def render_mic_conf(values):
     rather than left implicit. The adapter has ONE mute switch for all eight
     channels (numid 7 is a single boolean, measured 2026-09-14), so hardware
     cannot make this guarantee while the mic leg is running; `speaker_multi`'s
-    matching zeros on channels 4-7 are the other half of the same bargain,
+    matching zeros on channels 6-7 are the other half of the same bargain,
     keeping the room's music out of the desktop's input.
 
     Loaded by asound-bus-mode.conf through a hook with `errors false`: a missing
@@ -1379,7 +1379,10 @@ def rear_levels(current, level):
 
 
 def set_rear_level(applier, adapter, level):
-    """Read the adapter's eight playback values, move the rear pair, write back.
+    """Read the adapter's eight playback values, move the mic-return pair, write back.
+
+    The pair is channels 6/7 (the Surround jack, MIC_REAR_CHANNELS); "rear" is
+    only the legacy name of the knob and of the journal wording.
 
     Read-modify-write rather than a blind `cset` of all eight, because six of
     those numbers were arrived at by somebody standing at an amplifier and this
@@ -2049,6 +2052,8 @@ def apply_plan(state, applier, adapter_ok=True):
             and not wanted["mic_live"]:
         # Only the LOWERING direction is counted: see set_rear_level.
         failures += 1
+        # "rear pair" in this journal line means channels 6/7 (kept verbatim: other
+        # tools may grep it).
         log("the adapter's rear pair could NOT be returned to silence: the "
             "desktop's input is still wired to live channels. The generated "
             "route's explicit zeros are the only barrier left.")

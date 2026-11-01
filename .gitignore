@@ -59,6 +59,9 @@ vmtest/.out/
 # the hub's `--clean` does `rm -rf $OUT_DIR`, and nesting made an ordinary hub
 # rebuild silently delete the wall ISO, its SSH key and its SIM credentials.
 vmtest/.out-wall/
+# The kids kiosk's (SR-138), a sibling for the same reason: its ISO, baked debs,
+# OtterTube tarball, SIM key and credentials.
+vmtest/.out-kids/
 vmtest/*.iso
 # build-projectm-presets.sh's reproduced payload: 136 MB and 9795 files of an
 # UNLICENSED upstream pack. Keeping it out of git is the whole basis on which

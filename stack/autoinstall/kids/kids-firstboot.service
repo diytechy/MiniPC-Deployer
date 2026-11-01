@@ -1,0 +1,19 @@
+# First-boot configuration for the KIDS KIOSK: renders the session's config
+# from /etc/kids-kiosk/kids.env and the tty1 autologin. Idempotent and not gated
+# on its marker: re-running it after editing kids.env is the supported way to
+# change the kiosk's configuration.
+[Unit]
+Description=Kids kiosk first-boot configuration (session config, autologin)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/kids-firstboot.sh
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

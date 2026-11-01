@@ -55,7 +55,7 @@ while [ $# -gt 0 ]; do
         *) die "unknown argument '$1' (try --help)" ;;
     esac
 done
-case "$TARGET" in hub|wall) ;; *) die "--target must be hub or wall (got '$TARGET')" ;; esac
+case "$TARGET" in hub|wall|kids) ;; *) die "--target must be hub, wall or kids (got '$TARGET')" ;; esac
 
 [ -n "$SRC_ISO" ] || die "need --src-iso /path/to/repacked.iso"
 [ -f "$SRC_ISO" ] || die "not found: $SRC_ISO"
@@ -105,7 +105,15 @@ sed -e 's/^  interactive-sections:.*/  interactive-sections: []/' "$CONFIRM_UD" 
 # A side benefit worth naming: dropping access-points means the gate ISO does
 # not carry the Wi-Fi PSK, so of the two ISOs on the disk only the shippable
 # one holds it.
-if [ "$TARGET" = wall ]; then
+# THE KIDS KIOSK (SR-138) has the same radio and the same fix, on its own
+# interface (wlp2s0, the spare mini-PC's Intel 7265), and is DHCP-addressed, so
+# its address check at the end of this block differs.
+case "$TARGET" in
+    wall) WIFI_IF=wlp1s0 ;;
+    kids) WIFI_IF=wlp2s0 ;;
+    *)    WIFI_IF="" ;;
+esac
+if [ -n "$WIFI_IF" ]; then
     # THE REWRITE NOW INSERTS THE match:, RATHER THAN EDITING ONE (2026-09-03).
     # The shipped seed used to carry `match: name: "wl*"` + `set-name: wlan0`,
     # and this awk only had to swap the glob to "e*". That stanza is GONE from
@@ -118,13 +126,13 @@ if [ "$TARGET" = wall ]; then
     # always supported it. `set-name` keeps the netdef id and the kernel name
     # agreeing, so the gate seed stays as close to the shipped one as a wire
     # can be to a radio: same id, same address, same routes, same nameservers.
-    awk '
+    awk -v ifc="$WIFI_IF" '
       dropping { if ($0 ~ /^          /) next; dropping = 0 }
       /^    wifis:[[:space:]]*$/            { print "    ethernets:"; next }
-      /^      wlp1s0:[[:space:]]*$/         { print "      wlp1s0:";
+      $0 ~ "^      " ifc ":[[:space:]]*$"   { print "      " ifc ":";
                                               print "        match:";
                                               print "          name: \"e*\"";
-                                              print "        set-name: wlp1s0"; next }
+                                              print "        set-name: " ifc; next }
       /^        access-points:[[:space:]]*$/ { dropping = 1; next }
       /^        macaddress:/                { print "        # (gate ISO) macaddress dropped: no virtual Wi-Fi device exists to pin."; next }
                                             { print }
@@ -132,15 +140,15 @@ if [ "$TARGET" = wall ]; then
 
     # The netdef id has to have survived the swap, or the block below is
     # describing a device the rest of the seed never mentions.
-    grep -q '^      wlp1s0:' "$GATE_UD" \
-        || die "the wall gate seed lost its wlp1s0 netdef - the ethernets: block would name no device. Refusing to build."
+    grep -q "^      $WIFI_IF:" "$GATE_UD" \
+        || die "the $TARGET gate seed lost its $WIFI_IF netdef - the ethernets: block would name no device. Refusing to build."
 
     grep -q '^    ethernets:' "$GATE_UD" \
-        || die "the wall gate seed still has no ethernets: block - the panel would boot with no network. Refusing to build."
+        || die "the $TARGET gate seed still has no ethernets: block - the machine would boot with no network. Refusing to build."
     grep -qE '^\s*(wifis:|access-points:)' "$GATE_UD" \
-        && die "the wall gate seed still carries wifis:/access-points: - it would match no interface in a VM. Refusing to build."
+        && die "the $TARGET gate seed still carries wifis:/access-points: - it would match no interface in a VM. Refusing to build."
     grep -q 'name: "e\*"' "$GATE_UD" \
-        || die "the wall gate seed does not match e* - it would find no interface. Refusing to build."
+        || die "the $TARGET gate seed does not match e* - it would find no interface. Refusing to build."
 
     # The static address, the default route and the nameservers are CARRIED
     # THROUGH from the shipped seed, not injected here. The panel is statically
@@ -151,8 +159,15 @@ if [ "$TARGET" = wall ]; then
     # day; it existed only to work around the panel's address living in the
     # router, and deleting it is the point of the change rather than a side
     # effect of it.
-    grep -q '^        addresses: \[' "$GATE_UD" \
-        || die "the wall gate seed has no static address - the panel would come up with no address at all, since the DHCP that used to fill this in was removed from the shipped image. Refusing to build."
+    # The kids kiosk is DHCP-addressed by design (nothing allow-lists it), so
+    # what it must carry through is dhcp4: true.
+    if [ "$TARGET" = kids ]; then
+        grep -q '^        dhcp4: true' "$GATE_UD" \
+            || die "the kids gate seed lost dhcp4: true - the kiosk would come up with no address. Refusing to build."
+    else
+        grep -q '^        addresses: \[' "$GATE_UD" \
+            || die "the wall gate seed has no static address - the panel would come up with no address at all, since the DHCP that used to fill this in was removed from the shipped image. Refusing to build."
+    fi
 fi
 
 grep -q '^  interactive-sections: \[\]' "$GATE_UD" \

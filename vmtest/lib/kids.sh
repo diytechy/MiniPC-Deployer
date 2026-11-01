@@ -177,7 +177,13 @@ stage_kids_app_into_payload() {
     fi
     [ "${#found[@]}" -eq 1 ] || die "${#found[@]} OtterTube tarballs in $app_out - exactly one may ship: ${found[*]}"
     case "${found[0]}" in *-dirty-*) die "refusing a -dirty OtterTube build: ${found[0]}" ;; esac
-    tar -tvzf "${found[0]}" | grep -Eq '^-rwsr-xr-x 0/0 .* app/chrome-sandbox$' \
+    # NO LIVE PIPE INTO grep -q: the callers run under pipefail, and grep -q
+    # exiting at its match SIGPIPEs whatever is still writing - tar listing a
+    # 230 MB archive (a good tarball refused, 2026-11-01), or a printf of a
+    # listing longer than the pipe buffer. Capture, then a here-string.
+    local listing
+    listing="$(tar -tvzf "${found[0]}")" || die "${found[0]} is not a readable gzip tarball"
+    grep -Eq '^-rwsr-xr-x 0/0 .* app/chrome-sandbox$' <<< "$listing" \
         || die "${found[0]}: app/chrome-sandbox is not setuid root - Electron would refuse to start on the kiosk. Rebuild it with export-ottertube.sh."
     mkdir -p "$dest"
     cp "${found[0]}" "$dest/"

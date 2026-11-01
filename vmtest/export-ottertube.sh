@@ -85,10 +85,12 @@ rm -f "$OUT"/ottertube-*-linux-x64.tar.gz
 tarball="$OUT/ottertube-$short-linux-x64.tar.gz"
 tar --owner=0 --group=0 --numeric-owner -czf "$tarball" -C "$stage" app
 
-# Verify the ARTIFACT, not the exit codes above.
+# Verify the ARTIFACT, not the exit codes above. Here-strings, not pipes into
+# grep -q: under pipefail a writer still running when grep -q exits dies of
+# SIGPIPE and fails a good tarball (lib/kids.sh, stage_kids_app_into_payload).
 listing="$(tar -tvzf "$tarball")"
-printf '%s\n' "$listing" | grep -Eq '^-rwsr-xr-x 0/0 .* app/chrome-sandbox$' \
+grep -Eq '^-rwsr-xr-x 0/0 .* app/chrome-sandbox$' <<< "$listing" \
     || die "the tarball's app/chrome-sandbox is not -rwsr-xr-x 0/0"
-printf '%s\n' "$listing" | grep -Eq '^-rwxr-xr-x 0/0 .* app/ottertube-desktop$' \
+grep -Eq '^-rwxr-xr-x 0/0 .* app/ottertube-desktop$' <<< "$listing" \
     || die "the tarball's app/ottertube-desktop is not an executable owned by 0/0"
 log "OtterTube $version ($short): $tarball ($(du -h "$tarball" | cut -f1)), sha256 $(sha256sum "$tarball" | cut -d' ' -f1)"

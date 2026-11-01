@@ -22,8 +22,10 @@ pass() { echo "PASS $*"; }
 fail() { echo "FAIL $*"; FAIL=$((FAIL + 1)); }
 
 # Run a builder function in a subshell (die exits); print its combined output.
-build() {  # out-dir [VAR=value ...] -- function args...
-    ( set -e
+build() {  # function args...
+    # pipefail as in build-repacked-iso.sh: without it a pipeline that dies of
+    # SIGPIPE passes here and fails there (TC-1629's "many entries" case).
+    ( set -eo pipefail
       # shellcheck source=lib/common.sh
       . "$SCRIPT_DIR/lib/common.sh"
       # shellcheck source=lib/kids.sh
@@ -88,11 +90,14 @@ mkdir -p "$WORK/nofilled"
 expect_refusal "TC-1628 production refuses a site dir with no user-data.filled" "no user-data.filled" -- build_prod "$WORK/nofilled" "$WORK/p6"
 
 # ── TC-1629: the OtterTube tarball ───────────────────────────────────────────
-mk_tar() {  # dir name sandbox-mode
-    local s; s=$(mktemp -d); mkdir -p "$s/app"
+mk_tar() {  # dir name sandbox-mode [extra-entries-after-the-sandbox]
+    local s i; s=$(mktemp -d); mkdir -p "$s/app/locales"
     printf '#!/bin/sh\n' > "$s/app/ottertube-desktop"; chmod 755 "$s/app/ottertube-desktop"
     : > "$s/app/chrome-sandbox"; chmod "$3" "$s/app/chrome-sandbox"
-    mkdir -p "$1"; tar --owner=0 --group=0 --numeric-owner -czf "$1/$2" -C "$s" app; rm -rf "$s"
+    for i in $(seq "${4:-0}"); do : > "$s/app/locales/l$i.pak"; done
+    # chrome-sandbox first, as electron-builder's tree lists it, then the rest.
+    mkdir -p "$1"; tar --owner=0 --group=0 --numeric-owner -czf "$1/$2" -C "$s" \
+        app/chrome-sandbox app/ottertube-desktop app/locales; rm -rf "$s"
 }
 stage() { build stage_kids_app_into_payload "$1" "$2"; }
 mkdir -p "$WORK/none"
@@ -108,6 +113,15 @@ if out=$(stage "$WORK/s5" "$WORK/one") && [ -f "$WORK/s5/iso-root/deploy-payload
     pass "TC-1629 exactly one good tarball is staged under kids-app/"
 else
     fail "TC-1629 a good tarball was not staged: $(printf '%s' "${out:-}" | tail -n 2)"
+fi
+# The real tarball lists ~100 entries after chrome-sandbox; a grep -q on a live
+# tar pipe under pipefail refused it (2026-11-01). 5000 entries make the SIGPIPE
+# certain rather than a matter of timing.
+mk_tar "$WORK/many" ottertube-ccccccc-linux-x64.tar.gz 4755 5000
+if out=$(stage "$WORK/s6" "$WORK/many") && [ -f "$WORK/s6/iso-root/deploy-payload/kids-app/ottertube-ccccccc-linux-x64.tar.gz" ]; then
+    pass "TC-1629 a good tarball with many entries after chrome-sandbox is staged (pipefail)"
+else
+    fail "TC-1629 a good tarball with many entries was refused: $(printf '%s' "${out:-}" | tail -n 2)"
 fi
 
 echo "FAILURES=$FAIL"

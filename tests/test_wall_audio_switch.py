@@ -426,7 +426,14 @@ def test_the_hold_off_is_untouched_by_the_switch_owner_amendment_sr028():
     detector = read(WALL / "panel-amp-trigger.py")
     hold_off_block = detector.split("HOLD_OFF_SECONDS")[0]
     assert "ensure_off" not in hold_off_block.split("def sources_for")[-1]
-    assert "audio-state.json" not in detector, "the actuator must not read the switch"
+    # SR-140 changed this line honestly. The actuator used to read nothing of
+    # the switch; it now reads the stored position and the sleep preference,
+    # READ-ONLY, to decide whether to follow the screen. It still never writes
+    # the state file, and the hold-off itself still has no mode branch.
+    assert detector.count("AUDIO_STATE_FILE") == 2, "the constant and one read-only default arg"
+    assert "audio-state.json" in detector
+    for writer in ('open(AUDIO_STATE_FILE, "w', "os.replace(AUDIO_STATE_FILE", "write_atomic"):
+        assert writer not in detector
 
 
 def test_the_speaker_leg_carries_the_volume_and_the_tap_does_not_sr028():
@@ -449,7 +456,9 @@ def test_both_legs_share_one_control_on_an_always_present_card_ruling_f_sr028():
     control on the SAME always-present card."""
     conf = read(BUS_CONF)
     assert conf.count('name "Bus Playback Volume"') == 4
-    assert conf.count('card "Loopback"') == 4, "not on an adapter that can be unplugged"
+    # Four volume controls plus the speaker leg's fade stage (SR-140): all on the
+    # always-present card.
+    assert conf.count('card "Loopback"') == 5, "not on an adapter that can be unplugged"
     for chain in ("speaker_out", "headset_out", "bt_headset_out", "builtin_out"):
         block = conf.split("pcm.%s {" % chain, 1)[1].split("\npcm.", 1)[0]
         assert "type softvol" in block, chain
@@ -1414,10 +1423,14 @@ def test_the_chain_reaches_both_the_leg_and_our_own_pre_open_sr028(applier, monk
     unit = read(WALL / "wall-speaker-out.service")
     assert "EnvironmentFile=-/run/wall-panel/audio-speaker.env" in unit
     conf = read(BUS_CONF)
+    # Since SR-140 the chain choice lives one stage down, in speaker_fade, which
+    # is speaker_out's slave; the contract (env var, multi default) is unchanged.
     speaker_out = conf.split("pcm.speaker_out {", 1)[1].split("\n}", 1)[0]
-    assert "@func getenv" in speaker_out
-    assert applier.SPEAKER_CHAIN_VAR in speaker_out
-    assert '"speaker_multi"' in speaker_out, "the 8-channel chain is the default"
+    assert 'slave.pcm "speaker_fade"' in speaker_out
+    fade = conf.split("pcm.speaker_fade {", 1)[1].split("\n}", 1)[0]
+    assert "@func getenv" in fade
+    assert applier.SPEAKER_CHAIN_VAR in fade
+    assert '"speaker_multi"' in fade, "the 8-channel chain is the default"
 
 
 def test_the_chain_is_chosen_before_anything_opens_the_leg_sr028(applier, policy):
@@ -4246,3 +4259,172 @@ def test_an_unwritable_record_still_persists_the_mic_observation_llr1410(
                                                          real_save(st, path, dry_run=dry_run)))
     assert applier.main(["--state", str(state_file), "--dry-run", "apply-state"]) == 1
     assert any(entry["mic_legs_running"] is True for entry in saved)
+
+
+# ── SR-140: speakers sleep with the screen -- the setting, end to end ─────────
+
+def _fade_block():
+    return read(BUS_CONF).split("pcm.speaker_fade {", 1)[1].split("\n}", 1)[0]
+
+
+def test_the_fade_stage_is_its_own_control_between_the_volume_and_the_chain_llr1430():
+    """The fade must never be able to move the stored volume (SR-140)."""
+    conf = read(BUS_CONF)
+    out = conf.split("pcm.speaker_out {", 1)[1].split("\n}", 1)[0]
+    fade = _fade_block()
+    # speaker_out keeps the panel's volume and now slaves onto the fade stage...
+    assert 'name "Bus Playback Volume"' in out and 'slave.pcm "speaker_fade"' in out
+    # ...which has its own name, on the same always-present card, and the chain.
+    assert "type softvol" in fade
+    assert 'name "Speaker Fade Playback Volume"' in fade and 'card "Loopback"' in fade
+    assert "Bus Playback Volume" not in fade
+    assert "@func getenv" in fade and "WALL_AUDIO_SPEAKER_CHAIN" in fade
+    assert 'default "speaker_multi"' in fade, "the stereo fallback is still reached by the env"
+    # Exactly one declaration of the fade control, and the volume's count is unchanged.
+    assert conf.count('name "Speaker Fade Playback Volume"') == 1
+    assert conf.count('name "Bus Playback Volume"') == 4
+
+
+def test_only_the_speaker_leg_passes_through_the_fade_llr1430():
+    conf = read(BUS_CONF)
+    for leg in ("headset_out", "bt_headset_out", "builtin_out", "builtin_chime"):
+        block = conf.split("pcm.%s {" % leg, 1)[1].split("\n}", 1)[0]
+        assert "speaker_fade" not in block, leg
+    # Nothing but speaker_out slaves onto it.
+    users = [line for line in conf.splitlines()
+             if 'slave.pcm "speaker_fade"' in line]
+    assert len(users) == 1
+
+
+def test_the_fade_range_agrees_with_the_values_the_trigger_writes_llr1430():
+    """Assert against the other side: the ALSA range vs the trigger's constants."""
+    import re
+    fade = _fade_block()
+    resolution = int(re.search(r"resolution\s+(\d+)", fade).group(1))
+    max_db = float(re.search(r"max_dB\s+(-?[\d.]+)", fade).group(1))
+    min_db = float(re.search(r"min_dB\s+(-?[\d.]+)", fade).group(1))
+    trigger = load(WALL / "panel-amp-trigger.py", "panel_amp_trigger_fade")
+    assert max_db == 0.0, "unity must be 0 dB: a transparent stage"
+    assert trigger.FADE_UNITY == resolution - 1, "the top step is unity"
+    assert trigger.FADE_FLOOR == 0 and min_db <= -40.0
+    assert 'name "%s"' % trigger.FADE_CONTROL in fade
+
+
+def test_the_setting_defaults_on_and_an_older_file_is_not_damage_llr1431(policy):
+    assert policy.default_state()["speaker_sleeps_with_screen"] is True
+    # A file written before this release has no key: not a repair, so the
+    # microphone mute rule (which a repair triggers) is not tripped by it.
+    old = {"output": "speaker", "input_muted": False}
+    state = policy.normalize(old)
+    assert state["speaker_sleeps_with_screen"] is True
+    assert state["input_muted"] is False
+    off = policy.normalize({"output": "speaker", "input_muted": False,
+                            "speaker_sleeps_with_screen": False})
+    assert off["speaker_sleeps_with_screen"] is False and off["input_muted"] is False
+    # A key that is PRESENT and not a boolean is damage like any other.
+    bad = policy.normalize({"output": "speaker", "input_muted": False,
+                            "speaker_sleeps_with_screen": "off"})
+    assert bad["speaker_sleeps_with_screen"] is True and bad["input_muted"] is True
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_set_speaker_sleep_stores_a_boolean_and_touches_nothing_else_llr1431(policy, enabled):
+    before = policy.default_state()
+    after, lines = policy.apply_event(before, {"kind": "set_speaker_sleep",
+                                               "enabled": enabled})
+    assert after["speaker_sleeps_with_screen"] is enabled and lines
+    changed = {key for key in after if after[key] != before.get(key)}
+    assert changed <= {"speaker_sleeps_with_screen"}, changed
+
+
+@pytest.mark.parametrize("event", [
+    {"kind": "set_speaker_sleep"},
+    {"kind": "set_speaker_sleep", "enabled": "yes"},
+    {"kind": "set_speaker_sleep", "enabled": 1},
+    {"kind": "set_speaker_sleep", "enabled": None},
+    {"kind": "set_speaker_sleep", "enabled": True, "level": 1},
+])
+def test_set_speaker_sleep_is_strict_llr1431(policy, event):
+    with pytest.raises(policy.StateError):
+        policy.apply_event(policy.default_state(), event)
+
+
+def test_the_setting_survives_a_position_change_llr1431(policy):
+    state, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_speaker_sleep", "enabled": False})
+    for output in ("headset", "builtin", "mute", "speaker"):
+        state, _ = policy.apply_event(state, {"kind": "set_output", "output": output})
+        assert state["speaker_sleeps_with_screen"] is False, output
+
+
+def test_the_cli_spells_speaker_sleep_on_and_off_llr1431(applier):
+    def arguments(value):
+        return SimpleNamespace(command="speaker-sleep", value=value)
+    assert applier.event_from_arguments(arguments("on")) == {
+        "kind": "set_speaker_sleep", "enabled": True}
+    assert applier.event_from_arguments(arguments("off")) == {
+        "kind": "set_speaker_sleep", "enabled": False}
+
+
+def test_the_cli_persists_the_setting_and_refuses_other_words_llr1431(tmp_path):
+    done = run_applier(tmp_path, "speaker-sleep", "off")
+    assert done.returncode == 0, done.stderr
+    stored = json.loads((tmp_path / "audio-state.json").read_text(encoding="utf-8"))
+    assert stored["speaker_sleeps_with_screen"] is False
+    assert stored["output"] == "speaker", "only the preference moved"
+    done = run_applier(tmp_path, "speaker-sleep", "on")
+    assert done.returncode == 0, done.stderr
+    stored = json.loads((tmp_path / "audio-state.json").read_text(encoding="utf-8"))
+    assert stored["speaker_sleeps_with_screen"] is True
+    for word in ("maybe", "true"):
+        refused = run_applier(tmp_path, "speaker-sleep", word)
+        assert refused.returncode == 2, word
+
+
+def test_the_applier_accepts_the_request_kind_and_applies_it_llr1431(applier, tmp_path):
+    assert "set_speaker_sleep" in applier.ALLOWED_REQUEST_KINDS
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({"version": 1, "seq": 7, "event": {
+        "kind": "set_speaker_sleep", "enabled": False}}), encoding="utf-8")
+    assert applier.read_request(request, -1) == (
+        7, {"kind": "set_speaker_sleep", "enabled": False})
+    done = run_applier(tmp_path, "apply-request", str(request))
+    assert done.returncode == 0, done.stderr
+    stored = json.loads((tmp_path / "audio-state.json").read_text(encoding="utf-8"))
+    assert stored["speaker_sleeps_with_screen"] is False and stored["request_seq"] == 7
+
+
+def test_a_malformed_request_leaves_the_stored_setting_alone_llr1431(tmp_path):
+    state = tmp_path / "audio-state.json"
+    run_applier(tmp_path, "speaker-sleep", "off")
+    before = state.read_bytes()
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({"version": 1, "seq": 9, "event": {
+        "kind": "set_speaker_sleep", "enabled": "on"}}), encoding="utf-8")
+    done = run_applier(tmp_path, "apply-request", str(request))
+    assert done.returncode == 1
+    assert state.read_bytes() == before
+
+
+def test_the_applier_declares_by_opening_speaker_out_and_never_writes_the_fade_llr1430(
+        applier, policy):
+    """Opening speaker_out opens its slave, so both softvols are created in one
+    pre-open before the leg runs; and the applier never writes the fade."""
+    recorder = applier.Applier(dry_run=True)
+    applier.apply_plan(policy.default_state(), recorder)
+    flat = [" ".join(one) for one in recorder.commands]
+    assert any("-D speaker_out " in one for one in flat)
+    assert not any("Speaker Fade" in one for one in flat)
+
+
+def test_the_broker_routing_knows_the_new_verb_llr1432():
+    routing = import_panel_audio("routing")
+    for good in (True, False):
+        routing.validate_action("set_speaker_sleep", {"enabled": good})
+    for params in ({}, {"enabled": "on"}, {"enabled": 1}, {"enabled": None},
+                   {"enabled": True, "muted": True}, {"muted": True},
+                   {"enabled": True, "level": 1}):
+        with pytest.raises(routing.PolicyError):
+            routing.validate_action("set_speaker_sleep", params)
+    assert routing.switch_only_authorization("set_speaker_sleep", {"enabled": True})
+    assert "set_speaker_sleep" in routing.SELF_RECONCILING_METHODS

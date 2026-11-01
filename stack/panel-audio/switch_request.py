@@ -60,7 +60,8 @@ def next_seq(clock=time.time_ns):
 # among them: adapter presence is the kernel's fact, reported by udev, and a
 # renderer that could assert it could talk the panel into believing a headset is
 # plugged in and then silence every output (Owner ruling 7).
-REQUEST_KINDS = ("set_output", "set_input_mute", "set_volume", "nudge_volume")
+REQUEST_KINDS = ("set_output", "set_input_mute", "set_speaker_sleep", "set_volume",
+                 "nudge_volume")
 
 
 class RequestError(ValueError):
@@ -88,6 +89,7 @@ def envelope(seq, event, generation=None):
     if not isinstance(event, dict) or event.get("kind") not in REQUEST_KINDS:
         raise RequestError("unknown event kind")
     expected = {"set_output": {"kind", "output"}, "set_input_mute": {"kind", "muted"},
+                "set_speaker_sleep": {"kind", "enabled"},
                 "set_volume": {"kind", "level"}, "nudge_volume": {"kind", "louder"}}
     if set(event) != expected[event["kind"]]:
         raise RequestError("request fields are not exact")

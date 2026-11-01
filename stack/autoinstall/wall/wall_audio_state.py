@@ -93,6 +93,13 @@ STATE_SCHEMA = {
     # The mic mute, which is a SEPARATE button from the output switch (Owner
     # ruling E): `mute` silences the room, not the microphone.
     "input_muted": False,
+    # SPEAKER SLEEPS WITH THE SCREEN (SR-140, LLR-1431). Whether, in the Speaker
+    # position, the room speakers fade out and the amplifier relay opens when
+    # the panel's screen goes dark. Default TRUE (Owner, 2026-11-01). It is a
+    # preference and not a safety control, so it has none of `input_muted`'s
+    # damage rules: an ABSENT key is an older file and reads as true; only a
+    # present non-boolean is a repair. The amp trigger reads this key read-only.
+    "speaker_sleeps_with_screen": True,
     # Per-output level memory (Owner ruling F): switching back to an output
     # restores the level it had, rather than shouting at the last one's setting.
     "volume": {"headset": 60, "speaker": 60, "builtin": 60},
@@ -293,6 +300,10 @@ def normalize(raw):
     if isinstance(raw.get("input_muted"), bool):
         state["input_muted"] = raw["input_muted"]
     else:
+        repaired = True
+    if isinstance(raw.get("speaker_sleeps_with_screen"), bool):
+        state["speaker_sleeps_with_screen"] = raw["speaker_sleeps_with_screen"]
+    elif "speaker_sleeps_with_screen" in raw:
         repaired = True
     if isinstance(raw.get("headset_present"), bool):
         state["headset_present"] = raw["headset_present"]
@@ -567,6 +578,7 @@ def apply_event(state, event):
              event: {"kind": one of
                  "set_output"     {"output": one of OUTPUTS}
                  "set_input_mute" {"muted": bool}
+                 "set_speaker_sleep" {"enabled": bool}
                  "set_volume"     {"level": int}    -- absolute percent, clamped
                  "nudge_volume"   {"louder": bool, "step": int optional}
                                   -- a rocker movement; "step" is its size in
@@ -676,6 +688,23 @@ def _set_input_mute(state, event):
         return state, ["input mute already %s" % ("on" if muted else "off")]
     state["input_muted"] = muted
     return state, ["input mute %s" % ("on" if muted else "off")]
+
+
+def _set_speaker_sleep(state, event):
+    """Store the speaker-sleeps-with-screen preference. Implements: SR-140, LLR-1431."""
+    # Exactly {kind, enabled}: a stray key (a volume level, say) is a caller
+    # bug and is refused, not ignored.
+    if set(event) - {"kind", "enabled"}:
+        raise StateError("set_speaker_sleep takes only enabled")
+    enabled = event.get("enabled")
+    # Required and strictly boolean, like `muted`: a request that forgot to say
+    # which way must not silently flip the preference.
+    if not isinstance(enabled, bool):
+        raise StateError("enabled must be boolean")
+    if state["speaker_sleeps_with_screen"] == enabled:
+        return state, ["speaker sleep already %s" % ("on" if enabled else "off")]
+    state["speaker_sleeps_with_screen"] = enabled
+    return state, ["speaker sleep %s" % ("on" if enabled else "off")]
 
 
 def _set_volume(state, event):
@@ -958,6 +987,7 @@ def _headset_left_selected(state):
 _HANDLERS = {
     "set_output": _set_output,
     "set_input_mute": _set_input_mute,
+    "set_speaker_sleep": _set_speaker_sleep,
     "set_volume": _set_volume,
     "nudge_volume": _nudge_volume,
     "snap_volume": _snap_volume,

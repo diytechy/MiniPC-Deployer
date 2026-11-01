@@ -411,7 +411,9 @@ def test_status_reports_routing_unavailable_and_the_switch_present_sr028(panel):
                                 # unchanged and `headsetVia` is the null that
                                 # says why -- the position resolves to nothing.
                                 "headsetVia": None,
-                                "btHeadsetPresent": False}
+                                "btHeadsetPresent": False,
+                                # SR-140: the stored preference, true by default.
+                                "speakerSleepsWithScreen": True}
 
 
 def test_status_volume_is_the_selected_outputs_memory_sr028(panel):
@@ -717,7 +719,9 @@ def test_a_sparse_state_file_reports_a_supported_switch_sr028(panel):
                                 # from the rule it always came from and not
                                 # from the two fields this release added.
                                 "headsetVia": None,
-                                "btHeadsetPresent": False}
+                                "btHeadsetPresent": False,
+                                # SR-140: the stored preference, true by default.
+                                "speakerSleepsWithScreen": True}
 
 
 def test_a_lost_mutation_reconciles_on_a_sparse_state_file_llr015(panel, tmp_path):
@@ -807,3 +811,132 @@ def test_the_panel_word_is_not_an_output_llr1405(panel):
     # `panel` is the legacy audio MODE; the wire spelling is `builtin`.
     answer = reply(AudioBroker(backend(panel)), wire("set_output", {"output": "panel"}))
     assert answer["ok"] is False and not panel["request"].exists()
+
+
+# --- SR-140: the speaker-sleeps-with-screen verb and status field ------------
+# The contract is shared with the kiosk half and must not be renamed:
+# method `set_speaker_sleep`, params exactly {"enabled": bool}, status field
+# `speakerSleepsWithScreen`.
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("enabled", [True, False])
+def test_set_speaker_sleep_is_spooled_to_the_applier_like_set_input_mute_sr140(panel, enabled):
+    broker = AudioBroker(backend(panel))
+    answer = reply(broker, wire("set_speaker_sleep", {"enabled": enabled}, echo_seq=True))
+    assert answer["ok"] is True and answer["result"]["accepted"] is True
+    assert written(panel) == {"version": 1, "seq": answer["result"]["seq"],
+                              "generation": 0,
+                              "event": {"kind": "set_speaker_sleep", "enabled": enabled}}
+
+
+@pytest.mark.parametrize("params", [
+    {}, {"enabled": "on"}, {"enabled": 1}, {"enabled": None}, {"enabled": 0},
+    {"enabled": True, "muted": True}, {"muted": True}, {"enabled": True, "alias": "x"},
+    {"enabled": True, "level": 1},
+])
+def test_set_speaker_sleep_rejects_anything_but_one_boolean_sr140(panel, params):
+    spy = SpyBackend(backend(panel))
+    answer = reply(AudioBroker(spy), wire("set_speaker_sleep", params))
+    assert answer["ok"] is False
+    assert spy.calls == [] and not panel["request"].exists()
+
+
+def test_the_request_envelope_admits_exactly_this_event_sr140():
+    assert switch_request.envelope(3, {"kind": "set_speaker_sleep", "enabled": True})[
+        "event"] == {"kind": "set_speaker_sleep", "enabled": True}
+    for bad in ({"kind": "set_speaker_sleep"},
+                {"kind": "set_speaker_sleep", "enabled": True, "extra": 1},
+                {"kind": "set_speaker_sleep", "muted": True},
+                {"kind": "set_speaker_sleep", "enabled": True, "level": 1}):
+        with pytest.raises(switch_request.RequestError):
+            switch_request.envelope(3, bad)
+
+
+def test_a_spooled_request_is_one_the_real_applier_accepts_sr140(panel):
+    """Assert against the other side: the applier's own reader takes the file."""
+    import importlib.machinery
+    import importlib.util
+    path = ROOT / "stack/autoinstall/wall/wall-audio-output"
+    spec = importlib.util.spec_from_file_location(
+        "wall_audio_output_sr140", path,
+        loader=importlib.machinery.SourceFileLoader("wall_audio_output_sr140", str(path)))
+    applier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(applier)
+    reply(AudioBroker(backend(panel)), wire("set_speaker_sleep", {"enabled": False}))
+    seq, event = applier.read_request(panel["request"], -1, generation=0)
+    assert event == {"kind": "set_speaker_sleep", "enabled": False}
+
+
+@pytest.mark.parametrize("stored,expected", [
+    ({"speaker_sleeps_with_screen": False}, False),
+    ({"speaker_sleeps_with_screen": True}, True),
+    ({}, True),                                   # an older file: the default
+])
+def test_status_reports_the_stored_preference_sr140(panel, stored, expected):
+    set_state(panel, **stored)
+    switch = reply(AudioBroker(backend(panel)), wire("status"))["result"]["switch"]
+    assert switch["speakerSleepsWithScreen"] is expected
+
+
+def test_status_reports_null_not_a_default_when_the_file_is_unreadable_sr140(panel):
+    panel["state"].write_text("not json", encoding="utf-8")
+    switch = reply(AudioBroker(backend(panel)), wire("status"))["result"]["switch"]
+    assert switch["supported"] is False and switch["speakerSleepsWithScreen"] is None
+
+
+def test_a_damaged_preference_reads_as_the_applier_reads_it_sr140(panel):
+    import wall_audio_state
+    raw = {"output": "speaker", "input_muted": False, "speaker_sleeps_with_screen": "off"}
+    panel["state"].write_text(json.dumps(raw), encoding="utf-8")
+    mine = backend(panel)._normalized()
+    theirs = wall_audio_state.normalize(raw)
+    assert mine["speaker_sleeps_with_screen"] is theirs["speaker_sleeps_with_screen"] is True
+    assert mine["input_muted"] is theirs["input_muted"] is True
+
+
+class _SwitchStatusBackend:
+    """A backend whose status carries whatever switch block the test hands it."""
+
+    def __init__(self, switch):
+        self.switch = switch
+
+    def inventory(self, cancel):
+        return []
+
+    def call(self, method, params, cancel):
+        return SwitchApplierBackend._status_envelope(
+            self.switch, muted=False, mute_supported=True)
+
+
+def _good_switch(**extra):
+    base = {"supported": True, "output": "speaker", "inputMuted": False,
+            "available": True, "reason": None, "volume": 50}
+    base.update(extra)
+    return base
+
+
+@pytest.mark.parametrize("value", [True, False, None])
+def test_the_router_lets_the_new_status_field_through_sr140(value):
+    backend_ = _SwitchStatusBackend(_good_switch(speakerSleepsWithScreen=value))
+    answer = reply(AudioBroker(backend_), wire("status"))
+    assert answer["ok"] is True
+    assert answer["result"]["switch"]["speakerSleepsWithScreen"] is value
+
+
+@pytest.mark.parametrize("value", ["true", 1, 0, [], {}])
+def test_the_router_refuses_a_non_boolean_status_field_sr140(value):
+    backend_ = _SwitchStatusBackend(_good_switch(speakerSleepsWithScreen=value))
+    answer = reply(AudioBroker(backend_), wire("status"))
+    assert answer["ok"] is False
+
+
+def test_a_status_without_the_field_is_still_valid_for_an_older_applier_sr140():
+    answer = reply(AudioBroker(_SwitchStatusBackend(_good_switch())), wire("status"))
+    assert answer["ok"] is True
+    assert "speakerSleepsWithScreen" not in answer["result"]["switch"]
+
+
+def test_a_lost_set_speaker_sleep_reconciles_by_observation_sr140(panel, tmp_path):
+    """Self-reconciling, like set_input_mute: the switch block can be read back."""
+    import audio_router
+    assert audio_router.OBSERVABLE_BLOCK["set_speaker_sleep"] == "switch"

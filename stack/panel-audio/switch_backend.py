@@ -207,6 +207,10 @@ class SwitchApplierBackend:
     def _set_input_mute(self, params: Mapping[str, object]) -> dict:
         return self._submit({"kind": "set_input_mute", "muted": params["muted"]})
 
+    def _set_speaker_sleep(self, params: Mapping[str, object]) -> dict:
+        """Spool the speaker-sleeps-with-screen preference. Implements: SR-140, LLR-1432."""
+        return self._submit({"kind": "set_speaker_sleep", "enabled": params["enabled"]})
+
     def _set_volume(self, params: Mapping[str, object]) -> dict:
         """Set the level of the SELECTED output, optionally guarded by name.
 
@@ -734,6 +738,9 @@ class SwitchApplierBackend:
                 # this block can carry: null means the same thing here as it
                 # does in Speaker.
                 "headsetVia": None, "btHeadsetPresent": False,
+                # Null, not true: an unreadable file cannot say which way the
+                # preference is set, and a default here would be a claim.
+                "speakerSleepsWithScreen": None,
             }, muted=False, mute_supported=False)
         output = state["output"]
         # ── B4: Headset RESOLVES, so "is it available" is a priority ────────
@@ -773,6 +780,8 @@ class SwitchApplierBackend:
             # The same question without the switch, which is what explains the
             # red icon ("neither") and what a future pane would offer.
             "btHeadsetPresent": state["bt_headset_present"],
+            # SR-140: the persisted preference, read off the applier's file.
+            "speakerSleepsWithScreen": state["speaker_sleeps_with_screen"],
         }, muted=output == "mute", mute_supported=True)
 
     @staticmethod
@@ -804,6 +813,7 @@ class SwitchApplierBackend:
                  "headset_present": False, "bt_headset_present": False,
                  "request_seq": -1, "volume_event_seq": 0,
                  "generation": 0, "mic_legs_running": True,
+                 "speaker_sleeps_with_screen": True,
                  "volume": dict(DEFAULT_VOLUME)}
         # Same rule as wall_audio_state.normalize (step 4, terra rounds 2-4):
         # the microphone is MUTED unless the document explicitly carries the
@@ -817,6 +827,12 @@ class SwitchApplierBackend:
         if isinstance(raw.get("input_muted"), bool):
             state["input_muted"] = raw["input_muted"]
         else:
+            repaired = True
+        # SR-140: absent is an older file (reads true); a present non-boolean
+        # is a repair, exactly as wall_audio_state.normalize treats it.
+        if isinstance(raw.get("speaker_sleeps_with_screen"), bool):
+            state["speaker_sleeps_with_screen"] = raw["speaker_sleeps_with_screen"]
+        elif "speaker_sleeps_with_screen" in raw:
             repaired = True
         if isinstance(raw.get("headset_present"), bool):
             state["headset_present"] = raw["headset_present"]

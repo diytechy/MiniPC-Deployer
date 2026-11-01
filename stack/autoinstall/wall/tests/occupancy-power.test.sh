@@ -516,7 +516,10 @@ power_writers() {
     done <<< "$(find "$DIR" -type f ! -path '*/tests/*' ! -path '*__pycache__*' ! -name '*.md')"
     printf '%b' "$names" | grep -v '^$' | sort -u | tr '\n' ' '
 }
-# Two files NAME a power mechanism without being a second writer of it:
+# Three files NAME a power mechanism without being a second writer of it:
+#   panel-amp-trigger.py READS /sys/class/backlight (screen_lit, SR-140) to
+#     fade the speakers and open the amplifier relay when the screen is dark;
+#     it follows the backlight and never drives it, and
 #   wall-local-setup.py READS /sys/class/backlight so its root-owned touch
 #     witness can require brightness zero before it asks wall-sleep.sh to light
 #     the panel (LLR-911), and
@@ -646,12 +649,12 @@ for path in sys.argv[1:]:
         audit_shell(path, source)
 PYEOF
 }
-eq "wall-local-setup.py wall-sleep.sh " "$(power_writers "$BACKLIGHT_MECHANISMS")" \
+eq "panel-amp-trigger.py wall-local-setup.py wall-sleep.sh " "$(power_writers "$BACKLIGHT_MECHANISMS")" \
     "A11 only wall-sleep.sh changes the backlight; the witness only READS it"
 eq "wall-sleep.sh wall-touch-wakeup-report.sh " "$(power_writers "$SUSPEND_MECHANISMS")" \
     "A11 only wall-sleep.sh suspends; the wakeup report only READS the sleep nodes"
-eq "" "$(readonly_power_reader "$DIR/wall-local-setup.py" "$DIR/wall-touch-wakeup-report.sh")" \
-    "A11 neither admitted reader writes a backlight or sleep node (AST + redirection audit)"
+eq "" "$(readonly_power_reader "$DIR/panel-amp-trigger.py" "$DIR/wall-local-setup.py" "$DIR/wall-touch-wakeup-report.sh")" \
+    "A11 no admitted reader writes a backlight or sleep node (AST + redirection audit)"
 # The audit is proven to BITE, not merely to pass: a planted write in each
 # spelling the old regex missed must be caught. A guard nobody has seen fail is
 # not a guard.

@@ -255,6 +255,11 @@ MIC_SILENT_CHANNELS = (0, 1, 2, 3, 4, 5)
 MIC_GAIN_MAX = 4.0
 MIC_SOURCE_VAR = "WALL_AUDIO_MIC_SOURCE"
 MIC_SOURCE_ENV = RUN_DIR / "audio-mic-source.env"
+# WHICH OUTPUT THE LAST APPLY LEFT THE HARDWARE IN. It lives in /run (tmpfs), so
+# it is absent after every boot, and absent means "unknowable": the first apply
+# of a boot may mute the built-in speaker without knowing it was ever raised.
+APPLIED_OUTPUT_VAR = "WALL_AUDIO_APPLIED_OUTPUT"
+APPLIED_OUTPUT_ENV = RUN_DIR / "audio-applied-output.env"
 MIC_REAR_PCM = "mic_rear"
 MIC_REAR_UNIT = "wall-mic-rear.service"
 # numid of the adapter's eight-value `Speaker Playback Volume`.
@@ -1785,7 +1790,7 @@ def apply_builtin_capture_controls(wanted, mic_values, builtin, applier):
         required=bool(wanted["input_muted"]))
 
 
-def apply_plan(state, applier):
+def apply_plan(state, applier, adapter_ok=True):
     """Make the world match `state`. Returns the number of failures.
 
     ORDER MATTERS AND IT IS: stop, mute, re-point, unmute, start, level.
@@ -1793,6 +1798,14 @@ def apply_plan(state, applier):
     before the legs move means the switch does not click through the
     amplifier; the level is set LAST because the softvol control does not
     exist until something has opened the PCM that declares it.
+
+    `adapter_ok` False means the 5.1 USB adapter is not enumerated. EVERY STOP
+    AND EVERY MUTE STILL RUNS -- an apply that skipped them would leave a
+    running leg playing while the state says Mute -- but nothing that needs the
+    adapter is STARTED (its legs would only spend their 15-second waits, which is
+    the reason `apply-state` has always deferred), the adapter's rear pair is not
+    touched (there is no card to hold live channels), and the only leg that may
+    start is the built-in one, which does not use the adapter at all.
     """
     failures = 0
     wanted = policy.plan(state, aec_available=aec_available())
@@ -1842,8 +1855,10 @@ def apply_plan(state, applier):
             failures += applier.command(["/usr/bin/systemctl", "stop", unit])
     # Mixer mutes are not required: a card that has just been unplugged has no
     # controls to set, and that is the normal headset case, not an error.
-    applier.command(["/usr/bin/amixer", "-c", adapter, "-q", "sset", "Speaker",
-                     "mute" if wanted["adapter_muted"] else "unmute"], required=False)
+    if adapter_ok:
+        applier.command(["/usr/bin/amixer", "-c", adapter, "-q", "sset", "Speaker",
+                         "mute" if wanted["adapter_muted"] else "unmute"],
+                        required=False)
     if headset:
         applier.command(["/usr/bin/amixer", "-c", headset, "-q", "sset", "Speaker",
                          "mute" if wanted["headset_muted"] else "unmute"], required=False)
@@ -1862,21 +1877,48 @@ def apply_plan(state, applier):
     # Owner's calibrated 65 % and restores whatever it found. Not required: the
     # codec is always present, but a transient mixer error is a journal line,
     # not a failed apply (the leg either plays or it does not, and says so).
+    #
+    # MUTED ONLY WHEN LEAVING IT (or when the history is unknowable). An apply
+    # that merely stays in Speaker or Headset -- a mic-mute tap, a headset udev
+    # event -- must not touch the control: the chime path raises it for a moment
+    # and an unconditional mute here would cut a chime mid-sound. The previous
+    # applied output is kept in /run; absent (first apply of a boot) means it
+    # cannot be known, and muting then is the safe answer. A FAILED mute after
+    # builtin is counted (a speaker left live at 100 % is a real fault), and the
+    # marker is then left on `builtin` so the next apply retries it. The unmute on
+    # ENTERING builtin is NOT counted: the leg still plays at whatever the control
+    # holds and the journal carries the note, the same raise-versus-lower
+    # direction rule the mic switches and the rear pair follow.
+    previous_output = read_env(APPLIED_OUTPUT_ENV, APPLIED_OUTPUT_VAR, None)
+    mute_failed = False
     if wanted["builtin_speaker_on"]:
         applier.command(["/usr/bin/amixer", "-c", builtin, "-q", "sset",
                          "Speaker", "100%", "unmute"], required=False)
-    else:
-        applier.command(["/usr/bin/amixer", "-c", builtin, "-q", "sset",
-                         "Speaker", "mute"], required=False)
+    elif previous_output is None or previous_output == "builtin":
+        leaving = previous_output == "builtin"
+        mute_failed = applier.command(
+            ["/usr/bin/amixer", "-c", builtin, "-q", "sset", "Speaker", "mute"],
+            required=leaving) != 0
+        if mute_failed:
+            failures += 1
+            log("the built-in speaker could NOT be muted after leaving Panel: it "
+                "is still live at 100 %; the next apply retries")
     failures += apply_builtin_capture_controls(wanted, mic_values, builtin, applier)
+    if not mute_failed:
+        write_atomic(APPLIED_OUTPUT_ENV,
+                     "%s=%s\n" % (APPLIED_OUTPUT_VAR, state["output"]),
+                     mode=0o644, dry_run=applier.dry_run)
     # THE REAR PAIR IS RAISED ONLY WHILE A MIC LEG IS MEANT TO RUN, and put back
     # to the 0 the tone era left it at otherwise (coordinator log 2026-09-13
     # 22:50, "adapter rear pair (RL/RR) set to 0 and stored with alsactl"). Two
     # independent things therefore have to be wrong at once before the room's
     # music can reach the desktop's input: the generated speaker route's
     # explicit zeros on channels 4-7, and this level.
-    if not set_rear_level(applier, adapter,
-                          mic_values["rear_level"] if wanted["mic_live"] else 0) \
+    # With the adapter absent there is no card to hold live channels, and the
+    # read would fail and be miscounted as "could not return to silence".
+    if adapter_ok and not set_rear_level(
+            applier, adapter,
+            mic_values["rear_level"] if wanted["mic_live"] else 0) \
             and not wanted["mic_live"]:
         # Only the LOWERING direction is counted: see set_rear_level.
         failures += 1
@@ -1904,6 +1946,10 @@ def apply_plan(state, applier):
             set_bus_level(applier, loopback, wanted["volume"], expected=False)
     for unit, should_run in wanted["legs"].items():
         if not should_run:
+            continue
+        if not adapter_ok and unit not in policy.BUILTIN_LEGS:
+            # Deferred until the adapter's add event re-runs the apply; see the
+            # docstring. Stops and mutes above have already run.
             continue
         if unit in policy.MIC_LEGS:
             if unit == MIC_REAR_UNIT and not rear_mic_possible(applier):
@@ -2524,24 +2570,27 @@ def _locked_apply(arguments):
         verdict.confirm(state)
         return 0
     adapter = read_env(CARDS_FILE, "WALL_AUDIO_ADAPTER_CARD", "ICUSBAUDIO7D")
-    if not adapter_present(adapter):
+    adapter_ok = adapter_present(adapter)
+    if not adapter_ok and state["output"] in ("speaker", "headset"):
         # Slow USB enumeration is not a failed switch policy. Starting legs
         # here only spends their 15-second waits; the adapter add rule invokes
         # this non-sticky re-assert once the device actually exists. Do NOT
         # generalise this to a present-but-broken adapter: apply_plan below
         # still counts and reports those real failures.
-        wanted = policy.plan(state, aec_available=aec_available())
-        mic_values, mic_notes = load_mic()
-        for mic_note in mic_notes:
-            log(mic_note)
-        builtin = read_env(CARDS_FILE, "WALL_AUDIO_BUILTIN_CARD", "PCH")
-        deferred_applier = Applier(dry_run=arguments.dry_run)
-        publish_adapter_independent_state(wanted, headset_card(), deferred_applier)
-        failures = apply_builtin_capture_controls(
-            wanted, mic_values, builtin, deferred_applier)
-        log("audio adapter card id %r is not present: deferring apply until its "
-            "device re-add; published runtime audio state and "
-            "re-asserted built-in input controls" % adapter)
+        #
+        # THE DEFERRAL IS ONLY FOR POSITIONS THAT NEED THE ADAPTER. Mute and
+        # Panel (`builtin`) do not, and deferring them was a defect: with the
+        # adapter dead, selecting Panel did nothing, and with Panel playing and
+        # the adapter dropping, Mute was skipped and the speaker kept playing.
+        # They fall through to the normal apply with `adapter_ok` False. Even
+        # here every STOP and MUTE runs (a leg left over from Panel must not
+        # keep playing under Speaker); only STARTS are deferred.
+        failures = apply_plan(state, Applier(dry_run=arguments.dry_run),
+                              adapter_ok=False)
+        log("audio adapter card id %r is not present: deferring apply of "
+            "this position's legs until its device re-add; stops, mutes, "
+            "published runtime audio state and built-in input controls "
+            "were re-asserted" % adapter)
         if boot_mark is not None:
             write_boot_stamp(dry_run=arguments.dry_run, monotonic_usec=boot_mark)
         # DEFERRED IS NOT APPLIED. The level was written to the state file and
@@ -2550,8 +2599,13 @@ def _locked_apply(arguments):
         # rebase on a target it believes landed.
         verdict.refuse(policy.REFUSE_UNAVAILABLE)
         return 1 if failures else 0
+    if not adapter_ok:
+        log("audio adapter card id %r is not present, but %s does not need it: "
+            "applying (stops, mutes and the built-in leg only)"
+            % (adapter, state["output"]))
     before_observation = state.get("mic_legs_running")
-    failures = apply_plan(state, Applier(dry_run=arguments.dry_run))
+    failures = apply_plan(state, Applier(dry_run=arguments.dry_run),
+                          adapter_ok=adapter_ok)
     # A SECOND WRITE, AND IT IS NOT REDUNDANT. Everything else in the state is
     # an INTENTION and is persisted before the apply, so that a crash halfway
     # through cannot lose what the Owner asked for. `mic_legs_running` is an

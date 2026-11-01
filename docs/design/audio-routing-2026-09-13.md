@@ -1324,10 +1324,21 @@ restore what it found) keeps working there unchanged. The plan publishes
   the relay drops power, exactly as in Headset.
 * **No auto-switch away.** The USB-headset one-shot is `speaker -> headset` only. A headset
   arriving while Panel is selected is recorded (the latch is spent) and the position stays.
-* **Still waits for the USB adapter.** `apply-state` defers when the 5.1 adapter's card is
-  absent, in every position, so on a boot where the adapter enumerates late the Panel leg
-  starts when the adapter's add event re-runs the apply, as every other leg does. The
-  built-in card does not need the adapter; the deferral is the existing gate, not a new one.
+* **The adapter gate no longer defers Mute or Panel.** `apply-state` used to return early
+  whenever the 5.1 adapter's card was absent, which would have made Panel unselectable with the
+  adapter dead and would have skipped a Mute pressed while Panel played (the speaker would
+  have kept going). Now only Speaker and Headset defer, and even they run every *stop* and
+  *mute* (a leg left over from Panel must not keep playing); only the *starts* that would
+  spend 15-second waits on a missing card are deferred. Mute and Panel apply fully, minus the
+  adapter's own mixer calls and rear pair; Panel's leg starts, the Bluetooth call supervisor
+  and the rear mic leg wait for the adapter's add event.
+* **The PCH `Speaker` control is muted only on leaving Panel.** The applier records the last
+  applied output in `/run/wall-panel/audio-applied-output.env`. It mutes the control when the
+  previous output was `builtin`, or when there is no record (first apply of a boot), and
+  otherwise leaves it alone, so a mic-mute tap or headset event mid-chime cannot cut the
+  chime. A failed mute after Panel is counted as an apply failure and the record stays on
+  `builtin` so the next apply retries it. A failed unmute on entering Panel is not counted
+  (the leg still plays; the journal carries the note).
 * **Old state files.** A state file written before this change has no `builtin` level. That
   is not damage: it reads as the default 60 and does not mute the microphone.
 

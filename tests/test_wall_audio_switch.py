@@ -3730,6 +3730,20 @@ def test_the_other_copies_of_the_vocabulary_agree_llr1405_llr1406_llr1407():
 
 # -- the adapter gate and the built-in speaker's history (review 2026-10-31) ----
 
+def _quiet_capture(argv, timeout=15):
+    """What systemctl and amixer would answer on a healthy panel.
+
+    The applier's reads (`systemctl show`, `amixer sget`) must never reach the
+    host: on Windows there is no systemctl at all (WinError 2), and on a dev box
+    under WSL there is a real one that knows nothing about these units.
+    """
+    if argv[0].endswith("systemctl"):
+        return "inactive\n"
+    if argv[0].endswith("amixer") and "sget" in argv:
+        return "  Front Left: Playback 87 [100%] [0.00dB] [on]\n"
+    return None
+
+
 def _applied(applier, output):
     applier.APPLIED_OUTPUT_ENV.write_text(
         "%s=%s\n" % (applier.APPLIED_OUTPUT_VAR, output), encoding="utf-8")
@@ -3748,6 +3762,7 @@ def _apply_state_without_adapter(applier, policy, tmp_path, monkeypatch, output,
     if previous:
         _applied(applier, previous)
     recorder = applier.Applier(dry_run=True)
+    recorder.capture = _quiet_capture
     monkeypatch.setattr(applier, "Applier", lambda **_kw: recorder)
     code = applier.main(["--state", str(state_file), "--dry-run", "apply-state"])
     return code, _commands(recorder)
@@ -3860,3 +3875,98 @@ def test_a_failed_unmute_entering_panel_is_not_counted_llr1410(applier, policy):
     state["output"] = "builtin"
     assert applier.apply_plan(state, applier.Applier(run=failing)) == 0
     assert applier.APPLIED_OUTPUT_ENV.read_text(encoding="utf-8").strip().endswith("=builtin")
+
+
+# -- review 3 (2026-10-31): privacy observation, record order, probing, readback --
+
+def test_an_unprovable_mic_stop_is_persisted_even_when_the_adapter_is_absent_llr1409(
+        applier, policy, tmp_path, monkeypatch, capfd):
+    """The mic mute must not be reported confirmed while a leg may still transmit."""
+    state = policy.default_state()
+    state["output"] = "speaker"
+    state["input_muted"] = True
+    state["mic_legs_running"] = False  # what the file believed before this apply
+    state_file = tmp_path / "audio-state.json"
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(applier, "BOOT_STAMP", tmp_path / "stamp.json")
+    monkeypatch.setattr(applier, "headset_card", lambda *a, **k: None)
+    monkeypatch.setattr(applier, "adapter_present", lambda *a, **k: False)
+    monkeypatch.setattr(applier, "current_mode", lambda: "bus")
+    recorder = applier.Applier(dry_run=True)
+    # systemd says every unit is still running, before and after the kill.
+    recorder.capture = lambda argv, timeout=15: "active\n"
+    monkeypatch.setattr(applier, "Applier", lambda **_kw: recorder)
+    saved = []
+    real_save = applier.save_state
+    monkeypatch.setattr(applier, "save_state",
+                        lambda st, path, dry_run=False: (saved.append(dict(st)),
+                                                         real_save(st, path, dry_run=dry_run)))
+    code = applier.main(["--state", str(state_file), "--dry-run", "volume",
+                         "set:60:bus:speaker:60:0"])
+    out = capfd.readouterr().out
+    assert code == 1
+    assert any(entry["mic_legs_running"] is True for entry in saved), \
+        "the observation must reach the state file before the deferral returns"
+    assert "refused:apply-failed" in out and "refused:unavailable" not in out
+
+
+def test_the_panel_record_is_written_before_the_speaker_is_raised_llr1410(applier, policy):
+    seen = {}
+
+    def run(argv, **kwargs):
+        if argv[0].endswith("amixer") and "unmute" in argv and "PCH" in argv:
+            seen["record"] = applier.APPLIED_OUTPUT_ENV.read_text(encoding="utf-8")
+        return _Reply(0, "  Front Left: Playback 87 [100%] [0.00dB] [on]\n")
+
+    state = policy.default_state()
+    state["output"] = "builtin"
+    _applied(applier, "speaker")
+    applier.apply_plan(state, applier.Applier(run=run))
+    assert seen["record"].strip().endswith("=builtin"), \
+        "killed between the unmute and the write, the next leave must still mute"
+
+
+def test_a_deferred_speaker_apply_probes_nothing_llr1409(applier, policy, tmp_path, monkeypatch):
+    code, commands = _apply_state_without_adapter(
+        applier, policy, tmp_path, monkeypatch, "speaker", "builtin")
+    assert code == 0
+    assert not any(c.startswith("/usr/bin/aplay") for c in commands), \
+        "no probe or pre-open of a device that is not there"
+    # expected=False is ONE attempt (the level is still recorded), not the
+    # 20-attempt retry window of a leg that is really starting.
+    assert sum("sset Bus" in c for c in commands) <= 1, "no level retry window"
+    assert not applier.SPEAKER_CHAIN_ENV.exists(), "no chain published for nobody"
+
+
+@pytest.mark.parametrize("reading,reissued", [
+    ("  Front Left: Playback 87 [100%] [0.00dB] [off]\n", True),
+    ("  Front Left: Playback 56 [65%] [-22.50dB] [on]\n", True),
+    ("  Front Left: Playback 87 [100%] [0.00dB] [on]\n", False),
+])
+def test_panel_readback_raises_a_speaker_the_chime_left_muted_llr1410(applier, policy,
+                                                                      reading, reissued):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(" ".join(argv))
+        if argv[0].endswith("amixer") and "sget" in argv:
+            return _Reply(0, reading)
+        return _Reply(0)
+
+    state = policy.default_state()
+    state["output"] = "builtin"
+    assert applier.apply_plan(state, applier.Applier(run=run)) == 0
+    raises = [c for c in calls if c.endswith("-c PCH -q sset Speaker 100% unmute")]
+    assert len(raises) == (2 if reissued else 1), calls
+    if reissued:
+        # And it is AFTER the level retry, not before it.
+        assert calls.index("/usr/bin/amixer -c PCH sget Speaker") > max(
+            i for i, c in enumerate(calls) if "sset Bus" in c)
+
+
+def test_the_unmuted_chime_limitation_is_written_down_llr1410():
+    source = read(APPLIER)
+    assert "STATED LIMITATION" in source and "crashed mid-chime" in source
+    assert "crashed mid-chime" in read(ROOT / "docs/design/audio-routing-2026-09-13.md").replace(
+        "\n", " ").replace("  ", " ") or "chime process that crashed" in read(
+        ROOT / "docs/design/audio-routing-2026-09-13.md").replace("\n", " ")

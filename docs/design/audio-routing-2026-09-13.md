@@ -1339,6 +1339,17 @@ restore what it found) keeps working there unchanged. The plan publishes
   chime. A failed mute after Panel is counted as an apply failure and the record stays on
   `builtin` so the next apply retries it. A failed unmute on entering Panel is not counted
   (the leg still plays; the journal carries the note).
+* **Panel readback and the record order.** The record is written *before* the 100 % unmute (an
+  applier killed in between must still mute on the next leave), and after the level retry the
+  applier reads `Speaker` back and raises it again if it is off or not at 100 %, which closes
+  the window in which the chime's restore-after-reading-the-output could land after a switch
+  to Panel. With the adapter absent, Speaker and Headset skip the speaker-chain probe, the
+  pre-open and the level retry, and persist the mic observation before they return (a refused
+  mic stop reports `apply-failed`, not `unavailable`).
+* **Stated limitation.** An apply that stays in Speaker or Headset no longer re-mutes PCH
+  `Speaker`, so a chime process that crashed mid-chime leaves it unmuted at the chime level
+  until the next leave-Panel apply or boot. Nothing feeds the PCH card in those positions, so
+  the cost is hiss at most.
 * **Old state files.** A state file written before this change has no `builtin` level. That
   is not damage: it reads as the default 60 and does not mute the microphone.
 

@@ -1878,6 +1878,12 @@ def apply_plan(state, applier, adapter_ok=True):
     # codec is always present, but a transient mixer error is a journal line,
     # not a failed apply (the leg either plays or it does not, and says so).
     #
+    # STATED LIMITATION: because an apply that stays in Speaker or Headset no
+    # longer re-mutes this control, a chime process that crashed mid-chime
+    # leaves Speaker unmuted at its chime level until the next leave-builtin
+    # apply or the next boot. Nothing feeds the PCH card in those positions, so
+    # the cost is hiss at most.
+    #
     # MUTED ONLY WHEN LEAVING IT (or when the history is unknowable). An apply
     # that merely stays in Speaker or Headset -- a mic-mute tap, a headset udev
     # event -- must not touch the control: the chime path raises it for a moment
@@ -1892,6 +1898,13 @@ def apply_plan(state, applier, adapter_ok=True):
     previous_output = read_env(APPLIED_OUTPUT_ENV, APPLIED_OUTPUT_VAR, None)
     mute_failed = False
     if wanted["builtin_speaker_on"]:
+        # THE RECORD IS WRITTEN BEFORE THE CONTROL IS RAISED. An applier killed
+        # between the two must leave the record saying `builtin`, so that the
+        # next leave-builtin apply still mutes; the other order leaves the record
+        # on the previous output and a speaker live at 100 % that nothing mutes.
+        write_atomic(APPLIED_OUTPUT_ENV,
+                     "%s=builtin\n" % APPLIED_OUTPUT_VAR,
+                     mode=0o644, dry_run=applier.dry_run)
         applier.command(["/usr/bin/amixer", "-c", builtin, "-q", "sset",
                          "Speaker", "100%", "unmute"], required=False)
     elif previous_output is None or previous_output == "builtin":
@@ -1904,7 +1917,7 @@ def apply_plan(state, applier, adapter_ok=True):
             log("the built-in speaker could NOT be muted after leaving Panel: it "
                 "is still live at 100 %; the next apply retries")
     failures += apply_builtin_capture_controls(wanted, mic_values, builtin, applier)
-    if not mute_failed:
+    if not mute_failed and not wanted["builtin_speaker_on"]:
         write_atomic(APPLIED_OUTPUT_ENV,
                      "%s=%s\n" % (APPLIED_OUTPUT_VAR, state["output"]),
                      mode=0o644, dry_run=applier.dry_run)
@@ -1939,9 +1952,15 @@ def apply_plan(state, applier, adapter_ok=True):
     # that: probe, publish, then declare the control on the chain that answered.
     # Nothing is probed when the speaker leg is not wanted -- in Mute, or in
     # Headset, opening the adapter at all would be audio nobody asked for.
-    if state["output"] == "speaker" and any(wanted["legs"].values()):
+    # With the adapter absent nothing but the built-in leg will start, so none of
+    # the probing, declaring or level-retry below has anything to act on: it would
+    # probe a missing device, publish a chain nobody reads and spend the retry
+    # window for nothing.
+    legs_wanted = any(wanted["legs"].values()) and (
+        adapter_ok or state["output"] == "builtin")
+    if state["output"] == "speaker" and legs_wanted:
         select_speaker_chain(applier)
-    if leg_pcm and any(wanted["legs"].values()):
+    if leg_pcm and legs_wanted:
         if declare_bus_control(applier, leg_pcm):
             set_bus_level(applier, loopback, wanted["volume"], expected=False)
     for unit, should_run in wanted["legs"].items():
@@ -1969,10 +1988,23 @@ def apply_plan(state, applier, adapter_ok=True):
     # journal line, not a failed apply: the audio is playing, only the level is
     # not what was asked for.
     if not set_bus_level(applier, loopback, wanted["volume"],
-                         expected=any(wanted["legs"].values()),
+                         expected=legs_wanted,
                          pcm=leg_pcm):
         log("bus level %d%% could not be applied: the control never appeared"
             % wanted["volume"])
+    # ── item 5: THE READBACK THAT CLOSES THE CHIME WINDOW ──────────────────────
+    # The chime, on its non-Panel path, restores the Speaker state it remembered
+    # a moment after it last read the output. A switch to Panel landing between
+    # those can leave the control muted under a running leg. The level retry
+    # above takes seconds, so asking once more AFTER it closes the window: if the
+    # control is off or not at 100 %, raise it again and say so.
+    if wanted["builtin_speaker_on"]:
+        reading = applier.capture(["/usr/bin/amixer", "-c", builtin, "sget", "Speaker"])
+        if reading is not None and ("[off]" in reading or "[100%]" not in reading):
+            log("the built-in speaker was not at 100 %% and on after the apply "
+                "(%s): raising it again" % " ".join(reading.split())[-60:])
+            applier.command(["/usr/bin/amixer", "-c", builtin, "-q", "sset",
+                             "Speaker", "100%", "unmute"], required=False)
     if wanted["reason"]:
         log("output %s is UNAVAILABLE (%s): every output silent"
             % (state["output"], wanted["reason"]))
@@ -2585,8 +2617,16 @@ def _locked_apply(arguments):
         # They fall through to the normal apply with `adapter_ok` False. Even
         # here every STOP and MUTE runs (a leg left over from Panel must not
         # keep playing under Speaker); only STARTS are deferred.
+        before_observation = state.get("mic_legs_running")
         failures = apply_plan(state, Applier(dry_run=arguments.dry_run),
                               adapter_ok=False)
+        # THE OBSERVATION IS PERSISTED HERE TOO. apply_plan records in
+        # `mic_legs_running` whether a mic leg could be PROVEN stopped, and the
+        # broker reads it to decide if a mic mute may be reported as confirmed.
+        # Returning without saving it would leave a stale `False` in the file
+        # while a leg that would not stop keeps transmitting.
+        if state.get("mic_legs_running") != before_observation:
+            save_state(state, arguments.state, dry_run=arguments.dry_run)
         log("audio adapter card id %r is not present: deferring apply of "
             "this position's legs until its device re-add; stops, mutes, "
             "published runtime audio state and built-in input controls "
@@ -2597,8 +2637,14 @@ def _locked_apply(arguments):
         # will be asserted when the adapter re-enumerates, but nothing audible
         # moved, so the actor must reconcile from fresh truth rather than
         # rebase on a target it believes landed.
+        if failures:
+            # A real failure (a leg that would not stop, a speaker that would
+            # not mute) is not "unavailable": the actor must know the apply failed.
+            log("apply finished with %d failure(s): audio may be wrong" % failures)
+            verdict.refuse(policy.REFUSE_APPLY_FAILED)
+            return 1
         verdict.refuse(policy.REFUSE_UNAVAILABLE)
-        return 1 if failures else 0
+        return 0
     if not adapter_ok:
         log("audio adapter card id %r is not present, but %s does not need it: "
             "applying (stops, mutes and the built-in leg only)"

@@ -1182,23 +1182,109 @@ def test_the_mono_sum_reaches_both_centre_and_sub_d4_sr028(applier):
         assert centre == sub
 
 
-def test_the_rear_and_side_pairs_are_explicit_zeros_sr028(applier):
-    """Rear is wired to the desktop's INPUT: the room's music must never reach it.
+def test_the_surround_pair_is_an_explicit_zero_sr028(applier):
+    """Surround (6/7) is wired to the desktop's INPUT: music must never reach it.
 
-    Written out rather than left implicit, so "silent on purpose" and
-    "forgotten" do not look the same in a generated file.
+    Measured by the 2026-09-18 pair probe (d439e1e). Written out rather than
+    left implicit, so "silent on purpose" and "forgotten" do not look the same
+    in a generated file.
     """
     rendered = applier.render_trim_conf(applier.TRIM_DEFAULTS)
-    for channel in (4, 5, 6, 7):
+    for channel in (6, 7):
         assert "ttable.0.%d 0.0000" % channel in rendered
         assert "ttable.1.%d 0.0000" % channel in rendered
+    # And no route line gives either input a non-zero coefficient into 6 or 7.
+    for line in rendered.splitlines():
+        parts = line.split()
+        if parts and parts[0].startswith("ttable."):
+            destination = int(parts[0].split(".")[2])
+            if destination in (6, 7):
+                assert float(parts[1]) == 0.0, line
+
+
+def test_the_back_jack_carries_the_music_by_default_llr1421(applier):
+    """Back (4/5) is stereo at unity: L -> RL, R -> RR, no crossing."""
+    rendered = applier.render_trim_conf(dict(applier.TRIM_DEFAULTS))
+    assert "ttable.0.4 1.0000" in rendered
+    assert "ttable.1.5 1.0000" in rendered
+    assert "ttable.1.4 0.0000" in rendered, "R must not reach RL"
+    assert "ttable.0.5 0.0000" in rendered, "L must not reach RR"
+    # The front is unchanged by the addition.
+    assert "ttable.0.0 1.0000" in rendered and "ttable.1.1 1.0000" in rendered
+
+
+def test_trim_back_zero_silences_only_the_back_jack_llr1421(applier):
+    """`wall-audio-output trim back=0` is the off switch, and only for Back."""
+    wanted = applier.parse_trim_assignments(["back=0"], dict(applier.TRIM_DEFAULTS))
+    rendered = applier.render_trim_conf(wanted)
+    assert "ttable.0.4 0.0000" in rendered and "ttable.1.5 0.0000" in rendered
+    assert "ttable.0.0 1.0000" in rendered and "ttable.1.1 1.0000" in rendered
+    assert "ttable.0.2 0.5000" in rendered and "ttable.1.3 0.5000" in rendered
+    assert "BACK_L=0.0000" in applier.render_trim_env(wanted)
+    one = applier.parse_trim_assignments(["back_l=0.25"], dict(applier.TRIM_DEFAULTS))
+    assert "ttable.0.4 0.2500" in applier.render_trim_conf(one)
+    assert "ttable.1.5 1.0000" in applier.render_trim_conf(one)
+
+
+def test_an_env_file_without_back_keys_loads_the_defaults_quietly_llr1422(
+        applier, tmp_path):
+    """A panel installed before 2026-11-01 has a six-key env file.
+
+    It must gain the Back jack from the defaults, with no journal complaint and
+    with the numbers the Owner tuned left exactly as they were.
+    """
+    env = tmp_path / "audio-trim.env"
+    env.write_text("# GENERATED\n"
+                   "WALL_AUDIO_TRIM_FRONT_L=1.0000\nWALL_AUDIO_TRIM_FRONT_R=1.0000\n"
+                   "WALL_AUDIO_TRIM_CENTER_L=0.3500\nWALL_AUDIO_TRIM_CENTER_R=0.3500\n"
+                   "WALL_AUDIO_TRIM_SUB_L=0.6000\nWALL_AUDIO_TRIM_SUB_R=0.6000\n",
+                   encoding="utf-8")
+    values, notes = applier.load_trim(env)
+    assert notes == []
+    assert values["center_l"] == 0.35 and values["sub_r"] == 0.6
+    rendered = applier.render_trim_conf(values)
+    assert "ttable.0.4 1.0000" in rendered and "ttable.1.5 1.0000" in rendered
+    assert "ttable.0.2 0.3500" in rendered, "the tuned numbers survive"
+
+
+def test_firstboot_seeds_the_back_keys_for_new_installs_llr1422():
+    firstboot = read(WALL / "wall-firstboot.sh")
+    seed = firstboot.split("cat > /etc/wall-panel/audio-trim.env <<EOF", 1)[1].split("\nEOF", 1)[0]
+    assert "WALL_AUDIO_TRIM_BACK_L=${WALL_AUDIO_TRIM_BACK_L:-1.0}" in seed
+    assert "WALL_AUDIO_TRIM_BACK_R=${WALL_AUDIO_TRIM_BACK_R:-1.0}" in seed
+    env = read(WALL / "wall.env.example")
+    assert "WALL_AUDIO_TRIM_BACK_L=1.0" in env and "WALL_AUDIO_TRIM_BACK_R=1.0" in env
+
+
+def test_the_shipped_trim_example_matches_what_the_renderer_routes_llr1421(applier):
+    """The reviewable copy must not drift from the generator: 4/5 music, 6/7 zero."""
+    example = read(TRIM_EXAMPLE)
+    live = {}
+    for line in example.splitlines():
+        parts = line.split("#")[0].split()
+        if len(parts) == 2 and parts[0].startswith("ttable."):
+            live[parts[0]] = float(parts[1])
+    rendered = {}
+    for line in applier.render_trim_conf(dict(applier.TRIM_DEFAULTS)).splitlines():
+        parts = line.split("#")[0].split()
+        if len(parts) == 2 and parts[0].startswith("ttable."):
+            rendered[parts[0]] = float(parts[1])
+    assert live == rendered
+
+
+def test_the_mic_example_puts_the_microphone_on_the_measured_pair_llr1421(applier):
+    example = read(MIC_EXAMPLE)
+    assert "ttable.0.6 1.0000" in example and "ttable.0.7 1.0000" in example
+    for channel in range(6):
+        assert "ttable.0.%d 0.0000" % channel in example
 
 
 def test_the_trim_defaults_are_the_owners_day_one_table_sr028(applier):
-    """Front 1.0/1.0, centre 0.5/0.5 per input, sub 0.5/0.5 -- finding 8."""
+    """Front 1.0/1.0, centre 0.5/0.5 per input, sub 0.5/0.5 -- finding 8; back 1.0/1.0."""
     assert applier.TRIM_DEFAULTS == {"front_l": 1.0, "front_r": 1.0,
                                      "center_l": 0.5, "center_r": 0.5,
-                                     "sub_l": 0.5, "sub_r": 0.5}
+                                     "sub_l": 0.5, "sub_r": 0.5,
+                                     "back_l": 1.0, "back_r": 1.0}
     env = read(WALL / "wall.env.example")
     for key, value in applier.TRIM_DEFAULTS.items():
         assert "WALL_AUDIO_TRIM_%s=%s" % (key.upper(), value) in env
@@ -1739,16 +1825,57 @@ def test_the_mic_route_writes_explicit_zeros_everywhere_else_sr029(applier):
     assert rendered.count("ttable.0.6 1.0000") == rendered.count("ttable.0.7 1.0000")
 
 
+def test_no_ttable_key_is_defined_twice_and_the_last_back_value_wins_llr1421(applier):
+    """ALSA takes the LAST entry for a repeated ttable key.
+
+    A channel that is both routed and listed as silent would render twice
+    (1.0000 then 0.0000) and the Back jack would go quiet while every
+    first-match check still passed.
+    """
+    def entries(text):
+        found = []
+        for line in text.splitlines():
+            parts = line.split("#")[0].split()
+            if len(parts) == 2 and parts[0].startswith("ttable."):
+                found.append((parts[0], float(parts[1])))
+        return found
+
+    speaker = entries(applier.render_trim_conf(dict(applier.TRIM_DEFAULTS)))
+    mic = entries(applier.render_mic_conf(dict(applier.MIC_DEFAULTS)))
+    for name, table in (("speaker", speaker), ("mic", mic)):
+        keys = [key for key, _ in table]
+        assert len(keys) == len(set(keys)), (
+            "%s route repeats a ttable key: %s"
+            % (name, sorted(k for k in set(keys) if keys.count(k) > 1)))
+    last = {}
+    for key, value in speaker:
+        last[key] = value
+    assert last["ttable.0.4"] == 1.0 and last["ttable.1.5"] == 1.0
+
+
 def test_the_two_route_tables_do_not_overlap_sr029(applier):
     """The other direction, and the pair is the whole bargain.
 
-    The speaker route owns 0-3 and zeroes 4-7; the mic route owns 6-7 and zeroes
-    the rest. dmix sums per channel, so music cannot reach the desktop's input
-    and the microphone cannot reach the amplifier, and neither statement depends
-    on a mixer control.
+    The speaker route owns 0-5 (front, centre/sub, Back) and zeroes 6-7; the mic
+    route owns 6-7 and zeroes 0-5. dmix sums per channel, so music cannot reach
+    the desktop's input and the microphone cannot reach the amplifier, and
+    neither statement depends on a mixer control.
     """
     speaker = applier.render_trim_conf(dict(applier.TRIM_DEFAULTS))
     mic = applier.render_mic_conf(dict(applier.MIC_DEFAULTS))
+
+    def nonzero_destinations(text):
+        found = set()
+        for line in text.splitlines():
+            parts = line.split("#")[0].split()
+            if len(parts) == 2 and parts[0].startswith("ttable.") and float(parts[1]):
+                found.add(int(parts[0].split(".")[2]))
+        return found
+
+    # Read off the RENDERED text, not off the constants being checked.
+    assert nonzero_destinations(speaker) == {0, 1, 2, 3, 4, 5}, (
+        "music reaches the Back jack (4/5) and never 6/7")
+    assert nonzero_destinations(mic) == {6, 7}, "the mic never reaches 0-5"
     for channel in applier.MIC_REAR_CHANNELS:
         assert channel in applier.TRIM_SILENT_CHANNELS, (
             "channel %d carries the mic, so the speaker route must zero it"
@@ -2569,6 +2696,95 @@ def test_set_rear_level_reports_what_actually_happened_sr029(applier):
         return _Reply(0, raised)
 
     assert applier.set_rear_level(applier.Applier(run=accept), "ICUSBAUDIO7D", 0) is True
+
+
+# ── the Back jack's hardware level follows the Front's (LLR-1420) ──────────
+
+def _mixer(applier, initial, cget_text=None):
+    """A stateful fake amixer over numid 8. Returns (applier, state, argv log)."""
+    state = {"values": list(initial)}
+    log = []
+
+    def run(argv, **kwargs):
+        if argv[0].endswith("amixer") and "cget" in argv:
+            if cget_text is not None:
+                return _Reply(0, cget_text)
+            return _Reply(0, "numid=8\n  ; type=INTEGER\n  : values=%s\n"
+                          % ",".join(str(v) for v in state["values"]))
+        if argv[0].endswith("amixer") and "cset" in argv:
+            log.append(list(argv))
+            state["values"] = [int(v) for v in argv[-1].split(",")]
+            return _Reply(0)
+        return _Reply(0, "inactive\n")
+
+    return applier.Applier(run=run), state, log
+
+
+def test_the_back_level_follows_the_front_and_touches_only_4_and_5_llr1420(applier):
+    """Read all eight, change channels 4 and 5, write all eight back."""
+    mixer, state, log = _mixer(applier, [66, 66, 24, 24, 0, 0, 24, 24])
+    assert applier.set_back_level(mixer, "ICUSBAUDIO7D") is True
+    assert log == [["/usr/bin/amixer", "-c", "ICUSBAUDIO7D", "-q", "cset",
+                    "numid=8", "66,66,24,24,66,66,24,24"]]
+    assert state["values"][:4] == [66, 66, 24, 24], "0-3 untouched"
+    assert state["values"][6:] == [24, 24], "6/7 (the mic return) untouched"
+
+
+def test_the_back_level_tracks_a_different_front_level_llr1420(applier):
+    mixer, state, log = _mixer(applier, [90, 80, 24, 24, 66, 66, 197, 197])
+    assert applier.set_back_level(mixer, "ICUSBAUDIO7D") is True
+    assert log[-1][-1] == "90,80,24,24,90,80,197,197"
+
+
+def test_the_back_level_writes_nothing_when_already_equal_llr1420(applier):
+    mixer, state, log = _mixer(applier, [66, 66, 24, 24, 66, 66, 197, 197])
+    assert applier.set_back_level(mixer, "ICUSBAUDIO7D") is True
+    assert log == []
+
+
+@pytest.mark.parametrize("text", ["", "nothing useful", "  : values=66,66\n",
+                                  "  : values=a,b,c,d,e,f,g,h\n"])
+def test_an_unreadable_back_level_read_moves_nothing_llr1420(applier, text):
+    mixer, state, log = _mixer(applier, [66, 66, 24, 24, 0, 0, 24, 24], cget_text=text)
+    assert applier.set_back_level(mixer, "ICUSBAUDIO7D") is False
+    assert log == [], "no write on a read that did not parse"
+
+
+def test_a_refused_back_level_write_is_a_note_not_a_failed_apply_llr1420(applier):
+    def refuse(argv, **kwargs):
+        if "cset" in argv:
+            return _Reply(1, "", "nope")
+        return _Reply(0, "  : values=66,66,24,24,0,0,24,24\n")
+
+    mixer = applier.Applier(run=refuse)
+    assert applier.set_back_level(mixer, "ICUSBAUDIO7D") is False
+
+
+def test_every_apply_with_the_adapter_present_sets_the_back_level_llr1420(
+        applier, policy):
+    """The adapter-return path and boot both go through apply_plan.
+
+    Starting from the 2026-11-01 panel reading plus a fresh-adapter case (4/5 at
+    0), the end state has 4/5 equal to 0/1, 0-3 untouched, and 6/7 the mic pair
+    (0 here, because the input is muted). An apply WITHOUT the adapter touches
+    no mixer values at all.
+    """
+    muted, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_input_mute", "muted": True})
+    mixer, state, log = _mixer(applier, [66, 66, 24, 24, 0, 0, 197, 197])
+    assert applier.apply_plan(muted, mixer) == 0
+    assert state["values"] == [66, 66, 24, 24, 66, 66, 0, 0]
+
+    # Also in a position that is not Speaker: the level is inert there but the
+    # state is the same after any sequence of positions.
+    headset_off = dict(muted, output="mute")
+    mixer, state, log = _mixer(applier, [66, 66, 24, 24, 0, 0, 197, 197])
+    applier.apply_plan(headset_off, mixer)
+    assert state["values"][4:6] == [66, 66]
+
+    mixer, state, log = _mixer(applier, [66, 66, 24, 24, 0, 0, 197, 197])
+    applier.apply_plan(muted, mixer, adapter_ok=False)
+    assert log == [] and state["values"] == [66, 66, 24, 24, 0, 0, 197, 197]
 
 
 # ── review round 3: the gate's own fail-open, and two boundaries ───────────

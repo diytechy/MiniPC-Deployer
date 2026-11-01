@@ -15,8 +15,8 @@
 # because item 23 needs the room's music and the microphone out of the same
 # adapter at the same time. The adapter's mute is a single boolean over all
 # eight channels (numid 7, measured 2026-09-14), so it cannot say "front off,
-# rear on". These zeros, and the matching zeros on channels 4-7 in
-# audio-trim.conf, are therefore the WHOLE of the separation between the
+# rear on". These zeros (channels 0-5, including the Back jack's 4/5), and the
+# matching zeros on channels 6/7 in audio-trim.conf, are therefore the WHOLE of the separation between the
 # microphone and the speakers in one direction and the room's music and the
 # desktop's input in the other.
 #
@@ -25,18 +25,20 @@
 # The 8-channel map is the adapter's and is fixed:
 #   0 FL  1 FR  2 FC  3 LFE  4 RL  5 RR  6 SL  7 SR
 # Source channel 0 is the ONLY source: mic_selected is mono.
+# The desktop's Line In cable is on 6/7 (Surround jack): the 2026-09-18 pair
+# probe, d439e1e. This example said 4/5 until 2026-11-01; 4/5 are the Back jack.
 pcm.mic_rear_route {
     type route
     slave {
         pcm "usb_out_mix"
         channels 8
     }
-    ttable.0.4 1.0000  # the microphone, to the desktop's input
-    ttable.0.5 1.0000  # the microphone, to the desktop's input
+    ttable.0.6 1.0000  # the microphone, to the desktop's input
+    ttable.0.7 1.0000  # the microphone, to the desktop's input
     ttable.0.0 0.0000  # the mic must never reach this channel
     ttable.0.1 0.0000  # the mic must never reach this channel
     ttable.0.2 0.0000  # the mic must never reach this channel
     ttable.0.3 0.0000  # the mic must never reach this channel
-    ttable.0.6 0.0000  # the mic must never reach this channel
-    ttable.0.7 0.0000  # the mic must never reach this channel
+    ttable.0.4 0.0000  # the mic must never reach this channel
+    ttable.0.5 0.0000  # the mic must never reach this channel
 }

@@ -1068,7 +1068,9 @@ def plan(state, aec_available=False):
         # mute switch -- while `Speaker Playback Volume` (numid 8) is eight
         # values the Owner's bench session set to 66,66,24,24,0,0,24,24.
         #
-        # The mic leg's destination is the REAR pair (channels 4/5) of that same
+        # The mic leg's destination is the Surround pair (channels 6/7, the
+        # measured desktop Line In cable -- 2026-09-18 pair probe; this comment
+        # said 4/5 until 2026-11-01) of that same
         # eight-channel stream, so muting the card to silence the front output
         # would also silence the mic return to the desktop -- which is exactly
         # what item 23 D3 asks for in Headset position. The two cannot both be
@@ -1076,8 +1078,8 @@ def plan(state, aec_available=False):
         # meant to leave it, and what keeps the room's music out of the desktop
         # and the microphone out of the speakers is the pair of SOFTWARE route
         # tables, each of which writes EXPLICIT ZEROS into every channel it does
-        # not own (`ttable.*.4..7` in audio-trim.conf, `ttable.0.0..3,6,7` in
-        # audio-mic.conf). Both halves are asserted by tests, and by the ALSA
+        # not own (`ttable.*.6..7` in audio-trim.conf -- 4/5 are the Back jack's
+        # music since 2026-11-01 -- and `ttable.0.0..5` in audio-mic.conf). Both halves are asserted by tests, and by the ALSA
         # parse test that makes alsa-lib itself read them.
         #
         # The remaining hardware guarantee is the one that always did the real
@@ -1086,7 +1088,7 @@ def plan(state, aec_available=False):
         # removes power from the amplifier.
         #
         # THE PANEL POSITION FEEDS THE ADAPTER NOTHING, so by the same reasoning
-        # it is muted there unless a mic leg needs its rear pair: `speaker` is
+        # it is muted there unless a mic leg needs its return pair (6/7): `speaker` is
         # False in `builtin`, and the expression below is left exactly as it was.
         "adapter_muted": not (speaker or mic),
         # THE BUILT-IN SPEAKER'S HARDWARE STATE (Panel position). True means the

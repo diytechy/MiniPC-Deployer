@@ -256,6 +256,8 @@ FADE_WRITE_TIMEOUT_SECONDS = 1.0
 # While the unity value is unconfirmed (the control does not exist until the
 # speaker leg has opened its PCM once), how often to try again.
 UNITY_RETRY_SECONDS = 30.0
+# While the machine is enabled and the screen is lit, an unconfirmed unity is a
+# quiet room, so it is retried on the actuator beat instead (see step()).
 
 
 # The modes in which this daemon commands the amplifier at all. `panel` sends
@@ -1098,10 +1100,28 @@ class FadeStage:
         self._failures_logged = 0
 
     def argv(self, value):
+        # ONE VALUE, EVERY CHANNEL. Measured on the panel 2026-11-01: `amixer -c
+        # Loopback -q cset name='Bus Playback Volume' 165` set both channels of
+        # that softvol (166,166 -> 165,165). The fade is a softvol of the same
+        # kind on the same card, so a single value fills every channel and no
+        # per-channel list is needed here.
         if self._card is None:
             self._card = self._card_reader()
         return [self._amixer, "-c", self._card, "-q", "cset",
                 "name=%s" % FADE_CONTROL, str(int(value))]
+
+    def read(self):
+        """The control's current value (first channel), or None if unreadable."""
+        try:
+            argv = self.argv(0)[:3] + ["cget", "name=%s" % FADE_CONTROL]
+            done = self._run(argv, check=False, capture_output=True, text=True,
+                             timeout=FADE_WRITE_TIMEOUT_SECONDS)
+            if done.returncode != 0:
+                return None
+            found = re.search(r"values=(\d+)", done.stdout or "")
+            return int(found.group(1)) if found else None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
 
     def write(self, value):
         try:
@@ -1179,6 +1199,7 @@ class SpeakerSleep:
         self._last_relay_try = -1e9
         self._last_unity_try = -1e9
         self._unity_failure_logged = False
+        self._waiting_logged = False
 
     # ── what the main loop asks ──────────────────────────────────────────
     @property
@@ -1200,6 +1221,9 @@ class SpeakerSleep:
         else:
             self._fail_streak += 1
             self.unity_known = False
+            # The control may or may not have moved: the level is UNKNOWN, and
+            # the next ramp must not start from a stale belief (see _begin_ramp).
+            self.level = None
         return ok
 
     def reset_unity(self, now=0.0):
@@ -1214,6 +1238,14 @@ class SpeakerSleep:
         return ok
 
     def _begin_ramp(self, now, end, seconds):
+        if self.level is None:
+            # A fresh assumption: ask the control; if that fails too, assume it
+            # sits at the far end from where this ramp is going, which is the
+            # longest (never an abrupt) ramp.
+            reader = getattr(self.fade, "read", None)
+            seen = reader() if reader else None
+            self.level = seen if isinstance(seen, int) else (
+                FADE_UNITY if end == FADE_FLOOR else FADE_FLOOR)
         span = abs(end - self.level)
         self._fail_streak = 0
         self._ramp = (self.level, end, now,
@@ -1240,7 +1272,11 @@ class SpeakerSleep:
         self.phase = self.LIT
         self.reset_unity(now)
 
-    def step(self, now, enabled, lit, call, audio, beat=ACTUATOR_RETRY_SECONDS):
+    def step(self, now, enabled, lit, call, audio, beat=ACTUATOR_RETRY_SECONDS,
+             relay_is_on=False, relay_changed_at=-1e9):
+        """One tick. `relay_is_on` and `relay_changed_at` are the loop's own
+        record of the relay, so the sleep transitions honour the same
+        MIN_ON_SECONDS / MIN_OFF_SECONDS the attack and hold-off rules do."""
         awake = bool(lit or call)
         if not enabled:
             if self.phase != self.LIT:
@@ -1253,7 +1289,9 @@ class SpeakerSleep:
 
         if self.phase == self.LIT:
             if awake:
-                if not self.unity_known and now - self._last_unity_try >= UNITY_RETRY_SECONDS:
+                # A quiet room from a failed fade-in write is retried on the
+                # beat, not every UNITY_RETRY_SECONDS.
+                if not self.unity_known and now - self._last_unity_try >= beat:
                     self.reset_unity(now)
                 return
             self._emit("screen dark: fading the speakers out")
@@ -1265,8 +1303,18 @@ class SpeakerSleep:
                 self._emit("screen lit mid-fade: fading back in")
                 self._begin_ramp(now, FADE_UNITY, FADE_IN_SECONDS)
                 self.phase = self.FADING_IN
-            elif self._advance(now):
-                # The relay is opened whether or not the fade completed.
+            elif self._ramp is None or self._advance(now):
+                # The fade is done (or abandoned) and the stage sits at the
+                # floor. The relay opens whether or not the fade completed, but
+                # not before it has been ON for MIN_ON_SECONDS: until then the
+                # room is already silent and the relay simply waits.
+                if relay_is_on and now - relay_changed_at < MIN_ON_SECONDS:
+                    if not self._waiting_logged:
+                        self._waiting_logged = True
+                        self._emit("speakers silent; relay OFF waits out "
+                                   "the minimum on-time")
+                    return
+                self._waiting_logged = False
                 self._relay_off(now)
                 self.phase = self.DARK
                 self._last_relay_try = -1e9
@@ -1280,6 +1328,11 @@ class SpeakerSleep:
                 self._emit("screen lit, no audio: fade to unity, relay left to "
                            "the attack rule")
                 self._snap_to_lit(now)
+                return
+            # No wake relay-ON until the relay has been off for MIN_OFF_SECONDS
+            # (contact protection, and long enough for the boards to power
+            # down). The stage stays at the floor while it waits.
+            if not relay_is_on and now - relay_changed_at < MIN_OFF_SECONDS:
                 return
             if now - self._last_relay_try >= beat:
                 self._last_relay_try = now
@@ -1343,6 +1396,11 @@ def main():
     # RestartSec is the only cure for.
     _idle = (os.environ.get("WALL_AMP_ENABLED", "true").strip().lower()
              in ("false", "0", "no")) or current_mode() not in COMMANDING_MODES
+    if _idle:
+        # A daemon killed mid-fade and restarted into an idle path would leave
+        # the stage at the floor. Best effort; a failure is only logged by
+        # FadeStage.
+        FadeStage().write(FADE_UNITY)
     if _idle and not safe:
         return 1
 
@@ -1473,7 +1531,8 @@ def main():
                 sleep_facts = {"enabled": speaker_position and sleeps,
                                "lit": screen_lit(), "call": read_call_active()}
             sleeper.step(now, sleep_facts["enabled"], sleep_facts["lit"],
-                         sleep_facts["call"], not quiet, beat)
+                         sleep_facts["call"], not quiet, beat,
+                         relay_is_on=on, relay_changed_at=changed_at)
 
         if sleeper.governing:
             # The sleep machine owns the relay: the attack and hold-off rules are

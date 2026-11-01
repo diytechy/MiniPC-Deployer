@@ -58,16 +58,28 @@ class World:
 class FakeMixer:
     """Stands in for subprocess.run: records argv, can be told to fail."""
 
-    def __init__(self, world, fail=False):
+    def __init__(self, world, fail=False, value=60):
         self.world = world
         self.fail = fail
+        self.value = value            # the control's real state
+        self.fail_values = set()      # writes of these values fail
         self.argvs = []
 
     def __call__(self, argv, **kwargs):
         self.argvs.append(list(argv))
-        self.world.log("amixer", int(argv[-1]))
-        if self.fail:
+        if "cget" in argv:
+            self.world.log("cget")
+            if self.fail:
+                return SimpleNamespace(returncode=1, stdout="", stderr="no control")
+            return SimpleNamespace(
+                returncode=0, stderr="",
+                stdout="numid=1,iface=MIXER,name='x'\n  : values=%d,%d\n"
+                       % (self.value, self.value))
+        written = int(argv[-1])
+        self.world.log("amixer", written)
+        if self.fail or written in self.fail_values:
             return SimpleNamespace(returncode=1, stdout="", stderr="no such control")
+        self.value = written
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
 
@@ -79,6 +91,9 @@ class Rig:
         self.world = World()
         self.mixer = FakeMixer(self.world, fail=fail_fade)
         self.relay_on_results = list(relay_on_results or [])
+        # The loop's own record of the relay, as main() keeps it.
+        self.relay_is_on = True
+        self.relay_changed_at = -1e9
         self.messages = []
         fade = self.module.FadeStage(run=self.mixer, card_reader=lambda: "Loopback")
         self.sleeper = self.module.SpeakerSleep(
@@ -86,16 +101,22 @@ class Rig:
 
     def _on(self, now):
         self.world.log("relay", "ON")
-        return self.relay_on_results.pop(0) if self.relay_on_results else True
+        ok = self.relay_on_results.pop(0) if self.relay_on_results else True
+        if ok:
+            self.relay_is_on, self.relay_changed_at = True, now
+        return ok
 
     def _off(self, now):
         self.world.log("relay", "OFF")
+        self.relay_is_on, self.relay_changed_at = False, now
         return True
 
     def run(self, seconds, enabled=True, lit=True, call=False, audio=True, beat=5.0):
         """Step the machine every 50 ms for `seconds` of fake time."""
         for _ in range(int(round(seconds / STEP))):
-            self.sleeper.step(self.world.now, enabled, lit, call, audio, beat)
+            self.sleeper.step(self.world.now, enabled, lit, call, audio, beat,
+                              relay_is_on=self.relay_is_on,
+                              relay_changed_at=self.relay_changed_at)
             self.world.now += STEP
 
     def fade_values(self):
@@ -112,10 +133,14 @@ def settled_lit(rig, audio=True):
     assert rig.world.events == []
 
 
-def go_dark(rig, audio=True, seconds=3.0):
+def go_dark(rig, audio=True, seconds=3.0, dwell=True):
+    """Settled lit, then dark; by default long enough that the minimum off-time
+    has also passed, so a wake is not held back (the dwell has its own tests)."""
     settled_lit(rig, audio)
     rig.run(seconds, lit=False, audio=audio)
     assert rig.sleeper.phase == rig.module.SpeakerSleep.DARK
+    if dwell:
+        rig.run(rig.module.MIN_OFF_SECONDS + 1.0, lit=False, audio=audio)
 
 
 # ── lit -> dark ──────────────────────────────────────────────────────────────
@@ -324,7 +349,7 @@ def test_dark_again_while_settling_sleeps_again_llr1436():
     rig.world.events.clear()
     rig.run(0.5, lit=True)                       # relay ON, still settling
     assert rig.sleeper.phase == rig.module.SpeakerSleep.SETTLING
-    rig.run(3.0, lit=False)
+    rig.run(rig.module.MIN_ON_SECONDS + 4.0, lit=False)
     kinds = [d for _, k, d in rig.world.events if k == "relay"]
     assert kinds == ["ON", "OFF"]
     assert rig.sleeper.phase == rig.module.SpeakerSleep.DARK
@@ -362,7 +387,8 @@ def test_a_fade_that_cannot_be_written_still_turns_the_relay_off_llr1436():
     rig.run(3.0, lit=False)
     off = rig.world.of("relay")
     assert off and off[0][1] == "OFF"
-    assert len(rig.mixer.argvs) <= rig.module.FADE_FAIL_LIMIT, "gave up, did not hammer"
+    writes = [a for a in rig.mixer.argvs if "cset" in a]
+    assert len(writes) <= rig.module.FADE_FAIL_LIMIT, "gave up, did not hammer"
     assert off[0][0] - started <= 2.1, "the relay was not held back by the failure"
     assert any("not writable" in m or "cutting" in m for m in rig.messages)
 
@@ -396,7 +422,7 @@ def test_an_unconfirmed_unity_is_retried_quietly_while_lit_llr1436():
     rig.run(1.0, lit=True)
     assert rig.mixer.argvs == [], "not hammered every tick"
     rig.mixer.fail = False
-    rig.run(rig.module.UNITY_RETRY_SECONDS + 1.0, lit=True)
+    rig.run(6.0, lit=True)               # one 5 s beat, not 30 s
     assert rig.mixer.argvs == [FADE_ARGV_HEAD + ["60"]]
     assert rig.sleeper.unity_known is True
     rig.mixer.argvs.clear()
@@ -754,4 +780,159 @@ def test_the_loop_retries_an_unverified_off_while_dark_llr1436(daemon):
                       rig.world.index_of("relay", "OFF") is not None)
     failed = [e for e in rig.world.events if e[1:] == ("relay", "OFF-FAILED")]
     assert len(failed) == 2
+    rig.stop()
+
+
+# ── minimum dwell on the relay (fix round 1, item 1) ─────────────────────────
+
+def test_a_wake_waits_out_the_minimum_off_with_the_fade_at_the_floor_llr1436():
+    rig = Rig()
+    settled_lit(rig)
+    rig.run(3.0, lit=False)                    # fade out, relay OFF
+    off_at = rig.world.of("relay")[0][0]
+    assert rig.sleeper.phase == rig.module.SpeakerSleep.DARK
+    rig.world.events.clear()
+    rig.run(rig.module.MIN_OFF_SECONDS - 2.0, lit=True, audio=True)
+    assert rig.world.events == [], "no relay ON, no fade write, before the dwell"
+    assert rig.sleeper.level == rig.module.FADE_FLOOR
+    rig.run(4.0, lit=True, audio=True)
+    ons = rig.world.of("relay")
+    assert ons and ons[0][1] == "ON"
+    assert ons[0][0] - off_at >= rig.module.MIN_OFF_SECONDS - 0.01
+
+
+def test_a_flapping_backlight_cannot_cycle_the_relay_faster_than_the_dwell_llr1436():
+    rig = Rig()
+    settled_lit(rig)
+    for _ in range(40):                        # 4 s dark, 1 s lit, repeated
+        rig.run(4.0, lit=False, audio=True)
+        rig.run(1.0, lit=True, audio=True)
+    commands = [(t, d) for t, k, d in rig.world.events if k == "relay"]
+    assert commands, "it did cycle at least once"
+    for (t0, d0), (t1, d1) in zip(commands, commands[1:]):
+        assert d0 != d1, commands
+        floor = rig.module.MIN_OFF_SECONDS if d0 == "OFF" else rig.module.MIN_ON_SECONDS
+        assert t1 - t0 >= floor - 0.01, (d0, d1, t1 - t0)
+
+
+def test_the_relay_stays_on_for_the_minimum_even_when_the_fade_is_done_llr1436():
+    rig = Rig()
+    go_dark(rig)
+    rig.run(0.5, lit=True)                     # relay ON now
+    on_at = rig.world.of("relay")[-1][0]
+    rig.run(8.0, lit=False)                    # dark again: silent, but OFF must wait
+    assert rig.sleeper.level == rig.module.FADE_FLOOR
+    assert rig.world.of("relay")[-1][1] == "ON"
+    rig.run(rig.module.MIN_ON_SECONDS, lit=False)
+    off = rig.world.of("relay")[-1]
+    assert off[1] == "OFF" and off[0] - on_at >= rig.module.MIN_ON_SECONDS - 0.01
+
+
+def test_a_wake_during_the_off_wait_comes_back_without_a_relay_command_llr1436():
+    rig = Rig()
+    go_dark(rig)
+    rig.run(0.5, lit=True)
+    rig.run(8.0, lit=False)
+    rig.world.events.clear()
+    rig.run(3.0, lit=True)
+    assert rig.world.of("relay") == []
+    assert rig.fade_values()[-1] == 60
+
+
+def test_the_dwell_values_are_the_existing_contact_protection_llr1436():
+    module = load_module()
+    assert module.MIN_ON_SECONDS == 30.0 and module.MIN_OFF_SECONDS == 10.0
+    assert module.MIN_OFF_SECONDS >= 5.0, "long enough for the boards to power down"
+
+
+# ── retry and unknown level (items 2 and 3) ──────────────────────────────────
+
+def test_a_partial_fade_in_failure_is_retried_on_the_beat_not_every_30s_llr1436():
+    rig = Rig()
+    go_dark(rig)
+    rig.mixer.fail_values = {60}               # the top step never lands
+    rig.run(8.0, lit=True)
+    assert rig.sleeper.phase == rig.module.SpeakerSleep.LIT
+    assert rig.sleeper.unity_known is False
+    rig.mixer.fail_values = set()
+    rig.world.events.clear()
+    rig.run(6.0, lit=True)                     # one 5 s beat
+    assert rig.fade_values() == [60]
+    assert rig.mixer.value == 60 and rig.sleeper.unity_known is True
+
+
+def test_a_failed_write_leaves_the_level_unknown_and_the_next_ramp_reads_it_llr1436():
+    rig = Rig()
+    settled_lit(rig)
+    rig.mixer.fail = True
+    rig.sleeper.reset_unity(rig.world.now)     # fails
+    assert rig.sleeper.level is None
+    rig.mixer.fail = False
+    rig.mixer.value = 42                       # where the control really is
+    rig.world.events.clear()
+    rig.run(3.0, lit=False)
+    assert rig.world.of("cget"), "the start was read, not assumed"
+    values = rig.fade_values()
+    assert values[0] <= 42 and values[-1] == 0
+
+
+def test_an_unreadable_level_falls_back_to_the_far_end_ramp_llr1436():
+    rig = Rig()
+    settled_lit(rig)
+    rig.sleeper.level = None
+    rig.mixer.fail = False
+    rig.mixer.value = 60
+    rig.sleeper.fade.read = lambda: None
+    rig.run(3.0, lit=False)
+    assert rig.fade_values()[-1] == 0 and rig.sleeper.level == 0
+
+
+# ── start-up and idle paths (items 4 and 5) ──────────────────────────────────
+
+def test_the_loop_writes_unity_at_start_up_over_a_stage_left_low_llr1437(daemon):
+    rig = daemon
+    rig.mixer.value = 7                         # SIGKILLed mid-fade last time
+    rig.facts["sleeps"] = False                 # nothing else may touch it
+    rig.thread.start()
+    assert wait_until(lambda: rig.world.index_of("relay", "ON") is not None)
+    assert rig.mixer.value == 60, "restored before the daemon did anything else"
+    first_write = rig.world.index_of("amixer")
+    assert first_write < rig.world.index_of("relay", "ON")
+    rig.stop()
+
+
+@pytest.mark.parametrize("idle", ["disabled", "panel"])
+def test_the_idle_paths_restore_unity_too_llr1437(daemon, monkeypatch, idle):
+    rig = daemon
+    rig.mixer.value = 7
+    if idle == "disabled":
+        monkeypatch.setenv("WALL_AMP_ENABLED", "false")
+    else:
+        monkeypatch.setattr(rig.module, "current_mode", lambda: "panel")
+    rig.thread.start()
+    assert wait_until(lambda: rig.mixer.value == 60)
+    assert rig.world.of("relay")[0][1] == "ensure_off", "safe OFF first"
+    assert rig.world.index_of("relay", "ON") is None, "idle: the relay is not commanded"
+    rig.stop()
+
+
+def test_a_failed_unity_write_on_an_idle_path_is_only_logged_llr1437(daemon, monkeypatch):
+    rig = daemon
+    rig.mixer.fail = True
+    monkeypatch.setenv("WALL_AMP_ENABLED", "false")
+    rig.thread.start()
+    assert wait_until(lambda: rig.mixer.argvs)
+    rig.stop()
+    assert rig.outcome["status"] == 0
+
+
+def test_the_explicit_startup_reset_does_not_depend_on_the_machine_stepping_llr1437(
+        daemon, monkeypatch):
+    """The machine would also heal an unconfirmed unity on its first tick; this
+    pins the START-UP write itself, with stepping disabled."""
+    rig = daemon
+    monkeypatch.setattr(rig.module.SpeakerSleep, "step", lambda self, *a, **k: None)
+    rig.mixer.value = 7
+    rig.thread.start()
+    assert wait_until(lambda: rig.mixer.value == 60)
     rig.stop()

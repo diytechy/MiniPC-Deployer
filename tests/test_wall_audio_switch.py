@@ -4342,6 +4342,7 @@ def test_set_speaker_sleep_stores_a_boolean_and_touches_nothing_else_llr1431(pol
     {"kind": "set_speaker_sleep", "enabled": "yes"},
     {"kind": "set_speaker_sleep", "enabled": 1},
     {"kind": "set_speaker_sleep", "enabled": None},
+    {"kind": "set_speaker_sleep", "enabled": True, "level": 1},
 ])
 def test_set_speaker_sleep_is_strict_llr1431(policy, event):
     with pytest.raises(policy.StateError):
@@ -4421,7 +4422,8 @@ def test_the_broker_routing_knows_the_new_verb_llr1432():
     for good in (True, False):
         routing.validate_action("set_speaker_sleep", {"enabled": good})
     for params in ({}, {"enabled": "on"}, {"enabled": 1}, {"enabled": None},
-                   {"enabled": True, "muted": True}, {"muted": True}):
+                   {"enabled": True, "muted": True}, {"muted": True},
+                   {"enabled": True, "level": 1}):
         with pytest.raises(routing.PolicyError):
             routing.validate_action("set_speaker_sleep", params)
     assert routing.switch_only_authorization("set_speaker_sleep", {"enabled": True})

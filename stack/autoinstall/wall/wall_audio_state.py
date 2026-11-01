@@ -692,6 +692,10 @@ def _set_input_mute(state, event):
 
 def _set_speaker_sleep(state, event):
     """Store the speaker-sleeps-with-screen preference. Implements: SR-140, LLR-1431."""
+    # Exactly {kind, enabled}: a stray key (a volume level, say) is a caller
+    # bug and is refused, not ignored.
+    if set(event) - {"kind", "enabled"}:
+        raise StateError("set_speaker_sleep takes only enabled")
     enabled = event.get("enabled")
     # Required and strictly boolean, like `muted`: a request that forgot to say
     # which way must not silently flip the preference.

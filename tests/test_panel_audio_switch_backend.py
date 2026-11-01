@@ -832,6 +832,7 @@ def test_set_speaker_sleep_is_spooled_to_the_applier_like_set_input_mute_sr140(p
 @pytest.mark.parametrize("params", [
     {}, {"enabled": "on"}, {"enabled": 1}, {"enabled": None}, {"enabled": 0},
     {"enabled": True, "muted": True}, {"muted": True}, {"enabled": True, "alias": "x"},
+    {"enabled": True, "level": 1},
 ])
 def test_set_speaker_sleep_rejects_anything_but_one_boolean_sr140(panel, params):
     spy = SpyBackend(backend(panel))
@@ -845,7 +846,8 @@ def test_the_request_envelope_admits_exactly_this_event_sr140():
         "event"] == {"kind": "set_speaker_sleep", "enabled": True}
     for bad in ({"kind": "set_speaker_sleep"},
                 {"kind": "set_speaker_sleep", "enabled": True, "extra": 1},
-                {"kind": "set_speaker_sleep", "muted": True}):
+                {"kind": "set_speaker_sleep", "muted": True},
+                {"kind": "set_speaker_sleep", "enabled": True, "level": 1}):
         with pytest.raises(switch_request.RequestError):
             switch_request.envelope(3, bad)
 

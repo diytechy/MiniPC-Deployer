@@ -94,7 +94,8 @@ def _never_touch_the_real_run_dir(applier, tmp_path, monkeypatch):
     # BOOT_STAMP and LOCK_FILE are deliberately NOT in this list: their own
     # tests assert their real names and paths, and both are already given temp
     # locations by the cases that write them.
-    for name in ("SPEAKER_CHAIN_ENV", "MIC_SOURCE_ENV", "HEADSET_ENV", "APPLIED_OUTPUT_ENV"):
+    for name in ("SPEAKER_CHAIN_ENV", "MIC_SOURCE_ENV", "HEADSET_ENV", "APPLIED_OUTPUT_ENV",
+                 "INPUT_MUTE_ENV"):
         monkeypatch.setattr(applier, name, tmp_path / ("run-" + name.lower()))
     for name in ("SPEAKER_CHAIN_VAR", "MIC_SOURCE_VAR"):
         monkeypatch.delenv(getattr(applier, name), raising=False)

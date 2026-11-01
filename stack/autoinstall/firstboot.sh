@@ -314,9 +314,8 @@ OnCalendar=Sun *-*-* 02:30:00
 RandomizedDelaySec=0
 Persistent=true
 EOF
-systemctl daemon-reload
-systemctl restart apt-daily-upgrade.timer 2>/dev/null || true
-log "1d: unattended upgrades -> Sun 02:30 exactly (was daily 06:00 +/-60m); needrestart can only bounce services in that window"
+# The timer is NOT restarted here: Persistent=true means a restart can fire a
+# missed run at once, and that run must already find the guard below in place.
 
 # THE WINDOW IS NOT ENOUGH ON ITS OWN (SR-137). On 2026-11-01 the Sunday 02:30
 # run upgraded libbrotli1 and needrestart restarted the transient units of a
@@ -351,8 +350,14 @@ if [ -d /etc/needrestart ]; then
 else
     log "WARN: 1d: needrestart is not installed - the hold covers the scheduled upgrade only"
 fi
+# ONE reload, then the timer, in this order on purpose: an overdue Persistent
+# timer fires the moment it is (re)started, and on the first boot after a
+# delivery that run must already see the ExecCondition and the needrestart
+# snippet (Codex review 2026-11-01).
 systemctl daemon-reload
 log "1d: maintenance hold installed: $(/usr/local/sbin/homehub-maintenance-hold check 2>&1 | tail -n 1)"
+systemctl restart apt-daily-upgrade.timer 2>/dev/null || true
+log "1d: unattended upgrades -> Sun 02:30 exactly (was daily 06:00 +/-60m), and only when the maintenance hold is clear"
 
 # ── 1e. WEEKLY TRIM, WITHOUT THE WEEKLY RED LINE ─────────────────────────────
 # Stock fstrim.timer does real and useful work on the NVMe (33.6 GiB on `/` and

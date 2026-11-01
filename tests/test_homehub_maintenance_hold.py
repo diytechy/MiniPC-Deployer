@@ -54,9 +54,14 @@ def _stub(directory: Path, name: str, body: str) -> None:
     path.chmod(0o755)
 
 
+def _baseline(tmp_path: Path) -> Path:
+    return tmp_path / "state" / "never-upgraded-since"
+
+
 def run(tmp_path: Path, *args: str, processes: str = "", units: str = "",
         pgrep_rc: int | None = None, systemctl_rc: int = 0,
-        upgraded_days_ago: float | None = None):
+        upgraded_days_ago: float | None = None,
+        baseline_days_ago: float | None = None):
     """Run the guard against stub pgrep/systemctl and a private hold directory.
 
     processes: what `pgrep -a -x` would print ("PID CMDLINE" lines).
@@ -65,12 +70,19 @@ def run(tmp_path: Path, *args: str, processes: str = "", units: str = "",
     upgraded_days_ago: age of apt's upgrade-stamp; None = no stamp at all. The
                stamp is always a private path, so a dev box's real
                /var/lib/apt can never change a verdict here.
+    baseline_days_ago: age of the guard's own no-stamp baseline; None = none yet.
     """
+    def aged(path: Path, days_ago: float | None) -> None:
+        if days_ago is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+        stamped = time.time() - days_ago * 86400
+        os.utime(path, (stamped, stamped))
+
     stamp = tmp_path / "upgrade-stamp"
-    if upgraded_days_ago is not None:
-        stamp.touch()
-        stamped = time.time() - upgraded_days_ago * 86400
-        os.utime(stamp, (stamped, stamped))
+    aged(stamp, upgraded_days_ago)
+    aged(_baseline(tmp_path), baseline_days_ago)
     stubs = tmp_path / "bin"
     stubs.mkdir(exist_ok=True)
     _write_lf(tmp_path / "processes.txt", processes)
@@ -88,7 +100,8 @@ def run(tmp_path: Path, *args: str, processes: str = "", units: str = "",
     environment = dict(os.environ,
                        PATH=str(stubs) + os.pathsep + os.environ["PATH"],
                        HOMEHUB_MAINTENANCE_HOLD_DIR=str(tmp_path / "holds"),
-                       HOMEHUB_MAINTENANCE_HOLD_STAMP=str(stamp))
+                       HOMEHUB_MAINTENANCE_HOLD_STAMP=str(stamp),
+                       HOMEHUB_MAINTENANCE_HOLD_STATE_DIR=str(tmp_path / "state"))
     return subprocess.run(["sh", str(SCRIPT), *args], capture_output=True, text=True,
                           env=environment, cwd=str(tmp_path))
 
@@ -181,6 +194,27 @@ def test_the_second_held_sunday_already_turns_red_sr137(tmp_path):
     assert second.returncode == 255, second.stdout + second.stderr
 
 
+def test_no_stamp_records_a_baseline_on_the_first_held_run_sr137(tmp_path):
+    # A freshly imaged box held before its first unattended run has no stamp.
+    done = run(tmp_path, "check", units=GPARTED_UNITS)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert _baseline(tmp_path).is_file()
+
+
+def test_no_stamp_still_turns_red_when_the_hold_drags_on_sr137(tmp_path):
+    # Without the baseline this box would skip every Sunday forever (Codex
+    # review 2026-11-01): no stamp must not mean no limit.
+    done = run(tmp_path, "check", units=GPARTED_UNITS, baseline_days_ago=13.999)
+    assert done.returncode == 255, done.stdout + done.stderr
+
+
+def test_a_real_stamp_wins_and_retires_the_baseline_sr137(tmp_path):
+    done = run(tmp_path, "check", units=GPARTED_UNITS,
+               upgraded_days_ago=3, baseline_days_ago=30)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert not _baseline(tmp_path).exists()
+
+
 def test_a_recent_upgrade_keeps_an_ordinary_hold_sr137(tmp_path):
     done = run(tmp_path, "check", units=GPARTED_UNITS, upgraded_days_ago=3)
     assert done.returncode == 1, done.stdout + done.stderr
@@ -234,21 +268,85 @@ def test_firstboot_installs_the_guard_where_both_callers_look_sr137():
     assert "80-homehub-maintenance-hold.conf" in text
 
 
-def _eval_needrestart_conf(tmp_path: Path, guard_rc: int) -> str:
+def test_firstboot_starts_the_timer_only_after_the_guard_is_in_place_sr137():
+    # Persistent=true fires a missed run the moment the timer is (re)started.
+    # On the first boot after a delivery that run must already meet the guard
+    # (Codex review 2026-11-01: the restart used to come first).
+    text = FIRSTBOOT.read_text(encoding="utf-8")
+    restarts = [m.start() for m in re.finditer(r"^systemctl restart apt-daily-upgrade\.timer", text, re.M)]
+    assert len(restarts) == 1, restarts
+    guard_pieces = (f"ExecCondition={INSTALLED_PATH} check",
+                    "/etc/needrestart/conf.d/80-homehub-maintenance-hold.conf")
+    for piece in guard_pieces:
+        assert text.index(piece) < restarts[0], f"{piece} comes after the timer restart"
+    reload_before = text.rfind("\nsystemctl daemon-reload", 0, restarts[0])
+    assert reload_before > text.index(guard_pieces[0]), "no daemon-reload between the drop-in and the restart"
+
+
+def _eval_needrestart_conf(tmp_path: Path, guard_rc: int, cli_mode: str | None = None,
+                           env_mode: str | None = None, mode_var: str = "opt_r") -> str:
+    """Evaluate the snippet the way needrestart 3.6 does, then resolve the mode.
+
+    cli_mode: what `-r` already parsed into $opt_r before the config is read.
+    env_mode: NEEDRESTART_MODE in the environment.
+    The two resolution lines after the eval are needrestart 3.6's own, verbatim
+    (/usr/sbin/needrestart on the hub, read 2026-11-01): the snippet is judged
+    by the EFFECTIVE mode, not by what it wrote into %nrconf.
+    mode_var: the name needrestart keeps its mode in; anything but opt_r
+              stands for a future needrestart where setting $main::opt_r is a
+              no-op, leaving the snippet's other layers to hold.
+    """
     guard = tmp_path / "guard"
     _stub(tmp_path, "guard", f"exit {guard_rc}\n")
-    # The same `eval do { ... <> }` needrestart.conf uses to read conf.d.
-    program = ("our %nrconf = (override_rc => {}, override_cont => {});"
+    preset = f"$opt_r = q({cli_mode});" if cli_mode else ""
+    program = ("use strict; use warnings;"
+               "our ($opt_r, %nrconf); %nrconf = (override_rc => {}, override_cont => {});"
+               + preset +
+               # The same `eval do { ... <> }` needrestart.conf uses to read conf.d.
                "eval do { local(@ARGV, $/) = $ARGV[0]; <> }; die $@ if $@;"
-               "printf qq(rc=%s cont=%s restart=%s\\n),"
+               "my $configured = $nrconf{restart} // q(unset);"
+               "$opt_r = $ENV{NEEDRESTART_MODE} if(!defined($opt_r) && exists($ENV{NEEDRESTART_MODE}));"
+               "$opt_r = $nrconf{restart} unless(defined($opt_r));"
+               "printf qq(rc=%s cont=%s restart=%s effective=%s\\n),"
                " join(q(,), map { qq($_=$nrconf{override_rc}{$_}) } sort keys %{$nrconf{override_rc}}),"
                " join(q(,), map { qq($_=$nrconf{override_cont}{$_}) } sort keys %{$nrconf{override_cont}}),"
-               " $nrconf{restart} // q(unset);")
+               " $configured, $opt_r // q(unset);")
+    if mode_var != "opt_r":
+        # Rename needrestart's variable everywhere EXCEPT inside the snippet,
+        # which still writes $main::opt_r (now a variable nobody reads).
+        program = program.replace("$opt_r", "$" + mode_var)
     environment = dict(os.environ, HOMEHUB_MAINTENANCE_HOLD_BIN=str(guard))
+    environment.pop("NEEDRESTART_MODE", None)
+    if env_mode:
+        environment["NEEDRESTART_MODE"] = env_mode
     done = subprocess.run(["perl", "-e", program, str(NEEDRESTART_CONF)],
                           capture_output=True, text=True, env=environment)
     assert done.returncode == 0, done.stderr
     return done.stdout
+
+
+@pytest.mark.skipif(shutil.which("perl") is None, reason="perl is absent")
+@pytest.mark.parametrize("cli_mode,env_mode", [("i", None), (None, "i"), ("a", "i"), (None, None)])
+def test_a_held_box_resolves_to_list_mode_however_interactive_was_asked_sr137(tmp_path, cli_mode, env_mode):
+    # In interactive mode override_rc only pre-unticks the dialog; `-r i` or
+    # NEEDRESTART_MODE=i used to win over $nrconf{restart} (Codex review
+    # 2026-11-01). List mode dispatches no restart at all.
+    out = _eval_needrestart_conf(tmp_path, guard_rc=1, cli_mode=cli_mode, env_mode=env_mode)
+    assert out.strip().endswith("effective=l"), out
+
+
+@pytest.mark.skipif(shutil.which("perl") is None, reason="perl is absent")
+def test_if_needrestart_renames_its_mode_variable_the_environment_still_cannot_win_sr137(tmp_path):
+    # The fallback layer: with $main::opt_r a dead write, only the deleted
+    # NEEDRESTART_MODE stops "i" beating $nrconf{restart} = 'l'.
+    out = _eval_needrestart_conf(tmp_path, guard_rc=1, env_mode="i", mode_var="opt_mode")
+    assert out.strip().endswith("effective=l"), out
+
+
+@pytest.mark.skipif(shutil.which("perl") is None, reason="perl is absent")
+def test_a_clear_box_leaves_an_explicit_interactive_request_alone_sr137(tmp_path):
+    out = _eval_needrestart_conf(tmp_path, guard_rc=0, cli_mode="i")
+    assert out.strip().endswith("effective=i"), out
 
 
 @pytest.mark.skipif(shutil.which("perl") is None, reason="perl is absent")
@@ -269,4 +367,4 @@ def test_needrestart_also_restarts_nothing_when_the_guard_cannot_answer_sr137(tm
 @pytest.mark.skipif(shutil.which("perl") is None, reason="perl is absent")
 def test_needrestart_is_untouched_when_the_box_is_clear_sr137(tmp_path):
     out = _eval_needrestart_conf(tmp_path, guard_rc=0)
-    assert out.strip() == "rc= cont= restart=unset", out
+    assert out.strip() == "rc= cont= restart=unset effective=unset", out

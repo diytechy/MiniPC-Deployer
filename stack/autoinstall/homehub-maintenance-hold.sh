@@ -76,6 +76,14 @@
 # touched by unattended runs only; a box patched by hand still counts as
 # overdue, and starting the unit as the message says refreshes it.
 #
+# NO STAMP IS NOT "NO LIMIT". A freshly imaged box held before its first
+# unattended run never gets a stamp, and would skip every week forever. So the
+# first held check that finds no stamp records a baseline under /var/lib (it
+# must survive the reboots a /run hold does not), and the age is counted from
+# that instead - at most one week later than a real stamp would fire, because
+# the baseline is the first HELD run, not the last upgrade. A real stamp always
+# wins, and its arrival deletes the baseline.
+#
 # THE TRADE-OFF, STATED SO IT IS A CHOICE: a held week's patch waits for the
 # next Sunday. After a long operation, `sudo systemctl start
 # apt-daily-upgrade.service` runs it at once.
@@ -84,6 +92,8 @@ set -u
 HOLD_DIR=${HOMEHUB_MAINTENANCE_HOLD_DIR:-/run/homehub-maintenance-hold}
 UPGRADE_STAMP=${HOMEHUB_MAINTENANCE_HOLD_STAMP:-/var/lib/apt/periodic/upgrade-stamp}
 MAX_DAYS=${HOMEHUB_MAINTENANCE_HOLD_MAX_DAYS:-10}
+STATE_DIR=${HOMEHUB_MAINTENANCE_HOLD_STATE_DIR:-/var/lib/homehub-maintenance-hold}
+NO_STAMP_BASELINE=$STATE_DIR/never-upgraded-since
 
 # Exact process names (pgrep -x anchors the pattern at both ends), so the name
 # a tool was RUN as is what counts: mke2fs is usually run as mkfs.ext4. Long
@@ -171,10 +181,20 @@ check() {
 }
 
 days_since_last_upgrade() {
-    # No stamp (a box that has never patched) means no age to judge; the hold
-    # then behaves as an ordinary hold rather than inventing an overdue one.
-    [ -f "$UPGRADE_STAMP" ] || return 1
-    stamped=$(stat -c %Y "$UPGRADE_STAMP") || return 1
+    # Called only while held. Prints whole days since apt's upgrade-stamp, or
+    # since the no-stamp baseline (created here on first need); fails only when
+    # neither can be read or made - a non-root `check` run by hand, which then
+    # reports an ordinary hold rather than inventing an age.
+    if [ -f "$UPGRADE_STAMP" ]; then
+        rm -f "$NO_STAMP_BASELINE" 2>/dev/null
+        reference=$UPGRADE_STAMP
+    else
+        if [ ! -f "$NO_STAMP_BASELINE" ]; then
+            mkdir -p "$STATE_DIR" 2>/dev/null && : > "$NO_STAMP_BASELINE" 2>/dev/null || return 1
+        fi
+        reference=$NO_STAMP_BASELINE
+    fi
+    stamped=$(stat -c %Y "$reference") || return 1
     echo $(( ($(date +%s) - stamped) / 86400 ))
 }
 

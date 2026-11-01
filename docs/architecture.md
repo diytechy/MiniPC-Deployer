@@ -1175,7 +1175,7 @@ sequenceDiagram
     alt held, first skipped week (last upgrade within 10 days)
         G-->>S: exit 1 + every reason
         Note over S: skipped (not failed); next Sunday, or start by hand after release
-    else held, second skipped week or later (older than 10 days)
+    else held, second skipped week or later (older than 10 days; no stamp: counted from the first held run)
         G-->>S: exit 255 + every reason + the age
         Note over S: unit FAILED (red, so monitoring sees it); nothing installed
     else probe cannot answer
@@ -1189,7 +1189,7 @@ sequenceDiagram
         alt exit 0
             R->>R: restart services that map an old library
         else not clear
-            R->>R: override_rc / override_cont catch-all 0, list mode: restart nothing
+            R->>R: override_rc / override_cont catch-all 0; EFFECTIVE mode forced to l<br/>(beats -r i and NEEDRESTART_MODE=i): restart nothing
         end
     end
     Note over O,R: a manual apt run reaches needrestart the same way and gets the same answer.<br/>NOT covered: a package's maintainer script restarting its own daemon.

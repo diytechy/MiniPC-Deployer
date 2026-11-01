@@ -99,7 +99,7 @@ def set_state(panel, **fields):
 # --- the three verbs reach the applier ---------------------------------------
 
 @pytest.mark.smoke
-@pytest.mark.parametrize("output", ["mute", "headset", "speaker"])
+@pytest.mark.parametrize("output", ["mute", "headset", "speaker", "builtin"])
 def test_set_output_writes_one_request_the_applier_accepts_sr028(panel, output):
     broker = AudioBroker(backend(panel))
     answer = reply(broker, wire("set_output", {"output": output}, echo_seq=True))
@@ -773,3 +773,37 @@ def test_a_redo_is_not_refused_by_the_generation_ceiling_sr023(panel, tmp_path):
     assert second["ok"] is True, "the request's own success must not strand it"
     assert written(panel)["seq"] == 4_009
     assert second["generation"] == first["generation"] == JS_SAFE_INTEGER
+
+
+# --- the Panel position (`builtin`) through the broker, LLR-1405 ------------
+
+def test_the_panel_position_is_selectable_levelled_and_available_llr1405(panel):
+    set_state(panel, output="builtin", volume={"headset": 60, "speaker": 72, "builtin": 35})
+    broker = AudioBroker(backend(panel))
+    switch = reply(broker, wire("status"))["result"]["switch"]
+    assert switch["output"] == "builtin" and switch["volume"] == 35
+    assert switch["available"] is True and switch["reason"] is None
+    assert switch["headsetVia"] is None, "Headset's resolution is null in every other position"
+    answer = reply(broker, wire("set_volume", {"level": 40, "output": "builtin"}))
+    assert answer["result"]["accepted"] is True
+    assert written(panel)["event"] == {"kind": "set_volume", "level": 40}
+
+
+def test_a_state_file_without_a_panel_level_reads_the_default_llr1405(panel):
+    # `panel` seeds a state written before the position existed: no builtin key.
+    set_state(panel, output="builtin")
+    switch = reply(AudioBroker(backend(panel)), wire("status"))["result"]["switch"]
+    assert switch["volume"] == 60
+
+
+def test_a_volume_guard_for_the_panel_position_is_refused_once_the_switch_leaves_llr1405(panel):
+    set_state(panel, output="speaker")
+    answer = reply(AudioBroker(backend(panel)),
+                   wire("set_volume", {"level": 40, "output": "builtin"}))
+    assert answer["ok"] is False and answer["error"]["code"] == "switch_moved"
+
+
+def test_the_panel_word_is_not_an_output_llr1405(panel):
+    # `panel` is the legacy audio MODE; the wire spelling is `builtin`.
+    answer = reply(AudioBroker(backend(panel)), wire("set_output", {"output": "panel"}))
+    assert answer["ok"] is False and not panel["request"].exists()

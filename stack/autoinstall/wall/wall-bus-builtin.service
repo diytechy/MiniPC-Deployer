@@ -1,0 +1,48 @@
+# wall-bus-builtin.service — the switch on Panel: bus to the panel's own speaker.
+#
+# ONE HOP, NO TAP, like Headset. The amplifier is not involved in this position,
+# so nothing feeds `speaker_tap`, the amp detector's hold-off runs out and the
+# relay drops power exactly as it does for the headset.
+#
+# `builtin_out` (asound-bus-mode.conf) is the same softvol, under the same name,
+# so the level the Owner set on the Panel position is remembered separately and
+# applied here (Owner ruling F; the memory is in /etc/wall-panel/audio-state.json).
+# It opens the ALC255 through a dmix, which is what lets the doorbell chime
+# sound at the same time.
+#
+# NO BindsTo, AND THAT IS THE DIFFERENCE FROM wall-bus-headset. The built-in
+# card is soldered to the board and always present, so there is no hot-plug whose
+# disappearance must stop this leg. The bus-mode ExecCondition below is the only
+# gate it needs. The hardware `Speaker` control is wall-audio-output's to set
+# (100 %, unmuted, in this position only); this unit never touches a mixer.
+
+[Unit]
+Description=Wall panel: merged bus to the panel's own speaker (switch position Panel)
+Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
+After=sound.target
+Wants=sound.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecCondition=/bin/sh -c '[ "$(cat /etc/wall-panel/audio-mode 2>/dev/null || echo trigger)" = bus ]'
+ExecStart=/usr/local/lib/wall-panel/wall-alsaloop-guard.py \
+    --max-errors 20 --window 10 -- \
+    /usr/bin/alsaloop \
+    --cdevice bus_monitor \
+    --pdevice builtin_out \
+    --format S16_LE --rate 48000 --channels 2 \
+    --tlatency 30000 --sync 5
+Restart=always
+RestartSec=2
+Nice=-5
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=15
+LimitRTPRIO=15
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+SupplementaryGroups=audio
+StandardOutput=journal
+StandardError=journal

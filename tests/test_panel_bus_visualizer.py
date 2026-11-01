@@ -511,7 +511,7 @@ def test_mute_drops_the_pcm_stream_at_the_producer_too_sr041(service, tmp_path):
     state = tmp_path / "audio-state.json"
     state.write_text(json.dumps({"version": 1, "output": "mute"}), encoding="utf-8")
     assert module.output_is_audible(str(state)) is False
-    for output in ("speaker", "headset"):
+    for output in ("speaker", "headset", "builtin"):
         state.write_text(json.dumps({"version": 1, "output": output}), encoding="utf-8")
         assert module.output_is_audible(str(state)) is True, output
     # A sparse file is repaired to Speaker exactly as the applier repairs it.

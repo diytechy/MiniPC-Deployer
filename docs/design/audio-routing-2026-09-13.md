@@ -1271,3 +1271,99 @@ opening a device or writing a file.
 can request PCM, and the endpoint's absence is a supported state: the app falls
 back to Frame Media rather than failing. So the MiniPC producer lands first, and
 an app that lands first simply shows Frame Media until the producer arrives.
+
+
+## Amendment 2026-10-31 — a fourth switch position, `builtin` (shown as "Panel")
+
+**The Owner's request (2026-10-31).** "Add a fourth item to the speaker selection to
+play out of the panel speakers (instead of the usb adapter), this should be another
+switch state alongside speaker and headset and mute." Implemented, **not deployed**
+(SR-135, SR-136; LLR-1396..1409).
+
+**The name.** The wire value is `builtin`; the glass says "Panel" (aria-label "Panel
+speakers"). It is deliberately **not** `panel`: `panel` is already a value of the legacy
+audio *mode* (`/etc/wall-panel/audio-mode` is `trigger|bus|panel`, see
+`asound-panel-mode.conf`), and this codebase has a history of defects from one name
+meaning two things. The order on the glass is Mute | Headset | Speaker | Panel, the new
+segment rightmost so no existing position moves. `wall-audio-output set panel` is a
+usage error.
+
+**What the position does.** Selecting it stops every other leg and starts exactly one,
+`wall-bus-builtin.service`: one `alsaloop` hop, `bus_monitor` to `builtin_out`, with the
+same guard wrapper and scheduling as `wall-bus-headset.service`. It differs in having no
+`BindsTo` (the ALC255 behind `card_builtin` is soldered to the board) and in being gated
+only by the bus-mode `ExecCondition`. It has its own remembered level, default 60, and the
+rocker, slider and guarded absolute targets work unchanged, because `builtin_out` declares
+the same `Bus Playback Volume` softvol on the Loopback card that every other leg does.
+There is still exactly one gain in the path.
+
+**The shared dmix.** The leg and the doorbell chime both reach the card through one
+`builtin_mix` (`dmix`, `card_builtin` device 0, 48 kHz S16_LE stereo, `ipc_key 7716`, the
+next free key in the 77xx playback block), so neither holds the hardware exclusively and
+the chime can sound over music. `builtin_chime` is a mono-in `plug` onto that dmix with a
+fixed gain of **0.075** on both channels. That number is 10^(-22.5/20): the Owner
+calibrated the chime on 2026-10-23 with the hardware `Speaker` control at 65 % = -22.5 dB,
+and in this position that control is held at 100 % (0 dB), so the same loudness has to come
+from software. The chime is not on the softvol, so it does not follow the music level.
+
+**The hardware control.** In the `builtin` position the applier sets
+`amixer -c PCH sset Speaker 100% unmute` (card id from `WALL_AUDIO_BUILTIN_CARD`, default
+`PCH`) *after* every stop and *before* the leg starts. In every other position it sets
+`Speaker` to `mute` and leaves the level alone, so the existing chime path (unmute at 65 %,
+restore what it found) keeps working there unchanged. The plan publishes
+`builtin_speaker_on` for this; the applier does not re-derive it.
+
+**What it does not do, stated plainly.**
+
+* **No echo cancellation.** The canceller's reference is `speaker_tap`, which carries nothing
+  in this position (the leg is one hop with no tap), so AEC is not inserted and the microphone
+  is `mic_panel` (raw). With the panel's own speaker a few centimetres from its own
+  microphone this is the worst place to lack it. It is a limitation, not something this
+  change tries to solve.
+* **No amplifier.** Nothing feeds `speaker_tap`, so the amp detector's hold-off expires and
+  the relay drops power, exactly as in Headset.
+* **No auto-switch away.** The USB-headset one-shot is `speaker -> headset` only. A headset
+  arriving while Panel is selected is recorded (the latch is spent) and the position stays.
+* **The adapter gate no longer defers Mute or Panel.** `apply-state` used to return early
+  whenever the 5.1 adapter's card was absent, which would have made Panel unselectable with the
+  adapter dead and would have skipped a Mute pressed while Panel played (the speaker would
+  have kept going). Now only Speaker and Headset defer, and even they run every *stop* and
+  *mute* (a leg left over from Panel must not keep playing); only the *starts* that would
+  spend 15-second waits on a missing card are deferred. Mute and Panel apply fully, minus the
+  adapter's own mixer calls and rear pair; Panel's leg starts, the Bluetooth call supervisor
+  and the rear mic leg wait for the adapter's add event.
+* **The PCH `Speaker` control is muted only on leaving Panel.** The applier records the last
+  applied output in `/run/wall-panel/audio-applied-output.env`. It mutes the control when the
+  previous output was `builtin`, or when there is no record (first apply of a boot), and
+  otherwise leaves it alone, so a mic-mute tap or headset event mid-chime cannot cut the
+  chime. A failed mute after Panel is counted as an apply failure and the record stays on
+  `builtin` so the next apply retries it. A failed unmute on entering Panel is not counted
+  (the leg still plays; the journal carries the note).
+* **Panel readback and the record order.** The record is written *before* the 100 % unmute (an
+  applier killed in between must still mute on the next leave), and after the level retry the
+  applier reads `Speaker` back and raises it again if it is off or not at 100 %, which closes
+  the window in which the chime's restore-after-reading-the-output could land after a switch
+  to Panel. With the adapter absent, Speaker and Headset skip the speaker-chain probe, the
+  pre-open and the level retry, and persist the mic observation before they return (a refused
+  mic stop reports `apply-failed`, not `unavailable`).
+* **Stated limitation.** An apply that stays in Speaker or Headset no longer re-mutes PCH
+  `Speaker`, so a chime process that crashed mid-chime leaves it unmuted at the chime level
+  until the next leave-Panel apply or boot. Nothing feeds the PCH card in those positions, so
+  the cost is hiss at most.
+* **Old state files.** A state file written before this change has no `builtin` level. That
+  is not damage: it reads as the default 60 and does not mute the microphone.
+
+**Where the vocabulary lives.** `wall_audio_state.OUTPUTS` / `LEVELLED_OUTPUTS` /
+`STATE_SCHEMA`; the broker's own copies `routing.SWITCH_OUTPUTS` / `LEVELLED_OUTPUTS` and
+`switch_backend.OUTPUTS` / `LEVELLED_OUTPUTS` / `DEFAULT_VOLUME`; `panel-volume-keys.py`
+(the state reader), `panel-volume-request.py` (`GUARDED_OUTPUTS`, `MAX_REQUEST` is unchanged
+because `builtin` is seven bytes like `speaker`), and `panel-bus-visualizer.py`
+(`AUDIBLE_OUTPUTS`: Panel visualizes). The cross-repo fixture
+`tests/fixtures/audio-vocabulary-v1.json` carries the two lists and is byte-identical in
+OfficeWallNaglight. The unit is installed by `wall-firstboot.sh` and swept by
+`wall-audio-mode` wherever `wall-bus-headset.service` is.
+
+**Not measured.** Nothing here has run on the panel. The dmix, the 0.075 gain, the 100 %
+hardware level and the alsaloop hop are parsed and asserted but not heard; the first
+listening test should check loudness against the Owner's remembered chime level, the
+absence of clicks when the position is entered and left, and that the chime and music mix.

@@ -121,19 +121,19 @@ BUS_SOURCE = "bus_monitor"
 # differently, so they may not share a representation.
 BUS_PRODUCER_STATES = ("live", "silent", "unavailable")
 DEFAULT_APPLIER_PATH = Path("/usr/local/sbin/wall-audio-output")
-# The three positions and the two that carry a level. Duplicated from
+# The four positions and the three that carry a level. Duplicated from
 # wall_audio_state (LLR-013) rather than imported: that module lives in the root
 # applier's tree, which the broker's ProtectSystem=strict sandbox cannot read.
 # The two copies are held together by test_panel_audio_switch_backend.py, which
 # imports both and asserts they agree.
-OUTPUTS = ("mute", "headset", "speaker")
-LEVELLED_OUTPUTS = ("headset", "speaker")
+OUTPUTS = ("mute", "headset", "speaker", "builtin")
+LEVELLED_OUTPUTS = ("headset", "speaker", "builtin")
 # The applier's own defaults (wall_audio_state.STATE_SCHEMA). They are here so
 # that a file this backend reads means exactly what the applier will make it
 # mean: a state with no `volume` key is a Speaker at 60%, not a Speaker at
 # silence, and reporting 0 would have drawn a switch the panel is not in.
 DEFAULT_OUTPUT = "speaker"
-DEFAULT_VOLUME = {"headset": 60, "speaker": 60}
+DEFAULT_VOLUME = {"headset": 60, "speaker": 60, "builtin": 60}
 VOLUME_MIN, VOLUME_MAX = 0, 100
 # What an unmute from the legacy `set_mute` verb selects when the switch is
 # sitting in `mute`. Speaker rather than headset because speaker is audible

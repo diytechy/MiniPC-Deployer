@@ -21,13 +21,20 @@ Implements: SR-028, LLR-013
 
 from __future__ import annotations
 
-# The three switch positions, in the order they appear on the glass
-# (upper-left: input mute, then Mute / Headset / Speaker).
-OUTPUTS = ("mute", "headset", "speaker")
+# The four switch positions, in the order they appear on the glass
+# (upper-left: input mute, then Mute / Headset / Speaker / Panel).
+#
+# `builtin` IS THE PANEL POSITION (Owner, 2026-10-31): the merged bus plays out
+# of the panel's own PCH speaker instead of the USB adapter. The value is NOT
+# spelled `panel`, because `panel` is already a value of the legacy audio MODE
+# (/etc/wall-panel/audio-mode is trigger|bus|panel) and this codebase has a
+# documented history of defects from one name meaning two things. The glass
+# says "Panel"; the wire says `builtin`.
+OUTPUTS = ("mute", "headset", "speaker", "builtin")
 # Outputs that carry audio and therefore remember a level. `mute` does not:
 # there is nothing to set a level on, and a remembered "mute volume" would be a
 # second mute with no control of its own (Owner ruling F).
-LEVELLED_OUTPUTS = ("headset", "speaker")
+LEVELLED_OUTPUTS = ("headset", "speaker", "builtin")
 VOLUME_MIN, VOLUME_MAX = 0, 100
 # One rocker press. The bus level is a PERCENTAGE rather than the adapter's raw
 # 0..197 steps, so that it means the same thing on the headset card, whose own
@@ -88,7 +95,7 @@ STATE_SCHEMA = {
     "input_muted": False,
     # Per-output level memory (Owner ruling F): switching back to an output
     # restores the level it had, rather than shouting at the last one's setting.
-    "volume": {"headset": 60, "speaker": 60},
+    "volume": {"headset": 60, "speaker": 60, "builtin": 60},
     # Whether the headset adapter (0d8c:0014) is enumerated right now. False
     # with output == "headset" is the silence-everywhere case of ruling 7.
     "headset_present": False,
@@ -366,6 +373,10 @@ def normalize(raw):
                     repaired = True
             elif output in volume:
                 repaired = True
+            # An ABSENT level is not damage: a state file written before the
+            # Panel position existed has no `builtin` key, and treating that as
+            # a repair would mute the microphone on every panel the first time
+            # the new applier read its old file. It keeps the schema default.
     elif "volume" in raw:
         repaired = True
     if repaired:
@@ -913,6 +924,9 @@ def _headset(state, event):
         return state, lines + ["%s already present: no arrival to act on" % noun]
     armed = state[latch_key]
     state[latch_key] = False
+    # SPEAKER -> HEADSET ONLY, AND `builtin` IS DELIBERATELY NOT A SOURCE OF THE
+    # AUTO-SWITCH. The Owner who chose the Panel position chose it on purpose;
+    # a headset enumerating must not take it away (spent latch, journalled).
     if armed and state["output"] == "speaker":
         state["output"] = "headset"
         lines.append("auto-switch speaker -> headset (one-shot, %s, level %d%%)"
@@ -955,6 +969,10 @@ _HANDLERS = {
 # The forwarder units the switch owns. Named once, here, because the plan, the
 # applier and the tests must agree on the set and its order (stop before start).
 SPEAKER_LEGS = ("wall-bus-speaker.service", "wall-speaker-out.service")
+# THE PANEL POSITION IS ONE HOP AND ONE UNIT: bus -> the PCH speaker through its
+# own dmix (`builtin_out` in asound-bus-mode.conf). No tap, because the amplifier
+# is not involved and so there is nothing for the detector to watch.
+BUILTIN_LEGS = ("wall-bus-builtin.service",)
 # THE HEADSET POSITION IS TWO LEGS AND AT MOST ONE OF THEM RUNS (B4). Which one
 # is `headset_via`'s answer; the name `HEADSET_LEGS` is kept for the set of
 # units the position owns, because the applier, the tests and `ALL_LEGS` all
@@ -994,7 +1012,7 @@ MIC_LEGS = ("wall-mic-rear.service",)
 # two -- a unit stop can be outrun by an operator restart, and a per-tick
 # check cannot -- and it is what `wall-bt-call.service` argues at length.
 CALL_LEGS = ("wall-bt-call.service",)
-ALL_LEGS = SPEAKER_LEGS + HEADSET_LEGS + MIC_LEGS + CALL_LEGS
+ALL_LEGS = SPEAKER_LEGS + HEADSET_LEGS + BUILTIN_LEGS + MIC_LEGS + CALL_LEGS
 
 
 def plan(state, aec_available=False):
@@ -1005,6 +1023,7 @@ def plan(state, aec_available=False):
     script's branches.
 
     Outputs: {"legs": {unit name: should be running},
+              "builtin_speaker_on": bool,
               "volume": int percent for the bus softvol,
               "adapter_muted": bool, "headset_muted": bool,
               "input_muted": bool, "mic_live": bool,
@@ -1014,9 +1033,12 @@ def plan(state, aec_available=False):
     live = audible(state)
     speaker = live and state["output"] == "speaker"
     headset = live and state["output"] == "headset"
+    builtin = live and state["output"] == "builtin"
     via = headset_via(state)
     mic = mic_live(state)
     legs = {unit: speaker for unit in SPEAKER_LEGS}
+    # Named every time, true only in the Panel position, like every other leg.
+    legs.update({unit: builtin for unit in BUILTIN_LEGS})
     # EXACTLY ONE OF THE TWO, AND BOTH ARE NAMED EVERY TIME. Writing only the
     # winner would leave the loser's previous value in place -- the applier
     # stops what the plan says is False -- so a move from USB to Bluetooth would
@@ -1062,7 +1084,18 @@ def plan(state, aec_available=False):
         # work: in Mute and Headset nothing feeds `speaker_tap`, so the amp
         # detector's 240 s hold-off expires and the LCUS-2 relay physically
         # removes power from the amplifier.
+        #
+        # THE PANEL POSITION FEEDS THE ADAPTER NOTHING, so by the same reasoning
+        # it is muted there unless a mic leg needs its rear pair: `speaker` is
+        # False in `builtin`, and the expression below is left exactly as it was.
         "adapter_muted": not (speaker or mic),
+        # THE BUILT-IN SPEAKER'S HARDWARE STATE (Panel position). True means the
+        # applier sets the PCH `Speaker` control to 100 % and unmutes it, because
+        # the leg owns that control and the remembered level is applied in
+        # software by the shared softvol; False means it is put back to MUTE and
+        # its level is left alone (the chime path unmutes it itself for a moment
+        # and restores what it found).
+        "builtin_speaker_on": builtin,
         # THE USB CARD'S OWN MUTE, AND IT FOLLOWS THE RESOLUTION AND NOT THE
         # POSITION (B4). Headset resolving to Bluetooth leaves the USB adapter
         # plugged in with no leg feeding it, so it is muted exactly as it is in

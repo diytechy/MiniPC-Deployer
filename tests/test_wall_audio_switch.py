@@ -1,4 +1,4 @@
-"""SR-028: the merged bus, and the Mute/Headset/Speaker switch that follows it.
+"""SR-028: the merged bus, and the Mute/Headset/Speaker/Panel switch that follows it.
 
 Item 23 steps 1 and 2. Three groups of tests, in the order the design is read:
 
@@ -94,7 +94,7 @@ def _never_touch_the_real_run_dir(applier, tmp_path, monkeypatch):
     # BOOT_STAMP and LOCK_FILE are deliberately NOT in this list: their own
     # tests assert their real names and paths, and both are already given temp
     # locations by the cases that write them.
-    for name in ("SPEAKER_CHAIN_ENV", "MIC_SOURCE_ENV", "HEADSET_ENV"):
+    for name in ("SPEAKER_CHAIN_ENV", "MIC_SOURCE_ENV", "HEADSET_ENV", "APPLIED_OUTPUT_ENV"):
         monkeypatch.setattr(applier, name, tmp_path / ("run-" + name.lower()))
     for name in ("SPEAKER_CHAIN_VAR", "MIC_SOURCE_VAR"):
         monkeypatch.delenv(getattr(applier, name), raising=False)
@@ -102,8 +102,11 @@ def _never_touch_the_real_run_dir(applier, tmp_path, monkeypatch):
 
 # ── the pure switch policy ─────────────────────────────────────────────────
 
-def test_the_three_positions_are_the_owners_three_sr028(policy):
-    assert policy.OUTPUTS == ("mute", "headset", "speaker")
+def test_the_four_positions_are_the_owners_four_sr028(policy):
+    # Mute | Headset | Speaker | Panel. The fourth (`builtin`, shown as "Panel")
+    # is appended so no existing position moves on the glass. It is NOT spelled
+    # `panel`: that is already a value of the legacy audio MODE.
+    assert policy.OUTPUTS == ("mute", "headset", "speaker", "builtin")
 
 
 def test_a_selected_output_persists_through_a_round_trip_sr028(policy):
@@ -438,15 +441,15 @@ def test_the_speaker_leg_carries_the_volume_and_the_tap_does_not_sr028():
 
 
 def test_both_legs_share_one_control_on_an_always_present_card_ruling_f_sr028():
-    """THREE legs now, still one control. B4 gave the Headset position a second
+    """FOUR legs now, still one control. The Panel position added `builtin_out`; B4 gave the Headset position a second
     destination -- a Bluetooth headset -- and the Owner's remembered level has
     to act on it too, or the rocker does nothing in the one position where the
     output is on somebody's head. Every leg that plays the bus declares the SAME
     control on the SAME always-present card."""
     conf = read(BUS_CONF)
-    assert conf.count('name "Bus Playback Volume"') == 3
-    assert conf.count('card "Loopback"') == 3, "not on an adapter that can be unplugged"
-    for chain in ("speaker_out", "headset_out", "bt_headset_out"):
+    assert conf.count('name "Bus Playback Volume"') == 4
+    assert conf.count('card "Loopback"') == 4, "not on an adapter that can be unplugged"
+    for chain in ("speaker_out", "headset_out", "bt_headset_out", "builtin_out"):
         block = conf.split("pcm.%s {" % chain, 1)[1].split("\npcm.", 1)[0]
         assert "type softvol" in block, chain
         assert 'name "Bus Playback Volume"' in block, chain
@@ -921,7 +924,7 @@ def test_the_stamp_is_sampled_before_the_apply_and_published_after_it_sr028(appl
     monkeypatch.setattr(applier, "current_mode", lambda: "bus")
     order = []
 
-    def apply_plan(state, shell):
+    def apply_plan(state, shell, adapter_ok=True):
         order.append("apply")
         assert not stamp.exists(), "the stamp must not be published mid-apply"
         return 0
@@ -943,9 +946,17 @@ def test_apply_state_defers_successfully_until_the_audio_adapter_arrives_sr038(
     monkeypatch.setattr(applier, "headset_card", lambda *a, **k: None)
     monkeypatch.setattr(applier, "current_mode", lambda: "bus")
     monkeypatch.setattr(applier, "adapter_present", lambda *a, **k: False)
-    monkeypatch.setattr(applier, "apply_plan", lambda *_: pytest.fail(
-        "the absent adapter must not start or stop legs"))
+    seen = []
+
+    def apply_plan(state, shell, adapter_ok=True):
+        seen.append(adapter_ok)
+        return 0
+
+    monkeypatch.setattr(applier, "apply_plan", apply_plan)
+    # Speaker needs the adapter: its STARTS are deferred (apply_plan is told so),
+    # while every stop and mute still runs.
     assert applier.main(["--state", str(state_file), "apply-state"]) == 0
+    assert seen == [False]
     assert applier.read_boot_stamp(stamp) is not None
 
 
@@ -1062,7 +1073,8 @@ def test_the_pre_open_is_bounded_and_never_runs_with_no_leg_sr028(applier, polic
 
 
 def test_each_position_pre_opens_its_own_leg_sr028(applier):
-    assert applier.BUS_CONTROL_PCM == {"speaker": "speaker_out", "headset": "headset_out"}
+    assert applier.BUS_CONTROL_PCM == {"speaker": "speaker_out", "headset": "headset_out",
+                                       "builtin": "builtin_out"}
     conf = read(BUS_CONF)
     for pcm in applier.BUS_CONTROL_PCM.values():
         assert "pcm.%s {" % pcm in conf, "the pre-open must name a PCM that exists"
@@ -2487,6 +2499,11 @@ def test_adapter_absence_still_asserts_the_builtin_input_mute_sr029(
             self.commands.append((argv, required))
             return 0
 
+        def capture(self, argv, timeout=15):
+            # Stops now run while the adapter is absent, and the mic leg's
+            # stop is verified by asking systemd; "inactive" is its answer.
+            return "inactive\n"
+
     recorder = RecordingApplier()
     monkeypatch.setattr(applier, "Applier", lambda **_kwargs: recorder)
     arguments = SimpleNamespace(state=state, command="input-mute", value="on",
@@ -3444,3 +3461,571 @@ def test_a_missing_call_document_is_idle_and_never_an_error(tmp_path):
     backend = routed.RoutedDeviceBackend(None, call_path=tmp_path / "nothing.json")
     assert backend._call() == {"state": "idle", "gateway": None,
                                "headset": None, "since": None}
+
+
+# ── the Panel position: `builtin`, the panel's own speaker (SR-135, SR-136) ──
+#
+# Owner, 2026-10-31: a fourth switch position that plays the merged bus out of
+# the panel's PCH speaker instead of the USB adapter. Read in this order: the
+# policy (what the position means), the applier (what it does to the hardware),
+# the ALSA graph and the unit (how the audio gets there), then the places that
+# keep their own copy of the vocabulary.
+
+BUILTIN_UNIT = "wall-bus-builtin.service"
+
+
+def _on(policy, output, **fields):
+    state = policy.default_state()
+    state["output"] = output
+    state.update(fields)
+    return state
+
+
+def test_builtin_is_a_levelled_output_with_its_own_default_level_llr1396(policy):
+    assert policy.OUTPUTS[-1] == "builtin", "appended, so no position moves on the glass"
+    assert "builtin" in policy.LEVELLED_OUTPUTS
+    assert policy.default_state()["volume"] == {"headset": 60, "speaker": 60, "builtin": 60}
+    # The name is not `panel`: that is already a value of the legacy audio MODE.
+    assert "panel" not in policy.OUTPUTS
+
+
+def test_a_state_file_from_before_the_panel_position_is_not_damaged_llr1396(policy):
+    """No `builtin` volume key is an older-but-honest file, not a repair.
+
+    Treating it as damage would mute the microphone on every panel the first time
+    the new applier read its old state file -- the one failure nobody can hear.
+    """
+    old = {"output": "speaker", "input_muted": False,
+           "volume": {"headset": 40, "speaker": 70}, "headset_present": False,
+           "headset_autoswitch_armed": True}
+    state = policy.normalize(old)
+    assert state["input_muted"] is False, "an absent builtin level is not damage"
+    assert state["volume"] == {"headset": 40, "speaker": 70, "builtin": 60}
+
+
+def test_a_bad_builtin_level_is_still_a_repair_llr1396(policy):
+    state = policy.normalize({"output": "builtin", "input_muted": False,
+                              "volume": {"headset": 40, "speaker": 70, "builtin": 101}})
+    assert state["volume"]["builtin"] == 100
+    assert state["input_muted"] is True, "a clamp is a repair, so the mic comes back muted"
+    assert policy.normalize({"output": "builtin", "input_muted": False,
+                             "volume": {"builtin": "loud"}})["input_muted"] is True
+
+
+def test_builtin_survives_a_round_trip_and_remembers_its_own_level_llr1396(policy):
+    state = policy.default_state()
+    state, _ = policy.apply_event(state, {"kind": "set_output", "output": "builtin"})
+    state, _ = policy.apply_event(state, {"kind": "set_volume", "level": 35})
+    assert policy.volume_of(state) == 35
+    assert policy.volume_of(state, "speaker") == 60, "the other positions' memory is untouched"
+    reloaded = policy.normalize(json.loads(json.dumps(state)))
+    assert reloaded["output"] == "builtin" and policy.volume_of(reloaded) == 35
+    state, _ = policy.apply_event(state, {"kind": "set_output", "output": "speaker"})
+    state, _ = policy.apply_event(state, {"kind": "set_output", "output": "builtin"})
+    assert policy.volume_of(state) == 35, "switching back restores the Panel level"
+    state, _ = policy.apply_event(state, {"kind": "nudge_volume", "louder": True})
+    assert policy.volume_of(state) == 40 and policy.volume_of(state, "speaker") == 60
+
+
+def test_the_plan_runs_exactly_the_builtin_leg_in_the_panel_position_llr1397(policy):
+    assert policy.BUILTIN_LEGS == (BUILTIN_UNIT,)
+    assert BUILTIN_UNIT in policy.ALL_LEGS
+    plans = {output: policy.plan(_on(policy, output)) for output in policy.OUTPUTS}
+    for output, plan in plans.items():
+        assert BUILTIN_UNIT in plan["legs"], "named every time, or a stale True survives"
+        assert plan["legs"][BUILTIN_UNIT] is (output == "builtin"), output
+    panel = plans["builtin"]
+    # And in the Panel position NOTHING ELSE plays the bus.
+    assert panel["legs"]["wall-bus-speaker.service"] is False
+    assert panel["legs"]["wall-speaker-out.service"] is False
+    assert panel["legs"]["wall-bus-headset.service"] is False
+    assert panel["legs"]["wall-bus-bt-headset.service"] is False
+    assert panel["volume"] == 60 and panel["reason"] is None
+
+
+def test_the_panel_position_is_audible_and_its_hardware_state_follows_llr1398(policy):
+    assert policy.audible(_on(policy, "builtin")) is True
+    for output in policy.OUTPUTS:
+        plan = policy.plan(_on(policy, output))
+        assert plan["builtin_speaker_on"] is (output == "builtin"), output
+    # The USB adapter is fed nothing here, so it is muted unless a mic leg needs
+    # its rear pair; the headset card is muted.
+    quiet = policy.plan(_on(policy, "builtin", input_muted=True))
+    assert quiet["adapter_muted"] is True and quiet["headset_muted"] is True
+    live = policy.plan(_on(policy, "builtin", input_muted=False))
+    assert live["mic_live"] is True and live["adapter_muted"] is False
+    # AEC is inserted only in Speaker: its reference (speaker_tap) is silent here.
+    assert policy.plan(_on(policy, "builtin", input_muted=False), aec_available=True)[
+        "mic_source"] == policy.MIC_SOURCE_PANEL
+    assert policy.plan(_on(policy, "speaker", input_muted=False), aec_available=True)[
+        "mic_source"] == policy.MIC_SOURCE_CLEAN
+
+
+def test_a_headset_arriving_does_not_take_the_panel_position_llr1399(policy):
+    state = policy.default_state()
+    state, _ = policy.apply_event(state, {"kind": "set_output", "output": "builtin"})
+    state, lines = policy.apply_event(state, {"kind": "headset", "present": True})
+    assert state["output"] == "builtin", "the one-shot is speaker -> headset only"
+    assert any("no auto-switch" in line for line in lines)
+
+
+def test_the_guarded_volume_target_accepts_the_panel_position_llr1396(policy):
+    state = policy.default_state()
+    state, _ = policy.apply_event(state, {"kind": "set_output", "output": "builtin"})
+    state, _ = policy.apply_event(state, {
+        "kind": "set_volume_guarded", "target": 45, "expect_output": "builtin",
+        "expect_level": 60, "expect_revision": state["state_revision"]})
+    assert policy.volume_of(state) == 45
+
+
+def _commands(recorder):
+    return [" ".join(argv) for argv in recorder.commands]
+
+
+def test_the_applier_drives_the_pch_speaker_for_the_panel_position_llr1400(applier, policy):
+    state, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_output", "output": "builtin"})
+    recorder = applier.Applier(dry_run=True)
+    applier.apply_plan(state, recorder)
+    commands = _commands(recorder)
+    assert "/usr/bin/amixer -c PCH -q sset Speaker 100% unmute" in commands
+    assert "/usr/bin/amixer -c PCH -q sset Speaker mute" not in commands
+    assert "/usr/bin/systemctl start " + BUILTIN_UNIT in commands
+    for unit in ("wall-bus-speaker.service", "wall-speaker-out.service",
+                 "wall-bus-headset.service", "wall-bus-bt-headset.service"):
+        assert "/usr/bin/systemctl stop " + unit in commands, unit
+        assert "/usr/bin/systemctl start " + unit not in commands, unit
+    # The leg's softvol is declared by the PCM the leg opens, then the level
+    # lands LAST, exactly as in every other position.
+    assert any("-D builtin_out" in c for c in commands)
+    assert commands[-1] == "/usr/bin/amixer -c Loopback -q sset Bus 60%"
+    # The hardware control is raised BEFORE the leg starts (nothing is audible
+    # until the leg feeds it), and every stop precedes it.
+    on = commands.index("/usr/bin/amixer -c PCH -q sset Speaker 100% unmute")
+    assert on < commands.index("/usr/bin/systemctl start " + BUILTIN_UNIT)
+    assert max(i for i, c in enumerate(commands) if c.startswith("/usr/bin/systemctl stop")) < on
+
+
+@pytest.mark.parametrize("output", ["mute", "headset", "speaker"])
+def test_every_other_position_puts_the_pch_speaker_back_to_mute_llr1400(applier, policy, output):
+    state = policy.default_state()
+    state["output"] = output
+    state["headset_present"] = True
+    recorder = applier.Applier(dry_run=True)
+    applier.apply_plan(state, recorder)
+    commands = _commands(recorder)
+    assert "/usr/bin/amixer -c PCH -q sset Speaker mute" in commands
+    assert not any(c.startswith("/usr/bin/amixer -c PCH -q sset Speaker") and "unmute" in c
+                   for c in commands)
+    # Muted, and the LEVEL is left alone: no percentage is written to it.
+    assert not any(c.startswith("/usr/bin/amixer -c PCH -q sset Speaker") and "%" in c
+                   for c in commands)
+    assert "/usr/bin/systemctl stop " + BUILTIN_UNIT in commands
+    assert "/usr/bin/systemctl start " + BUILTIN_UNIT not in commands
+
+
+def test_leaving_the_panel_position_mutes_the_pch_speaker_after_the_leg_stops_llr1400(applier, policy):
+    state, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_output", "output": "mute"})
+    recorder = applier.Applier(dry_run=True)
+    applier.apply_plan(state, recorder)
+    commands = _commands(recorder)
+    assert commands.index("/usr/bin/systemctl stop " + BUILTIN_UNIT) \
+        < commands.index("/usr/bin/amixer -c PCH -q sset Speaker mute")
+
+
+def test_the_applier_names_the_pcm_that_declares_the_panel_level_llr1401(applier, policy):
+    assert applier.BUS_CONTROL_PCM["builtin"] == "builtin_out"
+    state = policy.default_state()
+    state["output"] = "builtin"
+    assert applier.bus_control_pcm(state) == "builtin_out"
+    # Headset's Bluetooth resolution must not leak into the Panel position.
+    state["bt_headset_present"] = True
+    assert applier.bus_control_pcm(state) == "builtin_out"
+
+
+def test_the_applier_cli_accepts_the_panel_position_llr1400(tmp_path):
+    done = run_applier(tmp_path, "set", "builtin")
+    assert done.returncode == 0, done.stderr
+    assert json.loads((tmp_path / "audio-state.json").read_text(encoding="utf-8"))["output"] == "builtin"
+    assert run_applier(tmp_path, "set", "panel").returncode == 2, \
+        "`panel` is a legacy audio MODE, never an output"
+
+
+def test_the_graph_has_one_dmix_on_the_builtin_card_and_two_users_llr1402():
+    conf = read(BUS_CONF)
+    mix = conf.split("pcm.builtin_mix {", 1)[1].split("\npcm.", 1)[0]
+    assert "type dmix" in mix and 'pcm "card_builtin"' in mix
+    assert "rate 48000" in mix and "channels 2" in mix and "format S16_LE" in mix
+    # Every other consumer reaches the card ONLY through the dmix.
+    for name in ("builtin_out", "builtin_chime"):
+        block = conf.split("pcm.%s {" % name, 1)[1].split("\npcm.", 1)[0]
+        assert '"builtin_mix"' in block, name
+        assert "card_builtin" not in block, name
+    out = conf.split("pcm.builtin_out {", 1)[1].split("\npcm.", 1)[0]
+    assert "type softvol" in out
+    assert 'name "Bus Playback Volume"' in out and 'card "Loopback"' in out
+    # Mono in, 0.075 on BOTH channels: 10^(-22.5/20), the chime's calibration.
+    chime = conf.split("pcm.builtin_chime {", 1)[1].split("\npcm.", 1)[0]
+    assert "type plug" in chime
+    assert "ttable.0.0 0.075" in chime and "ttable.0.1 0.075" in chime
+    assert abs(10 ** (-22.5 / 20) - 0.075) < 5e-4
+
+
+def test_the_builtin_ipc_key_is_unique_across_every_asound_file_llr1402():
+    import re
+    keys = {}
+    for path in sorted(WALL.glob("asound*.conf")):
+        for key in re.findall(r"^\s*ipc_key\s+(\d+)", read(path), re.M):
+            keys.setdefault(key, []).append(path.name)
+    assert keys["7716"] == ["asound-bus-mode.conf"], keys
+    assert all(len(files) == 1 for files in keys.values()), keys
+
+
+def test_the_builtin_unit_is_the_headset_unit_without_its_adapter_llr1403():
+    unit = read(WALL / BUILTIN_UNIT)
+    code = "\n".join(line for line in unit.splitlines() if not line.lstrip().startswith("#"))
+    assert "--cdevice bus_monitor" in unit and "--pdevice builtin_out" in unit
+    assert "wall-alsaloop-guard.py" in unit, "a bare alsaloop never exits when it wedges"
+    assert 'ExecCondition=/bin/sh -c \'[ "$(cat /etc/wall-panel/audio-mode 2>/dev/null || echo trigger)" = bus ]\'' in unit
+    # NO adapter to bind to: the built-in card is always present.
+    assert "BindsTo" not in code and "dev-wall_headset_adapter" not in code
+    assert "--tlatency 30000" in unit
+    # Same scheduling and sandbox as the sibling leg.
+    sibling = read(WALL / "wall-bus-headset.service")
+    for directive in ("Restart=always", "RestartSec=2", "Nice=-5", "CPUSchedulingPolicy=rr",
+                      "CPUSchedulingPriority=15", "LimitRTPRIO=15", "NoNewPrivileges=true",
+                      "SupplementaryGroups=audio", "StartLimitBurst=10"):
+        assert directive in unit and directive in sibling, directive
+    assert "[Install]" not in unit, "a leg is never enabled: the applier starts it"
+
+
+def test_the_builtin_unit_is_installed_and_swept_wherever_the_headset_leg_is_llr1404():
+    firstboot = read(WALL / "wall-firstboot.sh")
+    install = [ln for ln in firstboot.splitlines()
+               if "wall-bus-headset.service" in ln and "for _u in" in ln]
+    assert install and BUILTIN_UNIT in install[0], \
+        "the paired release delivers only what firstboot installs"
+    mode = read(WALL / "wall-audio-mode")
+    for line in (ln for ln in mode.splitlines() if "wall-bus-headset" in ln):
+        assert "wall-bus-builtin" in line, line
+    assert mode.count("wall-bus-builtin") == 3
+
+
+def test_the_other_copies_of_the_vocabulary_agree_llr1405_llr1406_llr1407():
+    routing = import_panel_audio("routing")
+    backend = import_panel_audio("switch_backend")
+    assert routing.SWITCH_OUTPUTS[-1] == "builtin" and "builtin" in routing.LEVELLED_OUTPUTS
+    assert backend.OUTPUTS[-1] == "builtin" and "builtin" in backend.LEVELLED_OUTPUTS
+    assert backend.DEFAULT_VOLUME["builtin"] == 60
+    request = load(WALL / "panel-volume-request.py", "volume_request_builtin")
+    visualizer = load(WALL / "panel-bus-visualizer.py", "bus_visualizer_builtin")
+    assert b"builtin" in request.GUARDED_OUTPUTS
+    assert "builtin" in visualizer.AUDIBLE_OUTPUTS
+    # The longest guarded request still fits MAX_REQUEST: `builtin` is 7 bytes,
+    # exactly as long as `trigger` and `speaker`, so the bound did not move.
+    guarded = b"set:100:trigger:builtin:100:9007199254740991\n"
+    assert len(guarded) <= request.MAX_REQUEST
+
+
+# -- the adapter gate and the built-in speaker's history (review 2026-10-31) ----
+
+def _quiet_capture(argv, timeout=15):
+    """What systemctl and amixer would answer on a healthy panel.
+
+    The applier's reads (`systemctl show`, `amixer sget`) must never reach the
+    host: on Windows there is no systemctl at all (WinError 2), and on a dev box
+    under WSL there is a real one that knows nothing about these units.
+    """
+    if argv[0].endswith("systemctl"):
+        return "inactive\n"
+    if argv[0].endswith("amixer") and "sget" in argv:
+        return "  Front Left: Playback 87 [100%] [0.00dB] [on]\n"
+    return None
+
+
+def _applied(applier, output):
+    applier.APPLIED_OUTPUT_ENV.write_text(
+        "%s=%s\n" % (applier.APPLIED_OUTPUT_VAR, output), encoding="utf-8")
+
+
+def _apply_state_without_adapter(applier, policy, tmp_path, monkeypatch, output, previous):
+    state = policy.default_state()
+    state["output"] = output
+    state["input_muted"] = True if output == "mute" else False
+    state_file = tmp_path / "audio-state.json"
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(applier, "BOOT_STAMP", tmp_path / "stamp.json")
+    monkeypatch.setattr(applier, "headset_card", lambda *a, **k: None)
+    monkeypatch.setattr(applier, "adapter_present", lambda *a, **k: False)
+    monkeypatch.setattr(applier, "current_mode", lambda: "bus")
+    if previous:
+        _applied(applier, previous)
+    recorder = applier.Applier(dry_run=True)
+    recorder.capture = _quiet_capture
+    monkeypatch.setattr(applier, "Applier", lambda **_kw: recorder)
+    code = applier.main(["--state", str(state_file), "--dry-run", "apply-state"])
+    return code, _commands(recorder)
+
+
+def test_panel_can_be_selected_with_the_usb_adapter_absent_llr1409(
+        applier, policy, tmp_path, monkeypatch, capfd):
+    """Exactly when the Owner would pick Panel: the adapter is dead."""
+    code, commands = _apply_state_without_adapter(
+        applier, policy, tmp_path, monkeypatch, "builtin", "speaker")
+    assert code == 0
+    # Applied through the NORMAL path, not the deferral (which would also start
+    # the leg but report the apply as refused/unavailable to the rocker).
+    journal = capfd.readouterr().err
+    assert "does not need it" in journal and "deferring apply" not in journal
+    assert "/usr/bin/systemctl start " + BUILTIN_UNIT in commands
+    assert "/usr/bin/amixer -c PCH -q sset Speaker 100% unmute" in commands
+    # Nothing that needs the absent adapter is started or touched.
+    assert not any("ICUSBAUDIO7D" in c for c in commands)
+    assert not any(c.startswith("/usr/bin/systemctl start") and BUILTIN_UNIT not in c
+                   and "wall-bt-call" not in c and "wall-mic-rear" not in c for c in commands)
+    assert "/usr/bin/systemctl start wall-mic-rear.service" not in commands
+
+
+def test_mute_still_silences_panel_when_the_adapter_drops_llr1409(
+        applier, policy, tmp_path, monkeypatch):
+    """Panel playing, the adapter re-enumerates, the Owner presses Mute."""
+    code, commands = _apply_state_without_adapter(
+        applier, policy, tmp_path, monkeypatch, "mute", "builtin")
+    assert code == 0
+    stop = commands.index("/usr/bin/systemctl stop " + BUILTIN_UNIT)
+    assert stop < commands.index("/usr/bin/amixer -c PCH -q sset Speaker mute")
+    assert not any(c.startswith("/usr/bin/systemctl start") for c in commands)
+
+
+@pytest.mark.parametrize("output", ["speaker", "headset"])
+def test_adapter_dependent_positions_still_defer_their_starts_but_stop_everything_llr1409(
+        applier, policy, tmp_path, monkeypatch, output):
+    code, commands = _apply_state_without_adapter(
+        applier, policy, tmp_path, monkeypatch, output, "builtin")
+    assert code == 0
+    assert not any(c.startswith("/usr/bin/systemctl start") for c in commands)
+    assert "/usr/bin/systemctl stop " + BUILTIN_UNIT in commands, \
+        "a leg left over from Panel must not keep playing under a deferred Speaker"
+    assert "/usr/bin/amixer -c PCH -q sset Speaker mute" in commands
+
+
+def test_staying_in_a_non_panel_position_leaves_the_pch_speaker_alone_llr1410(applier, policy):
+    """A mic-mute tap mid-chime must not cut the chime."""
+    for output in ("speaker", "headset", "mute"):
+        for previous in (output, "speaker"):
+            _applied(applier, previous)
+            state = policy.default_state()
+            state["output"] = output
+            recorder = applier.Applier(dry_run=True)
+            applier.apply_plan(state, recorder)
+            assert not any(c.startswith("/usr/bin/amixer -c PCH -q sset Speaker")
+                           for c in _commands(recorder)), (output, previous)
+
+
+def test_leaving_panel_mutes_the_pch_speaker_llr1410(applier, policy):
+    _applied(applier, "builtin")
+    state = policy.default_state()
+    state["output"] = "speaker"
+    recorder = applier.Applier(dry_run=True)
+    applier.apply_plan(state, recorder)
+    assert "/usr/bin/amixer -c PCH -q sset Speaker mute" in _commands(recorder)
+
+
+def test_an_unknown_history_mutes_the_pch_speaker_llr1410(applier, policy):
+    assert not applier.APPLIED_OUTPUT_ENV.exists()
+    state = policy.default_state()
+    recorder = applier.Applier(dry_run=True)
+    applier.apply_plan(state, recorder)
+    assert "/usr/bin/amixer -c PCH -q sset Speaker mute" in _commands(recorder)
+
+
+def _failing_pch_mute(argv, **kwargs):
+    if argv[0].endswith("amixer") and "PCH" in argv and "Speaker" in argv and "mute" in argv:
+        return _Reply(1, "", "no such control")
+    return _Reply(0)
+
+
+def test_a_failed_mute_after_leaving_panel_counts_and_is_retried_llr1410(applier, policy):
+    _applied(applier, "builtin")
+    state = policy.default_state()
+    state["output"] = "speaker"
+    failures = applier.apply_plan(state, applier.Applier(run=_failing_pch_mute))
+    assert failures >= 1
+    marker = applier.APPLIED_OUTPUT_ENV.read_text(encoding="utf-8")
+    assert marker.strip().endswith("=builtin"), "the next apply must retry the mute"
+    # And once it works the marker moves on.
+    ok = applier.apply_plan(state, applier.Applier(run=lambda argv, **k: _Reply(0)))
+    assert ok == 0
+    assert applier.APPLIED_OUTPUT_ENV.read_text(encoding="utf-8").strip().endswith("=speaker")
+
+
+def test_a_failed_mute_with_unknown_history_is_not_counted_llr1410(applier, policy):
+    state = policy.default_state()
+    assert applier.apply_plan(state, applier.Applier(run=_failing_pch_mute)) == 0
+
+
+def test_a_failed_unmute_entering_panel_is_not_counted_llr1410(applier, policy):
+    def failing(argv, **kwargs):
+        if argv[0].endswith("amixer") and "PCH" in argv and "unmute" in argv:
+            return _Reply(1, "", "no such control")
+        return _Reply(0)
+
+    state = policy.default_state()
+    state["output"] = "builtin"
+    assert applier.apply_plan(state, applier.Applier(run=failing)) == 0
+    assert applier.APPLIED_OUTPUT_ENV.read_text(encoding="utf-8").strip().endswith("=builtin")
+
+
+# -- review 3 (2026-10-31): privacy observation, record order, probing, readback --
+
+def test_an_unprovable_mic_stop_is_persisted_even_when_the_adapter_is_absent_llr1409(
+        applier, policy, tmp_path, monkeypatch, capfd):
+    """The mic mute must not be reported confirmed while a leg may still transmit."""
+    state = policy.default_state()
+    state["output"] = "speaker"
+    state["input_muted"] = True
+    state["mic_legs_running"] = False  # what the file believed before this apply
+    state_file = tmp_path / "audio-state.json"
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(applier, "BOOT_STAMP", tmp_path / "stamp.json")
+    monkeypatch.setattr(applier, "headset_card", lambda *a, **k: None)
+    monkeypatch.setattr(applier, "adapter_present", lambda *a, **k: False)
+    monkeypatch.setattr(applier, "current_mode", lambda: "bus")
+    recorder = applier.Applier(dry_run=True)
+    # systemd says every unit is still running, before and after the kill.
+    recorder.capture = lambda argv, timeout=15: "active\n"
+    monkeypatch.setattr(applier, "Applier", lambda **_kw: recorder)
+    saved = []
+    real_save = applier.save_state
+    monkeypatch.setattr(applier, "save_state",
+                        lambda st, path, dry_run=False: (saved.append(dict(st)),
+                                                         real_save(st, path, dry_run=dry_run)))
+    code = applier.main(["--state", str(state_file), "--dry-run", "volume",
+                         "set:60:bus:speaker:60:0"])
+    out = capfd.readouterr().out
+    assert code == 1
+    assert any(entry["mic_legs_running"] is True for entry in saved), \
+        "the observation must reach the state file before the deferral returns"
+    assert "refused:apply-failed" in out and "refused:unavailable" not in out
+
+
+def test_the_panel_record_is_written_before_the_speaker_is_raised_llr1410(applier, policy):
+    seen = {}
+
+    def run(argv, **kwargs):
+        if argv[0].endswith("amixer") and "unmute" in argv and "PCH" in argv:
+            seen["record"] = applier.APPLIED_OUTPUT_ENV.read_text(encoding="utf-8")
+        return _Reply(0, "  Front Left: Playback 87 [100%] [0.00dB] [on]\n")
+
+    state = policy.default_state()
+    state["output"] = "builtin"
+    _applied(applier, "speaker")
+    applier.apply_plan(state, applier.Applier(run=run))
+    assert seen["record"].strip().endswith("=builtin"), \
+        "killed between the unmute and the write, the next leave must still mute"
+
+
+def test_a_deferred_speaker_apply_probes_nothing_llr1409(applier, policy, tmp_path, monkeypatch):
+    code, commands = _apply_state_without_adapter(
+        applier, policy, tmp_path, monkeypatch, "speaker", "builtin")
+    assert code == 0
+    assert not any(c.startswith("/usr/bin/aplay") for c in commands), \
+        "no probe or pre-open of a device that is not there"
+    # expected=False is ONE attempt (the level is still recorded), not the
+    # 20-attempt retry window of a leg that is really starting.
+    assert sum("sset Bus" in c for c in commands) <= 1, "no level retry window"
+    assert not applier.SPEAKER_CHAIN_ENV.exists(), "no chain published for nobody"
+
+
+@pytest.mark.parametrize("reading,reissued", [
+    ("  Front Left: Playback 87 [100%] [0.00dB] [off]\n", True),
+    ("  Front Left: Playback 56 [65%] [-22.50dB] [on]\n", True),
+    ("  Front Left: Playback 87 [100%] [0.00dB] [on]\n", False),
+])
+def test_panel_readback_raises_a_speaker_the_chime_left_muted_llr1410(applier, policy,
+                                                                      reading, reissued):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(" ".join(argv))
+        if argv[0].endswith("amixer") and "sget" in argv:
+            return _Reply(0, reading)
+        return _Reply(0)
+
+    state = policy.default_state()
+    state["output"] = "builtin"
+    assert applier.apply_plan(state, applier.Applier(run=run)) == 0
+    raises = [c for c in calls if c.endswith("-c PCH -q sset Speaker 100% unmute")]
+    assert len(raises) == (2 if reissued else 1), calls
+    if reissued:
+        # And it is AFTER the level retry, not before it.
+        assert calls.index("/usr/bin/amixer -c PCH sget Speaker") > max(
+            i for i, c in enumerate(calls) if "sset Bus" in c)
+
+
+def test_the_unmuted_chime_limitation_is_written_down_llr1410():
+    source = read(APPLIER)
+    assert "STATED LIMITATION" in source and "crashed mid-chime" in source
+    assert "crashed mid-chime" in read(ROOT / "docs/design/audio-routing-2026-09-13.md").replace(
+        "\n", " ").replace("  ", " ") or "chime process that crashed" in read(
+        ROOT / "docs/design/audio-routing-2026-09-13.md").replace("\n", " ")
+
+
+def _broken_record(applier, monkeypatch):
+    real = applier.write_atomic
+
+    def write_atomic(path, text, mode=0o644, dry_run=False):
+        if Path(path) == applier.APPLIED_OUTPUT_ENV:
+            raise OSError(30, "Read-only file system")
+        return real(path, text, mode=mode, dry_run=dry_run)
+
+    monkeypatch.setattr(applier, "write_atomic", write_atomic)
+
+
+def test_an_unwritable_record_does_not_abort_entering_panel_llr1410(applier, policy, monkeypatch):
+    _broken_record(applier, monkeypatch)
+    _applied(applier, "speaker")
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(" ".join(argv))
+        return _Reply(0, "  Front Left: Playback 87 [100%] [0.00dB] [on]\n")
+
+    state = policy.default_state()
+    state["output"] = "builtin"
+    assert applier.apply_plan(state, applier.Applier(run=run)) == 0
+    assert "/usr/bin/systemctl start " + BUILTIN_UNIT in calls, "the Panel leg still starts"
+    assert not applier.APPLIED_OUTPUT_ENV.exists(), \
+        "a stale `speaker` must not survive: unknown history mutes on the next leave"
+    # And leaving Panel afterwards mutes, because the history is now unknown.
+    state["output"] = "speaker"
+    leave = []
+    applier.apply_plan(state, applier.Applier(
+        run=lambda argv, **k: (leave.append(" ".join(argv)), _Reply(0))[1]))
+    assert "/usr/bin/amixer -c PCH -q sset Speaker mute" in leave
+
+
+def test_an_unwritable_record_still_persists_the_mic_observation_llr1410(
+        applier, policy, tmp_path, monkeypatch):
+    _broken_record(applier, monkeypatch)
+    state = policy.default_state()
+    state["output"] = "mute"
+    state["input_muted"] = True
+    state["mic_legs_running"] = False
+    state_file = tmp_path / "audio-state.json"
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(applier, "BOOT_STAMP", tmp_path / "stamp.json")
+    monkeypatch.setattr(applier, "headset_card", lambda *a, **k: None)
+    monkeypatch.setattr(applier, "adapter_present", lambda *a, **k: True)
+    monkeypatch.setattr(applier, "current_mode", lambda: "bus")
+    recorder = applier.Applier(dry_run=True)
+    recorder.capture = lambda argv, timeout=15: "active\n"  # the mic leg will not stop
+    monkeypatch.setattr(applier, "Applier", lambda **_kw: recorder)
+    saved = []
+    real_save = applier.save_state
+    monkeypatch.setattr(applier, "save_state",
+                        lambda st, path, dry_run=False: (saved.append(dict(st)),
+                                                         real_save(st, path, dry_run=dry_run)))
+    assert applier.main(["--state", str(state_file), "--dry-run", "apply-state"]) == 1
+    assert any(entry["mic_legs_running"] is True for entry in saved)

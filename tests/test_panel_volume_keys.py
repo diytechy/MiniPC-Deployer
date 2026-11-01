@@ -1,4 +1,5 @@
 """SR-028 rocker privilege boundary and readout event regression tests."""
+import json
 import importlib.machinery
 import importlib.util
 from pathlib import Path
@@ -1138,3 +1139,25 @@ def test_sigterm_can_wake_an_idle_poll_loop():
     assert 'if stopping["now"]:' in startup.split("while True:", 1)[0]
     assert "def _close_wakeup(poller, wake_read, wake_write):" in keys
     assert "signal.set_wakeup_fd(-1)" in keys
+
+
+def test_a_guarded_target_lands_in_the_panel_positions_own_memory_llr1406():
+    policy = module("volume_policy", "wall_audio_state.py")
+    state = policy.default_state()
+    state["output"] = "builtin"
+    state["volume"]["builtin"] = 30
+    state = policy.normalize(state)
+    state, _ = policy.apply_event(state, {"kind": "set_volume_guarded", "target": 55,
+                                          "expect_output": "builtin", "expect_level": 30,
+                                          "expect_revision": state["state_revision"]})
+    assert state["volume"] == {"headset": 60, "speaker": 60, "builtin": 55}
+    assert state["volume_event_seq"] == 1
+
+
+def test_the_rocker_reads_the_panel_positions_level_from_the_state_file_llr1406(tmp_path):
+    keys = module("volume_keys_builtin", "panel-volume-keys.py")
+    path = tmp_path / "audio-state.json"
+    path.write_text(json.dumps({"output": "builtin", "state_revision": 4, "generation": 2,
+                                "volume": {"headset": 60, "speaker": 60, "builtin": 35}}),
+                    encoding="utf-8")
+    assert keys.read_public_state(str(path)) == ("builtin", 35, 4, 2)

@@ -22,7 +22,7 @@ MAX_REQUEST = len(b"set:100:trigger:speaker:100:9007199254740991\n")
 # parse as well.
 MAX_RELATIVE_REQUEST = len(b"down:100\n")
 GUARDED_MODES = (b"trigger", b"panel", b"bus")
-GUARDED_OUTPUTS = (b"mute", b"headset", b"speaker")
+GUARDED_OUTPUTS = (b"mute", b"headset", b"speaker", b"builtin")
 MAX_STATE_REVISION = 9007199254740991
 # Every reason the applier may answer a guarded target with. The reply is
 # rebuilt from this tuple rather than forwarded, so no byte of the applier's

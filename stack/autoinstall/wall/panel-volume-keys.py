@@ -548,7 +548,7 @@ def read_public_state(path=PUBLIC_STATE):
     if not isinstance(raw, dict):
         return None
     output = raw.get("output")
-    if output not in ("mute", "headset", "speaker"):
+    if output not in ("mute", "headset", "speaker", "builtin"):
         return None
     revision = raw.get("state_revision", 0)
     generation = raw.get("generation", 0)
@@ -558,7 +558,7 @@ def read_public_state(path=PUBLIC_STATE):
         generation = 0
     volumes = raw.get("volume")
     level = volumes.get(output) if isinstance(volumes, dict) else None
-    if output not in ("headset", "speaker"):
+    if output not in ("headset", "speaker", "builtin"):
         level = 0
     if not isinstance(level, int) or isinstance(level, bool) or not 0 <= level <= 100:
         return None

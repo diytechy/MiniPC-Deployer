@@ -44,11 +44,11 @@ MUTATING_METHODS = frozenset(
 # `set_output` with output="mute" is exactly that request with a wider range. It
 # stays accepted for one release so a panel running an older shell keeps its
 # mute button, and is removed with the chrome work (step 5).
-SWITCH_OUTPUTS = ("mute", "headset", "speaker")
+SWITCH_OUTPUTS = ("mute", "headset", "speaker", "builtin")
 # The positions that carry a level. `mute` does not: there is nothing to set a
 # level on, and a remembered "mute volume" would be a second mute with no
 # control of its own (Owner ruling F, and wall_audio_state.LEVELLED_OUTPUTS).
-LEVELLED_OUTPUTS = ("headset", "speaker")
+LEVELLED_OUTPUTS = ("headset", "speaker", "builtin")
 # A PERCENTAGE, not the adapter's raw steps. The headset card has 38 of them and
 # the bus softvol 197, so a raw number would mean two different loudnesses on
 # the two outputs; the applier is the only thing that knows either scale.

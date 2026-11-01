@@ -81,7 +81,7 @@ STATE_FILE = "/etc/wall-panel/audio-state.json"
 # The two positions that send the bus somewhere audible. Duplicated from the
 # applier, like switch_backend's copy and for the same reason: that module lives
 # in a tree this sandbox does not import.
-AUDIBLE_OUTPUTS = ("headset", "speaker")
+AUDIBLE_OUTPUTS = ("headset", "speaker", "builtin")
 DEFAULT_OUTPUT = "speaker"
 RUNTIME_DIR = "/run/wall-bus-visualizer"
 TELEMETRY_FILE = RUNTIME_DIR + "/bus-telemetry.json"

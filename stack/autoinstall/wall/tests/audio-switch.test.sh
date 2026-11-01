@@ -58,6 +58,9 @@
 #   B19 step 6's seam: the canceller is selected only with BOTH the knob and a
 #       binary, and only in Speaker; plus item J's effective mute, published
 #       for the canceller BEFORE any leg moves
+#   B20 the Panel position (`builtin`): its one leg, the PCH speaker raised and
+#       unmuted before the leg starts and muted again on leaving, its own
+#       remembered level, `panel` refused as an output, and no auto-switch away
 #   B13 the centre/sub trim: the rendered ttable is the (L+R)/2 sum the Owner
 #       asked for, a group name moves both halves of it, a refused value moves
 #       NOTHING, and a number-moving command never starts audio
@@ -628,6 +631,47 @@ stop_line="$(printf '%s\n' "$out" | grep -n 'systemctl stop' | head -1 | cut -d:
 { [ -n "$mute_line" ] && [ -n "$stop_line" ] && [ "$mute_line" -lt "$stop_line" ]; } \
     && pass "B19 and it is published before any leg moves" \
     || fail "B19 a leg moved before the mute was published"
+
+# B20 -- the Panel position (`builtin`): the merged bus plays out of the panel's
+# own speaker. Run for real in dry run, so what is asserted is the command
+# sequence itself: the PCH `Speaker` control is raised and unmuted BEFORE the
+# one leg starts, every other leg is stopped, the level lands LAST, and leaving
+# the position puts the control back to mute.
+rm -f "$STATE"
+run set speaker >/dev/null
+out="$(run set builtin)"
+has "systemctl start wall-bus-builtin.service" "$out" "B20 the Panel leg starts"
+hasnt "systemctl start wall-bus-speaker.service" "$out" "B20 and the speaker legs do not"
+hasnt "systemctl start wall-bus-headset.service" "$out" "B20 nor does the headset leg"
+has "systemctl stop wall-bus-speaker.service" "$out" "B20 the speaker leg is stopped"
+has "amixer -c PCH -q sset Speaker 100% unmute" "$out" "B20 the PCH speaker is raised to 0 dB and unmuted"
+has "aplay -q -D builtin_out -t raw -f S16_LE -r 48000 -c 2 -s 1 /dev/zero" "$out" \
+    "B20 the softvol control is declared by the Panel leg's own PCM"
+last="$(printf '%s\n' "$out" | grep -E 'systemctl|amixer' | tail -1)"
+has "sset Bus 60%" "$last" "B20 the level is applied LAST"
+hw_line="$(printf '%s\n' "$out" | grep -n 'sset Speaker 100% unmute' | head -1 | cut -d: -f1)"
+start_line="$(printf '%s\n' "$out" | grep -n 'systemctl start wall-bus-builtin' | head -1 | cut -d: -f1)"
+stop_line="$(printf '%s\n' "$out" | grep -n 'systemctl stop' | tail -1 | cut -d: -f1)"
+{ [ -n "$hw_line" ] && [ -n "$start_line" ] && [ "$stop_line" -lt "$hw_line" ] && [ "$hw_line" -lt "$start_line" ]; } \
+    && pass "B20 every stop precedes the hardware, and the hardware precedes the leg" \
+    || fail "B20 the Panel position was applied out of order"
+eq "builtin" "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["output"])' "$STATE")" \
+    "B20 the position is stored as builtin"
+run volume 35 >/dev/null
+run set speaker >/dev/null
+out="$(run set builtin)"
+has "sset Bus 35%" "$out" "B20 the Panel position remembers its own level"
+out="$(run set speaker)"
+has "systemctl stop wall-bus-builtin.service" "$out" "B20 leaving stops the Panel leg"
+has "amixer -c PCH -q sset Speaker mute" "$out" "B20 and the PCH speaker goes back to mute"
+hasnt "sset Speaker 100%" "$out" "B20 without raising it"
+out="$(run set panel)"
+has "set takes one of" "$out" "B20 panel is a legacy audio mode and never an output"
+# A headset arriving must not take the Panel position away.
+run set builtin >/dev/null
+out="$(run headset add --runtime)"
+eq "builtin" "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["output"])' "$STATE")" \
+    "B20 a headset arriving does not leave the Panel position"
 
 printf '\n%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

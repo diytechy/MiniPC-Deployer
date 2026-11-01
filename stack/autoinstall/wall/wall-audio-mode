@@ -325,7 +325,7 @@ apply_bus() {
     # stored switch position calls for.
     unit disable wall-mic-rear.service wall-bt-call.service \
         wall-bus-speaker.service wall-speaker-out.service \
-        wall-bus-headset.service
+        wall-bus-headset.service wall-bus-builtin.service
     # wall-line-in is the 3.5 mm feed the S/PDIF capture replaces by
     # construction -- one capture stream, one selector position.
     unit disable wall-line-in.service
@@ -353,7 +353,7 @@ case "${1:-}" in
     # The bus-mode forwarders too: they hold dmix/dsnoop segments that the
     # sweep below would otherwise skip as still-attached, which is the
     # stale-segment failure that "looks convincingly like a signal".
-    unit stop wall-spdif-in.service wall-bus-speaker.service         wall-speaker-out.service wall-bus-headset.service
+    unit stop wall-spdif-in.service wall-bus-speaker.service         wall-speaker-out.service wall-bus-headset.service wall-bus-builtin.service
     # bluealsa-aplay IS A CLIENT OF `default` LIKE THE KIOSK, and consequence 1
     # above applies to it word for word: it resolves `default` when it opens a
     # stream, so a connected phone would keep playing into the OLD chain after a
@@ -430,7 +430,7 @@ case "${1:-}" in
   status|"")
     printf 'mode:   %s\n' "$(cat "$MODE_FILE" 2>/dev/null || echo trigger)"
     printf 'chain:  %s\n' "$(readlink -f "$LINK" 2>/dev/null || echo MISSING)"
-    for u in wall-line-in wall-kiosk-loop wall-amp-trigger bluealsa bluealsa-aplay              wall-spdif-in wall-bus-speaker wall-speaker-out wall-bus-headset              wall-headset-present wall-mic-rear wall-bt-call; do
+    for u in wall-line-in wall-kiosk-loop wall-amp-trigger bluealsa bluealsa-aplay              wall-spdif-in wall-bus-speaker wall-speaker-out wall-bus-headset wall-bus-builtin              wall-headset-present wall-mic-rear wall-bt-call; do
         printf '%-18s %-10s %s\n' "$u:" \
             "$(systemctl is-active "$u.service" 2>/dev/null)" \
             "$(systemctl is-enabled "$u.service" 2>/dev/null)"

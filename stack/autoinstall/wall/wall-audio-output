@@ -16,7 +16,7 @@ a unit, a card or a mixer control.
 
 Usage:
   wall-audio-output status
-  wall-audio-output set {mute|headset|speaker}
+  wall-audio-output set {mute|headset|speaker|builtin}
   wall-audio-output input-mute {on|off}
   wall-audio-output volume {0..100|up|down|up:PCT|down:PCT|snap:PCT}
   wall-audio-output volume set:TARGET:MODE:OUTPUT:EXPECT:REVISION
@@ -854,14 +854,15 @@ BUS_CONTROL_INTERVAL_SECONDS = 0.1
 BUS_CONTROL_PREOPEN_AFTER = 5
 # The PCM that DECLARES the softvol for each position. Named here because the
 # pre-open must open the plugin that creates the control, not the bus: `Bus`
-# lives on speaker_out, headset_out and bt_headset_out in asound-bus-mode.conf,
+# lives on speaker_out, headset_out, builtin_out and bt_headset_out in asound-bus-mode.conf,
 # and opening `bus` would create nothing.
 #
 # HEADSET HAS TWO, BECAUSE IT RESOLVES (B4). The pre-open has to open the
 # plugin the LEG will open, or the control is declared on the wrong chain and
 # the level lands nowhere; `bus_control_pcm` below picks, from the one
 # resolution in the policy.
-BUS_CONTROL_PCM = {"speaker": "speaker_out", "headset": "headset_out"}
+BUS_CONTROL_PCM = {"speaker": "speaker_out", "headset": "headset_out",
+                   "builtin": "builtin_out"}
 BUS_CONTROL_PCM_BT_HEADSET = "bt_headset_out"
 
 
@@ -1853,6 +1854,20 @@ def apply_plan(state, applier):
         applier.command(["/usr/bin/amixer", "-c", headset, "-q", "sset", "Mic",
                          "%d%%" % mic_values["headset_capture_percent"]],
                         required=False)
+    # THE PANEL'S OWN SPEAKER (Panel position). In `builtin` the leg owns the
+    # PCH `Speaker` control: it is held at 100 % (0 dB) and UNMUTED, and the
+    # remembered level is applied in software by the shared softvol, so the
+    # rocker works unchanged. In every other position it goes back to MUTE and
+    # its level is left alone -- the chime path unmutes it for a moment at the
+    # Owner's calibrated 65 % and restores whatever it found. Not required: the
+    # codec is always present, but a transient mixer error is a journal line,
+    # not a failed apply (the leg either plays or it does not, and says so).
+    if wanted["builtin_speaker_on"]:
+        applier.command(["/usr/bin/amixer", "-c", builtin, "-q", "sset",
+                         "Speaker", "100%", "unmute"], required=False)
+    else:
+        applier.command(["/usr/bin/amixer", "-c", builtin, "-q", "sset",
+                         "Speaker", "mute"], required=False)
     failures += apply_builtin_capture_controls(wanted, mic_values, builtin, applier)
     # THE REAR PAIR IS RAISED ONLY WHILE A MIC LEG IS MEANT TO RUN, and put back
     # to the 0 the tone era left it at otherwise (coordinator log 2026-09-13

@@ -22,8 +22,17 @@
 #                              cleanly, with the reasons in its journal.
 #   needrestart (manual apt)   evaluates 80-homehub-maintenance-hold.conf, which
 #                              asks the same question and, while held, denies
-#                              every service and container restart. Packages
+#                              every restart needrestart would make. Packages
 #                              still install; the restart waits for a reboot.
+#
+# WHAT IT DOES NOT COVER, so nobody relies on it: a package's own maintainer
+# script still restarts that package's daemon (upgrading docker.io restarts
+# dockerd whatever needrestart says). The scheduled path is unaffected - a held
+# week installs nothing at all - but a MANUAL `apt upgrade` during a hold, or an
+# unattended run that passed the check and is still installing when a protected
+# operation starts, can still restart the daemon being upgraded. Hold off manual
+# upgrades while an operation runs; /usr/sbin/policy-rc.d is the lever if that
+# ever needs enforcing.
 #
 # WHAT HOLDS THE BOX (any one is enough, and every one found is printed):
 #
@@ -51,16 +60,29 @@
 # would look). A usage error is 255 for the same reason: a typo in the drop-in
 # must turn the unit red, not skip patching forever.
 #
+# A HOLD THAT OUTLIVES ITS LIMIT IS ALSO 255. Holds normally end on their own,
+# but an idle GParted window left open, or a backup unit wedged in
+# "deactivating", holds for as long as nobody notices - and a skipped unit is
+# invisible to monitoring, which reports FAILED units. So once the last
+# unattended upgrade (apt's upgrade-stamp) is older than MAX_DAYS, a held check
+# still installs nothing but exits 255, and the unit turns red every week until
+# someone finishes or releases the hold. Waiting must never become silently
+# not patching (SN-052).
+#
 # THE TRADE-OFF, STATED SO IT IS A CHOICE: a held week's patch waits for the
 # next Sunday. After a long operation, `sudo systemctl start
 # apt-daily-upgrade.service` runs it at once.
 set -u
 
 HOLD_DIR=${HOMEHUB_MAINTENANCE_HOLD_DIR:-/run/homehub-maintenance-hold}
+UPGRADE_STAMP=${HOMEHUB_MAINTENANCE_HOLD_STAMP:-/var/lib/apt/periodic/upgrade-stamp}
+MAX_DAYS=${HOMEHUB_MAINTENANCE_HOLD_MAX_DAYS:-14}
 
-# Exact process names (pgrep -x anchors the pattern at both ends). Long-running
-# block movers and checkers only; partclone and fsck are families.
-DISK_TOOLS='gpartedbin|ntfsresize|ntfsclone|resize2fs|e2fsck|e2image|mke2fs|badblocks|ddrescue|partclone\..+|fsck\..+'
+# Exact process names (pgrep -x anchors the pattern at both ends), so the name
+# a tool was RUN as is what counts: mke2fs is usually run as mkfs.ext4. Long
+# block movers, formatters and checkers only; mkfs, partclone and fsck are
+# families. dd is here because it is how a raw disk image is written.
+DISK_TOOLS='gpartedbin|ntfsresize|ntfsclone|mkntfs|resize2fs|e2fsck|e2image|e4defrag|mke2fs|badblocks|ddrescue|dd|pvmove|xfs_repair|partclone\..+|fsck\..+|mkfs\..+'
 
 # Units whose interruption loses work. Glob patterns, as systemctl takes them.
 PROTECTED_UNITS='ext4-* homehub-library-backup.service homehub-backup.service'
@@ -132,8 +154,21 @@ check() {
         return 0
     fi
     printf '%s\n' "$reasons"
+    if age=$(days_since_last_upgrade) && [ "$age" -gt "$MAX_DAYS" ]; then
+        echo "maintenance hold: HELD TOO LONG - the last unattended upgrade was $age days ago (limit $MAX_DAYS)." >&2
+        echo "  Nothing was installed. Finish or release the hold, then: systemctl start apt-daily-upgrade.service" >&2
+        exit 255
+    fi
     echo "maintenance hold: HELD - automatic upgrades and service restarts wait"
     return 1
+}
+
+days_since_last_upgrade() {
+    # No stamp (a box that has never patched) means no age to judge; the hold
+    # then behaves as an ordinary hold rather than inventing an overdue one.
+    [ -f "$UPGRADE_STAMP" ] || return 1
+    stamped=$(stat -c %Y "$UPGRADE_STAMP") || return 1
+    echo $(( ($(date +%s) - stamped) / 86400 ))
 }
 
 hold() {

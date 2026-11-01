@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -54,13 +55,22 @@ def _stub(directory: Path, name: str, body: str) -> None:
 
 
 def run(tmp_path: Path, *args: str, processes: str = "", units: str = "",
-        pgrep_rc: int | None = None, systemctl_rc: int = 0):
+        pgrep_rc: int | None = None, systemctl_rc: int = 0,
+        upgraded_days_ago: float | None = None):
     """Run the guard against stub pgrep/systemctl and a private hold directory.
 
     processes: what `pgrep -a -x` would print ("PID CMDLINE" lines).
     units:     what `systemctl list-units --plain --no-legend` would print.
     pgrep_rc:  force pgrep's exit status (default: 0 if it printed, else 1).
+    upgraded_days_ago: age of apt's upgrade-stamp; None = no stamp at all. The
+               stamp is always a private path, so a dev box's real
+               /var/lib/apt can never change a verdict here.
     """
+    stamp = tmp_path / "upgrade-stamp"
+    if upgraded_days_ago is not None:
+        stamp.touch()
+        stamped = time.time() - upgraded_days_ago * 86400
+        os.utime(stamp, (stamped, stamped))
     stubs = tmp_path / "bin"
     stubs.mkdir(exist_ok=True)
     _write_lf(tmp_path / "processes.txt", processes)
@@ -77,7 +87,8 @@ def run(tmp_path: Path, *args: str, processes: str = "", units: str = "",
           f'cat "{(tmp_path / "units.txt").as_posix()}"\n')
     environment = dict(os.environ,
                        PATH=str(stubs) + os.pathsep + os.environ["PATH"],
-                       HOMEHUB_MAINTENANCE_HOLD_DIR=str(tmp_path / "holds"))
+                       HOMEHUB_MAINTENANCE_HOLD_DIR=str(tmp_path / "holds"),
+                       HOMEHUB_MAINTENANCE_HOLD_STAMP=str(stamp))
     return subprocess.run(["sh", str(SCRIPT), *args], capture_output=True, text=True,
                           env=environment, cwd=str(tmp_path))
 
@@ -99,11 +110,14 @@ def test_a_running_gparted_holds_and_names_itself_sr137(tmp_path):
 def test_the_disk_tool_list_reaches_pgrep_as_one_exact_match_pattern_sr137(tmp_path):
     run(tmp_path, "check")
     pattern = (tmp_path / "pgrep-pattern.txt").read_text().strip()
+    # mke2fs is normally run AS mkfs.ext4, and the process name is the name it
+    # was run as - so the family must be matched, not just the binary.
     for name in ("gpartedbin", "ntfsresize", "ntfsclone", "resize2fs", "e2fsck",
-                 "partclone.ntfs", "fsck.ext4"):
+                 "partclone.ntfs", "fsck.ext4", "mkfs.ext4", "mkfs.ntfs", "mkntfs",
+                 "pvmove", "dd", "e4defrag"):
         # pgrep -x anchors the pattern at both ends; emulate that here.
         assert re.fullmatch(f"(?:{pattern})", name), f"{name} would not hold the box"
-    for name in ("gparted", "rsync", "bash", "e2fsckx"):
+    for name in ("gparted", "rsync", "bash", "e2fsckx", "add", "ddx"):
         assert not re.fullmatch(f"(?:{pattern})", name), f"{name} would hold the box"
 
 
@@ -146,6 +160,25 @@ def test_a_probe_that_cannot_answer_fails_the_unit_rather_than_allowing_it_sr137
 def test_a_pgrep_failure_is_a_probe_error_not_an_empty_answer_sr137(tmp_path):
     done = run(tmp_path, "check", pgrep_rc=3)
     assert done.returncode == 255, done.stdout + done.stderr
+
+
+def test_a_hold_that_outlives_its_limit_turns_the_unit_red_sr137(tmp_path):
+    # A skipped unit is invisible to monitoring; a failed one is reported. An
+    # idle GParted window left open for weeks must not stop patching quietly.
+    done = run(tmp_path, "check", units=GPARTED_UNITS, upgraded_days_ago=20)
+    assert done.returncode == 255, done.stdout + done.stderr
+    assert "20 days" in done.stderr
+    assert "ext4-gparted.service" in done.stdout   # still says WHY it is held
+
+
+def test_a_recent_upgrade_keeps_an_ordinary_hold_sr137(tmp_path):
+    done = run(tmp_path, "check", units=GPARTED_UNITS, upgraded_days_ago=3)
+    assert done.returncode == 1, done.stdout + done.stderr
+
+
+def test_an_overdue_box_that_is_clear_simply_upgrades_sr137(tmp_path):
+    done = run(tmp_path, "check", upgraded_days_ago=60)
+    assert done.returncode == 0, done.stdout + done.stderr
 
 
 def test_a_mistyped_subcommand_fails_the_unit_rather_than_skipping_it_sr137(tmp_path):
@@ -197,9 +230,10 @@ def _eval_needrestart_conf(tmp_path: Path, guard_rc: int) -> str:
     # The same `eval do { ... <> }` needrestart.conf uses to read conf.d.
     program = ("our %nrconf = (override_rc => {}, override_cont => {});"
                "eval do { local(@ARGV, $/) = $ARGV[0]; <> }; die $@ if $@;"
-               "printf qq(rc=%s cont=%s\\n),"
+               "printf qq(rc=%s cont=%s restart=%s\\n),"
                " join(q(,), map { qq($_=$nrconf{override_rc}{$_}) } sort keys %{$nrconf{override_rc}}),"
-               " join(q(,), map { qq($_=$nrconf{override_cont}{$_}) } sort keys %{$nrconf{override_cont}});")
+               " join(q(,), map { qq($_=$nrconf{override_cont}{$_}) } sort keys %{$nrconf{override_cont}}),"
+               " $nrconf{restart} // q(unset);")
     environment = dict(os.environ, HOMEHUB_MAINTENANCE_HOLD_BIN=str(guard))
     done = subprocess.run(["perl", "-e", program, str(NEEDRESTART_CONF)],
                           capture_output=True, text=True, env=environment)
@@ -212,6 +246,8 @@ def test_needrestart_restarts_nothing_while_held_sr137(tmp_path):
     out = _eval_needrestart_conf(tmp_path, guard_rc=1)
     assert "rc=(?^:.)=0" in out, out
     assert "cont=(?^:.)=0" in out, out
+    # The second layer: interactive mode gets a list, not a dialog.
+    assert "restart=l" in out, out
 
 
 @pytest.mark.skipif(shutil.which("perl") is None, reason="perl is absent")
@@ -223,4 +259,4 @@ def test_needrestart_also_restarts_nothing_when_the_guard_cannot_answer_sr137(tm
 @pytest.mark.skipif(shutil.which("perl") is None, reason="perl is absent")
 def test_needrestart_is_untouched_when_the_box_is_clear_sr137(tmp_path):
     out = _eval_needrestart_conf(tmp_path, guard_rc=0)
-    assert out.strip() == "rc= cont=", out
+    assert out.strip() == "rc= cont= restart=unset", out

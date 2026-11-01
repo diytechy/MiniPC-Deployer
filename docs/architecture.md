@@ -1172,9 +1172,12 @@ sequenceDiagram
     T->>S: start
     S->>G: ExecCondition: check
     G->>G: pgrep -x disk tools; systemctl list-units ext4-*, backups; hold files
-    alt held
+    alt held, last upgrade within 14 days
         G-->>S: exit 1 + every reason
         Note over S: skipped (not failed); next Sunday, or start by hand after release
+    else held, last upgrade older than 14 days
+        G-->>S: exit 255 + every reason + the age
+        Note over S: unit FAILED (red, so monitoring sees it); nothing installed
     else probe cannot answer
         G-->>S: exit 255
         Note over S: unit FAILED (red); nothing installed
@@ -1186,8 +1189,8 @@ sequenceDiagram
         alt exit 0
             R->>R: restart services that map an old library
         else not clear
-            R->>R: override_rc / override_cont catch-all 0: list, restart nothing
+            R->>R: override_rc / override_cont catch-all 0, list mode: restart nothing
         end
     end
-    Note over O,R: a manual apt run reaches needrestart the same way and gets the same answer
+    Note over O,R: a manual apt run reaches needrestart the same way and gets the same answer.<br/>NOT covered: a package's maintainer script restarting its own daemon.
 ```

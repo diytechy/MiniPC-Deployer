@@ -1790,6 +1790,35 @@ def apply_builtin_capture_controls(wanted, mic_values, builtin, applier):
         required=bool(wanted["input_muted"]))
 
 
+def record_applied_output(applier, output):
+    """Remember which output the hardware was last left in. ADVISORY, never fatal.
+
+    The record only decides whether a later apply mutes the built-in speaker. If
+    /run is full or read-only the write raises OSError, and that must not escape
+    apply_plan: it would abort the apply after the mic legs were stopped but
+    before the mic observation is recorded, and on entering Panel before the leg
+    starts. So the failure is journalled and the record is REMOVED, which makes
+    the history "unknown" -- and unknown history mutes, the safe answer. If it
+    cannot even be removed the stale value stays; that is the one case this
+    cannot cover, and it is said out loud.
+    """
+    try:
+        write_atomic(APPLIED_OUTPUT_ENV, "%s=%s\n" % (APPLIED_OUTPUT_VAR, output),
+                     mode=0o644, dry_run=applier.dry_run)
+        return True
+    except OSError as exc:
+        log("could not record the applied output (%s): treating the history as "
+            "unknown, so the next apply mutes the built-in speaker" % exc)
+    try:
+        APPLIED_OUTPUT_ENV.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log("and the old record could not be removed (%s): a stale %s may be "
+            "trusted by the next apply" % (exc, APPLIED_OUTPUT_VAR))
+    return False
+
+
 def apply_plan(state, applier, adapter_ok=True):
     """Make the world match `state`. Returns the number of failures.
 
@@ -1902,9 +1931,7 @@ def apply_plan(state, applier, adapter_ok=True):
         # between the two must leave the record saying `builtin`, so that the
         # next leave-builtin apply still mutes; the other order leaves the record
         # on the previous output and a speaker live at 100 % that nothing mutes.
-        write_atomic(APPLIED_OUTPUT_ENV,
-                     "%s=builtin\n" % APPLIED_OUTPUT_VAR,
-                     mode=0o644, dry_run=applier.dry_run)
+        record_applied_output(applier, "builtin")
         applier.command(["/usr/bin/amixer", "-c", builtin, "-q", "sset",
                          "Speaker", "100%", "unmute"], required=False)
     elif previous_output is None or previous_output == "builtin":
@@ -1918,9 +1945,7 @@ def apply_plan(state, applier, adapter_ok=True):
                 "is still live at 100 %; the next apply retries")
     failures += apply_builtin_capture_controls(wanted, mic_values, builtin, applier)
     if not mute_failed and not wanted["builtin_speaker_on"]:
-        write_atomic(APPLIED_OUTPUT_ENV,
-                     "%s=%s\n" % (APPLIED_OUTPUT_VAR, state["output"]),
-                     mode=0o644, dry_run=applier.dry_run)
+        record_applied_output(applier, state["output"])
     # THE REAR PAIR IS RAISED ONLY WHILE A MIC LEG IS MEANT TO RUN, and put back
     # to the 0 the tone era left it at otherwise (coordinator log 2026-09-13
     # 22:50, "adapter rear pair (RL/RR) set to 0 and stored with alsactl"). Two

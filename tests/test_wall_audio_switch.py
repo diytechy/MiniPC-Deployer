@@ -3970,3 +3970,62 @@ def test_the_unmuted_chime_limitation_is_written_down_llr1410():
     assert "crashed mid-chime" in read(ROOT / "docs/design/audio-routing-2026-09-13.md").replace(
         "\n", " ").replace("  ", " ") or "chime process that crashed" in read(
         ROOT / "docs/design/audio-routing-2026-09-13.md").replace("\n", " ")
+
+
+def _broken_record(applier, monkeypatch):
+    real = applier.write_atomic
+
+    def write_atomic(path, text, mode=0o644, dry_run=False):
+        if Path(path) == applier.APPLIED_OUTPUT_ENV:
+            raise OSError(30, "Read-only file system")
+        return real(path, text, mode=mode, dry_run=dry_run)
+
+    monkeypatch.setattr(applier, "write_atomic", write_atomic)
+
+
+def test_an_unwritable_record_does_not_abort_entering_panel_llr1410(applier, policy, monkeypatch):
+    _broken_record(applier, monkeypatch)
+    _applied(applier, "speaker")
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(" ".join(argv))
+        return _Reply(0, "  Front Left: Playback 87 [100%] [0.00dB] [on]\n")
+
+    state = policy.default_state()
+    state["output"] = "builtin"
+    assert applier.apply_plan(state, applier.Applier(run=run)) == 0
+    assert "/usr/bin/systemctl start " + BUILTIN_UNIT in calls, "the Panel leg still starts"
+    assert not applier.APPLIED_OUTPUT_ENV.exists(), \
+        "a stale `speaker` must not survive: unknown history mutes on the next leave"
+    # And leaving Panel afterwards mutes, because the history is now unknown.
+    state["output"] = "speaker"
+    leave = []
+    applier.apply_plan(state, applier.Applier(
+        run=lambda argv, **k: (leave.append(" ".join(argv)), _Reply(0))[1]))
+    assert "/usr/bin/amixer -c PCH -q sset Speaker mute" in leave
+
+
+def test_an_unwritable_record_still_persists_the_mic_observation_llr1410(
+        applier, policy, tmp_path, monkeypatch):
+    _broken_record(applier, monkeypatch)
+    state = policy.default_state()
+    state["output"] = "mute"
+    state["input_muted"] = True
+    state["mic_legs_running"] = False
+    state_file = tmp_path / "audio-state.json"
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(applier, "BOOT_STAMP", tmp_path / "stamp.json")
+    monkeypatch.setattr(applier, "headset_card", lambda *a, **k: None)
+    monkeypatch.setattr(applier, "adapter_present", lambda *a, **k: True)
+    monkeypatch.setattr(applier, "current_mode", lambda: "bus")
+    recorder = applier.Applier(dry_run=True)
+    recorder.capture = lambda argv, timeout=15: "active\n"  # the mic leg will not stop
+    monkeypatch.setattr(applier, "Applier", lambda **_kw: recorder)
+    saved = []
+    real_save = applier.save_state
+    monkeypatch.setattr(applier, "save_state",
+                        lambda st, path, dry_run=False: (saved.append(dict(st)),
+                                                         real_save(st, path, dry_run=dry_run)))
+    assert applier.main(["--state", str(state_file), "--dry-run", "apply-state"]) == 1
+    assert any(entry["mic_legs_running"] is True for entry in saved)

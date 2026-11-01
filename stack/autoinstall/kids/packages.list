@@ -51,6 +51,13 @@ systemd-timesyncd
 libnss-systemd
 systemd-sysv
 libpam-systemd
+# The glib family, for the same reason (export-apt.sh's offline proof,
+# 2026-11-01): baking libglib2.0-0t64 takes the noble-updates build, and the
+# base's libglib2.0-bin and gir1.2-glib-2.0 are strict-versioned against it.
+# Unnamed, apt resolves by REMOVING them, and with them networkd-dispatcher,
+# apport, packagekit and the ubuntu-server metapackage.
+libglib2.0-bin
+gir1.2-glib-2.0
 
 # ── remote management ─────────────────────────────────────────────────────────
 openssh-server

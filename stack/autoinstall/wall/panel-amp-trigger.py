@@ -1273,10 +1273,12 @@ class SpeakerSleep:
         self.reset_unity(now)
 
     def step(self, now, enabled, lit, call, audio, beat=ACTUATOR_RETRY_SECONDS,
-             relay_is_on=False, relay_changed_at=-1e9):
+             *, relay_is_on, relay_changed_at):
         """One tick. `relay_is_on` and `relay_changed_at` are the loop's own
         record of the relay, so the sleep transitions honour the same
-        MIN_ON_SECONDS / MIN_OFF_SECONDS the attack and hold-off rules do."""
+        MIN_ON_SECONDS / MIN_OFF_SECONDS the attack and hold-off rules do. Both are REQUIRED
+        keyword-only arguments on purpose: a default would silently disable
+        the dwell for a caller that forgot them."""
         awake = bool(lit or call)
         if not enabled:
             if self.phase != self.LIT:

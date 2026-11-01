@@ -936,3 +936,30 @@ def test_the_explicit_startup_reset_does_not_depend_on_the_machine_stepping_llr1
     rig.thread.start()
     assert wait_until(lambda: rig.mixer.value == 60)
     rig.stop()
+
+
+def test_the_real_loop_honours_the_dwell_through_a_backlight_flap_llr1437(
+        daemon, monkeypatch):
+    """The call site in main() passes the loop's own relay record to step();
+    a flapping backlight must not cycle the relay faster than the dwells."""
+    rig = daemon
+    monkeypatch.setattr(rig.module, "MIN_ON_SECONDS", 0.6)
+    monkeypatch.setattr(rig.module, "MIN_OFF_SECONDS", 0.5)
+    rig.thread.start()
+    assert wait_until(lambda: rig.world.index_of("relay", "ON") is not None)
+    deadline = time.monotonic() + 4.0
+    lit = True
+    while time.monotonic() < deadline:
+        lit = not lit
+        rig.facts["lit"] = lit
+        time.sleep(0.5 if not lit else 0.3)
+    rig.facts["lit"] = True
+    rig.stop()
+    commands = [(t, d) for t, k, d in rig.world.events
+                if k == "relay" and d in ("ON", "OFF")]
+    # Drop the shutdown OFF, which is not a sleep transition.
+    commands = commands[:-1]
+    assert len([c for c in commands if c[1] == "OFF"]) >= 1, "it did sleep"
+    for (t0, d0), (t1, d1) in zip(commands, commands[1:]):
+        floor = 0.5 if d0 == "OFF" else 0.6
+        assert t1 - t0 >= floor - 0.05, (d0, d1, t1 - t0, commands)

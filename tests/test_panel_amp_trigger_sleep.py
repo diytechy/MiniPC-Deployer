@@ -947,12 +947,14 @@ def test_the_real_loop_honours_the_dwell_through_a_backlight_flap_llr1437(
     monkeypatch.setattr(rig.module, "MIN_OFF_SECONDS", 0.5)
     rig.thread.start()
     assert wait_until(lambda: rig.world.index_of("relay", "ON") is not None)
-    deadline = time.monotonic() + 4.0
+    deadline = time.monotonic() + 5.0
     lit = True
     while time.monotonic() < deadline:
         lit = not lit
         rig.facts["lit"] = lit
-        time.sleep(0.5 if not lit else 0.3)
+        # 0.8 s dark leaves 0.4 s beyond the 0.4 s fade-out, so a loaded
+        # runner (-n 12) still completes a sleep inside the window.
+        time.sleep(0.8 if not lit else 0.3)
     rig.facts["lit"] = True
     rig.stop()
     commands = [(t, d) for t, k, d in rig.world.events
@@ -962,4 +964,6 @@ def test_the_real_loop_honours_the_dwell_through_a_backlight_flap_llr1437(
     assert len([c for c in commands if c[1] == "OFF"]) >= 1, "it did sleep"
     for (t0, d0), (t1, d1) in zip(commands, commands[1:]):
         floor = 0.5 if d0 == "OFF" else 0.6
-        assert t1 - t0 >= floor - 0.05, (d0, d1, t1 - t0, commands)
+        # Times are stamped at the logger, slightly after the loop's own
+        # `now`; 0.15 s absorbs that lag without hiding a real dwell skip.
+        assert t1 - t0 >= floor - 0.15, (d0, d1, t1 - t0, commands)

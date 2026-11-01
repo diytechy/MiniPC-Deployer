@@ -15,9 +15,14 @@ log() { logger -t kids-app -- "$*" 2>/dev/null || echo "[kids-app] $*" >&2; }
 
 fast=0
 while true; do
+    # Twice, a second apart: one failed connect must not end OtterTube for the
+    # whole session (independent review, round 2).
     if ! swaymsg -t get_version >/dev/null 2>&1; then
-        log "sway is gone - stopping"
-        exit 0
+        sleep 1
+        if ! swaymsg -t get_version >/dev/null 2>&1; then
+            log "sway is gone - stopping"
+            exit 0
+        fi
     fi
     if [ ! -x "$APP" ]; then
         log "FATAL: $APP is not executable - OtterTube is NOT INSTALLED; retrying hourly"

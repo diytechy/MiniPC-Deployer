@@ -69,6 +69,27 @@ if [ "$MODE" = tv-at-start ]; then
     finish
 fi
 
+if [ "$MODE" = launcher-killed ]; then
+    # What a getty restart does: the launcher dies WITH sway, so its pkill
+    # backstop never runs and only the scripts' own exit-with-sway protects the
+    # next session (independent review, round 2).
+    swaymsg -q create_output; swaymsg -q 'output HEADLESS-2 resolution 1280x720'; sleep 4
+    mirror_on HEADLESS-2 || bad "TC-1624 [launcher-killed] no mirror to leave behind: $(state)"
+    victims=$( { pgrep -u "$(id -u)" -f '/usr/local/bin/kids-(outputs|app-loop)\.sh|ottertube-desktop'; pgrep -u "$(id -u)" -x wl-mirror; } | tr '\n' ' ')
+    snap=$(ps -o pid=,args= -p "$(echo "$victims" | tr ' ' ',' | sed 's/,$//')" 2>/dev/null)
+    pkill -u "$(id -u)" -f /usr/local/bin/kids-kiosk.sh; pkill -u "$(id -u)" -x sway
+    for _ in $(seq 150); do
+        alive=""; for p in $victims; do kill -0 "$p" 2>/dev/null && alive="$alive $p"; done
+        [ -z "$alive" ] && break; sleep 0.1
+    done
+    if [ -z "$alive" ]; then
+        ok "TC-1624 with the launcher killed too, the scripts, OtterTube and the mirror all ended by themselves ($(echo "$victims" | wc -w) processes)"
+    else
+        bad "TC-1624 [launcher-killed] still alive 15 s later:$alive"; printf '%s\n' "$snap" | grep -wE "$(echo "$alive" | sed 's/^ //; s/ /|/g')" | cut -c1-150
+    fi
+    finish
+fi
+
 sleep 2
 kiosk_ok && ok "TC-1624 OtterTube fullscreen on $TOUCH (setuid sandbox on, as kiosk, via kids-kiosk.sh)" || bad "TC-1624 not fullscreen on $TOUCH: $(state)"
 pid0=$(app_pid)

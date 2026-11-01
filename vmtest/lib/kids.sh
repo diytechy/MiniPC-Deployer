@@ -154,6 +154,15 @@ PY
         mkdir -p "$out_dir/iso-root/deploy-payload/site"
         install -m 0600 "$KIDS_SITE_DIR/kids.env" "$out_dir/iso-root/deploy-payload/site/kids.env"
         log "PRODUCTION: staged site/kids.env (late-command 4a installs it 0600 and deletes the payload copy)"
+        # A warning, not a refusal: the connector name (or the monitor's make,
+        # model and serial) is read off the booted box, so the FIRST stick
+        # cannot know it. Unset, a TV that is on at boot in a lower-sorting
+        # socket takes the kiosk until it is unplugged (independent review).
+        if ! grep -Eq '^KIDS_TOUCH_OUTPUT=..*' "$KIDS_SITE_DIR/kids.env"; then
+            log "WARNING: kids.env sets no KIDS_TOUCH_OUTPUT. With a TV already on at boot the kiosk may"
+            log "  open on the TV. After the first boot, read the touch monitor's name with"
+            log "  'swaymsg -t get_outputs' (as kiosk) and set it in the config, then rebuild or edit kids.env."
+        fi
     else
         log "no site kids.env - the kiosk seeds /etc/kids-kiosk/kids.env from kids.env.example"
     fi

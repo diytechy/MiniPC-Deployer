@@ -108,11 +108,16 @@ reconcile
 ( swaymsg -t subscribe -m '["output"]' 2>/dev/null | while read -r _; do echo; done ) |
 while true; do
     read -r -t 2 _; rc=$?
-    # rc > 128 is the 2 s timeout; any other failure is EOF: sway is gone.
-    if [ "$rc" -ne 0 ] && [ "$rc" -le 128 ]; then
-        log "sway's IPC closed - stopping, and taking this session's mirrors with it"
-        for pidf in "$RUN"/*.pid; do [ -e "$pidf" ] && read -r pid _ < "$pidf" && kill "$pid" 2>/dev/null; done
-        exit 0
-    fi
+    # rc > 128 is the 2 s timeout; any other failure is EOF on the event stream.
+    [ "$rc" -ne 0 ] && [ "$rc" -le 128 ] && break
     reconcile
 done
+# EOF: normally sway is gone. If sway still answers, the SUBSCRIPTION failed;
+# keep the outputs managed by polling rather than leaving the session unmirrored.
+if swaymsg -t get_version >/dev/null 2>&1; then
+    log "WARNING: sway's output events stopped while sway still answers - polling every 2 s instead"
+    while swaymsg -t get_version >/dev/null 2>&1; do sleep 2; reconcile; done
+fi
+log "sway's IPC closed - stopping, and taking this session's mirrors with it"
+for pidf in "$RUN"/*.pid; do [ -e "$pidf" ] && read -r pid _ < "$pidf" && kill "$pid" 2>/dev/null; done
+exit 0

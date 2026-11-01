@@ -53,5 +53,7 @@ runuser -u kiosk -- bash /lib-test/kids-session-scenario.sh main
 FAIL=$((FAIL + $?))
 runuser -u kiosk -- bash /lib-test/kids-session-scenario.sh tv-at-start
 FAIL=$((FAIL + $?))
+runuser -u kiosk -- bash /lib-test/kids-session-scenario.sh launcher-killed
+FAIL=$((FAIL + $?))
 echo "FAILURES=$FAIL"
 [ "$FAIL" -eq 0 ]

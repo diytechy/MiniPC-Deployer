@@ -171,7 +171,11 @@ check() {
         return 0
     fi
     printf '%s\n' "$reasons"
-    if age=$(days_since_last_upgrade) && [ "$age" -gt "$MAX_DAYS" ]; then
+    # An age that cannot be established is "cannot tell", like any other probe:
+    # treating it as an ordinary hold would let a box with no stamp and an
+    # unwritable state directory skip forever (Codex review round 2).
+    age=$(days_since_last_upgrade) || probe_failed "cannot tell how long patching has waited (see above)"
+    if [ "$age" -gt "$MAX_DAYS" ]; then
         echo "maintenance hold: HELD TOO LONG - the last unattended upgrade was $age days ago (limit $MAX_DAYS)." >&2
         echo "  Nothing was installed. Finish or release the hold, then: systemctl start apt-daily-upgrade.service" >&2
         exit 255
@@ -182,19 +186,25 @@ check() {
 
 days_since_last_upgrade() {
     # Called only while held. Prints whole days since apt's upgrade-stamp, or
-    # since the no-stamp baseline (created here on first need); fails only when
-    # neither can be read or made - a non-root `check` run by hand, which then
-    # reports an ordinary hold rather than inventing an age.
+    # since the no-stamp baseline (created here on first need). Fails, with the
+    # cause on stderr, when neither can be read or made; check() turns that into
+    # 255. A non-root `check` on a box with no stamp lands here too, and says so.
     if [ -f "$UPGRADE_STAMP" ]; then
         rm -f "$NO_STAMP_BASELINE" 2>/dev/null
         reference=$UPGRADE_STAMP
     else
         if [ ! -f "$NO_STAMP_BASELINE" ]; then
-            mkdir -p "$STATE_DIR" 2>/dev/null && : > "$NO_STAMP_BASELINE" 2>/dev/null || return 1
+            if ! { mkdir -p "$STATE_DIR" && : > "$NO_STAMP_BASELINE"; } 2>/dev/null; then
+                echo "maintenance hold: no upgrade-stamp, and the baseline $NO_STAMP_BASELINE cannot be created (not root?)" >&2
+                return 1
+            fi
         fi
         reference=$NO_STAMP_BASELINE
     fi
-    stamped=$(stat -c %Y "$reference") || return 1
+    if ! stamped=$(stat -c %Y "$reference" 2>/dev/null); then
+        echo "maintenance hold: cannot read the age of $reference" >&2
+        return 1
+    fi
     echo $(( ($(date +%s) - stamped) / 86400 ))
 }
 

@@ -208,6 +208,17 @@ def test_no_stamp_still_turns_red_when_the_hold_drags_on_sr137(tmp_path):
     assert done.returncode == 255, done.stdout + done.stderr
 
 
+def test_a_baseline_that_cannot_be_recorded_fails_the_unit_sr137(tmp_path):
+    # No stamp AND no way to record a baseline used to read as an ordinary
+    # hold - skipped forever, silently (Codex review round 2). A regular file
+    # where the state directory should be makes the creation fail.
+    (tmp_path / "state").write_text("not a directory")
+    done = run(tmp_path, "check", units=GPARTED_UNITS)
+    assert done.returncode == 255, done.stdout + done.stderr
+    assert "baseline" in done.stderr
+    assert "ext4-gparted.service" in done.stdout   # still says WHY it is held
+
+
 def test_a_real_stamp_wins_and_retires_the_baseline_sr137(tmp_path):
     done = run(tmp_path, "check", units=GPARTED_UNITS,
                upgraded_days_ago=3, baseline_days_ago=30)

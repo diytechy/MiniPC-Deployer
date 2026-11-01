@@ -1148,3 +1148,49 @@ sequenceDiagram
     Note over L: first fully passing run: event "close"
     L->>H: clear "liveness.clear" (default)
 ```
+
+### Patching waits for a maintenance hold (SR-137, LLR-1411, LLR-1412, LLR-1413)
+
+Two callers can restart a running service without anyone asking: the weekly
+unattended upgrade and needrestart after any apt transaction. Both ask the same
+guard first. What is skipped is a week's patch or a restart, never the
+operation being protected; a guard that cannot answer turns the unit red instead
+of guessing.
+
+```mermaid
+sequenceDiagram
+    %% Renders SR-137, LLR-1411, LLR-1412, LLR-1413
+    participant O as Operator
+    participant T as apt-daily-upgrade.timer (Sun 02:30)
+    participant S as apt-daily-upgrade.service
+    participant G as homehub-maintenance-hold
+    participant A as unattended-upgrade / apt
+    participant R as needrestart (80-homehub-maintenance-hold.conf)
+    opt anything the guard cannot recognise
+        O->>G: hold NAME REASON (file in /run/homehub-maintenance-hold)
+    end
+    T->>S: start
+    S->>G: ExecCondition: check
+    G->>G: pgrep -x disk tools; systemctl list-units ext4-*, backups; hold files
+    alt held, first skipped week (last upgrade within 10 days)
+        G-->>S: exit 1 + every reason
+        Note over S: skipped (not failed); next Sunday, or start by hand after release
+    else held, second skipped week or later (older than 10 days; no stamp: counted from the first held run)
+        G-->>S: exit 255 + every reason + the age
+        Note over S: unit FAILED (red, so monitoring sees it); nothing installed
+    else probe cannot answer
+        G-->>S: exit 255
+        Note over S: unit FAILED (red); nothing installed
+    else clear
+        G-->>S: exit 0
+        S->>A: install upgrades
+        A->>R: DPkg::Post-Invoke
+        R->>G: check (again: an operation may have started since)
+        alt exit 0
+            R->>R: restart services that map an old library
+        else not clear
+            R->>R: override_rc / override_cont catch-all 0; EFFECTIVE mode forced to l<br/>(beats -r i and NEEDRESTART_MODE=i): restart nothing
+        end
+    end
+    Note over O,R: a manual apt run reaches needrestart the same way and gets the same answer.<br/>NOT covered: a package's maintainer script restarting its own daemon.
+```

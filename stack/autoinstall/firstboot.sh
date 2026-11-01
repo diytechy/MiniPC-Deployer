@@ -314,9 +314,50 @@ OnCalendar=Sun *-*-* 02:30:00
 RandomizedDelaySec=0
 Persistent=true
 EOF
+# The timer is NOT restarted here: Persistent=true means a restart can fire a
+# missed run at once, and that run must already find the guard below in place.
+
+# THE WINDOW IS NOT ENOUGH ON ITS OWN (SR-137). On 2026-11-01 the Sunday 02:30
+# run upgraded libbrotli1 and needrestart restarted the transient units of a
+# GParted Resize/Move 24h54m into the operation; GParted was terminated
+# mid-move. An operation that runs for days spans every window, so both callers
+# now ask homehub-maintenance-hold first (its header has the rules):
+#   - apt-daily-upgrade.service gets it as an ExecCondition: held = this week's
+#     run is skipped, cleanly, reasons in the journal; a probe error = red unit.
+#   - needrestart gets 80-homehub-maintenance-hold.conf: held = no service or
+#     container restart, for manual apt too.
+# ExecCondition is list-valued and the stock unit has none, so this drop-in ADDS
+# one with no reset - which is the intent: it must never displace a condition a
+# future apt package ships.
+install -m 0755 "$STACK_DIR/autoinstall/homehub-maintenance-hold.sh" /usr/local/sbin/homehub-maintenance-hold
+mkdir -p /etc/systemd/system/apt-daily-upgrade.service.d
+cat > /etc/systemd/system/apt-daily-upgrade.service.d/homehub-maintenance-hold.conf <<'EOF'
+# Installed by firstboot 1d (SR-137). Skip the unattended upgrade while a disk
+# operation, backup or operator hold is in progress: `homehub-maintenance-hold check`.
+[Service]
+ExecCondition=/usr/local/sbin/homehub-maintenance-hold check
+EOF
+if [ -d /etc/needrestart ]; then
+    install -d -m 0755 /etc/needrestart/conf.d
+    install -m 0644 "$STACK_DIR/autoinstall/80-homehub-maintenance-hold.conf" /etc/needrestart/conf.d/80-homehub-maintenance-hold.conf
+    # PROVE it parses: needrestart dies on a conf.d syntax error, and it runs
+    # after every apt transaction, so a broken file would fail them all.
+    if command -v perl >/dev/null 2>&1 \
+        && ! perl -c /etc/needrestart/conf.d/80-homehub-maintenance-hold.conf >/dev/null 2>&1; then
+        rm -f /etc/needrestart/conf.d/80-homehub-maintenance-hold.conf
+        log "WARN: 1d: 80-homehub-maintenance-hold.conf failed perl -c - removed; needrestart will NOT honour the hold"
+    fi
+else
+    log "WARN: 1d: needrestart is not installed - the hold covers the scheduled upgrade only"
+fi
+# ONE reload, then the timer, in this order on purpose: an overdue Persistent
+# timer fires the moment it is (re)started, and on the first boot after a
+# delivery that run must already see the ExecCondition and the needrestart
+# snippet (Codex review 2026-11-01).
 systemctl daemon-reload
+log "1d: maintenance hold installed: $(/usr/local/sbin/homehub-maintenance-hold check 2>&1 | tail -n 1)"
 systemctl restart apt-daily-upgrade.timer 2>/dev/null || true
-log "1d: unattended upgrades -> Sun 02:30 exactly (was daily 06:00 +/-60m); needrestart can only bounce services in that window"
+log "1d: unattended upgrades -> Sun 02:30 exactly (was daily 06:00 +/-60m), and only when the maintenance hold is clear"
 
 # ── 1e. WEEKLY TRIM, WITHOUT THE WEEKLY RED LINE ─────────────────────────────
 # Stock fstrim.timer does real and useful work on the NVMe (33.6 GiB on `/` and

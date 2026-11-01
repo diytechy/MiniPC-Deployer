@@ -18,6 +18,7 @@ Usage:
   wall-audio-output status
   wall-audio-output set {mute|headset|speaker|builtin}
   wall-audio-output input-mute {on|off}
+  wall-audio-output speaker-sleep {on|off}   # fade + relay off with the screen (Speaker only)
   wall-audio-output volume {0..100|up|down|up:PCT|down:PCT|snap:PCT}
   wall-audio-output volume set:TARGET:MODE:OUTPUT:EXPECT:REVISION
         one ABSOLUTE level, applied only while the mode, output, level and
@@ -2198,6 +2199,8 @@ def event_from_arguments(arguments):
         return {"kind": "set_output", "output": arguments.value}
     if arguments.command == "input-mute":
         return {"kind": "set_input_mute", "muted": arguments.value == "on"}
+    if arguments.command == "speaker-sleep":
+        return {"kind": "set_speaker_sleep", "enabled": arguments.value == "on"}
     if arguments.command == "volume":
         if arguments.value in ("up", "down"):
             return {"kind": "nudge_volume", "louder": arguments.value == "up"}
@@ -2294,8 +2297,8 @@ def _volume_value_is_valid(value):
 
 
 ALLOWED_REQUEST_KINDS = frozenset(
-    {"set_output", "set_input_mute", "set_volume", "nudge_volume",
-     "snap_volume"})
+    {"set_output", "set_input_mute", "set_speaker_sleep", "set_volume",
+     "nudge_volume", "snap_volume"})
 
 
 def read_request(path, last_seq=-1, generation=None, epoch_vouched=True):
@@ -2404,8 +2407,9 @@ def main(argv=None):
                         help="the trim values file (a test seam)")
     parser.add_argument("--trim-conf", default=None,
                         help="the rendered ALSA trim file (a test seam)")
-    parser.add_argument("command", choices=("status", "set", "input-mute", "volume",
-                                            "headset", "apply-state", "apply-request",
+    parser.add_argument("command", choices=("status", "set", "input-mute",
+                                            "speaker-sleep", "volume", "headset",
+                                            "apply-state", "apply-request",
                                             "trim", "mic", "mic-allowed"))
     # `trim` and `mic` take a whole table's worth of KEY=VALUE; every other takes
     # at most one word. Parsed as a list here and narrowed below, so that a
@@ -2450,6 +2454,7 @@ def main(argv=None):
         parser.error("--via only means anything for `headset`")
 
     expects_value = {"set": policy.OUTPUTS, "input-mute": ("on", "off"),
+                     "speaker-sleep": ("on", "off"),
                      "headset": ("add", "remove")}
     if arguments.command in expects_value:
         if arguments.value not in expects_value[arguments.command]:

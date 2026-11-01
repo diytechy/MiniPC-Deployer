@@ -37,7 +37,8 @@ DEFAULT_BACKEND_TIMEOUT_SECONDS = 2.0
 MAX_BACKEND_WORKERS = 4
 # The status block that settles each self-reconciling method (see _reconcile).
 OBSERVABLE_BLOCK = {"set_mute": "mute", "set_output": "switch",
-                    "set_input_mute": "switch", "set_volume": "switch"}
+                    "set_input_mute": "switch", "set_volume": "switch",
+                    "set_speaker_sleep": "switch"}
 # The one optional field an action result may carry beyond {"accepted"}: the
 # sequence number the backend minted for this request. See _ensure_safe_result
 # and ECHO_SEQ_FIELD.
@@ -667,7 +668,8 @@ class AudioBroker:
     # it yesterday, which is the right answer on a panel that has not upgraded.
     SWITCH_OPTIONAL_FIELDS = {"generation", "requestSeq",
                               "inputMuteHeld", "inputMutedConfirmed",
-                              "headsetVia", "btHeadsetPresent"}
+                              "headsetVia", "btHeadsetPresent",
+                              "speakerSleepsWithScreen"}
     # What `headsetVia` may say. Null is legal and means "the switch is not on
     # Headset", which is not the same as "Headset resolves to nothing" -- that
     # is `available: false` with `reason: headset_absent`.
@@ -699,6 +701,12 @@ class AudioBroker:
             raise BrokerError("unsafe_backend_result", "headset resolution is invalid")
         if "btHeadsetPresent" in value and not isinstance(value["btHeadsetPresent"], bool):
             raise BrokerError("unsafe_backend_result", "headset resolution is invalid")
+        # SR-140. Null is legal ("this broker could not read it"); anything but
+        # a boolean or null is not a preference.
+        if ("speakerSleepsWithScreen" in value
+                and value["speakerSleepsWithScreen"] is not None
+                and not isinstance(value["speakerSleepsWithScreen"], bool)):
+            raise BrokerError("unsafe_backend_result", "speaker sleep preference is invalid")
         if value["reason"] is not None:
             self._safe_string(value["reason"], 32)
         volume = value["volume"]

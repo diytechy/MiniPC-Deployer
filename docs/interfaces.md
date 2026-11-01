@@ -30,7 +30,7 @@ only the Contract cell's opening words; the CSV holds the contract.
 | **IF-012** | Consumes | OfficeWallNaglight (the panel shell) | Draft | v1 | SR-020 | v1 panel presence signal (SR-020, SN-015). The shell WRITES {$WALL_PRESENCE_FILE} (default … |
 | **IF-013** | Consumes | NagLight | Implemented | v1 | SR-021 | v1 AI-usage gauge feed (SR-021, SN-016). POST {$AI_USAGE_FEED_URL} with kind="gauge" and the tightened … |
 | **IF-014** | Consumes | NagLight | Partial | v1 | SR-022 | v1 weight gauge feed (SR-022, SN-040). POST {$WEIGHT_FEED_URL} with kind="gauge", id="weight" - THE SAME ID … |
-| **IF-015** | Provides | OfficeWallNaglight | Implemented | v1 | SR-023, SR-028, SR-048 | v1 panel-local audio socket at {$WALL_AUDIO_SOCKET}; Unix only, peer-UID checked, mode 0660, bounded … |
+| **IF-015** | Provides | OfficeWallNaglight | Implemented | v1 | SR-023, SR-028, SR-048, SR-140, SR-141 | v1 panel-local audio socket at {$WALL_AUDIO_SOCKET}; Unix only, peer-UID checked, mode 0660, bounded … |
 | **IF-016** | Consumes | OfficeWallNaglight | Implemented | v1 | SR-024 | Private shell artifact capability door-stream-v1 must include doorstream/service.py and doorstream/motion.py. … |
 | **IF-017** | Provides | OfficeWallNaglight | Implemented | v1 | SR-026 | v1 amplifier-activation service boundary: OfficeWallNaglight and Bluetooth deliver audio only to the existing … |
 | **IF-018** | Provides | OfficeWallNaglight | Implemented | v1 | SR-032 | v1 root-owned local setup AF_UNIX socket accepts newline-delimited {method,params} only from the panel uid. … |

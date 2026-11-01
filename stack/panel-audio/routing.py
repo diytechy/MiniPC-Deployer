@@ -17,6 +17,9 @@ MUTATING_METHODS = frozenset(
     {"discover", "cancel", "pair", "connect", "disconnect", "forget",
      "select_input", "select_output", "set_visualizer", "set_mute",
      "set_output", "set_input_mute", "set_volume",
+     # SR-140: the speaker-sleeps-with-screen preference. A switch verb: it
+     # names no device and moves one persisted boolean.
+     "set_speaker_sleep",
      # WSN-024, added with the routed-device backend (Owner, 2026-09-19:
      # "need bluetooth to have a method to trust a device, might need a method
      # to ... turn on discoverability").
@@ -67,7 +70,8 @@ METHODS = MUTATING_METHODS | {"status", "telemetry"}
 # So a pending entry for one of these is resolved by OBSERVING the device rather
 # than by trusting the journal or an operator. See AudioRouter._reconcile.
 SELF_RECONCILING_METHODS = frozenset(
-    {"set_mute", "set_output", "set_input_mute", "set_volume"})
+    {"set_mute", "set_output", "set_input_mute", "set_volume",
+     "set_speaker_sleep"})
 HARDWARE_ADDRESS = re.compile(
     r"(?i)(?<![0-9a-f])(?:(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}|"
     r"(?:[0-9a-f]{2}_){5}[0-9a-f]{2}|(?:[0-9a-f]{4}\.){2}[0-9a-f]{4}|"
@@ -163,6 +167,7 @@ def validate_action(method: str, params: Mapping[str, object]) -> None:
         "set_mute": {"muted"},
         "set_output": {"output"},
         "set_input_mute": {"muted"},
+        "set_speaker_sleep": {"enabled"},
         "set_volume": {"level", "output"},
     }[method]
     if set(params) - allowed:
@@ -179,7 +184,8 @@ def validate_action(method: str, params: Mapping[str, object]) -> None:
         timeout = params.get("timeoutSeconds", 30)
         if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 120:
             raise PolicyError("discovery timeout outside 1..120 seconds")
-    if method in ("set_visualizer", "set_discoverable") and not isinstance(params.get("enabled"), bool):
+    if (method in ("set_visualizer", "set_discoverable", "set_speaker_sleep")
+            and not isinstance(params.get("enabled"), bool)):
         raise PolicyError("enabled must be boolean")
     # Required rather than defaulted, for the same reason `muted` is: a trust
     # request that forgot to say which way is a caller bug, and guessing it
@@ -223,7 +229,8 @@ def validate_action(method: str, params: Mapping[str, object]) -> None:
 
 # The verbs the panel's own switch is made of. They carry no alias, so none of
 # them can reach a Bluetooth device, and none of them is `select_output`.
-SWITCH_METHODS = frozenset({"set_output", "set_input_mute", "set_volume", "set_mute"})
+SWITCH_METHODS = frozenset({"set_output", "set_input_mute", "set_volume", "set_mute",
+                            "set_speaker_sleep"})
 
 
 def switch_only_authorization(method: str, params: Mapping[str, object]) -> bool:

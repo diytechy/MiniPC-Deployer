@@ -8,7 +8,6 @@
 #   vmtest/export-apt.sh --target kids     bakes the closure into an apt repo
 #   kids/user-data late-command 3c         installs FROM that repo
 #   kids/user-data late-command 7          asserts each name is installed
-#   vmtest/assert-installed.sh             asserts each name on the booted kiosk
 #   vmtest/test-kids-session.sh            installs exactly this list in a
 #                                          container, runs ldd on OtterTube and
 #                                          drives the session there

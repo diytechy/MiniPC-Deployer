@@ -77,7 +77,12 @@ else
 fi
 build_prod() { KIDS_SITE_DIR="$1" build render_kids_seed_tree "$REPO_ROOT" "$2" test; }
 variant allowpw 's/allow-pw: false/allow-pw: true/'
-expect_refusal "TC-1628 production refuses allow-pw: true" "allow-pw: true" -- build_prod "$WORK/allowpw" "$WORK/p1"
+expect_refusal "TC-1628 production refuses allow-pw: true" "allow-pw to false" -- build_prod "$WORK/allowpw" "$WORK/p1"
+# YAML 1.1 reads these as true as well; a grep for "true" missed every one.
+variant allowpw_yes 's/allow-pw: false/allow-pw: yes/'
+expect_refusal "TC-1628 production refuses allow-pw: yes" "allow-pw to false" -- build_prod "$WORK/allowpw_yes" "$WORK/p1b"
+variant allowpw_True 's/allow-pw: false/allow-pw: True/'
+expect_refusal "TC-1628 production refuses allow-pw: True" "allow-pw to false" -- build_prod "$WORK/allowpw_True" "$WORK/p1c"
 variant simpin 's/serial: FPT310M8SSD128G_TESTSERIAL/model: Virtual_Disk/'
 expect_refusal "TC-1628 production refuses the SIM disk pin" "Virtual_Disk" -- build_prod "$WORK/simpin" "$WORK/p2"
 variant nowifi 's/^    wifis:$/    ethernets:/'

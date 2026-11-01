@@ -65,12 +65,17 @@ autoinstall:
           "REPLACE_WITH_WIFI_SSID":
             password: "REPLACE_WITH_WIFI_PSK"
 
+  # TWO ACCOUNTS, unlike the panel (independent review, 2026-11-01). This one,
+  # `kidsops`, is the operator's: it holds the SSH key and NOPASSWD sudo
+  # (3c-bis), and nothing runs as it. The kiosk session runs as `kiosk`
+  # (late-command 5b): no sudo, no SSH (3c-ter denies it), a locked password.
+  # OtterTube is a browser that loads remote sites, so its account must not be
+  # one step from root on a machine children use.
   identity:
     hostname: kids-kiosk
     realname: "Kids Kiosk"
-    username: kiosk
-    # Locked: tty1 autologins into the kiosk session (kids-firstboot.sh), which
-    # needs no password, and SSH is key-only.
+    username: kidsops
+    # Locked: SSH is key-only, and the console autologins `kiosk`, not this.
     password: "!"
 
   # install-server: false and sshd still installed - ../user-data has the
@@ -178,7 +183,8 @@ autoinstall:
       T=$(mktemp)
       printf "%s\n" \
         "# Managed by the kids kiosk autoinstall. See kids/user-data 3c-bis." \
-        "kiosk ALL=(ALL) NOPASSWD:ALL" > "$T"
+        "# The operator account only; the kiosk account has no sudo at all." \
+        "kidsops ALL=(ALL) NOPASSWD:ALL" > "$T"
       visudo -cf "$T"
       install -o root -g root -m 0440 "$T" /etc/sudoers.d/90-kids-kiosk-ops
       rm -f "$T"
@@ -197,7 +203,9 @@ autoinstall:
         "PasswordAuthentication no" \
         "KbdInteractiveAuthentication no" \
         "PermitRootLogin no" \
-        "PubkeyAuthentication yes" > "$F"
+        "PubkeyAuthentication yes" \
+        "# The kiosk account runs the browser; a key it planted must not open a door." \
+        "DenyUsers kiosk" > "$F"
       chmod 0644 "$F"
       if sshd -t 2>/tmp/sshd-t.with; then
         echo "kids: $F installed and validated (sshd -t)"
@@ -210,7 +218,7 @@ autoinstall:
         fi
         install -o root -g root -m 0644 /tmp/90-kids-kiosk-hardening.conf "$F"
         echo "kids: WARN - sshd -t cannot run in this chroot (it fails with and without" >&2
-        echo "kids: the drop-in). Keeping it; assert-installed.sh checks sshd -T on the box." >&2
+        echo "kids: the drop-in). Keeping it UNVERIFIED: check sshd -T on the box (nothing here does yet)." >&2
       fi'
 
     # ---- 3d. Remote management: SSH + unattended-upgrades, no Cockpit --------
@@ -249,7 +257,17 @@ autoinstall:
     - install -m 0755 /target/opt/kids-kiosk/stack/autoinstall/kids/kids-outputs.sh /target/usr/local/bin/kids-outputs.sh
     - install -m 0755 /target/opt/kids-kiosk/stack/autoinstall/kids/kids-app-loop.sh /target/usr/local/bin/kids-app-loop.sh
     - curtin in-target --target=/target -- systemctl enable kids-firstboot.service
-    - curtin in-target --target=/target -- usermod -aG video,input,render,audio kiosk
+
+    # ---- 5b. The kiosk account: the session's, and nothing else --------------
+    # No sudo, no SSH (3c-ter), a locked password; the groups the compositor and
+    # audio need. Refuses to finish if it somehow landed in sudo or admin.
+    - >-
+      curtin in-target --target=/target -- bash -c 'set -e;
+      id kiosk >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Kids kiosk session" kiosk;
+      usermod -aG video,input,render,audio kiosk;
+      passwd -l kiosk >/dev/null;
+      if id -nG kiosk | tr " " "\n" | grep -qxE "sudo|admin|adm|lxd"; then echo "kids: FATAL - kiosk is in a privileged group: $(id -nG kiosk)"; exit 1; fi;
+      echo "kids: kiosk account ready ($(id -nG kiosk))"'
 
     # ---- 7. REFUSE TO FINISH AN INSTALL THAT DID NOT PRODUCE ITS ARTIFACTS ----
     # The panel's step 7 (../wall/user-data): every path the kiosk needs, and
@@ -268,6 +286,7 @@ autoinstall:
           echo "kids: FATAL - the install is incomplete. Missing:$missing" >&2
           exit 1
         fi
+        id kiosk >/dev/null 2>&1 || { echo "kids: FATAL - no kiosk account, so tty1 would autologin nobody." >&2; exit 1; }
         L=/opt/kids-kiosk/apt/packages.baked.list
         if [ ! -s "$L" ]; then
           echo "kids: FATAL - $L is absent, so late-command 3c cannot have installed anything." >&2

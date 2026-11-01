@@ -43,6 +43,12 @@ while true; do
     rc=${PIPESTATUS[0]}
     ran=$(( $(date +%s) - started ))
     log "sway exited ($rc) after ${ran}s - restarting"
+    # Sway does not kill what it exec'd. Both scripts stop on their own when
+    # its IPC closes; this is the backstop, so the next session starts with
+    # exactly one of each and OtterTube's single-instance lock is free.
+    pkill -u "$(id -u)" -f '/usr/local/bin/kids-(outputs|app-loop)\.sh' 2>/dev/null
+    pkill -u "$(id -u)" -x wl-mirror 2>/dev/null
+    pkill -u "$(id -u)" -f "^${KIDS_APP_CMD}( |\$)" 2>/dev/null
     if [ "$ran" -lt "$FAST_EXIT_SECS" ]; then fast_exits=$(( fast_exits + 1 )); else fast_exits=0; fi
     if [ "$fast_exits" -ge "$FAST_EXIT_LIMIT" ]; then
         fast_exits=0

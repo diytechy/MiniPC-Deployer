@@ -28,13 +28,31 @@ built-in mirroring: `kids-outputs.sh` starts one `wl-mirror` per extra output
 and kills it when that output goes away, before it touches anything else.
 
 **The touch output** is `KIDS_TOUCH_OUTPUT` in `/etc/kids-kiosk/kids.env`
-(a connector such as `HDMI-A-1`, or "make model serial" as `swaymsg -t
-get_outputs` prints them), else the first active output by name. Plug the touch
-monitor into the lower-numbered HDMI socket, or name it.
+when that output is present: a connector such as `HDMI-A-1`, or better its
+"make model serial" as `swaymsg -t get_outputs` prints them, which follows the
+monitor to whichever socket it is in. Unset, the session keeps the output it
+chose first (STICKY, so a TV plugged in later never takes the kiosk because
+its connector sorts first), and chooses the first active output by name only
+when it has none. **Set it on the real box**: with nothing configured and the
+TV already on at boot, the first-by-name rule can still pick the TV.
+
+**It ends with sway.** Sway does not kill what it exec'd. `kids-outputs.sh`
+and `kids-app-loop.sh` exit when sway's IPC goes away, their output never
+touches sway's stdout, and `kids-kiosk.sh` kills any survivor before starting
+sway again. Without that a dead session left a script spinning a core and held
+the launcher's pipe open: a black screen until reboot (the independent review,
+2026-11-01).
 
 **No key bindings, no Xwayland, no swaynag.** There is nothing to exit to.
 Alt+F4 still closes OtterTube (its own escape hatch); the app loop brings it
 back.
+
+## Two accounts
+
+`kiosk` runs the session and nothing else: no sudo, a locked password, and
+`DenyUsers kiosk` in sshd, because OtterTube is a browser that loads remote
+sites. `kidsops` (the installer's identity user) holds the SSH key and
+NOPASSWD sudo, and nothing runs as it. SSH in as `kidsops`.
 
 ## Configuration
 
@@ -65,8 +83,13 @@ WSL's own filesystem, not `/mnt/c`.
 
 Each session check was mutation-tested on 2026-11-01: dropping the kiosk
 workspace rule, reversing the mirror, not killing a gone TV's mirror,
-overwriting `config.json`, and ignoring `KIDS_TOUCH_OUTPUT` each turned a
-named check red.
+overwriting `config.json`, ignoring `KIDS_TOUCH_OUTPUT`, and removing both
+the outputs script's exit-with-sway and the launcher's backstop each turned a
+named check red. Removing the `>/dev/null` on sway's `exec` lines (with the
+backstop) did NOT: the scripts already exit with sway and release the pipe, so
+that redirect is a second layer no test isolates. The builder's tarball check
+was found by the first real ISO build (a live pipe into `grep -q` under
+pipefail); its test now reproduces that and fails without the fix.
 
 ## NOT proven
 

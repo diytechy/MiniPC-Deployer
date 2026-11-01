@@ -49,7 +49,9 @@ jq -n --arg c "$CATALOG" '{catalog: $c}' > "$cfg"; chown kiosk:kiosk "$cfg"; chm
 if bash /kids/tests/kids-outputs.test.sh > /tmp/unit.log 2>&1; then ok "TC-1627 kids-outputs.test.sh ($(grep -c '^PASS' /tmp/unit.log) checks)"; else bad "TC-1627 kids-outputs.test.sh:"; grep -v '^PASS' /tmp/unit.log; fi
 
 # ── TC-1624..1626: the session, as the kiosk user ─────────────────────────────
-runuser -u kiosk -- bash /lib-test/kids-session-scenario.sh
+runuser -u kiosk -- bash /lib-test/kids-session-scenario.sh main
+FAIL=$((FAIL + $?))
+runuser -u kiosk -- bash /lib-test/kids-session-scenario.sh tv-at-start
 FAIL=$((FAIL + $?))
 echo "FAILURES=$FAIL"
 [ "$FAIL" -eq 0 ]

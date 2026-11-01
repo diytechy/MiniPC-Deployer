@@ -47,8 +47,14 @@ render_kids_seed_tree() {
         # Anchored to ACTIVE settings: the tracked comments quote placeholders.
         grep -Eq '^[[:space:]]*[A-Za-z_"-][^#]*REPLACE_WITH' "$user_data_out" && \
             die "user-data.filled has an ACTIVE setting still holding a REPLACE_WITH placeholder - re-run Materialize-Deploy.ps1 -Image kids."
-        grep -Eq '^[[:space:]]*allow-pw:[[:space:]]*true' "$user_data_out" && \
-            die "user-data.filled sets allow-pw: true - the kiosk is SSH-key-only. Refusing to bake it."
+        # PARSED, not grepped: YAML reads True, yes and on as true too, and a
+        # grep for one spelling is a guard with three holes (independent review).
+        python3 - "$user_data_out" <<'PY' || die "user-data.filled does not set ssh.allow-pw to false - the kiosk is SSH-key-only. Refusing to bake it."
+import sys, yaml
+doc = yaml.safe_load(open(sys.argv[1]))
+ssh = (doc.get("autoinstall", doc) or {}).get("ssh") or {}
+sys.exit(0 if ssh.get("allow-pw") is False else 1)
+PY
         grep -Eq '^[[:space:]]+(path|serial|model|wwn):' "$user_data_out" || \
             die "user-data.filled has no storage.layout match: - the unattended wipe would pick a disk by heuristic."
         grep -Eq '^[[:space:]]+model:[[:space:]]*Virtual_Disk' "$user_data_out" && \

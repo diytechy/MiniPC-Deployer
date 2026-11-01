@@ -5,12 +5,20 @@
 # Started by sway (sway.config). An OtterTube crash or exit (Alt+F4 still
 # closes it) brings it straight back. Three exits inside 15 s back off to one
 # attempt a minute, so a broken build does not spin the CPU.
+#
+# It ends with sway: sway does not kill what it exec'd, and a loop that
+# outlived its compositor would relaunch OtterTube into the next session beside
+# that session's own loop (one single-instance lock, two loops fighting).
 set -u
 APP=${KIDS_APP_CMD:-/opt/kids-kiosk/app/ottertube-desktop}
 log() { logger -t kids-app -- "$*" 2>/dev/null || echo "[kids-app] $*" >&2; }
 
 fast=0
 while true; do
+    if ! swaymsg -t get_version >/dev/null 2>&1; then
+        log "sway is gone - stopping"
+        exit 0
+    fi
     if [ ! -x "$APP" ]; then
         log "FATAL: $APP is not executable - OtterTube is NOT INSTALLED; retrying hourly"
         sleep 3600; continue

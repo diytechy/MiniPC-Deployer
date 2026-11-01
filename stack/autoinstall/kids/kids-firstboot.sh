@@ -29,6 +29,18 @@ failed=0
 log()  { echo "[kids-firstboot] $*"; }
 fail() { log "FAILED: $*"; failed=1; }
 
+# What the running session and journald read. This unit runs on EVERY boot, and
+# restarting getty@tty1 kills a kiosk session that is already up (and, before
+# the session learned to end with sway, left its children spinning: the
+# independent review, 2026-11-01). So each is restarted only when its files
+# actually changed.
+SESSION_FILES="$ROOT$ETC/kiosk.env $ROOT/etc/systemd/system/getty@tty1.service.d/kids-autologin.conf $ROOT/etc/profile.d/zz-kids-kiosk.sh"
+JOURNAL_FILES="$ROOT/etc/systemd/journald.conf.d/90-kids-kiosk.conf"
+# shellcheck disable=SC2086  # word-split on purpose: a list of paths without spaces
+snapshot() { cat $1 2>/dev/null | sha256sum; }
+session_before=$(snapshot "$SESSION_FILES")
+journal_before=$(snapshot "$JOURNAL_FILES")
+
 # ── 0. read kids.env (shell-sourced, like the panel's wall.env) ───────────────
 KIDS_TOUCH_OUTPUT='' KIDS_APP_CMD=/opt/kids-kiosk/app/ottertube-desktop KIDS_OTTERTUBE_CATALOG=''
 if [ -r "$ENV_FILE" ]; then
@@ -134,13 +146,16 @@ else
 fi
 
 # ── apply, unless this is a test against a scratch tree ──────────────────────
+session_changed=no; [ "$(snapshot "$SESSION_FILES")" = "$session_before" ] || session_changed=yes
+journal_changed=no; [ "$(snapshot "$JOURNAL_FILES")" = "$journal_before" ] || journal_changed=yes
+log "session config changed: $session_changed; journald config changed: $journal_changed"
 if [ -z "$ROOT" ]; then
     systemctl daemon-reload
     udevadm control --reload 2>/dev/null || true
-    systemctl restart systemd-journald 2>/dev/null || true
+    [ "$journal_changed" = yes ] && { systemctl restart systemd-journald 2>/dev/null || true; }
     # --no-block: firstboot is itself a unit, and getty@tty1 is ordered after
     # the boot transaction this oneshot is part of.
-    systemctl restart --no-block getty@tty1.service
+    [ "$session_changed" = yes ] && systemctl restart --no-block getty@tty1.service
 fi
 
 if [ "$failed" -eq 0 ]; then

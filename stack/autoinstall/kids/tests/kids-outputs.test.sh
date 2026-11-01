@@ -24,7 +24,7 @@ OUTPUTS='[
  {"name":"DP-1","active":false,"make":"Unknown","model":"Unknown","serial":"Unknown"},
  {"name":"HDMI-A-1","active":true,"make":"Siliconworks","model":"SiW Touch","serial":"0000"}
 ]'
-pick() { printf '%s' "$OUTPUTS" | active_outputs | touch_output "$1"; }
+pick() { printf '%s' "$OUTPUTS" | active_outputs | touch_output "$1" "${2:-}"; }
 
 check "active outputs only, sorted by name" $'HDMI-A-1\nHDMI-A-2' "$(printf '%s' "$OUTPUTS" | active_outputs | cut -f1)"
 check "unset -> the first active output by name" "HDMI-A-1" "$(pick '')"
@@ -32,6 +32,12 @@ check "a connector name is honoured" "HDMI-A-2" "$(pick 'HDMI-A-2')"
 check "make model serial is honoured" "HDMI-A-2" "$(pick 'Samsung Electric Company SAMSUNG 0x01000E00')"
 check "an absent touch output falls back to the first" "HDMI-A-1" "$(pick 'HDMI-A-9')"
 check "an inactive output is never chosen" "HDMI-A-1" "$(pick 'DP-1')"
+# STICKY when nothing is configured: a TV whose connector sorts first must not
+# take the kiosk when it is plugged in after the touch monitor was chosen.
+check "unset, remembered and present -> the remembered one, not the first" "HDMI-A-2" "$(pick '' 'HDMI-A-2')"
+check "unset, remembered but gone -> the first" "HDMI-A-1" "$(pick '' 'HDMI-A-9')"
+check "configured and present beats remembered" "HDMI-A-1" "$(pick 'HDMI-A-1' 'HDMI-A-2')"
+check "configured but absent -> the remembered one" "HDMI-A-2" "$(pick 'HDMI-A-9' 'HDMI-A-2')"
 check "only one output: it, whatever is configured" "HDMI-A-2" \
     "$(printf '%s' '[{"name":"HDMI-A-2","active":true,"make":"a","model":"b","serial":"c"}]' | active_outputs | touch_output 'HDMI-A-1')"
 

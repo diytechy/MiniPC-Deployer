@@ -446,8 +446,8 @@ log "OK — repacked ISO ready: $REPACKED_ISO (BIOS + UEFI boot images intact, /
 # The account and the console story differ per target — the wall autologins
 # into the kiosk on tty1, so a shell there means Ctrl+Alt+F2.
 if [ "$TARGET" = "kids" ]; then
-    log "SSH:     ssh -i $SSH_KEY kiosk@<vm-ip>"
-    log "Console: tty1 runs the KIOSK — use Ctrl+Alt+F2 for a shell, user 'kiosk',"
+    log "SSH:     ssh -i $SSH_KEY kidsops@<vm-ip>   (the kiosk account has no SSH)"
+    log "Console: tty1 runs the KIOSK — use Ctrl+Alt+F2 for a shell, user 'kidsops',"
     log "         SIM password in $CREDS_FILE"
 elif [ "$TARGET" = "wall" ]; then
     log "SSH:     ssh -i $SSH_KEY panel@<vm-ip>"

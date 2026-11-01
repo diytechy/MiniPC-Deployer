@@ -40,7 +40,7 @@ Config:  /etc/wall-panel/audio-state.json   the state (this script owns it)
          /etc/wall-panel/audio-mode         trigger|panel|bus; hardware is only
                                             touched in `bus`
          /etc/wall-panel/audio-cards.env    generated card map
-         /etc/wall-panel/audio-trim.env     the six centre/sub trim values
+         /etc/wall-panel/audio-trim.env     the eight front/centre/sub/back trim values
          /etc/wall-panel/audio-trim.conf    rendered from them, read by ALSA
 Exit:    0 applied (or nothing to do), 1 a refused/failed apply, 2 usage.
 Implements: SR-028, LLR-014
@@ -177,7 +177,7 @@ BUS_CONTROL = "Bus"
 # ── the centre/sub trim (step 3, D4, review finding 8) ─────────────────────
 # Two files, for the same reason audio-cards has two: ALSA reads one and the
 # scripts read the other, and neither has to parse the other's syntax. The env
-# file is the Owner's six numbers; the conf file is the `route` rendered from
+# file is the Owner's eight numbers; the conf file is the `route` rendered from
 # them. Both live in CONF_DIR, so the hermetic suite gets its own pair.
 TRIM_ENV = CONF_DIR / "audio-trim.env"
 TRIM_CONF = CONF_DIR / "audio-trim.conf"
@@ -186,23 +186,39 @@ TRIM_ENV_PREFIX = "WALL_AUDIO_TRIM_"
 # (L+R)/2 mono sum the Owner asked for in D4, expressed as two coefficients
 # rather than one so that the tuning session can make the sum asymmetric if the
 # room turns out to want that.
+#
+# BACK (added 2026-11-01) carries the room's music on the adapter's Back jack,
+# channels 4/5, at the same unity as the front. It is a knob of its own so that
+# `wall-audio-output trim back=0` turns the Back jack off without touching the
+# front. An env file written before this key existed simply lacks it and
+# load_trim hands it the default: an existing panel gains the Back jack on its
+# next boot's `trim --render`, with no edit to its stored numbers.
 TRIM_DEFAULTS = {"front_l": 1.0, "front_r": 1.0,
                  "center_l": 0.5, "center_r": 0.5,
-                 "sub_l": 0.5, "sub_r": 0.5}
-TRIM_KEYS = ("front_l", "front_r", "center_l", "center_r", "sub_l", "sub_r")
+                 "sub_l": 0.5, "sub_r": 0.5,
+                 "back_l": 1.0, "back_r": 1.0}
+TRIM_KEYS = ("front_l", "front_r", "center_l", "center_r", "sub_l", "sub_r",
+             "back_l", "back_r")
 # The convenience names a person actually types at an amplifier: `center=0.35`
 # moves both halves of the mono sum at once and keeps it a sum.
 TRIM_GROUPS = {"front": ("front_l", "front_r"),
                "center": ("center_l", "center_r"),
-               "sub": ("sub_l", "sub_r")}
+               "sub": ("sub_l", "sub_r"),
+               "back": ("back_l", "back_r")}
 # (source channel, destination channel) in the adapter's FIXED 8-channel map
-# FL FR FC LFE RL RR SL SR, measured on the panel. 4..7 are rendered as explicit
-# zeros and have no knob: rear is wired to the desktop's input and must never
-# carry the room's music.
+# FL FR FC LFE RL RR SL SR, measured on the panel. Physical jacks, by ear on the
+# panel 2026-11-01: Front = 0/1, Center/Sub = 2/3, Back = 4/5, Surround (the old
+# adapter's "Side") = 6/7. 6/7 are rendered as explicit zeros and have no knob:
+# that pair is wired to the desktop's line input (the 2026-09-18 pair probe,
+# d439e1e) and must never carry the room's music. 4/5 USED to be in that
+# group, on the strength of the pre-2026-09-18 belief that they were the mic
+# return; that belief was disproved by the same probe, so since 2026-11-01 they
+# carry the music on the Back jack (the `back` knob).
 TRIM_TTABLE = {"front_l": (0, 0), "front_r": (1, 1),
                "center_l": (0, 2), "center_r": (1, 2),
-               "sub_l": (0, 3), "sub_r": (1, 3)}
-TRIM_SILENT_CHANNELS = (4, 5, 6, 7)
+               "sub_l": (0, 3), "sub_r": (1, 3),
+               "back_l": (0, 4), "back_r": (1, 5)}
+TRIM_SILENT_CHANNELS = (6, 7)
 # A coefficient above 1.0 is digital gain on a signal that is already at the
 # bus's full scale, so it clips rather than getting louder. Some headroom is
 # allowed anyway -- a quiet sub on a lazy amplifier input is a real case, and
@@ -226,13 +242,15 @@ MIC_ENV_PREFIX = "WALL_AUDIO_MIC_"
 # with `Internal Mic Boost` 0, and that is what is seeded here so a firstboot
 # re-run agrees with the hardware instead of shouting over it.
 #
-# REAR_LEVEL is the adapter's own per-channel value for channels 4 and 5, on its
-# 0..197 / -36.93..0 dB scale. 66 is what the Owner's bench session set the
-# FRONT pair to, i.e. a level already proven sane out of this adapter's analog
-# section; the rear pair itself sits at 0 today because the tone era put it
-# there (coordinator log, 2026-09-13 22:50) and step 4 is precisely the step
-# that gives those channels a job again. It is a bench number: turn it with
+# REAR_LEVEL is the adapter's own per-channel value for the MIC RETURN pair, on
+# its 0..197 / -36.93..0 dB scale. The pair is channels 6 and 7 (MIC_REAR_CHANNELS
+# below); this comment used to say 4 and 5, which was the pre-2026-09-18 belief
+# the pair probe disproved. 66 is what the Owner's bench session set the FRONT
+# pair to, i.e. a level already proven sane out of this adapter's analog
+# section. It is a bench number: turn it with
 # `wall-audio-output mic rear_level=N` while watching the desktop's input meter.
+# Channels 4/5 are NOT governed by this: they carry music on the Back jack and
+# follow the front level (see set_back_level).
 MIC_DEFAULTS = {"capture_percent": 62, "boost": 0, "headset_capture_percent": 60,
                 "rear_level": 66, "rear_gain": 1.0}
 MIC_INT_KEYS = ("capture_percent", "boost", "headset_capture_percent", "rear_level")
@@ -952,11 +970,12 @@ def set_bus_level(applier, card, level, expected=True, sleep=time.sleep, pcm=Non
 
 
 def load_trim(path=None):
-    """The six trim coefficients, with a note for anything that had to be replaced.
+    """The eight trim coefficients, with a note for anything that had to be replaced.
 
     Field by field, exactly as `policy.normalize` treats the state file and for
-    the same reason: a typo in one number must not throw the other five away and
-    leave the room with no centre channel.
+    the same reason: a typo in one number must not throw the other seven away and
+    leave the room with no centre channel. A key the file lacks (the back keys,
+    on a panel whose env file predates them) takes its default silently.
 
     Inputs:  path: the env file, or None for TRIM_ENV
     Outputs: (dict of TRIM_KEYS -> float, [journal lines])
@@ -1041,10 +1060,15 @@ def render_trim_conf(values):
     # does not reach FR and R does not reach FL.
     lines.append("    ttable.1.0 0.0000  # R does not reach FL: front stays stereo")
     lines.append("    ttable.0.1 0.0000  # L does not reach FR")
+    # The cross terms the back knobs do not name: Back is stereo too, so R does
+    # not reach RL and L does not reach RR.
+    lines.append("    ttable.1.4 0.0000  # R does not reach RL: back stays stereo")
+    lines.append("    ttable.0.5 0.0000  # L does not reach RR")
     for channel in TRIM_SILENT_CHANNELS:
         # Written out rather than left implicit: "silent on purpose" and
-        # "forgotten" must not look the same in a generated file. Rear carries
-        # the desktop's input, and the room's music must never reach it.
+        # "forgotten" must not look the same in a generated file. 6/7 carry the
+        # desktop's line input (measured 2026-09-18), and the room's music must
+        # never reach them.
         lines.append("    ttable.0.%d 0.0000" % channel)
         lines.append("    ttable.1.%d 0.0000" % channel)
     lines.append("}")
@@ -1052,7 +1076,7 @@ def render_trim_conf(values):
 
 
 def render_trim_env(values):
-    """The six coefficients, as the env file the next run reads back."""
+    """The eight coefficients, as the env file the next run reads back."""
     lines = ["# GENERATED by `wall-audio-output trim`. Must agree with audio-trim.conf."]
     for key in TRIM_KEYS:
         lines.append("%s%s=%.4f" % (TRIM_ENV_PREFIX, key.upper(), values[key]))
@@ -1343,7 +1367,7 @@ def parse_adapter_levels(text):
 
 
 def rear_levels(current, level):
-    """The eight values with ONLY channels 4 and 5 moved to `level`.
+    """The eight values with ONLY the mic-return pair (6 and 7) moved to `level`.
 
     The other six are the Owner's bench session (66,66,24,24,*,*,24,24 measured
     2026-09-14) and this function is the promise that they are not touched.
@@ -1375,7 +1399,7 @@ def set_rear_level(applier, adapter, level):
         return True
     # IT REPORTED SUCCESS WHETHER OR NOT THE WRITE LANDED (terra, round 2). The
     # direction decides, exactly as it does for the mute: failing to RAISE the
-    # rear pair is a quiet mic return, while failing to LOWER it leaves the
+    # mic-return pair is quiet, while failing to LOWER it leaves the
     # desktop's input wired to live channels after the leg has gone -- which is
     # the independent hardware barrier this function exists to be.
     lowering = level < max(current[channel] for channel in MIC_REAR_CHANNELS)
@@ -1383,6 +1407,64 @@ def set_rear_level(applier, adapter, level):
                             "numid=%d" % ADAPTER_SPEAKER_NUMID,
                             ",".join(str(value) for value in wanted)],
                            required=lowering) == 0
+
+
+BACK_CHANNELS = (4, 5)
+FRONT_LEVEL_CHANNELS = (0, 1)
+
+
+def back_levels(current):
+    """The eight values with ONLY channels 4 and 5 set equal to channels 0 and 1.
+
+    Pure. Never touches 0-3 or 6/7: 2/3 are the Owner's centre/sub bench trim
+    and 6/7 are the mic return that set_rear_level owns.
+    """
+    wanted = list(current)
+    for back, front in zip(BACK_CHANNELS, FRONT_LEVEL_CHANNELS):
+        wanted[back] = current[front]
+    return wanted
+
+
+def set_back_level(applier, adapter):
+    """Make the Back jack's hardware level (channels 4/5) follow the Front's.
+
+    Read-modify-write exactly like set_rear_level: read all eight values, change
+    only 4 and 5, write the eight back. A read that does not answer eight
+    integers moves NOTHING and says so. Called on every apply with the adapter
+    present, so it holds after boot and after a USB re-enumeration; it is a
+    no-op (no write) when 4/5 already equal 0/1. A refused write is journaled and
+    returned False, but not a counted failure: a quiet Back jack is a degraded room, not a safety fault
+    (the music/mic separation is the generated route's explicit zeros). The
+    write is made `required` only so that Applier.command returns the truth and
+    journals it; apply_plan deliberately ignores the result.
+
+    WHY ALWAYS AND NOT ONLY IN SPEAKER. Nothing feeds channels 4/5 except the
+    speaker route, and only when the Owner is in Speaker; in every other
+    position the adapter is muted or fed only the mic on 6/7. A level on a
+    channel nothing feeds is inert, and applying it unconditionally means the
+    state is the same after any sequence of positions and re-enumerations,
+    where a Speaker-only write would leave a freshly enumerated adapter at
+    whatever it came up with until the next Speaker apply.
+
+    Inputs:  applier: Applier; adapter: the card id
+    Outputs: True if the levels are (now) as wanted, False otherwise
+    Implements: SR-028, LLR-1420
+    """
+    captured = applier.capture(["/usr/bin/amixer", "-c", adapter, "cget",
+                                "numid=%d" % ADAPTER_SPEAKER_NUMID])
+    current = parse_adapter_levels(captured)
+    if current is None:
+        log("the adapter's 8 playback levels could not be read: the Back jack's "
+            "level is left as it is (check `amixer -c %s cget numid=%d`)"
+            % (adapter, ADAPTER_SPEAKER_NUMID))
+        return False
+    wanted = back_levels(current)
+    if wanted == current:
+        return True
+    return applier.command(["/usr/bin/amixer", "-c", adapter, "-q", "cset",
+                            "numid=%d" % ADAPTER_SPEAKER_NUMID,
+                            ",".join(str(value) for value in wanted)],
+                           required=True) == 0
 
 
 def mic_command(arguments, dry_run=False):
@@ -1947,13 +2029,20 @@ def apply_plan(state, applier, adapter_ok=True):
     if not mute_failed and not wanted["builtin_speaker_on"]:
         record_applied_output(applier, state["output"])
     # THE REAR PAIR IS RAISED ONLY WHILE A MIC LEG IS MEANT TO RUN, and put back
-    # to the 0 the tone era left it at otherwise (coordinator log 2026-09-13
-    # 22:50, "adapter rear pair (RL/RR) set to 0 and stored with alsactl"). Two
+    # to 0 otherwise. "The rear pair" here is channels 6/7 (MIC_REAR_CHANNELS),
+    # the measured desktop line-input cable; the 2026-09-13 log wording (RL/RR,
+    # 4/5) predates the 2026-09-18 pair probe. Two
     # independent things therefore have to be wrong at once before the room's
     # music can reach the desktop's input: the generated speaker route's
-    # explicit zeros on channels 4-7, and this level.
+    # explicit zeros on channels 6 and 7, and this level.
     # With the adapter absent there is no card to hold live channels, and the
     # read would fail and be miscounted as "could not return to silence".
+    #
+    # THE BACK JACK'S LEVEL FOLLOWS THE FRONT'S, on every apply with the adapter
+    # present (see set_back_level). Run before set_rear_level; each is its own
+    # read-modify-write so neither can clobber the other's channels.
+    if adapter_ok:
+        set_back_level(applier, adapter)
     if adapter_ok and not set_rear_level(
             applier, adapter,
             mic_values["rear_level"] if wanted["mic_live"] else 0) \

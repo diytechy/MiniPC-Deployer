@@ -271,8 +271,10 @@ has "ttable.0.3 0.5000" "$conf" "B13 the SAME mono sum into the sub"
 has "ttable.1.3 0.5000" "$conf" "B13 and its other half"
 has "ttable.0.0 1.0000" "$conf" "B13 front left at unity"
 has "ttable.1.0 0.0000" "$conf" "B13 front stays stereo: R does not reach FL"
-has "ttable.0.4 0.0000" "$conf" "B13 rear is an explicit zero, not an omission"
-has "ttable.1.7 0.0000" "$conf" "B13 and so is the side pair"
+has "ttable.0.4 1.0000" "$conf" "B13 L reaches the Back jack's RL (music on 4/5 since 2026-11-01)"
+has "ttable.1.5 1.0000" "$conf" "B13 and R reaches RR"
+has "ttable.0.6 0.0000" "$conf" "B13 the surround pair 6/7 is an explicit zero, not an omission"
+has "ttable.1.7 0.0000" "$conf" "B13 and so is its other half"
 
 out="$(trim center=0.35 sub=0.6)"
 has "trim center_l 0.500 -> 0.350" "$out" "B13 a group name moves both halves"
@@ -296,6 +298,12 @@ out="$(trim center=99)"
 has "refused" "$out" "B13 a coefficient that is a wiring problem is refused"
 out="$(trim rear=0.5)"
 has "refused" "$out" "B13 there is no knob for the pair wired to the desktop's input"
+out="$(trim back=0)"
+conf="$(cat "$WALL_PANEL_CONF_DIR/audio-trim.conf")"
+has "ttable.0.4 0.0000" "$conf" "B13 trim back=0 silences the Back jack's RL"
+has "ttable.1.5 0.0000" "$conf" "B13 and its RR"
+has "ttable.0.0 1.0000" "$conf" "B13 without touching the front"
+out="$(trim back=1)"
 
 # B14 — step 4: WHICH MICROPHONE, and when the switch says so.
 # B12 left the switch in Mute, and ITEM J means that latched the input mute. The
@@ -398,14 +406,15 @@ has 'pcm "usb_out_mix"' "$conf" "B17 through the SHARED eight-channel dmix"
 # The desktop's Line In is on the adapter's SIDE jack: the 2026-09-18 pair
 # probe (d439e1e) proved channels 6/7 reach that cable and a tone on the
 # nominal rear pair 4/5 moved nothing, so the "rear" route carries the mic on
-# SL/SR (MIC_REAR_CHANNELS) and 4/5 join the explicit zeros.
+# SL/SR (MIC_REAR_CHANNELS) and 4/5 join the mic route's explicit zeros (they
+# carry the music on the Back jack from 2026-11-01).
 has "ttable.0.6 1.0000" "$conf" "B17 the microphone on SL, the measured Line In pair"
 has "ttable.0.7 1.0000" "$conf" "B17 and identically on SR"
 has "ttable.0.0 0.0000" "$conf" "B17 an EXPLICIT zero on front left"
 has "ttable.0.1 0.0000" "$conf" "B17 and on front right"
 has "ttable.0.2 0.0000" "$conf" "B17 the mic never reaches the centre"
 has "ttable.0.3 0.0000" "$conf" "B17 nor the sub"
-has "ttable.0.4 0.0000" "$conf" "B17 nor the nominal rear pair"
+has "ttable.0.4 0.0000" "$conf" "B17 nor the Back jack (4/5, music since 2026-11-01)"
 has "ttable.0.5 0.0000" "$conf" "B17 either half of it"
 
 out="$(mic capture_percent=30 rear_level=80)"

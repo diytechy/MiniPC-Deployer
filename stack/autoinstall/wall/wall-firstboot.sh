@@ -1462,7 +1462,7 @@ fi
 # ── the centre/sub trim (item 23 step 3, D4, review finding 8) ─────────────
 # INSTALLED ONLY IF ABSENT, exactly like amp-trigger.env and for the same
 # reason: the Owner's tuning session (Owner ruling on finding 8: a dedicated
-# effort after everything else is in) moves these six numbers with
+# effort after everything else is in) moves these eight numbers with
 # `wall-audio-output trim`, and a firstboot re-run must not throw away numbers
 # somebody arrived at by standing in the room and listening. The wall.env knobs
 # below are therefore the values a FRESH panel starts at, not a table this
@@ -1476,9 +1476,11 @@ WALL_AUDIO_TRIM_CENTER_L=${WALL_AUDIO_TRIM_CENTER_L:-0.5}
 WALL_AUDIO_TRIM_CENTER_R=${WALL_AUDIO_TRIM_CENTER_R:-0.5}
 WALL_AUDIO_TRIM_SUB_L=${WALL_AUDIO_TRIM_SUB_L:-0.5}
 WALL_AUDIO_TRIM_SUB_R=${WALL_AUDIO_TRIM_SUB_R:-0.5}
+WALL_AUDIO_TRIM_BACK_L=${WALL_AUDIO_TRIM_BACK_L:-1.0}
+WALL_AUDIO_TRIM_BACK_R=${WALL_AUDIO_TRIM_BACK_R:-1.0}
 EOF
     chmod 0644 /etc/wall-panel/audio-trim.env
-    log "audio: centre/sub trim seeded — front 1.0/1.0, centre and sub 0.5 of each input ((L+R)/2)"
+    log "audio: centre/sub trim seeded — front 1.0/1.0, centre and sub 0.5 of each input ((L+R)/2), back 1.0/1.0"
 fi
 
 # -- the mic knobs (item 23 step 4, spec C, D3, D4) ------------------------
@@ -1492,7 +1494,9 @@ fi
 # the AEC measurement run lowered it live, and it is seeded so that the stored
 # value and the hardware agree instead of fighting.
 #
-# REAR_LEVEL is the adapter's own per-channel value for channels 4 and 5 on its
+# REAR_LEVEL is the adapter's own per-channel value for the mic-return pair
+# (channels 6 and 7, measured 2026-09-18; the Back jack, 4/5, carries music and
+# follows the front level) on its
 # 0..197 scale; 66 is what the Owner's bench session set the FRONT pair to, so
 # it is a level already proven sane out of this adapter's analog section. It is
 # a bench number: turn it with `wall-audio-output mic rear_level=N` while

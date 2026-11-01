@@ -1,5 +1,17 @@
 # Panel audio routing redesign — item 23, 2026-09-13
 
+> **Channel map correction 2026-11-01 (the sections below describe the 2026-09-13/14 view and are kept as history).**
+> Where this document says the speaker route zeroes channels 4-7, or that the
+> mic return is on the rear pair (RL/RR, channels 4/5), read it with this
+> correction. The 2026-09-18 pair probe (`d439e1e`) proved the desktop's line-in
+> cable is on channels 6/7, and on 2026-11-01 the physical jacks were
+> identified by ear: Front 0/1, Center/Sub 2/3, **Back 4/5**, Surround 6/7.
+> Since the `back-jack-music` change the speaker route carries the room's music
+> on Back (4/5, trim keys `back_l`/`back_r`, `trim back=0` turns it off) and
+> zeroes only 6/7; the mic route carries the mic on 6/7 and zeroes 0-5; and
+> the applier keeps the adapter's per-channel level for 4/5 equal to 0/1
+> (`set_back_level`). SR-028, SR-029, LLR-1420..1424.
+
 > **Status 2026-10-19 (supersedes the status line below; this file's path is
 > load-bearing, 14 wall units cite it in `Documentation=`, so it stays put).**
 > Steps 1-5 are merged and live since 2026-09-14: steps 1-3 merged `40ca126`,

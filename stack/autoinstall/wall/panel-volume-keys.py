@@ -196,11 +196,14 @@ TARGETS = {
 CONTROL = "Speaker"
 VOLUME_KCONTROL = "Speaker Playback Volume"
 # The volume control carries ONE VALUE PER CHANNEL, and `amixer sset` writes all
-# of them. That is wrong here (measured 2026-09-12): the rear pair is pinned at
+# of them. That is wrong here (measured 2026-09-12): the rear pair was pinned at
 # 0 dB as the amplifier's trigger line, and a single press of the rocker dragged
 # it from 197 back down to 24 with the front pair, silently disarming the
-# trigger. Only the front pair may move, so this reads the control, changes
-# indices 0 and 1, and writes every channel back.
+# trigger. (The trigger tone was retired 2026-09-13.) Only the front pair may
+# move, so this reads the control, changes indices 0 and 1, and writes every
+# channel back. In the deployed bus mode the rocker moves the softvol, not this
+# control; this physical arm is the rollback path, and there the Back jack
+# (4/5) keeps the level the applier gave it until the next apply.
 FRONT_CHANNELS = (0, 1)
 
 

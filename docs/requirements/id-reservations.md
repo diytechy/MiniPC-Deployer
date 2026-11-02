@@ -30,5 +30,6 @@ truth for what each id means.
 | 2026-10-31 | Panel speakers (the built-in PCH speaker) as a fourth output-switch position `builtin`, system half (branch `panel-speaker-output`) | SR-135..136; LLR-1396..1410; TC-1596..1615 (used: SR-135..136, LLR-1396..1410, TC-1596..1611; IF-015 amended) |
 | 2026-11-01 | Back jack carries the room's music (adapter channels 4/5; branch `back-jack-music`) | LLR-1420..1424; TC-1630..1639 (used: LLR-1420..1424, TC-1630..1638; no new SR - SR-028 and SR-029 amended) |
 | 2026-11-01 | Speakers sleep with the screen: fade stage, relay off with the dark screen, persisted preference (system half; branch `speaker-sleep-with-screen`; the kiosk toggle is OfficeWallNaglight's) | SR-140..141; LLR-1430..1444; TC-1640..1659 (used: SR-140..141, LLR-1430..1437, TC-1640..1655; SR-028, SR-039, LLR-013, LLR-014, LLR-015, LLR-941 and IF-015 amended) |
+| 2026-11-01 | Kids kiosk image: OtterTube on the spare mini-PC with a USB touch monitor, TV mirror (branch `kids-kiosk`) | SN-053; SR-138..139; LLR-1414..1419; TC-1621..1629 (used: all) |
 
 The plan is HomeHub `docs/archive/2026-10-23/IMPLEMENTATION_PLAN_2026-10-22.md`.

@@ -1,0 +1,366 @@
+#cloud-config
+# Ubuntu Server autoinstall (cloud-init) for the KIDS KIOSK — the third image
+# target of this repo, beside the hub (../user-data) and the office wall panel
+# (../wall/user-data). SN-053, SR-138.
+#
+# WHAT IT IS: one USB stick that turns the spare mini-PC (Celeron N3350, 8 GB,
+# Intel HD 500, two HDMI outputs, Wi-Fi) into a kids' touch kiosk running
+# OtterTube full screen on a USB touch monitor. An HDMI TV may be attached as a
+# MIRROR of the touch monitor; unplugging it or switching it off must not
+# affect the kiosk (the Owner, 2026-11-01; SR-139).
+#
+# HOW IT DIFFERS FROM THE WALL PANEL, and why:
+#   - SWAY, NOT CAGE. Cage shows one client and can neither map a touchscreen
+#     to one output nor mirror, so a TV beside the touch monitor would receive
+#     the touches' coordinates. Sway maps touch to the touch output and
+#     kids-outputs.sh runs one wl-mirror per extra output (see ./README.md).
+#   - NOTHING BUT THE KIOSK: no sensors, camera, audio router, media sync,
+#     sleep window, gateway or kiosk site. OtterTube is self-contained: its
+#     videos stream from the sources' own players (HomeHub ruling, 2026-10-24).
+#   - DHCP, not a static address: nothing on the hub allow-lists this machine.
+#
+# The mechanisms it shares with the panel (the payload copy, its permissions,
+# the offline apt install, sudoers, the sshd drop-in, the completeness check,
+# the failure banner) are the panel's, step for step, with the same numbers.
+# Their full reasoning is in ../wall/user-data and ../user-data at the same
+# steps; it is not repeated here.
+#
+# SECURITY: this template ships with PLACEHOLDERS. The identity block, the
+# Wi-Fi credentials, the hub address and the disk serial pin are materialised
+# by HomeHub's secret tooling (Materialize-Deploy.ps1 -Image kids); never commit
+# a filled-in copy. The kiosk is SSH key-only, like every image here.
+
+autoinstall:
+  version: 1
+  interactive-sections: []
+  locale: en_US.UTF-8
+  timezone: REPLACE_WITH_TIMEZONE
+  keyboard:
+    layout: us
+
+  # ── Network: Wi-Fi, DHCP, the hub's resolver ───────────────────────────────
+  # The install itself needs no network (packages: is empty; every deb comes off
+  # the payload, late-command 3c). This block is for the RUNNING kiosk.
+  #
+  # Keyed by the REAL interface name: subiquity renders netplan with networkd,
+  # which refuses `match:` on wifis (../wall/user-data, 2026-09-03). wlp2s0 is
+  # the spare mini-PC's Intel Wireless 7265 at PCI 02:00.0, read from its
+  # 2026-07-28 hardware baseline.
+  #
+  # NAMESERVER IS THE HUB, as on the panel, and for the kids it is the point:
+  # the hub's resolver carries the blocklists, and the hub's own names (the
+  # OtterTube catalogue) resolve split-horizon only there. use-dns: false keeps
+  # the router's resolver from being used beside it.
+  network:
+    version: 2
+    wifis:
+      wlp2s0:
+        dhcp4: true
+        dhcp4-overrides:
+          use-dns: false
+        nameservers:
+          addresses: [REPLACE_WITH_HUB_IP]
+        macaddress: permanent
+        access-points:
+          "REPLACE_WITH_WIFI_SSID":
+            password: "REPLACE_WITH_WIFI_PSK"
+
+  # TWO ACCOUNTS, unlike the panel (independent review, 2026-11-01). This one,
+  # `kidsops`, is the operator's: it holds the SSH key and NOPASSWD sudo
+  # (3c-bis), and nothing runs as it. The kiosk session runs as `kiosk`
+  # (late-command 5b): no sudo, no SSH (3c-ter denies it), a locked password.
+  # OtterTube is a browser that loads remote sites, so its account must not be
+  # one step from root on a machine children use.
+  identity:
+    hostname: kids-kiosk
+    realname: "Kids Kiosk"
+    username: kidsops
+    # Locked: SSH is key-only, and the console autologins `kiosk`, not this.
+    password: "!"
+
+  # install-server: false and sshd still installed - ../user-data has the
+  # argument; late-command 3c installs openssh-server offline and enables it.
+  ssh:
+    install-server: false
+    allow-pw: false
+    authorized-keys:
+      - "ssh-ed25519 AAAA_REPLACE_WITH_YOUR_PUBLIC_KEY you@host"
+
+  # DESTRUCTIVE and unattended. Pinned by MODEL in this public file (a model is
+  # not device-identifying); the materialiser rewrites it to the serial. The
+  # spare mini-PC's disk is a 128 GB SATA SSD (FPT310M8SSD128G, 2026-07-28
+  # baseline), so it enumerates as sd* exactly like the USB stick being booted:
+  # a path: match would be a coin flip on enumeration order.
+  storage:
+    layout:
+      name: lvm
+      match:
+        model: FPT310M8SSD128G
+
+  # EMPTY, DELIBERATELY AND PERMANENTLY - see ../wall/user-data. ./packages.list
+  # is the one list; late-command 3c installs it from the baked repo.
+  packages: []
+
+  late-commands:
+    # ---- 3. Place the payload ------------------------------------------------
+    # Repacked ISO: /cdrom/deploy-payload. Light path: the CIDATA seed, mounted
+    # by label. Absent is FATAL: the units, scripts and the baked apt repo all
+    # come from it.
+    - mkdir -p /target/opt/kids-kiosk
+    - >-
+      bash -c 'set -e;
+      for d in /cdrom /media /media/* /run/media/*; do
+      if [ -d "$d/deploy-payload" ]; then cp -a "$d/deploy-payload/." /target/opt/kids-kiosk/; echo "kids: payload copied from $d/deploy-payload"; exit 0; fi;
+      done;
+      dev=$(blkid -L CIDATA 2>/dev/null || true);
+      if [ -n "$dev" ]; then m=$(mktemp -d);
+      if mount -o ro "$dev" "$m" 2>/dev/null; then
+      if [ -d "$m/deploy-payload" ]; then cp -a "$m/deploy-payload/." /target/opt/kids-kiosk/; echo "kids: payload copied from the CIDATA seed at $dev"; umount "$m"; exit 0; fi;
+      umount "$m"; fi; fi;
+      echo "kids: FATAL - no deploy-payload found. Looked under /cdrom, /media, /run/media/* and on the CIDATA volume ($dev).";
+      echo "kids: the payload carries the baked apt repo - without it this kiosk installs no openssh-server, no sway and no OtterTube.";
+      exit 1'
+
+    # ---- 3a. Decide the payload's PERMISSIONS --------------------------------
+    # Before 3b, so the recursive chmod cannot strip chrome-sandbox's setuid bit.
+    - >-
+      bash -c 'R=/target/opt/kids-kiosk;
+      if [ ! -d "$R" ]; then echo "kids: FATAL - no $R to normalise, though step 3 reported a copy"; exit 1; fi;
+      chown -R 0:0 "$R" || { echo "kids: FATAL - could not take ownership of $R"; exit 1; };
+      chmod -R go-w "$R" || { echo "kids: FATAL - could not clear group/world write on $R"; exit 1; };
+      chmod 0755 "$R";
+      if [ -d "$R/site" ]; then chmod 0700 "$R/site"; find "$R/site" -type f -exec chmod 0600 {} +; fi;
+      bad=$(find "$R" -perm /022 | head -n 5);
+      if [ -n "$bad" ]; then
+      echo "kids: FATAL - $R is STILL group- or world-writable after normalisation:";
+      echo "$bad";
+      exit 1;
+      fi;
+      echo "kids: /opt/kids-kiosk normalised - root-owned, nothing group- or world-writable"'
+
+    # ---- 3b. Unpack OtterTube (SR-138) --------------------------------------
+    # The payload carries vmtest/export-ottertube.sh's tarball at
+    # /opt/kids-kiosk/kids-app/ottertube-*-linux-x64.tar.gz. Unpacked AS ROOT by
+    # tar, because app/chrome-sandbox must arrive root:root 4755: Ubuntu 24.04
+    # closes the unprivileged-userns sandbox, so the setuid helper is
+    # Electron's only route (../wall/user-data 3b).
+    #
+    # ABSENT IS FATAL HERE, unlike the panel: OtterTube is this image's whole
+    # reason to exist, and the builder already refuses an ISO without it.
+    - >-
+      bash -c 'set -e;
+      t=$(ls -1 /target/opt/kids-kiosk/kids-app/ottertube-*-linux-x64.tar.gz 2>/dev/null | head -n1);
+      if [ -z "$t" ]; then echo "kids: FATAL - no OtterTube tarball in the payload (kids-app/ottertube-*-linux-x64.tar.gz)"; exit 1; fi;
+      echo "kids: unpacking $t into /target/opt/kids-kiosk";
+      tar -xzf "$t" -C /target/opt/kids-kiosk;
+      [ -x /target/opt/kids-kiosk/app/ottertube-desktop ] || { echo "kids: FATAL - unpacked but app/ottertube-desktop is not executable"; exit 1; };
+      [ -u /target/opt/kids-kiosk/app/chrome-sandbox ] || { echo "kids: FATAL - chrome-sandbox lost its setuid bit; Electron will refuse to start"; exit 1; };
+      echo "kids: OtterTube installed - $(cat /target/opt/kids-kiosk/app/VERSION 2>/dev/null)"'
+
+    # ---- 3c. INSTALL EVERY PACKAGE, FROM THE PAYLOAD, WITH NO NETWORK --------
+    # The panel's mechanism exactly (../wall/user-data 3c): a local repo inside
+    # the target, nothing written to /etc/apt, --no-remove.
+    - >-
+      curtin in-target --target=/target -- bash -c 'set -e;
+      R=/opt/kids-kiosk;
+      [ -s "$R/apt/Packages" ] || { echo "kids: FATAL - no baked apt repo at $R/apt (no Packages index)."; exit 1; };
+      [ -s "$R/apt/packages.baked.list" ] || { echo "kids: FATAL - $R/apt carries no packages.baked.list, so nothing here knows what to install."; exit 1; };
+      mkdir -p /run/baked-apt/parts;
+      echo "deb [trusted=yes] file://$R/apt ./" > /run/baked-apt/sources.list;
+      APT="-o Dir::Etc::sourcelist=/run/baked-apt/sources.list -o Dir::Etc::sourceparts=/run/baked-apt/parts -o APT::Get::List-Cleanup=0";
+      export DEBIAN_FRONTEND=noninteractive;
+      apt-get $APT update;
+      xargs -a "$R/apt/packages.baked.list" apt-get $APT install -y --no-install-recommends --no-remove;
+      echo "kids: installed $(wc -l < "$R/apt/packages.baked.list") package(s) from the baked repo, with no network at all"'
+    - curtin in-target --target=/target -- systemctl enable ssh
+
+    # ---- 3c-bis. NOPASSWD sudo for the key-only account ----------------------
+    # The cloud-image posture (../wall/user-data 3c-bis): locked password,
+    # key-only SSH, so without this there is no remote root path at all.
+    - |
+      curtin in-target --target=/target -- bash -c '
+      set -e
+      T=$(mktemp)
+      printf "%s\n" \
+        "# Managed by the kids kiosk autoinstall. See kids/user-data 3c-bis." \
+        "# The operator account only; the kiosk account has no sudo at all." \
+        "kidsops ALL=(ALL) NOPASSWD:ALL" > "$T"
+      visudo -cf "$T"
+      install -o root -g root -m 0440 "$T" /etc/sudoers.d/90-kids-kiosk-ops
+      rm -f "$T"
+      echo "kids: /etc/sudoers.d/90-kids-kiosk-ops installed and validated"'
+
+    # ---- 3c-ter. The sshd hardening allow-pw: false never applies ------------
+    # Validated differentially, as on the panel (../wall/user-data 3c-ter).
+    - |
+      curtin in-target --target=/target -- bash -c '
+      set -e
+      D=/etc/ssh/sshd_config.d
+      mkdir -p "$D"
+      F="$D/90-kids-kiosk-hardening.conf"
+      printf "%s\n" \
+        "# Managed by the kids kiosk autoinstall. See kids/user-data 3c-ter." \
+        "PasswordAuthentication no" \
+        "KbdInteractiveAuthentication no" \
+        "PermitRootLogin no" \
+        "PubkeyAuthentication yes" \
+        "# The kiosk account runs the browser; a key it planted must not open a door." \
+        "DenyUsers kiosk" > "$F"
+      chmod 0644 "$F"
+      if sshd -t 2>/tmp/sshd-t.with; then
+        echo "kids: $F installed and validated (sshd -t)"
+      else
+        mv "$F" /tmp/90-kids-kiosk-hardening.conf
+        if sshd -t 2>/dev/null; then
+          echo "kids: FATAL - the sshd hardening drop-in does not parse:" >&2
+          cat /tmp/sshd-t.with >&2
+          exit 1
+        fi
+        install -o root -g root -m 0644 /tmp/90-kids-kiosk-hardening.conf "$F"
+        echo "kids: WARN - sshd -t cannot run in this chroot (it fails with and without" >&2
+        echo "kids: the drop-in). Keeping it UNVERIFIED: check sshd -T on the box (nothing here does yet)." >&2
+      fi'
+
+    # ---- 3d. Remote management: SSH + unattended-upgrades, no Cockpit --------
+    - curtin in-target --target=/target -- bash -c 'echo "unattended-upgrades unattended-upgrades/enable_auto_updates boolean true" | debconf-set-selections'
+    - curtin in-target --target=/target -- dpkg-reconfigure -f noninteractive unattended-upgrades
+    - curtin in-target --target=/target -- systemctl enable unattended-upgrades
+
+    # ---- 3e. Lighten the image ----------------------------------------------
+    - curtin in-target --target=/target -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get purge -y snapd 2>/dev/null || true; apt-get autoremove -y --purge'
+
+    # ---- 4a. Install a pre-filled kids.env if the payload carries one ---------
+    # Installed 0600 root:root and the payload copy DELETED (../wall/user-data
+    # 4a: the payload's owner is the builder's uid, which is 1000 = kiosk).
+    - >-
+      curtin in-target --target=/target -- bash -c 'set -e;
+      s=/opt/kids-kiosk/site/kids.env;
+      if [ ! -f "$s" ]; then echo "kids: no site/kids.env in the payload - step 4 seeds from kids.env.example"; exit 0; fi;
+      install -d -m 0755 /etc/kids-kiosk;
+      install -m 0600 -o root -g root "$s" /etc/kids-kiosk/kids.env;
+      rm -f "$s";
+      rmdir /opt/kids-kiosk/site 2>/dev/null || true;
+      echo "kids: installed /etc/kids-kiosk/kids.env (0600 root:root); payload copy REMOVED"'
+
+    # ---- 4. Seed kids.env from the example if not pre-filled ------------------
+    - curtin in-target --target=/target -- bash -c '[ -f /etc/kids-kiosk/kids.env ] || { install -d -m 0755 /etc/kids-kiosk && install -m 0600 /opt/kids-kiosk/stack/autoinstall/kids/kids.env.example /etc/kids-kiosk/kids.env; }'
+
+    # ---- 5. First-boot unit and the session's scripts -------------------------
+    # kids-firstboot renders the kiosk config and the tty1 autologin once; the
+    # session itself is kids-kiosk.sh (tty1) -> sway -> kids-outputs.sh +
+    # kids-app-loop.sh. The sway config is static; what varies (the touch
+    # output) reaches the session through kiosk.env, which firstboot renders.
+    - install -m 0644 /target/opt/kids-kiosk/stack/autoinstall/kids/kids-firstboot.service /target/etc/systemd/system/kids-firstboot.service
+    - install -D -m 0644 /target/opt/kids-kiosk/stack/autoinstall/kids/sway.config /target/etc/kids-kiosk/sway.config
+    - install -m 0755 /target/opt/kids-kiosk/stack/autoinstall/kids/kids-firstboot.sh /target/usr/local/sbin/kids-firstboot.sh
+    - install -m 0755 /target/opt/kids-kiosk/stack/autoinstall/kids/kids-kiosk.sh /target/usr/local/bin/kids-kiosk.sh
+    - install -m 0755 /target/opt/kids-kiosk/stack/autoinstall/kids/kids-outputs.sh /target/usr/local/bin/kids-outputs.sh
+    - install -m 0755 /target/opt/kids-kiosk/stack/autoinstall/kids/kids-app-loop.sh /target/usr/local/bin/kids-app-loop.sh
+    - curtin in-target --target=/target -- systemctl enable kids-firstboot.service
+
+    # ---- 5b. The kiosk account: the session's, and nothing else --------------
+    # No sudo, no SSH (3c-ter), a locked password; the groups the compositor and
+    # audio need. Refuses to finish if it somehow landed in sudo or admin.
+    - >-
+      curtin in-target --target=/target -- bash -c 'set -e;
+      id kiosk >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Kids kiosk session" kiosk;
+      usermod -aG video,input,render,audio kiosk;
+      passwd -l kiosk >/dev/null;
+      if id -nG kiosk | tr " " "\n" | grep -qxE "sudo|admin|adm|lxd"; then echo "kids: FATAL - kiosk is in a privileged group: $(id -nG kiosk)"; exit 1; fi;
+      echo "kids: kiosk account ready ($(id -nG kiosk))"'
+
+    # ---- 7. REFUSE TO FINISH AN INSTALL THAT DID NOT PRODUCE ITS ARTIFACTS ----
+    # The panel's step 7 (../wall/user-data): every path the kiosk needs, and
+    # every baked package actually installed.
+    - |
+      curtin in-target --target=/target -- bash -c '
+        missing=""
+        for p in /opt/kids-kiosk /usr/sbin/sshd /usr/bin/sway /usr/bin/wl-mirror \
+                 /opt/kids-kiosk/app/ottertube-desktop \
+                 /etc/systemd/system/kids-firstboot.service /usr/local/sbin/kids-firstboot.sh \
+                 /etc/kids-kiosk/sway.config \
+                 /usr/local/bin/kids-kiosk.sh /usr/local/bin/kids-outputs.sh /usr/local/bin/kids-app-loop.sh; do
+          [ -e "$p" ] || missing="$missing $p"
+        done
+        if [ -n "$missing" ]; then
+          echo "kids: FATAL - the install is incomplete. Missing:$missing" >&2
+          exit 1
+        fi
+        id kiosk >/dev/null 2>&1 || { echo "kids: FATAL - no kiosk account, so tty1 would autologin nobody." >&2; exit 1; }
+        L=/opt/kids-kiosk/apt/packages.baked.list
+        if [ ! -s "$L" ]; then
+          echo "kids: FATAL - $L is absent, so late-command 3c cannot have installed anything." >&2
+          exit 1
+        fi
+        notinst=""
+        while read -r pkg; do
+          [ -n "$pkg" ] || continue
+          dpkg-query -W -f=\${Status} "$pkg" 2>/dev/null | grep -q "^install ok installed$" \
+            || notinst="$notinst $pkg"
+        done < "$L"
+        if [ -n "$notinst" ]; then
+          echo "kids: FATAL - the baked repo did not install:$notinst" >&2
+          exit 1
+        fi
+        echo "kids: install completeness check passed ($(wc -l < "$L") baked package(s) installed)."
+      '
+
+  # ── If the install does not run, SAY WHY, on the console ───────────────────
+  # The panel's banner (../wall/user-data), with this machine's words.
+  error-commands:
+    - |
+      {
+        echo
+        echo "=============================================================="
+        echo " THE KIDS KIOSK INSTALL FAILED."
+        echo "=============================================================="
+        echo
+        if grep -q ' /target ' /proc/mounts 2>/dev/null; then
+          TARGET_MOUNTED=yes
+          echo "STATE: /target IS MOUNTED - the target disk HAS been written."
+          echo "       A PARTIAL INSTALL exists; the cause is in the log below."
+        else
+          TARGET_MOUNTED=no
+          echo "STATE: /target is not mounted."
+          echo "       Most likely nothing was written by THIS run."
+        fi
+        echo
+        if [ "$TARGET_MOUNTED" = yes ] && cp -a /var/log/installer /target/var/log/installer-failed 2>/dev/null; then
+          echo "LOGS: saved to /var/log/installer-failed/ ON THE TARGET DISK."
+        else
+          echo "LOGS: could NOT be saved to the target. They are at"
+          echo "      /var/log/installer here and die at reboot. Copy them now."
+        fi
+        echo
+        echo "-- the tail of the installer's own log --"
+        tail -n 25 /var/log/installer/subiquity-server-debug.log 2>/dev/null \
+          || echo "   (no subiquity-server-debug.log - the failure was very early)"
+        echo
+        echo "-- the disk this image expects (its pin, read back from the seed) --"
+        for f in /autoinstall.yaml /cdrom/nocloud/user-data; do
+          [ -f "$f" ] || continue
+          sed -n '/^  storage:/,/^  [a-z]/p' "$f" | grep -E '^ +(serial|model|path|wwn):' && break
+        done
+        echo
+        echo "-- the disks this machine actually reports --"
+        lsblk -dn -o NAME,SIZE,MODEL,SERIAL 2>/dev/null
+        echo
+        echo "-- udev ID_SERIAL per disk (THIS is what 'match: serial' compares) --"
+        for d in /dev/sd? /dev/nvme?n? /dev/mmcblk?; do
+          [ -b "$d" ] || continue
+          echo "   $d  $(udevadm info --query=property --name="$d" 2>/dev/null | sed -n 's/^ID_SERIAL=//p')"
+        done
+        echo
+        if [ "$TARGET_MOUNTED" = no ]; then
+          echo "The internal disk is SATA and enumerates as sd*, exactly like the"
+          echo "USB stick you booted from. Read the sizes."
+          echo
+          echo "TO INSTALL ON THIS MACHINE ANYWAY: reboot, and at the GRUB menu choose"
+          echo "    Install - choose target disk manually (unpinned)"
+          echo "TO LOOK AROUND FIRST: choose 'Diagnostic Shell (no autoinstall)'."
+        fi
+        echo "=============================================================="
+        echo
+      } > /dev/console 2>&1
+
+  shutdown: reboot

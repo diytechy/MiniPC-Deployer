@@ -1,0 +1,5 @@
+# Empty NoCloud meta-data beside the kids kiosk's user-data. A DISTINCT
+# instance-id from the hub and panel images, so cloud-init treats a kiosk as a
+# fresh instance even if the same builder stick was used for another image.
+instance-id: kids-kiosk-001
+local-hostname: kids-kiosk

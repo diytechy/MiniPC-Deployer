@@ -36,6 +36,7 @@
 # Usage:
 #   bash vmtest/build-repacked-iso.sh --src-iso /path/to/ubuntu-24.04.x-live-server-amd64.iso
 #   bash vmtest/build-repacked-iso.sh --target wall --src-iso ...   # the WALL panel image
+#   bash vmtest/build-repacked-iso.sh --target kids --src-iso ...   # the KIDS KIOSK image (SR-138)
 #   bash vmtest/build-repacked-iso.sh --src-iso ... --expected-sha256 <hash from releases.ubuntu.com/24.04/SHA256SUMS>
 #   bash vmtest/build-repacked-iso.sh --src-iso ... --volid HOMEHUB   # ISO volume label
 #   OUT_DIR=/mnt/d/vmtest-out bash vmtest/build-repacked-iso.sh --src-iso ...
@@ -49,6 +50,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
+# shellcheck source=lib/kids.sh
+. "$SCRIPT_DIR/lib/kids.sh"
 
 REPO_ROOT="$(repo_root)"
 SRC_ISO=""
@@ -78,7 +81,8 @@ done
 case "$TARGET" in
     hub)  DEFAULT_OUT="$REPO_ROOT/vmtest/.out";      ISO_NAME="repacked.iso";      DEFAULT_VOLID="HOMEHUB";  DEFAULT_APT_OUT="$REPO_ROOT/vmtest/.out/apt" ;;
     wall) DEFAULT_OUT="$REPO_ROOT/vmtest/.out-wall"; ISO_NAME="wall-repacked.iso"; DEFAULT_VOLID="WALLPANEL"; DEFAULT_APT_OUT="$REPO_ROOT/vmtest/.out-wall/apt" ;;
-    *)    die "--target must be 'hub' or 'wall' (got '$TARGET')" ;;
+    kids) DEFAULT_OUT="$REPO_ROOT/vmtest/.out-kids"; ISO_NAME="kids-repacked.iso"; DEFAULT_VOLID="KIDSKIOSK"; DEFAULT_APT_OUT="$REPO_ROOT/vmtest/.out-kids/apt" ;;
+    *)    die "--target must be 'hub', 'wall' or 'kids' (got '$TARGET')" ;;
 esac
 
 # ── the ISO's own volume label (2026-08-06) ─────────────────────────────────
@@ -152,7 +156,12 @@ mkdir -p "$OUT_DIR"
 
 # ── 1. render the SIM user-data/meta-data/.env + deploy-payload (shared with
 #      build-seed.sh) ────────────────────────────────────────────────────────
-if [ "$TARGET" = "wall" ]; then
+if [ "$TARGET" = "kids" ]; then
+    # SR-138: the kids kiosk. OtterTube is its whole reason to exist, so the
+    # stager REFUSES an ISO without the export-ottertube.sh tarball.
+    render_kids_seed_tree "$REPO_ROOT" "$OUT_DIR" "build-repacked-iso.sh"
+    stage_kids_app_into_payload "$OUT_DIR" "${KIDS_APP_OUT:-$OUT_DIR/kids-app}"
+elif [ "$TARGET" = "wall" ]; then
     render_wall_seed_tree "$REPO_ROOT" "$OUT_DIR" "build-repacked-iso.sh"
     # IF-005: the panel's own half of the shell build.
     stage_wall_shell_into_payload "$OUT_DIR" "$REPO_ROOT"
@@ -436,7 +445,11 @@ log "volume label: $VOLID (in the ISO itself; survives the raw write)"
 log "OK — repacked ISO ready: $REPACKED_ISO (BIOS + UEFI boot images intact, /nocloud + /deploy-payload present)"
 # The account and the console story differ per target — the wall autologins
 # into the kiosk on tty1, so a shell there means Ctrl+Alt+F2.
-if [ "$TARGET" = "wall" ]; then
+if [ "$TARGET" = "kids" ]; then
+    log "SSH:     ssh -i $SSH_KEY kidsops@<vm-ip>   (the kiosk account has no SSH)"
+    log "Console: tty1 runs the KIOSK — use Ctrl+Alt+F2 for a shell, user 'kidsops',"
+    log "         SIM password in $CREDS_FILE"
+elif [ "$TARGET" = "wall" ]; then
     log "SSH:     ssh -i $SSH_KEY panel@<vm-ip>"
     log "Console: tty1 runs the KIOSK — use Ctrl+Alt+F2 for a shell, user 'panel',"
     log "         SIM password in $CREDS_FILE"

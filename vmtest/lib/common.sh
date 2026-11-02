@@ -516,7 +516,7 @@ copy_repo_into_payload() {
         log "WARNING: $repo_root is not a git checkout (or git is absent) — falling back to a"
         log "  WHOLE-WORKTREE copy. Anything gitignored and present will be BAKED INTO THE"
         log "  IMAGE, including stack/.env and stack/provision/.token if they exist here."
-        ( cd "$repo_root" && tar -c --exclude=.git --exclude=vmtest/.out --exclude=vmtest/.out-wall . ) \
+        ( cd "$repo_root" && tar -c --exclude=.git --exclude=vmtest/.out --exclude=vmtest/.out-wall --exclude=vmtest/.out-kids . ) \
             | ( cd "$payload_dir" && tar -x )
     fi
 }
@@ -1694,7 +1694,8 @@ packages_list_path() {
     case "$2" in
         hub)  printf '%s' "$1/stack/autoinstall/packages.list" ;;
         wall) printf '%s' "$1/stack/autoinstall/wall/packages.list" ;;
-        *)    die "packages_list_path: target must be hub or wall (got '$2')" ;;
+        kids) printf '%s' "$1/stack/autoinstall/kids/packages.list" ;;
+        *)    die "packages_list_path: target must be hub, wall or kids (got '$2')" ;;
     esac
 }
 
@@ -1709,7 +1710,8 @@ optional_packages_list_path() {
     case "$2" in
         hub)  f="$1/stack/autoinstall/packages.optional.list" ;;
         wall) f="$1/stack/autoinstall/wall/packages.optional.list" ;;
-        *)    die "optional_packages_list_path: target must be hub or wall (got '$2')" ;;
+        kids) f="$1/stack/autoinstall/kids/packages.optional.list" ;;
+        *)    die "optional_packages_list_path: target must be hub, wall or kids (got '$2')" ;;
     esac
     [ -f "$f" ] && printf '%s' "$f"
 }

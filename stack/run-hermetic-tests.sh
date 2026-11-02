@@ -60,6 +60,9 @@ SUITES=(
     "monitoring/tests/monitoring.test.sh"
     # SN-050 door relay cutover: the panel script's file verbs on a fake tree.
     "door/tests/door-cutover-panel.test.sh"
+    # SN-053 kids kiosk: which output carries OtterTube and touch (the session
+    # itself is vmtest/test-kids-session.sh, which needs docker).
+    "autoinstall/kids/tests/kids-outputs.test.sh"
 )
 
 if [ "${1:-}" = "--list" ]; then

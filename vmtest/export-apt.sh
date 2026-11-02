@@ -82,7 +82,8 @@ done
 case "$TARGET" in
     hub)  : ;;
     wall) : ;;
-    *) die "--target must be hub or wall" ;;
+    kids) : ;;
+    *) die "--target must be hub, wall or kids" ;;
 esac
 [ -n "$OUT" ] || die "need --out <directory>"
 [ -n "$LIST" ] || LIST="$(packages_list_path "$REPO_ROOT" "$TARGET")"

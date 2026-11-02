@@ -23,6 +23,12 @@ Related requirements: [stakeholder-needs.md](requirements/stakeholder-needs.md)
    kiosk compositor, with no Docker, no login, and a nightly sleep window
    (SR-017). It is a **disposable thin client**: reimage-not-repair, held to
    SN-013's lighter bar rather than SN-001's zero-click always-on guarantee.
+3. The **kids kiosk** — the spare mini-PC with a USB touch monitor
+   (`stack/autoinstall/kids/`, SR-138/SR-139): OtterTube's Linux build full
+   screen under **sway** (not cage: touch must be pinned to one output and a TV
+   may mirror it), with an output reconciler that mirrors to any other output
+   and survives the TV going away. No Docker, no hub services; the hub is only
+   its resolver.
 
 The pipeline (ISO assembly, payload bake, secret materialisation, SSH posture) is
 shared; only the target and its `user-data` differ.
@@ -167,6 +173,7 @@ graph LR
 | `stack/caddy/Caddyfile` | reverse-proxy routing + auth model (+ commented tier-2 sites) |
 | `stack/autoinstall/` | Ubuntu autoinstall + first-boot bring-up (the AWOW core) |
 | `stack/autoinstall/wall/` | image target 2 — the wall panel: graphical variant, hardware-quirk fixes, sleep window, burn-in checklist |
+| `stack/autoinstall/kids/` | image target 3 — the kids kiosk: OtterTube under sway, TV mirror (`kids-outputs.sh`); built by `vmtest/export-ottertube.sh` + `build-repacked-iso.sh --target kids` (`vmtest/lib/kids.sh`) |
 | `stack/wall-shell/` | payload dir the kiosk site serves as its document root (the OfficeWallNaglight build; IF-005) |
 | `stack/provision/` | idempotent Technitium provisioning + headless health check |
 | `stack/backup/` | the bash backup service (six-step pipeline, restore, drive power) |

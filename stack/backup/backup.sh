@@ -794,8 +794,26 @@ drive_power_restore() {
     log "drive-power: restoring standby timeout ($STANDBY_VALUE = $(standby_desc "$STANDBY_VALUE")) on exit"
     drive_standby_set "$STANDBY_VALUE" "${BACKUP_DRIVES[@]}"
 }
-# Containers first (a stopped service is the more urgent restore), drives second.
-trap 'quiesce_restore; drive_power_restore' EXIT
+# ── hand the archive to the drive's owner (the ext4 cutover) ─────────────────
+# This service runs as root, so on ext4 everything it writes is root-owned. The
+# Backup share reaches the drive as the forced `filebackup` user, which can read
+# that output through the group and can neither rename nor delete it, so admin
+# could not clean up any archive this produced. Measured on the first run after the
+# cutover, 2026-11-04: all 71 entries root:filebackup. On NTFS ownership is
+# synthesized from the mount and there is nothing to hand over. Runs on EXIT so a
+# failed run's leftovers are handed over too, and never fails the run: the archive
+# is intact either way.
+hand_off_archive() {
+    [ -n "${TARGET_MOUNT:-}" ] && [ "$TARGET_MOUNT" != "/" ] && [ -d "$BACKUP_TARGET" ] || return 0
+    [ "$(findmnt -no FSTYPE --target "$TARGET_MOUNT" 2>/dev/null)" = ext4 ] || return 0
+    local owner
+    owner="$(stat -c '%u:%g' "$TARGET_MOUNT" 2>/dev/null)" || return 0
+    chown -R "$owner" "$BACKUP_TARGET" 2>/dev/null || warn "could not hand $BACKUP_TARGET to $owner; admin cannot clean it up over the Backup share"
+    return 0
+}
+# Containers first (a stopped service is the more urgent restore), drives last, so
+# the hand-off walks a drive that is still spinning.
+trap 'quiesce_restore; hand_off_archive; drive_power_restore' EXIT
 
 log "== AWOW backup run $RUN_TS =="
 if [ "$PLAN_ONLY" = 1 ]; then RUN_MODE=plan; else RUN_MODE=full; fi

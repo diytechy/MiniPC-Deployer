@@ -93,13 +93,14 @@ def test_instrumentation_did_not_disturb_the_destructive_parts(autoinstall):
 
 SELECTOR = (
     'for disk in $(lsblk -dno NAME,TRAN | awk \'$2 == "usb" { print $1 }\'); do '
-    'lsblk -no FSTYPE "/dev/$disk" | grep -qi ntfs || continue; '
+    'lsblk -rno FSTYPE,LABEL "/dev/$disk" | grep -qiE \'^ntfs|^ext4 (Library|PriBackup)$\' || continue; '
     'echo "$disk"; done'
 )
 
 
 def _fake_lsblk(tmp_path):
-    """The hub's real layout: NTFS data drives, ISO boot stick, NVMe target."""
+    """The hub's real layout: ext4 data drives, one with an NTFS partition left,
+    an ISO boot stick with an ext4 partition of its own, and the NVMe target."""
     d = tmp_path / "bin"
     d.mkdir()
     (d / "lsblk").write_text(
@@ -108,9 +109,9 @@ def _fake_lsblk(tmp_path):
         "  printf 'sda usb\nsdb usb\nsdc usb\nnvme0n1 nvme\n'; exit 0\n"
         "fi\n"
         'case "$3" in\n'
-        "  /dev/sda) printf '\nntfs\n' ;;\n"
-        "  /dev/sdb) printf 'iso9660\niso9660\nvfat\next4\n' ;;\n"
-        "  /dev/sdc) printf '\nntfs\n' ;;\n"
+        "  /dev/sda) printf '\next4 Library\n' ;;\n"
+        "  /dev/sdb) printf 'iso9660 Ubuntu\niso9660 Ubuntu\nvfat ESP\next4 casper-rw\n' ;;\n"
+        "  /dev/sdc) printf '\nntfs PriBackup-old\next4 PriBackup\n' ;;\n"
         "  *) printf '\n' ;;\n"
         "esac\n",
         encoding="utf-8",
@@ -122,8 +123,9 @@ def _fake_lsblk(tmp_path):
 def test_the_detach_selector_takes_the_data_drives_and_nothing_else(tmp_path):
     # THE SELECTOR IS THE DANGEROUS PART. "Every USB disk" would eat the stick
     # the installer is running from; anything matching the target would eat the
-    # install. "USB and carries NTFS" is exact: NVMe is not USB, the boot medium
-    # is iso9660/vfat, and only the data drives are NTFS.
+    # install. "USB and carries NTFS or a data-drive ext4 label" is exact: NVMe is
+    # not USB, the boot medium is iso9660/vfat plus perhaps its own ext4, and only
+    # the data drives are NTFS or carry those labels.
     import os
 
     env = dict(os.environ, PATH=f"{_fake_lsblk(tmp_path)}:{os.environ['PATH']}")

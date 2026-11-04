@@ -39,3 +39,13 @@ def test_neither_earlier_fence_waits_for_the_game_fence():
     # dropping a unit from the boot transaction without failing anything.
     assert "homehub-game-isolation.service" not in _after("llm-isolation/homehub-llm-isolation.service")
     assert "homehub-game-isolation.service" not in _after("rustdesk/homehub-rustdesk-isolation.service")
+
+
+def test_the_relay_reasserts_the_fence_after_its_precheck():
+    # tailscaled inserts ts-input above the fence after the fence has run, and the
+    # relay's postcheck requires the fence to be first. Without firstboot to restart
+    # it, only this line puts it back before the relay starts.
+    text = (STACK / "game-isolation/homehub-gunmaster3-relay.service").read_text(encoding="utf-8")
+    pre = re.findall(r"^ExecStartPre=(.*)$", text, flags=re.M)
+    assert pre[-1].endswith("game-isolation/game-isolation.sh"), pre
+    assert any(line.endswith("gunmaster3-relay.sh precheck") for line in pre[:-1]), pre

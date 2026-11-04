@@ -47,6 +47,17 @@ After=network-online.target docker.service homehub-backup.service
 
 [Service]
 Type=oneshot
+# THE SCHEDULE IS OFF UNTIL THE KNOB SAYS OTHERWISE (SR-142). Late-command 5c
+# enables the timer on every image and 5d asserts it, because an enabled timer is
+# what defect 22 found missing. So the decision lives here: a timer firing with
+# FILEBACKUP_TIMER_ENABLED anything but exactly `true` is a clean `condition not
+# met` skip, the shape homehub-gunmaster3-relay.service uses. Without this a
+# reimage arms a library backup at 03:00 with FILEBACKUP_MEM_LIMIT at 0, against
+# whichever image the sibling checkout baked (HomeHub open-items E13, C110).
+# Turning it on is the cutover's last step (README "The layout knob"); the
+# cutover's first run calls the wrapper directly, so it does not pass through
+# here. A .env that cannot be read skips too, the safe direction for this unit.
+ExecCondition=/bin/sh -c 'grep -qx FILEBACKUP_TIMER_ENABLED=true /opt/homehub/stack/.env'
 ExecStart=/opt/homehub/stack/backup/library-backup.sh
 User=root
 # THE FIRST REAL RUN IS A MULTI-DAY JOB. ~2 TiB over USB, hashed per file. The

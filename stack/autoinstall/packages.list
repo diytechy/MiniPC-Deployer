@@ -155,6 +155,11 @@ wakeonlan             # WoL magic packet - bash /dev/udp is refused on this kern
 #   it was a missing package. (ntfs-3g already brings ntfsfix for the library.)
 exfatprogs            # fsck.exfat / exfatlabel for the backup drive's filesystem
 
+# acl — setfacl and getfacl. The ext4 data drives carry default ACLs on their roots
+#   (storage-map §1a), and provision-mounts.sh sets them. The hub had no setfacl when
+#   the cutover needed it, 2026-11-02.
+acl                   # setfacl for the ext4 volume roots
+
 # smartmontools — nothing on this box could read a drive's health. The design
 #   runs two drive-health timers and C3 asks whether the USB enclosures honour
 #   hdparm standby; none of that can see reallocated sectors, pending sectors or

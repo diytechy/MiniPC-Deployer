@@ -1367,7 +1367,7 @@ render_seed_tree() {
         # a hub that ships without one degrades to js/config.js defaults in
         # total silence (loadConfig never throws). OI-20.
         local site_required=".env backup.env smb.conf.fragment library-mounts.fstab config.json"
-        local site_optional="cifs.creds samba-users.creds drive-identity.conf"
+        local site_optional="cifs.creds samba-users.creds drive-identity.conf drive-baseline.conf"
 
         # REFUSE BEFORE STAGING, on the FILES rather than on a count.
         # This used to be `staged > 0` over a list that INCLUDED

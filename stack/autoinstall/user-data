@@ -278,15 +278,17 @@ autoinstall:
     #    hook. The kernel forgets the device; the disk is untouched and returns
     #    on the next boot, which is why the installed system still mounts it.
     #
-    #    THE SELECTOR IS "USB AND CARRIES NTFS", and that is deliberately exact:
-    #    the install target is NVMe (never matched), the boot medium is
-    #    iso9660/vfat (never matched), and only the data drives are NTFS. A
-    #    selector like "every USB disk" would eat the stick the installer is
-    #    running from.
+    #    THE SELECTOR IS "USB AND CARRIES NTFS OR A DATA-DRIVE EXT4 LABEL", and
+    #    that is deliberately exact: the install target is NVMe (never matched),
+    #    the boot medium is iso9660/vfat (never matched), and the data drives are
+    #    NTFS or labelled ext4 since the 2026-11 cutover. EXT4 ALONE IS NOT A
+    #    SELECTOR: a boot stick can carry an ext4 partition of its own, so only
+    #    the storage-map labels count. A selector like "every USB disk" would eat
+    #    the stick the installer is running from.
     - |
       {
         for disk in $(lsblk -dno NAME,TRAN | awk '$2 == "usb" { print $1 }'); do
-          lsblk -no FSTYPE "/dev/$disk" | grep -qi ntfs || continue
+          lsblk -rno FSTYPE,LABEL "/dev/$disk" | grep -qiE '^ntfs|^ext4 (Library|PriBackup)$' || continue
           echo 1 > "/sys/block/$disk/device/delete"
         done
       } 2>/dev/null || true
@@ -864,6 +866,7 @@ autoinstall:
       "smb.conf.fragment:/target/etc/homehub-samba/smb.conf.fragment:required"
       "library-mounts.fstab:/target/etc/homehub-samba/library-mounts.fstab:required"
       "drive-identity.conf:/target/etc/homehub-samba/drive-identity.conf:optional"
+      "drive-baseline.conf:/target/etc/homehub-samba/drive-baseline.conf:optional"
       "ottertube-list.json:/target/opt/homehub/stack/ottertube/config/list.json:optional"; do
       f=${spec%%:*}; rest=${spec#*:}; d=${rest%:*}; kind=${rest##*:};
       if [ ! -f "$S/$f" ]; then

@@ -8,11 +8,15 @@
 # consumer downstream — Samba shares, MEDIA_ROOT, the backup source paths —
 # was pointing at nothing.
 #
-# INPUT  /etc/homehub-samba/library-mounts.fstab  (generated from storage-map §1,
+# INPUT  /etc/homehub-samba/library-mounts.fstab  (generated from storage-map §1a,
 #        carried on the USB payload as site/library-mounts.fstab)
+#        /etc/homehub-samba/drive-baseline.conf  (ownership of each ext4 volume root)
 #
-# IDEMPOTENT: a line whose mountpoint is already in /etc/fstab is left alone.
-# Safe to re-run; it never rewrites or reorders existing entries.
+# IDEMPOTENT: a line whose mountpoint is already in /etc/fstab is left alone, with
+# ONE exception: a row whose filesystem type is stale. A box that cut over to ext4
+# by hand, or a drive reformatted under an old row, has `auto` and NTFS options
+# where ext4 refuses them. That row is replaced, and only once the drive itself
+# has been read and really is the new type.
 #
 # NOT FATAL when a drive is absent. `nofail` is in the generated options for
 # the same reason: a headless always-on box must boot without its USB drives
@@ -20,6 +24,8 @@
 set -euo pipefail
 
 FSTAB_FRAGMENT="/etc/homehub-samba/library-mounts.fstab"
+FSTAB="${FSTAB:-/etc/fstab}"
+DRIVE_BASELINE="${DRIVE_BASELINE:-/etc/homehub-samba/drive-baseline.conf}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --fragment) FSTAB_FRAGMENT="$2"; shift 2 ;;
@@ -79,7 +85,59 @@ wait_for_mount_spec() {
     return 1
 }
 
+# replace_stale_row MOUNTPOINT LINE DEVICE — swap an existing fstab row for the
+# fragment's when their types differ AND the device really carries the fragment's
+# type. Reading the device is the point: a row is only stale if the drive moved on.
+# An `auto` row in the fragment says nothing a device could confirm, so it never
+# replaces anything. Returns 0 when the row was replaced.
+replace_stale_row() {
+    local mnt="$1" line="$2" device="$3" have want actual tmp
+    want="$(printf '%s' "$line" | awk '{print $3}')"
+    have="$(awk -v m="$mnt" '!/^[[:space:]]*#/ && $2 == m { print $3 }' "$FSTAB" | tail -n 1)"
+    [ -n "$have" ] && [ "$have" != "$want" ] && [ "$want" != auto ] || return 1
+    actual="$(blkid -c /dev/null -p -s TYPE -o value "$device" 2>/dev/null || true)"
+    if [ "$actual" != "$want" ]; then
+        log "WARN: fstab has type $have for $mnt, the map says $want, and the drive reads '${actual:-unknown}' — row left alone."
+        return 1
+    fi
+    # EVERY STEP IS CHECKED BY HAND: this runs as an `if` condition, where `set -e`
+    # is off, so a failed mv would otherwise fall through to the success line.
+    if tmp="$(mktemp "$FSTAB.XXXXXX")"        && awk -v m="$mnt" -v l="$line" '!/^[[:space:]]*#/ && $2 == m { print l; next } { print }' "$FSTAB" > "$tmp"        && chmod 0644 "$tmp"        && mv -f -- "$tmp" "$FSTAB"; then
+        log "fstab: replaced the stale $have row for $mnt with the $want row"
+    else
+        rm -f -- "${tmp:-}"
+        log "WARN: could not replace the stale $have row for $mnt — it needs fixing by hand."
+        return 1
+    fi
+}
+
+# apply_volume_baseline MOUNTPOINT — set the root of a MOUNTED ext4 volume from
+# drive-baseline.conf. The root only, never a walk: the tree keeps its own
+# ownership across a reimage, and new files inherit through setgid and the default
+# ACL. Without this a freshly formatted drive is root:root 0755, so every household
+# and backup write is refused while the mount reads as healthy.
+apply_volume_baseline() {
+    local mnt="$1" row uid gid mode acl
+    if [ ! -f "$DRIVE_BASELINE" ]; then
+        log "WARN: no $DRIVE_BASELINE — $mnt keeps whatever ownership it has."
+        return 1
+    fi
+    row="$(awk -F'\t' -v m="$mnt" '!/^#/ && $1 == m { print; exit }' "$DRIVE_BASELINE")"
+    if [ -z "$row" ]; then
+        log "WARN: $DRIVE_BASELINE has no row for $mnt — it keeps whatever ownership it has."
+        return 1
+    fi
+    IFS=$'\t' read -r _ uid gid mode acl <<< "$row"
+    if chown "$uid:$gid" "$mnt" && chmod "$mode" "$mnt" && setfacl -m "$acl" "$mnt"; then
+        log "$mnt baseline: $uid:$gid mode $mode, default ACL $acl"
+    else
+        log "WARN: could not apply the baseline to $mnt (is the acl package installed?)."
+        return 1
+    fi
+}
+
 added=0
+replaced=0
 rc=0        # was never initialised and never read — every failure below was
             # reported as success and firstboot's `|| log WARN` could not fire.
 while IFS= read -r line || [ -n "$line" ]; do
@@ -91,10 +149,10 @@ while IFS= read -r line || [ -n "$line" ]; do
     # Match on MOUNTPOINT, not the whole line: options may legitimately be
     # edited on the box, and re-adding the same mountpoint would be a
     # duplicate-entry error at mount -a time.
-    if awk '!/^[[:space:]]*#/ && NF >= 2 { print $2 }' /etc/fstab | grep -qxF "$mnt"; then
+    if awk '!/^[[:space:]]*#/ && NF >= 2 { print $2 }' "$FSTAB" | grep -qxF "$mnt"; then
         log "fstab already has an entry for $mnt — left as-is"
     else
-        printf '%s\n' "$line" >> /etc/fstab
+        printf '%s\n' "$line" >> "$FSTAB"
         log "fstab += $mnt"
         added=$((added + 1))
     fi
@@ -174,12 +232,18 @@ while IFS= read -r line || [ -n "$line" ]; do
         continue
     fi
     log "$dev resolved to $resolved"
+    if replace_stale_row "$mnt" "$line" "$resolved"; then
+        replaced=$((replaced + 1))
+        systemctl daemon-reload || true
+    fi
     if mountpoint -q "$mnt"; then
         log "$mnt already mounted"
     elif mount "$mnt" 2>/dev/null; then
         log "mounted $mnt"
     else
         log "WARN: mount $mnt FAILED."
+        log "      If this drive is ext4, an fstab row with uid=/gid=/umask= is refused by the"
+        log "      kernel: compare the row with the generated fragment."
         log "      If this drive is NTFS and Windows left it dirty (Fast Startup, or an"
         log "      unclean removal), ntfs3 refuses it by design. Fix it by attaching the"
         log "      drive to Windows, disabling Fast Startup, and doing a clean eject —"
@@ -229,6 +293,8 @@ while IFS= read -r line || [ -n "$line" ]; do
     # synthesized ownership, not on the spelling of the option string.
     fstype="$(findmnt -no FSTYPE --target "$mnt" 2>/dev/null || echo '')"
     case "$fstype" in
+        ext4)
+            apply_volume_baseline "$mnt" || rc=1 ;;
         ntfs|ntfs3|fuseblk)
             log "note: $mnt is $fstype"
             __own_ok=0
@@ -272,7 +338,7 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "$FSTAB_FRAGMENT"
 
 [ "$added" -gt 0 ] && systemctl daemon-reload || true
-log "done: $added fstab entry/entries added."
+log "done: $added fstab entry/entries added, $replaced replaced."
 if [ "$rc" -ne 0 ]; then
     log "FAILURES ABOVE — at least one drive is missing, read-only, or wrongly mounted."
 fi

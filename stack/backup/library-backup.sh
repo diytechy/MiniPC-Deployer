@@ -697,15 +697,18 @@ log "capacity: logs $(gb "$_sa") GB free (floor ${MIN_FREE_STATE_GB} GB)"
 for _d in "$FB_STORE" "$FB_LOGS"; do
     if [ ! -d "$_d" ]; then
         mkdir -p "$_d" || { FAIL_NOTE="cannot create the bind path $_d"; false; }
+        # On ext4 ownership is real, and this wrapper runs as root, so a directory
+        # it creates is one the container cannot write. Harmless where ownership is
+        # synthesized: the write-probe below is what proves the result either way.
+        chown "$FB_UID:$FB_UID" "$_d" 2>/dev/null || true
         log "created bind path $_d"
     fi
 done
 # /logs is on the SYSTEM disk (ext4), where ownership is real and a
 # root-created directory is unwritable to the container — the first lab run
 # died on exactly that ('/logs/Backup_Global.log' Access denied). chown works
-# there and is the fix. The store paths are NOT chowned: NTFS/exFAT ownership
-# comes from the mount options alone (Q-FB5) and chown is a no-op or an error
-# there — the write-probe below is what proves those.
+# there and is the fix. An EXISTING store path is NOT chowned: its ownership is
+# the drive's own, and the write-probe below is what proves it.
 chown "$FB_UID:$FB_UID" "$FB_LOGS" \
     || refuse "cannot chown $FB_LOGS to uid $FB_UID — the container cannot write its logs without it."
 # The wrapper's own log lands beside the container's, now that the directory is

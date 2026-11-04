@@ -84,7 +84,7 @@ Sources of truth (FileBackup, read-only): `docs/plans/bounded-run-loop.md` §13 
 - **Open questions for the Owner:**
   (a) prune/snapshots with the **store drive unplugged**: exit 2 as built, or 4 "retry later"? (FileBackup review item B, open there.)
   (b) **C43 gating**: gate step 8 now (which way), or deploy only once the follow-up is in the image?
-  (c) **C36 / power safety:** both hub drives are USB NTFS through ntfs-3g (FUSE), which journals none of its own writes, so a power
+  (c) **C36 / power safety (ANSWERED 2026-11-04: both data drives are ext4; only the kept Backup-old partition is still NTFS):** both hub drives are USB NTFS through ntfs-3g (FUSE), which journals none of its own writes, so a power
   cut can damage the filesystem itself, not just the last files; FileBackup's flushes cannot fix that. For the clean start, is the
   backup drive to be **ext4** (more power-safe), given it would then not be readable on Windows? (Found 2026-10-27;
   `homehub-backup.timer` is enabled, 03:00 nightly.)

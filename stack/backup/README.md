@@ -705,6 +705,13 @@ hub.** The materialised `.env` is written from it, so a value edited only in
 
 #### Rolling back the cutover
 
+- **After step 9, first** (the schedule is on):
+  `FILEBACKUP_TIMER_ENABLED='false'` in `config.homehub.psd1`, materialise and
+  ship the `.env`, then `systemctl disable --now
+  homehub-library-backup.timer`, and confirm
+  `homehub-library-backup.service` is not `active` or `activating`. The knob is
+  the half a reimage keeps: a timer disabled by hand alone comes back armed with
+  the next image (SR-142).
 - **Up to step 5** (nothing set aside): `FILEBACKUP_LAYOUT='legacy'` in
   `config.homehub.psd1` (materialise, ship) and `docker tag filebackup:kit12
   filebackup:local`. The installed `filebackup-store.json` may stay: only the

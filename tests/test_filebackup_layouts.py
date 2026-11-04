@@ -84,6 +84,7 @@ def test_the_tracked_default_is_off_and_the_image_still_enables_the_timer():
     assert "systemctl enable homehub-library-backup.timer" in USER_DATA.read_text(encoding="utf-8")
 
 
+@pytest.mark.smoke
 @pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX sh")
 @pytest.mark.parametrize(
     "env, runs",

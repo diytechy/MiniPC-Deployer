@@ -288,7 +288,7 @@ autoinstall:
     - |
       {
         for disk in $(lsblk -dno NAME,TRAN | awk '$2 == "usb" { print $1 }'); do
-          lsblk -rno FSTYPE,LABEL "/dev/$disk" | grep -qiE '^ntfs|^ext4 (Library|PriBackup)$' || continue
+          lsblk -rno FSTYPE,LABEL "/dev/$disk" | grep -qiE '^ntfs|^ext4 (Library|PriBackup|MediaDrive)$' || continue
           echo 1 > "/sys/block/$disk/device/delete"
         done
       } 2>/dev/null || true

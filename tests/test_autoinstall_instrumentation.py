@@ -93,7 +93,7 @@ def test_instrumentation_did_not_disturb_the_destructive_parts(autoinstall):
 
 SELECTOR = (
     'for disk in $(lsblk -dno NAME,TRAN | awk \'$2 == "usb" { print $1 }\'); do '
-    'lsblk -rno FSTYPE,LABEL "/dev/$disk" | grep -qiE \'^ntfs|^ext4 (Library|PriBackup)$\' || continue; '
+    'lsblk -rno FSTYPE,LABEL "/dev/$disk" | grep -qiE \'^ntfs|^ext4 (Library|PriBackup|MediaDrive)$\' || continue; '
     'echo "$disk"; done'
 )
 
@@ -106,12 +106,13 @@ def _fake_lsblk(tmp_path):
     (d / "lsblk").write_text(
         "#!/bin/sh\n"
         'if [ "$1" = "-dno" ]; then\n'
-        "  printf 'sda usb\nsdb usb\nsdc usb\nnvme0n1 nvme\n'; exit 0\n"
+        "  printf 'sda usb\nsdb usb\nsdc usb\nsdd usb\nnvme0n1 nvme\n'; exit 0\n"
         "fi\n"
         'case "$3" in\n'
         "  /dev/sda) printf '\next4 Library\n' ;;\n"
         "  /dev/sdb) printf 'iso9660 Ubuntu\niso9660 Ubuntu\nvfat ESP\next4 casper-rw\n' ;;\n"
         "  /dev/sdc) printf '\nntfs PriBackup-old\next4 PriBackup\n' ;;\n"
+        "  /dev/sdd) printf '\next4 MediaDrive\n' ;;\n"
         "  *) printf '\n' ;;\n"
         "esac\n",
         encoding="utf-8",
@@ -133,7 +134,7 @@ def test_the_detach_selector_takes_the_data_drives_and_nothing_else(tmp_path):
         ["sh", "-c", SELECTOR], capture_output=True, text=True, env=env
     )
     picked = result.stdout.split()
-    assert picked == ["sda", "sdc"], picked
+    assert picked == ["sda", "sdc", "sdd"], picked
     assert "sdb" not in picked, "would have detached the installer's own boot medium"
     assert not any(p.startswith("nvme") for p in picked), "would have detached the target"
 

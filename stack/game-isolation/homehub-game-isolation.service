@@ -26,6 +26,14 @@ Documentation=file:///opt/homehub/stack/game-isolation/game-isolation.sh
 Before=docker.service
 DefaultDependencies=no
 After=network-pre.target
+# AFTER THE OTHER TWO FENCES, because this one asserts it is the FIRST INPUT rule and
+# they insert at the head of INPUT too. Started side by side, one lands between this
+# unit's insert and its check: measured on 2026-11-04, the first reboot in 13 days,
+# this unit failed and took the relay down with it (Requires=). Firstboot used to
+# restart it later in the same boot, which is why nothing had shown; it was disabled
+# for the storage transition. homehub-dns-console runs after this and takes position
+# 1 for itself, which its own check requires.
+After=homehub-llm-isolation.service homehub-rustdesk-isolation.service
 Wants=network-pre.target
 
 [Service]

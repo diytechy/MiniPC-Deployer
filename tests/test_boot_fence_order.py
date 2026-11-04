@@ -2,7 +2,7 @@
 
 Three fences insert at the head of INPUT, and two of them assert a position:
 homehub-game-isolation checks it is first the moment it has inserted, and
-homehub-dns-console must end up at position 1, which its two-minute check enforces.
+homehub-dns-console must stay above ts-input, which its two-minute check enforces.
 Left to start side by side, another fence lands between the game fence's insert and
 its check, the unit fails, and the relay goes with it. That happened on 2026-11-04.
 """
@@ -28,7 +28,7 @@ def test_the_game_fence_runs_after_the_fences_that_insert_beside_it():
     assert "homehub-rustdesk-isolation.service" in after
 
 
-def test_the_dns_console_fence_runs_last_so_it_keeps_position_one():
+def test_the_dns_console_fence_runs_last_so_it_stays_above_ts_input():
     after = _after("dns-console/homehub-dns-console.service")
     assert "homehub-game-isolation.service" in after
     assert "homehub-llm-isolation.service" in after

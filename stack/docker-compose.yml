@@ -958,7 +958,7 @@ services:
       - /tmp:rw,noexec,nosuid,nodev
 
   # ── filebackup-store — the SAME library backup, one-mount layout (SR-133) ────
-  # FileBackup BoundedRebuild with single-store call C44 (e28e49d): ONE writable
+  # FileBackup BoundedRebuild with single-store call C44 with L9-L11 (88640a0): ONE writable
   # /store mount holding CurrentBackup/ and BackupHistory/. Chosen by
   # FILEBACKUP_LAYOUT=single and run only by library-backup.sh in that mode;
   # the `filebackup` service above is the three-mount layout the deployed

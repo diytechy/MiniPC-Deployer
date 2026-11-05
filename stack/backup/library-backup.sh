@@ -12,7 +12,7 @@
 # is one `docker compose run` in the middle of a lot of proof.
 #
 # REQUIRES a FileBackup image built from BoundedRebuild with its single-store
-# call C44 (e28e49d or later): ONE writable /store mount holding CurrentBackup/, the
+# call C44 with L9-L11 (88640a0 or later): ONE writable /store mount holding CurrentBackup/, the
 # BackupHistory/ of dated snapshots, and the run files Temp.lock, backup.log, Incoming/,
 # Building_*, Verify/; filebackup-store.json at ConfigVersion 3 (StorePath), no
 # /state mount, and the backup exit table 0/1/2/4 below (verify 0/1/2/4).
@@ -354,7 +354,7 @@ run_state starting
 # speak the one-mount contract would refuse at best, and the knob cannot tell
 # what is loaded under the tag. scripts/ensure-local-images.sh stamps
 # homehub.filebackup.contract at build time from the FileBackup checkout:
-# `current-history-v3` only when that commit contains BoundedRebuild e28e49d (C44
+# `current-history-v3` only when that commit contains BoundedRebuild 88640a0 (C44
 # with its review fixes) and its engine's ConfigSchemaVersion is 3. No label - a
 # hand-tagged image, the deployed kit-12 one, anything built before the stamp -
 # is a refusal, as is a docker that cannot be asked.
@@ -369,7 +369,7 @@ case "$_contract" in
     "$FB_WANT_CONTRACT") log "image: $FB_IMAGE speaks the one-mount contract ($FB_WANT_CONTRACT)" ;;
     *) _rev="$(docker image inspect "$FB_IMAGE" --format '{{index .Config.Labels "homehub.source.revision"}}' 2>/dev/null || true)"
        refuse "the image $FB_IMAGE does not speak the one-mount layout: its homehub.filebackup.contract label is '${_contract:-<none>}' (want $FB_WANT_CONTRACT), source revision '${_rev:-<none>}'." \
-              "Build it from a FileBackup commit that contains BoundedRebuild e28e49d (scripts/ensure-local-images.sh --rebuild), or set FILEBACKUP_LAYOUT=legacy. Nothing was looked at or created." ;;
+              "Build it from a FileBackup commit that contains BoundedRebuild 88640a0 (scripts/ensure-local-images.sh --rebuild), or set FILEBACKUP_LAYOUT=legacy. Nothing was looked at or created." ;;
 esac
 
 # ── 2. MOUNT-IDENTITY PREFLIGHT (E2 cross-check 1 / upstream finding H) ───────

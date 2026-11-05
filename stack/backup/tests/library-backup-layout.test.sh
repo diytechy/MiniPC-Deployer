@@ -223,7 +223,7 @@ if [ "$(_mounts "$legacy_block")" = "$_want_legacy" ] \
    && grep -qF '"ChangePath": "/changes",' "$FBJ" && ! grep -qF StorePath "$FBJ" \
    && grep -qF '"ConfigVersion": 3,' "$FBS" && grep -qF '"StorePath": "/store",' "$FBS" \
    && ! grep -qE 'BackupPath|ChangePath|SourceStatePath' "$FBS"; then
-    pass "TC-1585 filebackup keeps the three-mount binds and a ConfigVersion 2 config; filebackup-store binds one /store with a ConfigVersion 2 config naming /store/backup and /store/changes"
+    pass "TC-1585 filebackup keeps the three-mount binds and a ConfigVersion 2 config; filebackup-store binds one /store with a ConfigVersion 3 config naming StorePath "
 else
     fail "TC-1585 the layout services drifted: legacy=[$(_mounts "$legacy_block" | tr '\n' '|')] store=[$(_mounts "$store_block" | tr '\n' '|')]"
 fi

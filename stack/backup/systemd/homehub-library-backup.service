@@ -63,7 +63,9 @@ User=root
 # THE LIBRARY IS READ-ONLY HERE, even to root. The container already mounts it
 # :ro; this covers the wrapper, which runs on the host, where that mount protects
 # nothing. dockerd is outside this namespace, so the container is unaffected. `-`:
-# this unit must still start with the drive missing (see After= above).
+# this unit must still start with the drive missing (see After= above). The legacy
+# wrapper's preflight refuses a read-only library, so a `legacy` run through this
+# unit stops at the guard; that layout is not a real fallback any more.
 ReadOnlyPaths=-/srv/library
 # THE FIRST REAL RUN IS A MULTI-DAY JOB. ~2 TiB over USB, hashed per file. The
 # systemd default is DefaultTimeoutStartSec=90s, and for a Type=oneshot that

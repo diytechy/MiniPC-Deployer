@@ -76,6 +76,8 @@ PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" \
 PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo-ro" \
     "$GUARD" --check Shared >/dev/null 2>&1 && {
         echo "FAIL: Samba preexec must still reject a read-only library" >&2; exit 1; }
+PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo-ro"     "$GUARD" --check --library /srv/library --label library --allow-read-only >/dev/null 2>&1 || {
+        echo "FAIL: a reader of the library must accept the read-only mount its unit makes" >&2; exit 1; }
 
 # The FileBackup-only helper has a distinct payload. A monitor cannot call this
 # path, and the config backup posts only nightlySuccess (see

@@ -54,7 +54,8 @@
 # Usage: library-backup.sh [--config PATH] [--preflight-only [--layout L]] [--verify MODE]
 #   --config         backup.env (default /etc/homehub-backup/backup.env, else
 #                    the backup.env beside this script)
-#   --preflight-only steps 1-5 and stop. Nothing is created, no container runs.
+#   --preflight-only steps 1-5 and stop. No container runs, but step 4 creates
+#                    the empty store folder and chowns /logs, and step 5 probes.
 #                    This is TC-H-M21's preflight entry point; the full case
 #                    also proves the combined last_success is unchanged.
 #   --layout L       legacy | single, for THIS --preflight-only only, over the
@@ -498,11 +499,16 @@ identity_note() {
     fi
 }
 
-# preflight_mount MOUNTPOINT LABEL — the whole gate for one mount.
+# preflight_mount MOUNTPOINT LABEL [ro] — the whole gate for one mount. `ro` is for
+# the source: this run only reads it, and the unit makes it read-only on purpose.
 preflight_mount() {
-    local mp="$1" label="$2" note
-    if ! bash "$GUARD" --check --library "$mp" --label "$label" 2>&1; then
-        refuse "$mp is not a usable $label mount — it is absent, or mounted read-only." \
+    local mp="$1" label="$2" access="${3:-rw}" note
+    local guard_args=() want="absent, or mounted read-only" kind=writable
+    if [ "$access" = ro ]; then
+        guard_args=(--allow-read-only); want="absent or stale"; kind=readable
+    fi
+    if ! bash "$GUARD" --check --library "$mp" --label "$label" ${guard_args[@]+"${guard_args[@]}"} 2>&1; then
+        refuse "$mp is not a usable $label mount — it is $want." \
                "With nofail in the fstab that path is still an ordinary EMPTY DIRECTORY on the" \
                "SYSTEM disk, so a run would write the library there and look green until the" \
                "system disk filled. Nothing was created and no container was started." \
@@ -514,7 +520,7 @@ preflight_mount() {
     if ! findmnt -n --mountpoint "$mp" >/dev/null 2>&1; then
         refuse "library-guard says $mp is mounted but findmnt does not see it as a mountpoint — refusing rather than picking a winner"
     fi
-    log "preflight: $mp is a real, writable mount ($(findmnt -n -o SOURCE,FSTYPE --mountpoint "$mp" 2>/dev/null | tr -s ' '))"
+    log "preflight: $mp is a real, $kind mount ($(findmnt -n -o SOURCE,FSTYPE --mountpoint "$mp" 2>/dev/null | tr -s ' '))"
 
     # `|| _rc=$?` and NOT `$(fstab_declares …; echo $?)`: `set -o errtrace` makes
     # the ERR trap fire inside a command substitution too, so an unchecked
@@ -545,7 +551,7 @@ SOURCE_MOUNT="$(mount_of "$FB_SOURCE")"
               "A backup of it would be a backup of nothing. FileBackup itself stops with exit 4 when the source is" \
               "empty at the start of a run while the latest state holds rows (its call C39), leaving the latest state" \
               "as it was; this refusal answers first, before the drive spins up or a container starts, and names the cause."
-preflight_mount "$FB_SOURCE" library
+preflight_mount "$FB_SOURCE" library ro
 
 BACKUP_MOUNT="$(mount_of "$FB_STORE")"
 [ -n "$BACKUP_MOUNT" ] && [ "$BACKUP_MOUNT" != "/" ] \

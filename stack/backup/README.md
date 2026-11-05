@@ -693,7 +693,11 @@ hub.** The materialised `.env` is written from it, so a value edited only in
    twice that peak, in `config.homehub.psd1` again; materialise, ship the
    `.env`, and check `docker compose --profile filebackup config
    filebackup-store` shows the new `mem_limit` and `memswap_limit`; then
-   `systemctl enable --now homehub-library-backup.timer`. The timer runs the
+   `FILEBACKUP_TIMER_ENABLED='true'` in `config.homehub.psd1`, materialise and
+   ship the `.env`, and `systemctl enable --now
+   homehub-library-backup.timer`. Both are needed: an image enables the timer
+   and the knob keeps its runs skipping (SR-142), while this hub's timer was
+   disabled by hand (E13). The timer runs the
    weekly verify by itself; with `7a6a80a` that is the C43 memory risk named
    in step 1, bounded by the cap (an OOM kill of the container, not the box).
    Whether the timer waits for an image with C43's second half is the Owner's
@@ -701,6 +705,13 @@ hub.** The materialised `.env` is written from it, so a value edited only in
 
 #### Rolling back the cutover
 
+- **After step 9, first** (the schedule is on):
+  `FILEBACKUP_TIMER_ENABLED='false'` in `config.homehub.psd1`, materialise and
+  ship the `.env`, then `systemctl disable --now
+  homehub-library-backup.timer`, and confirm
+  `homehub-library-backup.service` is not `active` or `activating`. The knob is
+  the half a reimage keeps: a timer disabled by hand alone comes back armed with
+  the next image (SR-142).
 - **Up to step 5** (nothing set aside): `FILEBACKUP_LAYOUT='legacy'` in
   `config.homehub.psd1` (materialise, ship) and `docker tag filebackup:kit12
   filebackup:local`. The installed `filebackup-store.json` may stay: only the

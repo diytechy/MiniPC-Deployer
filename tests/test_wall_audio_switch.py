@@ -15,6 +15,7 @@ acceptance in docs/design/audio-routing-2026-09-13.md.
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import importlib.machinery
 import importlib.util
@@ -4581,6 +4582,17 @@ def _requests(applier, tmp_path, monkeypatch, plan):
         return 0
 
     monkeypatch.setattr(applier, "_locked_apply", fake_pass)
+    # The lock is per pass: the rocker must never queue behind a whole walk.
+    held = []
+
+    @contextlib.contextmanager
+    def fake_lock(dry_run=False):
+        assert not held, "the lock must be let go between passes"
+        held.append(1)
+        yield
+        held.clear()
+
+    monkeypatch.setattr(applier, "apply_lock", fake_lock)
     arguments = SimpleNamespace(dry_run=False, value=str(request), state=str(state))
     assert applier.apply_requests(arguments) == 0
     return passes
@@ -4610,6 +4622,7 @@ def test_the_drain_is_bounded_llr1446(applier, tmp_path, monkeypatch):
 
     passes = _requests(applier, tmp_path, monkeypatch, plan)
     assert len(passes) == applier.REQUEST_DRAIN_PASSES + 1
+    assert applier.REQUEST_DRAIN_PASSES >= 24, "the whole S/PDIF range in one start"
 
 
 @pytest.mark.parametrize("text", ["not json", "[]", "{}", '{"seq": true}', '{"seq": "9"}'])

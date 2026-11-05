@@ -1409,7 +1409,8 @@ class SpeakerSleep:
                 self._relay_hold = False
                 self._begin_ramp(now, FADE_FLOOR, FADE_OUT_SECONDS)
                 self.phase = self.FADING_OUT
-            elif self._advance(now):
+            # No ramp: hold_for_relay() took it for a relay restart that failed.
+            elif self._ramp is None or self._advance(now):
                 self.phase = self.LIT
                 self._relay_hold = False
                 self._emit("speakers awake")
@@ -1535,6 +1536,7 @@ def main():
             if settle:
                 sleeper.hold_for_relay()
             if actuator.start():
+                changed_at = at
                 if settle:
                     sleeper.relay_closed(at)
             else:

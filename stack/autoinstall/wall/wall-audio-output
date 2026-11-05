@@ -2552,16 +2552,17 @@ def main(argv=None):
                          indent=2, sort_keys=True))
         return 0
 
+    if arguments.command == "apply-request":
+        return apply_requests(arguments)
     with apply_lock(dry_run=arguments.dry_run):
-        if arguments.command == "apply-request":
-            return apply_requests(arguments)
         return _locked_apply(arguments)
 
 
-# How many requests one start will pick up behind the first. A person cannot queue
-# more than this during one pass; the bound is here so a loop in the privileged
-# path ends by itself.
-REQUEST_DRAIN_PASSES = 5
+# How many requests one start will pick up behind the first. Sized from the longest
+# thing a person walks through this path, the 24 steps of the S/PDIF level, so a
+# walk that keeps chaining reaches its end inside one start. The bound is here so a
+# loop in the privileged path ends by itself.
+REQUEST_DRAIN_PASSES = 25
 
 
 def waiting_request_seq(path, state_path):
@@ -2584,9 +2585,17 @@ def apply_requests(arguments):
     state is saved before the hardware is touched, so a renderer that takes the
     report and sends its next step lands exactly there, and that request would sit
     unread until something else wrote the file. So the file is looked at again
-    before this start ends. Implements: SR-145, LLR-1446
+    before this start ends. A write in the instant between the last look and the
+    exit is still lost, and the renderer says so when its deadline passes.
+
+    THE LOCK IS TAKEN PER PASS, so the rocker's apply is never queued behind a walk.
+    Implements: SR-145, LLR-1446
     """
-    status = _locked_apply(arguments)
+    def one_pass():
+        with apply_lock(dry_run=arguments.dry_run):
+            return _locked_apply(arguments)
+
+    status = one_pass()
     if arguments.dry_run:
         return status
     path = arguments.value or DEFAULT_REQUEST
@@ -2598,7 +2607,7 @@ def apply_requests(arguments):
         if seq is None or seq == tried:
             break
         tried = seq
-        status = _locked_apply(arguments)
+        status = one_pass()
     return status
 
 

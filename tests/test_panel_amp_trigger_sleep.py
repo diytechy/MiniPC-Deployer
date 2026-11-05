@@ -1157,3 +1157,37 @@ def test_a_relay_restarted_after_it_stopped_settles_too_llr1440(daemon):
     assert writes and writes[-1] == 0, "silent before the relay closes again"
     rising = [e[0] for e in tail[closed:] if e[1] == "amixer" and e[2] > 0]
     assert rising and rising[0] - tail[closed][0] >= 0.25, "and then the settle"
+
+
+def test_a_failed_restart_mid_fade_in_does_not_stop_the_machine_llr1440():
+    """hold_for_relay() takes the ramp, and a failed start leaves the phase alone."""
+    rig = Rig()
+    settled_lit(rig)
+    rig.relay_is_on = False
+    close_by_attack_rule(rig)
+    rig.run(5.3, lit=True)
+    assert rig.sleeper.phase == rig.module.SpeakerSleep.FADING_IN
+    rig.sleeper.hold_for_relay()                 # main() then finds start() failed
+    rig.run(1.0, lit=True)
+    assert rig.sleeper.phase == rig.module.SpeakerSleep.LIT
+    rig.run(6.0, lit=True)
+    assert rig.fade_values()[-1] == 60, "the beat puts unity back"
+
+
+def test_a_restarted_relay_keeps_its_minimum_on_time_llr1440(daemon, monkeypatch):
+    """The restart is a real close, so the dwell runs from it."""
+    rig = daemon
+    monkeypatch.setattr(rig.module, "MIN_ON_SECONDS", 0.8)
+    rig.thread.start()
+    assert wait_until(lambda: rig.mixer.value == 60)
+    time.sleep(0.8)                              # past the first close's dwell
+    mark = len(rig.world.events)
+    rig.actuator.running_flag = False
+    assert wait_until(lambda: any(e[1:] == ("relay", "ON") for e in rig.world.events[mark:]))
+    rig.facts["lit"] = False
+    assert wait_until(lambda: any(e[1:] == ("relay", "OFF") for e in rig.world.events[mark:]))
+    rig.stop()
+    tail = rig.world.events[mark:]
+    closed = next(e[0] for e in tail if e[1:] == ("relay", "ON"))
+    opened = next(e[0] for e in tail if e[1:] == ("relay", "OFF"))
+    assert opened - closed >= 0.65, (closed, opened)

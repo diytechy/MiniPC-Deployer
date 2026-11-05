@@ -1033,3 +1033,5 @@ def test_the_scan_survives_the_oneshot_and_a_burst_survives_the_limit_llr1447():
     assert "\nKillMode=process\n" in service
     assert "\nStartLimitBurst=50\n" in head, "a [Unit] key, or it is ignored"
     assert "\nStartLimitIntervalSec=10\n" in head
+    # `observe` drains the same directory, so a scan can start from there as well.
+    assert "\nKillMode=process\n" in _unit("wall-bluetooth-observe.service")

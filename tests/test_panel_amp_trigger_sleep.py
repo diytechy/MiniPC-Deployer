@@ -272,7 +272,7 @@ def test_a_call_becoming_active_while_dark_turns_the_relay_on_at_unity_llr1436()
     go_dark(rig, audio=False)
     rig.world.events.clear()
     # No audio, screen still dark: the CALL alone wakes the room.
-    rig.run(5.0, lit=False, call=True, audio=False)
+    rig.run(7.0, lit=False, call=True, audio=False)
     assert rig.world.index_of("relay", "ON") is not None
     assert rig.fade_values()[-1] == 60, "the stage is back at unity for the call"
     assert rig.sleeper.phase == rig.module.SpeakerSleep.LIT
@@ -302,7 +302,7 @@ def test_dark_to_lit_with_audio_closes_the_relay_waits_then_fades_in_llr1436():
     go_dark(rig, audio=True)
     rig.world.events.clear()
     lit_at = rig.world.now
-    rig.run(4.0, lit=True, audio=True)
+    rig.run(7.0, lit=True, audio=True)
 
     relay_on = rig.world.index_of("relay", "ON")
     first_write = rig.world.index_of("amixer")
@@ -311,7 +311,7 @@ def test_dark_to_lit_with_audio_closes_the_relay_waits_then_fades_in_llr1436():
     on_time = rig.world.events[relay_on][0]
     first_time = rig.world.events[first_write][0]
     assert on_time - lit_at < 0.2, "the relay closes at once"
-    assert first_time - on_time >= 1.0, "then a second for the boards to start"
+    assert first_time - on_time >= 5.0, "then five seconds for the boards to start"
     values = rig.fade_values()
     assert values == sorted(values) and values[-1] == 60
     assert values[0] <= 4, "the ramp starts from the floor"
@@ -706,6 +706,8 @@ def test_the_whole_loop_sleeps_wakes_and_restores_unity_llr1436(daemon):
     startup = rig.world.events[0:3]
     assert ("relay", "ensure_off") == startup[0][1:], "safe OFF first"
     assert startup[1][1:] == ("amixer", 60), "then the stage to unity, at start-up"
+    # That close takes the settle and the fade (SR-143) before the room is lit.
+    assert wait_until(lambda: rig.mixer.value == 60)
     rig.world.events.append((0, "mark", "dark"))
 
     # Screen dark: fade down, THEN the relay opens; audio keeps playing.
@@ -755,6 +757,10 @@ def test_the_loop_with_the_setting_off_is_todays_behaviour_llr1436(daemon):
     rig.facts["sleeps"] = False
     rig.thread.start()
     assert wait_until(lambda: rig.world.index_of("relay", "ON") is not None)
+    # The close itself settles even with the setting off (SR-143): that is about
+    # the amplifier starting. It is the SCREEN that has no say from here on.
+    assert wait_until(lambda: rig.mixer.value == 60)
+    time.sleep(0.05)
     mark = len(rig.world.events)
     rig.facts["lit"] = False
     time.sleep(0.6)                      # dark for 30 fade-out lengths
@@ -766,8 +772,11 @@ def test_the_loop_with_the_setting_off_is_todays_behaviour_llr1436(daemon):
     # Merely dark, audio still loud, hold-off far away: the relay was not touched
     # and the stage was not written -- exactly the loop of yesterday.
     assert [e for e in dark_window if e[1] in ("relay", "amixer")] == []
-    # The only fade writes are the start-up and the shutdown unity.
-    assert [argv[-1] for argv in rig.mixer.argvs] == ["60", "60"]
+    # The only fade writes are the start-up unity, the close's hold and ramp,
+    # and the shutdown unity.
+    values = [int(argv[-1]) for argv in rig.mixer.argvs]
+    assert values[:2] == [60, 0] and values[-2:] == [60, 60]
+    assert values[1:-1] == sorted(values[1:-1])
 
 
 def test_the_loop_retries_an_unverified_off_while_dark_llr1436(daemon):
@@ -895,8 +904,8 @@ def test_the_loop_writes_unity_at_start_up_over_a_stage_left_low_llr1437(daemon)
     rig.facts["sleeps"] = False                 # nothing else may touch it
     rig.thread.start()
     assert wait_until(lambda: rig.world.index_of("relay", "ON") is not None)
-    assert rig.mixer.value == 60, "restored before the daemon did anything else"
     first_write = rig.world.index_of("amixer")
+    assert rig.world.events[first_write][2] == 60, "restored before anything else"
     assert first_write < rig.world.index_of("relay", "ON")
     rig.stop()
 
@@ -932,6 +941,7 @@ def test_the_explicit_startup_reset_does_not_depend_on_the_machine_stepping_llr1
     pins the START-UP write itself, with stepping disabled."""
     rig = daemon
     monkeypatch.setattr(rig.module.SpeakerSleep, "step", lambda self, *a, **k: None)
+    LoopLevel.loud = False      # no relay close: its hold would write the floor
     rig.mixer.value = 7
     rig.thread.start()
     assert wait_until(lambda: rig.mixer.value == 60)
@@ -967,3 +977,150 @@ def test_the_real_loop_honours_the_dwell_through_a_backlight_flap_llr1437(
         # Times are stamped at the logger, slightly after the loop's own
         # `now`; 0.15 s absorbs that lag without hiding a real dwell skip.
         assert t1 - t0 >= floor - 0.15, (d0, d1, t1 - t0, commands)
+
+
+# ── SR-143: the settle follows the relay, not the screen ─────────────────────
+# Owner, 2026-11-05: "When in speaker mode, wait 5 seconds after relay turns on
+# before fading in audio, otherwise can fade in as soon as presence is detected."
+
+def close_by_attack_rule(rig):
+    """What main()'s attack branch does in the Speaker position."""
+    rig.sleeper.hold_for_relay()
+    rig.world.log("relay", "ON")
+    rig.relay_is_on, rig.relay_changed_at = True, rig.world.now
+    rig.sleeper.relay_closed(rig.world.now)
+
+
+def test_the_settle_is_five_seconds_by_default_llr1440(monkeypatch):
+    monkeypatch.delenv("WALL_AMP_SLEEP_WAKE_SETTLE_SECONDS", raising=False)
+    assert load_module().WAKE_SETTLE_SECONDS == 5.0
+
+
+@pytest.mark.parametrize("enabled", [True, False], ids=["sleep-on", "sleep-off"])
+def test_the_attack_rules_close_silences_settles_and_fades_llr1440(enabled):
+    """Floor before the relay, nothing for five seconds, then the ramp to unity.
+    The sleep preference has no say: this is the amplifier starting."""
+    rig = Rig()
+    settled_lit(rig)
+    rig.relay_is_on = False
+    close_by_attack_rule(rig)
+    on_at = rig.world.now
+    assert rig.sleeper.governing, "the hold-off rule must not act mid-settle"
+    rig.run(7.0, enabled=enabled, lit=True)
+
+    floor = rig.world.index_of("amixer", 0)
+    relay_on = rig.world.index_of("relay", "ON")
+    assert floor is not None and floor < relay_on, "silent before the relay closes"
+    ups = [(t, d) for t, d in rig.world.of("amixer") if d > 0]
+    assert ups and ups[0][0] - on_at >= 5.0, ups[:1]
+    assert ups[-1][1] == 60 and rig.sleeper.phase == rig.module.SpeakerSleep.LIT
+    assert not rig.sleeper.governing, "the relay is the existing rule's again"
+
+
+def test_a_dark_screen_does_not_stop_the_hold_with_the_preference_off_llr1440():
+    rig = Rig()
+    settled_lit(rig)
+    rig.relay_is_on = False
+    close_by_attack_rule(rig)
+    rig.run(7.0, enabled=False, lit=False)
+    assert rig.fade_values()[-1] == 60
+    assert rig.world.of("relay") == [(rig.world.of("relay")[0][0], "ON")], "no OFF"
+    assert rig.sleeper.phase == rig.module.SpeakerSleep.LIT
+
+
+def test_a_dark_screen_during_the_hold_sleeps_with_the_preference_on_llr1440():
+    rig = Rig()
+    settled_lit(rig)
+    rig.relay_is_on = False
+    close_by_attack_rule(rig)
+    rig.run(rig.module.MIN_ON_SECONDS + 4.0, enabled=True, lit=False)
+    assert rig.sleeper.phase == rig.module.SpeakerSleep.DARK
+    assert [d for _, d in rig.world.of("relay")] == ["ON", "OFF"]
+
+
+def test_a_relay_already_closed_fades_in_at_once_llr1440():
+    """The "otherwise": the screen lights mid-fade, the relay never opened."""
+    rig = Rig()
+    settled_lit(rig)
+    rig.run(1.0, lit=False)
+    assert rig.sleeper.phase == rig.module.SpeakerSleep.FADING_OUT
+    rig.world.events.clear()
+    lit_at = rig.world.now
+    rig.run(2.0, lit=True)
+    assert rig.world.of("relay") == []
+    assert rig.world.of("amixer")[0][0] - lit_at < 0.2, "no settle to wait for"
+    assert rig.fade_values()[-1] == 60
+
+
+def test_a_relay_still_closed_after_the_fade_out_fades_in_at_once_llr1440():
+    """Silent, waiting out MIN_ON_SECONDS: the relay is closed, so no settle."""
+    rig = Rig()
+    settled_lit(rig)
+    rig.relay_changed_at = rig.world.now
+    rig.run(4.0, lit=False)
+    assert rig.sleeper.phase == rig.module.SpeakerSleep.FADING_OUT
+    assert rig.relay_is_on and rig.fade_values()[-1] == 0
+    rig.world.events.clear()
+    lit_at = rig.world.now
+    rig.run(2.0, lit=True)
+    assert rig.world.of("relay") == []
+    assert rig.world.of("amixer")[0][0] - lit_at < 0.2
+    assert rig.fade_values()[-1] == 60
+
+
+def test_a_screen_bounce_cannot_shorten_the_settle_llr1440():
+    """Dark then lit again inside the five seconds: the boards still get them."""
+    rig = Rig()
+    go_dark(rig, audio=True)
+    rig.world.events.clear()
+    rig.run(1.0, lit=True)                       # relay ON, settling
+    on_at = rig.world.of("relay")[0][0]
+    rig.run(1.0, lit=False)                      # dark again, relay still held ON
+    rig.run(7.0, lit=True)
+    ups = [(t, d) for t, d in rig.world.of("amixer") if d > 0]
+    assert ups and ups[0][0] - on_at >= 5.0, ups[:1]
+    assert rig.fade_values()[-1] == 60
+    assert [d for _, d in rig.world.of("relay")] == ["ON"]
+
+
+def test_the_loop_holds_the_stage_down_across_the_close_in_speaker_llr1440(daemon):
+    rig = daemon
+    rig.thread.start()
+    assert wait_until(lambda: rig.world.index_of("relay", "ON") is not None)
+    assert wait_until(lambda: rig.mixer.value == 60)
+    rig.stop()
+    relay_on = rig.world.index_of("relay", "ON")
+    writes = [(i, e[0], e[2]) for i, e in enumerate(rig.world.events) if e[1] == "amixer"]
+    before = [w for w in writes if w[0] < relay_on]
+    after = [w for w in writes if w[0] > relay_on]
+    assert before[-1][2] == 0, "the floor is the last write before the relay closes"
+    assert after[0][1] - rig.world.events[relay_on][0] >= 0.25, "then the settle"
+    assert after[-1][2] == 60
+
+
+def test_the_loop_leaves_the_stage_alone_outside_speaker_llr1440(daemon):
+    rig = daemon
+    rig.facts["output"] = "headset"
+    rig.thread.start()
+    assert wait_until(lambda: rig.world.index_of("relay", "ON") is not None)
+    time.sleep(0.6)
+    rig.stop()
+    assert [argv[-1] for argv in rig.mixer.argvs] == ["60", "60"], "start-up and shutdown only"
+
+
+def test_a_failed_close_does_not_leave_the_stage_down_llr1440(daemon):
+    """The close failed, the relay is open: nothing is heard, and unity returns."""
+    rig = daemon
+    real_start = rig.actuator.start
+    attempts = []
+
+    def refuse_twice():
+        attempts.append(1)
+        return False if len(attempts) <= 2 else real_start()
+
+    rig.actuator.start = refuse_twice
+    rig.thread.start()
+    assert wait_until(lambda: len(attempts) >= 3)
+    assert wait_until(lambda: rig.world.index_of("relay", "ON") is not None)
+    assert wait_until(lambda: rig.mixer.value == 60)
+    rig.stop()

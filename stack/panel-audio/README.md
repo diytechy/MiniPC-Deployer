@@ -73,7 +73,7 @@ Consequently:
   switch request is refused with `backend_unavailable`;
 - mutation requests require an injected authorization callback, and the shipped
   one allows the SWITCH verbs only (`set_output`, `set_input_mute`,
-  `set_speaker_sleep`, `set_volume`, and the legacy `set_mute`). Those name no device and are the
+  `set_speaker_sleep`, `set_spdif_level`, `set_volume`, and the legacy `set_mute`). Those name no device and are the
   physical control of the wall in front of whoever is standing at it. Every verb
   that names a device still defaults to deny: the image has intentionally not
   guessed how panel authentication maps onto BLUETOOTH authority, so the shipped

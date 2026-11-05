@@ -413,7 +413,9 @@ def test_status_reports_routing_unavailable_and_the_switch_present_sr028(panel):
                                 "headsetVia": None,
                                 "btHeadsetPresent": False,
                                 # SR-140: the stored preference, true by default.
-                                "speakerSleepsWithScreen": True}
+                                "speakerSleepsWithScreen": True,
+                                # SR-144: the stored level, unity by default.
+                                "spdifLevelDb": 0}
 
 
 def test_status_volume_is_the_selected_outputs_memory_sr028(panel):
@@ -721,7 +723,9 @@ def test_a_sparse_state_file_reports_a_supported_switch_sr028(panel):
                                 "headsetVia": None,
                                 "btHeadsetPresent": False,
                                 # SR-140: the stored preference, true by default.
-                                "speakerSleepsWithScreen": True}
+                                "speakerSleepsWithScreen": True,
+                                # SR-144: the stored level, unity by default.
+                                "spdifLevelDb": 0}
 
 
 def test_a_lost_mutation_reconciles_on_a_sparse_state_file_llr015(panel, tmp_path):
@@ -940,3 +944,76 @@ def test_a_lost_set_speaker_sleep_reconciles_by_observation_sr140(panel, tmp_pat
     """Self-reconciling, like set_input_mute: the switch block can be read back."""
     import audio_router
     assert audio_router.OBSERVABLE_BLOCK["set_speaker_sleep"] == "switch"
+
+
+# --- SR-144: the desktop's S/PDIF level ---------------------------------------
+# The contract is shared with the kiosk half and must not be renamed:
+# method `set_spdif_level`, params exactly {"db": int}, status field `spdifLevelDb`.
+
+@pytest.mark.parametrize("db", [-12, 0, 5, 12])
+def test_set_spdif_level_is_spooled_to_the_applier_llr1444(panel, db):
+    answer = reply(AudioBroker(backend(panel)),
+                   wire("set_spdif_level", {"db": db}, echo_seq=True))
+    assert answer["ok"] is True and answer["result"]["accepted"] is True
+    assert written(panel) == {"version": 1, "seq": answer["result"]["seq"],
+                              "generation": 0,
+                              "event": {"kind": "set_spdif_level", "db": db}}
+
+
+@pytest.mark.parametrize("params", [
+    {}, {"db": 13}, {"db": -13}, {"db": 1.5}, {"db": "3"}, {"db": True}, {"db": None},
+    {"db": 3, "level": 1}, {"level": 3},
+])
+def test_set_spdif_level_rejects_anything_but_one_in_range_integer_llr1444(panel, params):
+    spy = SpyBackend(backend(panel))
+    answer = reply(AudioBroker(spy), wire("set_spdif_level", params))
+    assert answer["ok"] is False
+    assert spy.calls == [] and not panel["request"].exists()
+
+
+def test_the_request_envelope_admits_exactly_this_event_llr1444():
+    assert switch_request.envelope(3, {"kind": "set_spdif_level", "db": 4})[
+        "event"] == {"kind": "set_spdif_level", "db": 4}
+    for bad in ({"kind": "set_spdif_level"},
+                {"kind": "set_spdif_level", "db": 4, "extra": 1},
+                {"kind": "set_spdif_level", "enabled": True}):
+        with pytest.raises(switch_request.RequestError):
+            switch_request.envelope(3, bad)
+
+
+def test_a_spooled_level_is_one_the_real_applier_accepts_llr1444(panel):
+    """Assert against the other side: the applier's own reader takes the file."""
+    import importlib.machinery
+    import importlib.util
+    path = ROOT / "stack/autoinstall/wall/wall-audio-output"
+    spec = importlib.util.spec_from_file_location(
+        "wall_audio_output_sr144", path,
+        loader=importlib.machinery.SourceFileLoader("wall_audio_output_sr144", str(path)))
+    applier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(applier)
+    reply(AudioBroker(backend(panel)), wire("set_spdif_level", {"db": -3}))
+    seq, event = applier.read_request(panel["request"], -1, generation=0)
+    assert event == {"kind": "set_spdif_level", "db": -3}
+
+
+@pytest.mark.parametrize("stored,expected", [
+    ({"spdif_level_db": 6}, 6), ({"spdif_level_db": -2}, -2), ({}, 0),
+])
+def test_status_reports_the_stored_level_llr1444(panel, stored, expected):
+    set_state(panel, **stored)
+    switch = reply(AudioBroker(backend(panel)), wire("status"))["result"]["switch"]
+    assert switch["spdifLevelDb"] == expected
+
+
+def test_status_reports_null_not_a_default_when_the_file_is_unreadable_llr1444(panel):
+    panel["state"].write_text("not json", encoding="utf-8")
+    switch = reply(AudioBroker(backend(panel)), wire("status"))["result"]["switch"]
+    assert switch["supported"] is False and switch["spdifLevelDb"] is None
+
+
+def test_the_level_is_a_switch_verb_the_panel_can_reconcile_llr1444():
+    import audio_router
+    import routing
+    assert audio_router.OBSERVABLE_BLOCK["set_spdif_level"] == "switch"
+    assert "set_spdif_level" in routing.SELF_RECONCILING_METHODS
+    assert routing.switch_only_authorization("set_spdif_level", {"db": 3})

@@ -45,8 +45,9 @@ EnvironmentFile=-/etc/wall-panel/audio-cards.env
 ExecStartPre=/usr/bin/amixer -c ${WALL_AUDIO_ADAPTER_CARD} sset 'PCM Capture Source' 'IEC958 In'
 # S/PDIF arrives at digital full scale with no analog stage in front of it, so
 # the +4.4 dB of unsheddable analog gain that forced the line input to 0% does
-# not apply. The capture volume is left where alsactl has it; if the desktop
-# ever sends something hotter than 0 dBFS it is the desktop that is wrong.
+# not apply. The capture volume is left where alsactl has it. The level the
+# Owner adjusts in Settings is `spdif_level`, the softvol this delivers into on
+# its way to the bus (SR-144; asound-bus-mode.conf says why it is there).
 #
 # --respawn: THE GUARD RELAUNCHES ALSALOOP ITSELF (2026-10-16). Measured that
 # evening: systemd's restart counter is never reset by a healthy run, so the
@@ -63,7 +64,7 @@ ExecStart=/usr/local/lib/wall-panel/wall-alsaloop-guard.py \
     --respawn --respawn-delays 1,2,4,8,16,30 --healthy-after 20 -- \
     /usr/bin/alsaloop \
     --cdevice spdif_in \
-    --pdevice bus \
+    --pdevice spdif_level \
     --format S16_LE --rate 48000 --channels 2 \
     --tlatency 66000 --sync 5
 # 66 ms, not 30 (measured 2026-10-15). spdif_in and bus_mix both move 1024-frame

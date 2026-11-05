@@ -24,7 +24,8 @@ from typing import Callable, Mapping, Protocol
 import routed_backend
 import switch_backend
 from routing import (ALIAS, HARDWARE_ADDRESS, Device, MUTATING_METHODS,
-                     SELF_RECONCILING_METHODS, SWITCH_OUTPUTS, PolicyError,
+                     SELF_RECONCILING_METHODS, SPDIF_LEVEL_MAX_DB, SPDIF_LEVEL_MIN_DB,
+                     SWITCH_OUTPUTS, PolicyError,
                      device_authorization, switch_only_authorization,
                      validate_action, validate_inventory_action)
 
@@ -38,7 +39,7 @@ MAX_BACKEND_WORKERS = 4
 # The status block that settles each self-reconciling method (see _reconcile).
 OBSERVABLE_BLOCK = {"set_mute": "mute", "set_output": "switch",
                     "set_input_mute": "switch", "set_volume": "switch",
-                    "set_speaker_sleep": "switch"}
+                    "set_speaker_sleep": "switch", "set_spdif_level": "switch"}
 # The one optional field an action result may carry beyond {"accepted"}: the
 # sequence number the backend minted for this request. See _ensure_safe_result
 # and ECHO_SEQ_FIELD.
@@ -669,7 +670,7 @@ class AudioBroker:
     SWITCH_OPTIONAL_FIELDS = {"generation", "requestSeq",
                               "inputMuteHeld", "inputMutedConfirmed",
                               "headsetVia", "btHeadsetPresent",
-                              "speakerSleepsWithScreen"}
+                              "speakerSleepsWithScreen", "spdifLevelDb"}
     # What `headsetVia` may say. Null is legal and means "the switch is not on
     # Headset", which is not the same as "Headset resolves to nothing" -- that
     # is `available: false` with `reason: headset_absent`.
@@ -707,6 +708,11 @@ class AudioBroker:
                 and value["speakerSleepsWithScreen"] is not None
                 and not isinstance(value["speakerSleepsWithScreen"], bool)):
             raise BrokerError("unsafe_backend_result", "speaker sleep preference is invalid")
+        # SR-144, on the same terms.
+        spdif = value.get("spdifLevelDb")
+        if spdif is not None and (isinstance(spdif, bool) or not isinstance(spdif, int)
+                                  or not SPDIF_LEVEL_MIN_DB <= spdif <= SPDIF_LEVEL_MAX_DB):
+            raise BrokerError("unsafe_backend_result", "S/PDIF level is invalid")
         if value["reason"] is not None:
             self._safe_string(value["reason"], 32)
         volume = value["volume"]

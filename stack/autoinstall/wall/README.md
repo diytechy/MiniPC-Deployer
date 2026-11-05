@@ -45,7 +45,10 @@ RegisterAgent *and* RequestDefaultAgent -- `bluetoothctl --agent` does not do th
 second, and a window opened in front of a non-default agent rejects the pairing
 it was opened for), opens both properties, sleeps the window out, stops the
 agent and re-asserts the at-rest state. The window is bounded three ways: BlueZ's
-timeouts, the helper's own sleep, and the agent's independent timeout.
+timeouts, the helper's own sleep, and the agent's independent timeout. From the
+glass it runs under `wall-bluetooth-pairing.service`, because it outlives the
+request that opened it: the unit's `ExecStopPost` is that same `close`, however the
+window ends (SR-145).
 
 **The window bounds BONDING, not use.** A phone paired inside one reconnects and
 plays whenever it likes afterwards, with the adapter closed and no agent running.

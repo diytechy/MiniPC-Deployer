@@ -27,6 +27,15 @@
 >   2026-09-20 panel deploy (HomeHub `docs/FOLLOWUP_BLUETOOTH_ACCEPTANCE_2026-09-19d.md`),
 >   and PANEL_CURRENT row 12 ("Bluetooth physical routing disabled") closed on
 >   2026-09-20.
+> - **2026-11-05, the button itself.** Those two calls went straight to this
+>   socket from a probe. From the glass, `set_discoverable` and `trust` had never
+>   got here: the kiosk's `electron/audio-bridge.cjs` keeps its own allow-list and
+>   stopped them (OfficeWallNaglight WSN-113). Letting them through exposed the
+>   rest, fixed under SR-145: the window now has `wall-bluetooth-pairing.service`,
+>   and the scan and a burst of requests survive. Merged, not deployed; no phone
+>   has yet bonded through a window opened from the glass.
+> - **2026-11-05, `set_spdif_level`** (SR-144): the desktop's level in whole dB,
+>   -12..12, a switch verb reported as `spdifLevelDb`.
 
 This directory implements SR-023's narrow local protocol and pure policy. It
 was written as a deliberately non-routing boundary; see the status header for

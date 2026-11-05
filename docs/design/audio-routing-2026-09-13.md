@@ -318,7 +318,7 @@ as "no change", never as zero. **Not implemented in the renderer here.**
 |---|---|---|
 | `asound-bus-mode.conf` | new | the whole bus-mode graph (bus, tap, both legs, S/PDIF capture, `!default`) |
 | `wall-audio-mode` | changed | third mode `bus`; `apply_bus()`; stops the new forwarders before the IPC sweep; status lists them |
-| `wall-spdif-in.service` | new | adapter capture (selector → `IEC958 In`) → bus; successor to `wall-line-in` |
+| `wall-spdif-in.service` | new | adapter capture (selector → `IEC958 In`) → `spdif_level` (the desktop's own softvol, SR-144, 2026-11-05) → bus; successor to `wall-line-in` |
 | `wall-bus-speaker.service` | new | bus → `speaker_tap_mix` |
 | `wall-speaker-out.service` | new | `speaker_tap` → `speaker_out` (softvol → adapter front) |
 | `wall-bus-headset.service` | new | bus → `headset_out`; bound to the headset alias |

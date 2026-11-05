@@ -22,6 +22,8 @@
 #   bash scripts/ensure-local-images.sh              # ensure (skip refs that exist)
 #   bash scripts/ensure-local-images.sh --rebuild    # force sibling rebuilds
 #   bash scripts/ensure-local-images.sh --dry-run    # print decisions, change nothing
+#   FILEBACKUP_IMAGE_TAG=fae17c1 bash scripts/ensure-local-images.sh --rebuild --only-filebackup
+#                                                    # that image alone, under its own tag
 #   SIBLING_ROOT=/elsewhere bash scripts/ensure-local-images.sh
 #
 # Called automatically by sim/run-sim.sh; export-images.sh points here when the
@@ -32,11 +34,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 SIBLING_ROOT="${SIBLING_ROOT:-$(dirname "$REPO_ROOT")}"
 
-REBUILD=0; DRY_RUN=0
+REBUILD=0; DRY_RUN=0; ONLY_FILEBACKUP=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --rebuild) REBUILD=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
+        --only-filebackup) ONLY_FILEBACKUP=1; shift ;;
         -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         *) echo "unknown arg: $1 (try --help)" >&2; exit 2 ;;
     esac
@@ -84,7 +87,7 @@ TRACKER_PUBLIC_IMAGE="${TRACKER_PUBLIC_IMAGE:-$(env_get TRACKER_PUBLIC_IMAGE)}"
 FINANCE_AUDITOR_IMAGE_TAG="$(env_get FINANCE_AUDITOR_IMAGE_TAG)"
 FINANCE_AUDITOR_PUBLIC_IMAGE="${FINANCE_AUDITOR_PUBLIC_IMAGE:-$(env_get FINANCE_AUDITOR_PUBLIC_IMAGE)}"
 ACTUAL_IMAGE_TAG="$(env_get ACTUAL_IMAGE_TAG)"
-FILEBACKUP_IMAGE_TAG="$(env_get FILEBACKUP_IMAGE_TAG)"
+FILEBACKUP_IMAGE_TAG="${FILEBACKUP_IMAGE_TAG:-$(env_get FILEBACKUP_IMAGE_TAG)}"
 
 # ensure_image REF SIBLING_DIR PUBLIC_REF [docker-build args...] : resolve one
 # local image via the present → sibling-build → declared-public chain; die
@@ -92,6 +95,9 @@ FILEBACKUP_IMAGE_TAG="$(env_get FILEBACKUP_IMAGE_TAG)"
 ensure_image() {
     local ref="$1" sibling="$SIBLING_ROOT/$2" public="${3:-}"
     shift 3 || shift $#
+    if [ "$ONLY_FILEBACKUP" = 1 ] && [ "${ref%%:*}" != filebackup ]; then
+        log "skip: $ref (--only-filebackup)"; return 0
+    fi
     local build_args=("$@")
 
     if [ "$REBUILD" -eq 0 ] && docker image inspect "$ref" >/dev/null 2>&1; then
@@ -189,19 +195,18 @@ ensure_image "finance-auditor:${FINANCE_AUDITOR_IMAGE_TAG:-local}" "Finance-Audi
 #
 # THE CONTRACT LABEL (SR-133). stack/backup/library-backup.sh refuses to run
 # the one-mount layout (FILEBACKUP_LAYOUT=single) on an image that does not
-# carry homehub.filebackup.contract=one-mount-v2. It is decided HERE, from the
+# carry homehub.filebackup.contract=current-history-v3. It is decided HERE, from the
 # checkout being built, because the hub has no FileBackup history to ask:
-#   one-mount-v2      HEAD contains BoundedRebuild 7a6a80a (the bounded run
-#                     loop with the 2026-10-26 review's fixes) AND the engine's
-#                     ConfigSchemaVersion is 2 - so not FileBackup's later C44
-#                     (StorePath, Latest/), which would bump it and needs its own
-#                     contract change on the hub first;
-#   pre-bounded       HEAD does not contain 7a6a80a (the kit-12 era and older);
-#   unknown-history   the checkout does not have 7a6a80a at all (shallow/older);
+#   current-history-v3   HEAD contains the commit that built L9-L11 (StorePath,
+#                     CurrentBackup/, BackupHistory/) AND the engine's
+#                     ConfigSchemaVersion is 3;
+#   pre-single-store  HEAD does not contain it (kit 12, 7a6a80a's backup/ +
+#                     changes/, fae17c1's Latest/: same schema version, other layout);
+#   unknown-history   the checkout does not have that commit at all (shallow/older);
 #   configversion-N   it does, but the engine says another ConfigSchemaVersion.
 #   unknown           git could not be asked about the checkout at all.
 # The schema line is read from the WORKING TREE, which is what gets built.
-FILEBACKUP_CONTRACT_BASE=7a6a80acdafad57b48ab78f1dfc143c0ba808b1e
+FILEBACKUP_CONTRACT_BASE=88640a030f000f7ce8958a9b7cf1ebe97dba9e31
 filebackup_contract() {
     local fb="$SIBLING_ROOT/FileBackup" v
     # git that cannot be asked (no checkout, safe.directory) is not an answer.
@@ -214,14 +219,21 @@ filebackup_contract() {
         printf 'unknown-history'; return 0
     fi
     if ! repo_git "$fb" merge-base --is-ancestor "$FILEBACKUP_CONTRACT_BASE" HEAD 2>/dev/null; then
-        printf 'pre-bounded'; return 0
+        printf 'pre-single-store'; return 0
+    fi
+    # Uncommitted work in a tracked file is not the commit this answer is about:
+    # the build takes the working tree. Untracked files do not count, because the
+    # Dockerfile copies named paths only.
+    if [ -n "$(repo_git "$fb" status --porcelain --untracked-files=no -- . 2>/dev/null)" ]; then
+        printf 'dirty-tree'; return 0
     fi
     # shellcheck disable=SC2016  # $script: is PowerShell text, matched literally
     v="$(sed -n 's/^\$script:ConfigSchemaVersion = \([0-9][0-9]*\).*/\1/p' "$fb/Modules/FileBackup.Engine.psm1" 2>/dev/null | head -1)"
-    if [ "$v" = 2 ]; then printf 'one-mount-v2'; else printf 'configversion-%s' "${v:-unknown}"; fi
+    if [ "$v" = 3 ]; then printf 'current-history-v3'; else printf 'configversion-%s' "${v:-unknown}"; fi
 }
 ensure_image "filebackup:${FILEBACKUP_IMAGE_TAG:-local}" "FileBackup" "" \
     --label "homehub.filebackup.contract=$(filebackup_contract)"
+[ "$ONLY_FILEBACKUP" = 0 ] || exit 0
 
 # Sure - the Owner's FORK (SURE_IMAGE, default sure-auroleap:local), built from the
 # sibling ../sure by its own script because it builds a NAMED ref via `git archive`

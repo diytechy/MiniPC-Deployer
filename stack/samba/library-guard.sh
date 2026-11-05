@@ -37,6 +37,7 @@ DRIVE_LABEL="${DRIVE_LABEL:-library}"
 IDENTITY_FILE="${IDENTITY_FILE:-/etc/homehub-samba/drive-identity.conf}"
 MODE="--check"
 SHARE=""
+ALLOW_READ_ONLY=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --check)
@@ -50,6 +51,9 @@ while [ $# -gt 0 ]; do
         --library) LIBRARY_ROOT="$2"; shift 2 ;;
         --label)   DRIVE_LABEL="$2";  shift 2 ;;
         --expect)  IDENTITY_FILE="$2"; shift 2 ;;
+        # For a caller that only reads this mount: the library backup's unit
+        # makes the library read-only on purpose. A share never passes this.
+        --allow-read-only) ALLOW_READ_ONLY=1; shift ;;
         *) shift ;;
     esac
 done
@@ -105,7 +109,7 @@ check_mount() {
                 # ntfs3 falls back to read-only when the NTFS dirty bit is set
                 # (Windows Fast Startup, unclean eject). Reads look perfect
                 # while every write fails, so this is a failure too.
-                fail_reason="$LIBRARY_ROOT is mounted READ-ONLY — writes will fail (NTFS dirty bit? clear it from Windows)"
+                [ "$ALLOW_READ_ONLY" = 1 ] || fail_reason="$LIBRARY_ROOT is mounted READ-ONLY — writes will fail (NTFS dirty bit? clear it from Windows)"
                 ;;
         esac
     fi

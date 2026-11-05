@@ -221,9 +221,9 @@ if [ "$(_mounts "$legacy_block")" = "$_want_legacy" ] \
    && printf '%s\n' "$store_block"  | grep -qF 'profiles: ["filebackup"]' \
    && grep -qF '"ConfigVersion": 2,' "$FBJ" && grep -qF '"BackupPath": "/backup",' "$FBJ" \
    && grep -qF '"ChangePath": "/changes",' "$FBJ" && ! grep -qF StorePath "$FBJ" \
-   && grep -qF '"ConfigVersion": 2,' "$FBS" && grep -qF '"BackupPath": "/store/backup",' "$FBS" \
-   && grep -qF '"ChangePath": "/store/changes",' "$FBS" && ! grep -qE 'StorePath|SourceStatePath' "$FBS"; then
-    pass "TC-1585 filebackup keeps the three-mount binds and a ConfigVersion 2 config; filebackup-store binds one /store with a ConfigVersion 2 config naming /store/backup and /store/changes"
+   && grep -qF '"ConfigVersion": 3,' "$FBS" && grep -qF '"StorePath": "/store",' "$FBS" \
+   && ! grep -qE 'BackupPath|ChangePath|SourceStatePath' "$FBS"; then
+    pass "TC-1585 filebackup keeps the three-mount binds and a ConfigVersion 2 config; filebackup-store binds one /store with a ConfigVersion 3 config naming StorePath "
 else
     fail "TC-1585 the layout services drifted: legacy=[$(_mounts "$legacy_block" | tr '\n' '|')] store=[$(_mounts "$store_block" | tr '\n' '|')]"
 fi
@@ -281,6 +281,14 @@ else
     else
         fail "TC-1586 manifest choice: legacy=$_a witness='$_b' copy=$_c rollback=$_d; out: $(tr '\n' '|' <"$FFD/out" | cut -c1-300)"
     fi
+fi
+
+# The unit makes the library read-only, so the source check must accept that and the
+# store check must not: a read-only backup drive is the failure the guard exists for.
+if grep -q '^preflight_mount "$FB_SOURCE" library ro$' "$HERE/../library-backup.sh"    && grep -q '^preflight_mount "$BACKUP_MOUNT" backup-drive$' "$HERE/../library-backup.sh"; then
+    pass "the source is checked as readable and the backup drive as writable"
+else
+    fail "preflight must accept a read-only source and refuse a read-only backup drive"
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

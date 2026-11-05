@@ -130,6 +130,14 @@ apply_volume_baseline() {
     IFS=$'\t' read -r _ uid gid mode acl <<< "$row"
     if chown "$uid:$gid" "$mnt" && chmod "$mode" "$mnt" && setfacl -m "$acl" "$mnt"; then
         log "$mnt baseline: $uid:$gid mode $mode, default ACL $acl"
+        # The library backup runs as uid 65532 and walks the whole volume. ext4's
+        # own lost+found is root 0700, so that walk cannot list it, and one
+        # folder it cannot list ends every run with exit 1: never a verified
+        # success. Read and traverse for that uid alone; e2fsck keeps the ACL.
+        if [ "$mnt" = /srv/library ] && [ -d "$mnt/lost+found" ]; then
+            setfacl -m u:65532:rx "$mnt/lost+found" \
+                || log "WARN: could not let uid 65532 list $mnt/lost+found - every library backup will exit 1."
+        fi
     else
         log "WARN: could not apply the baseline to $mnt (is the acl package installed?)."
         return 1

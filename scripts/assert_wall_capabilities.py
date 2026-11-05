@@ -85,6 +85,7 @@ ALLOWED_SITE_FILES = {
     # Checklist drill wake grace (OfficeWallNaglight bb05ecf) and the touch
     # protection badge (c754f44, touch-status-v1): both imported by js/main.js,
     # both served by the live hub site since the 2026-10-21 paired releases.
+    "js/door-chime-mute.js",
     "js/drill-wake.js",
     "js/event-id.js",
     "js/feed-contact.js",
@@ -155,6 +156,7 @@ ALLOWED_SITE_FILES = {
     "vendor/icons/clock.svg",
     "vendor/icons/heart.svg",
     "vendor/icons/sleep.svg",
+    "vendor/icons/wallet.svg",
     "vendor/icons/weight.svg",
     "vendor/projectm/PROVENANCE.md",
     "vendor/projectm/projectm.mjs",

@@ -22,6 +22,7 @@
 # Usage:
 #   bash vmtest/assert-iso-payload.sh --iso vmtest/.out/repacked.iso
 #   bash vmtest/assert-iso-payload.sh --iso <path> --target wall
+#   bash vmtest/assert-iso-payload.sh --iso <path> --target kids
 #
 # Exit 0 = every assertion held. Nonzero = the count of failures.
 
@@ -45,8 +46,8 @@ done
 # quietly ran the five weak assertions against a hub ISO and called it clean. A
 # typo must not be able to downgrade the check it was asked for.
 case "$TARGET" in
-    hub|wall) ;;
-    *) echo "unknown --target '$TARGET' (expected hub or wall)" >&2; exit 2 ;;
+    hub|wall|kids) ;;
+    *) echo "unknown --target '$TARGET' (expected hub, wall or kids)" >&2; exit 2 ;;
 esac
 [ -f "$ISO" ] || { echo "not found: $ISO" >&2; exit 2; }
 command -v xorriso >/dev/null || { echo "xorriso is required" >&2; exit 2; }
@@ -160,6 +161,51 @@ if [ "$TARGET" = "hub" ]; then
     esac
 fi
 
+# ── carriage: OtterTube, the one thing the kids image exists to run ─────────
+# Late-command 3b unpacks kids-app/ottertube-*-linux-x64.tar.gz and halts the
+# install without it, so the guards on the build side (stage_kids_app_into_payload)
+# are asked again here, of the artifact: a file can be right when staged and still
+# not reach the ISO, which is why this script exists at all.
+if [ "$TARGET" = "kids" ]; then
+    echo
+    echo "== carriage: OtterTube =="
+    # -find prints each path quoted; strip the quotes.
+    xorriso -indev "$ISO" -find /deploy-payload/kids-app -name 'ottertube-*-linux-x64.tar.gz' 2>/dev/null \
+        | tr -d "'" | grep '^/deploy-payload/kids-app/' > "$TMP/kids-tars" || true
+    n_tar="$(grep -c . "$TMP/kids-tars")"
+    if [ "$n_tar" -ne 1 ]; then
+        bad "$n_tar OtterTube tarballs under /deploy-payload/kids-app - exactly one may ship, and late-command 3b would take the first"
+    else
+        TAR_ISO="$(cat "$TMP/kids-tars")"
+        ok "exactly one OtterTube tarball rides the ISO: ${TAR_ISO##*/}"
+        case "$TAR_ISO" in *-dirty-*) bad "${TAR_ISO##*/} is a -dirty build" ;; esac
+        iso_get "$TAR_ISO" "$TMP/kids-app.tgz"
+        # CAPTURE, THEN A HERE-STRING: never a live pipe into grep -q under
+        # pipefail (a good tarball was refused that way on 2026-11-01).
+        if listing="$(tar -tvzf "$TMP/kids-app.tgz" 2>/dev/null)"; then
+            grep -Eq '^-rwsr-xr-x 0/0 .* app/chrome-sandbox$' <<< "$listing" \
+                && ok "app/chrome-sandbox is setuid root, so Electron can start with its sandbox on" \
+                || bad "app/chrome-sandbox is not setuid root - Electron would refuse to start on the kiosk"
+            grep -Eq '^-rwx.* app/ottertube-desktop$' <<< "$listing" \
+                && ok "app/ottertube-desktop is executable" \
+                || bad "app/ottertube-desktop is missing or not executable - late-command 3b halts the install"
+            # The name says which commit; the build's own stamp says which it is.
+            name_commit="${TAR_ISO##*/ottertube-}"; name_commit="${name_commit%%-*}"
+            if tar -xzf "$TMP/kids-app.tgz" -C "$TMP" app/build-info.json 2>/dev/null; then
+                stamp="$(sed -n 's/.*"commit": *"\([0-9a-f]*\)".*/\1/p' "$TMP/app/build-info.json" | head -1)"
+                case "$stamp" in
+                    "$name_commit"*) ok "its build stamp agrees with its name ($name_commit)" ;;
+                    *) bad "the tarball is named $name_commit but its build stamp says ${stamp:-<none>}" ;;
+                esac
+            else
+                bad "app/build-info.json is not in the tarball - which build this is cannot be told"
+            fi
+        else
+            bad "${TAR_ISO##*/} on the ISO is not a readable gzip tarball"
+        fi
+    fi
+fi
+
 # ── carriage: every payload file a late-command touches ─────────────────────
 # ADDED 2026-08-29, and the near-miss that produced it is worth stating plainly.
 # The crossplay relay's two new files were written, referenced by four new
@@ -184,6 +230,7 @@ echo "== carriage: every payload file a late-command touches =="
 case "$TARGET" in
     hub)  UD_ISO=/deploy-payload/stack/autoinstall/user-data;      PAY_ROOT=/opt/homehub ;;
     wall) UD_ISO=/deploy-payload/stack/autoinstall/wall/user-data; PAY_ROOT=/opt/wall-panel ;;
+    kids) UD_ISO=/deploy-payload/stack/autoinstall/kids/user-data; PAY_ROOT=/opt/kids-kiosk ;;
 esac
 UDF="$TMP/late-user-data"
 iso_get "$UD_ISO" "$UDF"

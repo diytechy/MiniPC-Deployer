@@ -32,5 +32,6 @@ truth for what each id means.
 | 2026-11-01 | Speakers sleep with the screen: fade stage, relay off with the dark screen, persisted preference (system half; branch `speaker-sleep-with-screen`; the kiosk toggle is OfficeWallNaglight's) | SR-140..141; LLR-1430..1444; TC-1640..1659 (used: SR-140..141, LLR-1430..1437, TC-1640..1655; SR-028, SR-039, LLR-013, LLR-014, LLR-015, LLR-941 and IF-015 amended) |
 | 2026-11-01 | Kids kiosk image: OtterTube on the spare mini-PC with a USB touch monitor, TV mirror (branch `kids-kiosk`) | SN-053; SR-138..139; LLR-1414..1419; TC-1621..1629 (used: all) |
 | 2026-11-04 | The library backup schedule knob: a reimage cannot arm the backup (branch `library-backup-timer-knob`) | SR-142; LLR-1438; TC-1656..1657 (used: all) |
+| 2026-11-04 | The built kids ISO is read back (branch `kids-iso-payload-check`) | LLR-1439; TC-1658 (used: all; no new SR, SR-138 covers it) |
 
 The plan is HomeHub `docs/archive/2026-10-23/IMPLEMENTATION_PLAN_2026-10-22.md`.

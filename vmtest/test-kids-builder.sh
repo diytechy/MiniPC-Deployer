@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# vmtest/test-kids-builder.sh — the kids kiosk builder's seams. Verifies: TC-1628, TC-1629.
+# vmtest/test-kids-builder.sh — the kids kiosk builder's seams. Verifies: TC-1628, TC-1629, TC-1658.
 #
 # render_kids_seed_tree and stage_kids_app_into_payload decide what a stick
 # installs and on which disk. Each guard below is exercised by building the
@@ -10,9 +10,12 @@
 #           a good filled seed and its kids.env staged)
 #   TC-1629 the OtterTube tarball: none, two, -dirty, or chrome-sandbox not
 #           setuid root - each refused; exactly one good one staged
+#   TC-1658 the same tarball read back off a built ISO by
+#           assert-iso-payload.sh --target kids: each fault fails it, a good one
+#           passes
 #
 # Needs: bash, python3 + PyYAML (validate_autoinstall_yaml), openssl,
-# ssh-keygen, tar. Builds nothing big; a few seconds.
+# ssh-keygen, tar, xorriso. Builds nothing big; a few seconds.
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -127,6 +130,57 @@ if out=$(stage "$WORK/s6" "$WORK/many") && [ -f "$WORK/s6/iso-root/deploy-payloa
     pass "TC-1629 a good tarball with many entries after chrome-sandbox is staged (pipefail)"
 else
     fail "TC-1629 a good tarball with many entries was refused: $(printf '%s' "${out:-}" | tail -n 2)"
+fi
+
+# ── TC-1658: the built ISO is read back ──────────────────────────────────────
+# assert-iso-payload.sh --target kids over small real ISOs. Only its OtterTube
+# section is judged: these ISOs carry no user-data or apt repo, so its later
+# sections fail by design and would drown the verdict.
+mk_iso() {  # dir-name, then "tarball-name sandbox-mode stamp-commit" per tarball
+    local d="$WORK/iso-$1" name mode stamp s; shift
+    mkdir -p "$d/root/deploy-payload/kids-app"
+    while [ $# -gt 0 ]; do
+        name="$1"; mode="$2"; stamp="$3"; shift 3
+        s=$(mktemp -d); mkdir -p "$s/app"
+        printf '#!/bin/sh\n' > "$s/app/ottertube-desktop"; chmod 755 "$s/app/ottertube-desktop"
+        : > "$s/app/chrome-sandbox"; chmod "$mode" "$s/app/chrome-sandbox"
+        [ "$stamp" = none ] || printf '{"product":"OtterTube","commit":"%s"}\n' "$stamp" > "$s/app/build-info.json"
+        tar --owner=0 --group=0 --numeric-owner -czf "$d/root/deploy-payload/kids-app/$name" -C "$s" app; rm -rf "$s"
+    done
+    xorriso -as mkisofs -quiet -o "$d/k.iso" -R "$d/root" >/dev/null 2>&1
+}
+section() {  # dir-name: the OtterTube section of the checker's output
+    bash "$SCRIPT_DIR/assert-iso-payload.sh" --iso "$WORK/iso-$1/k.iso" --target kids 2>&1 \
+        | sed -n '/== carriage: OtterTube ==/,/== carriage: every payload/p'
+}
+expect_read() {  # label dir-name pattern-a-FAIL-line-must-match
+    local o; o=$(section "$2")
+    if printf '%s\n' "$o" | grep 'FAIL' | grep -q "$3"; then pass "$1"; else fail "$1: $o"; fi
+}
+
+if command -v xorriso >/dev/null 2>&1; then
+    A=ottertube-aaaaaaa-linux-x64.tar.gz; FULL=aaaaaaa1111111111111111111111111111111aa
+    mk_iso good "$A" 4755 "$FULL"
+    o=$(section good)
+    if ! printf '%s\n' "$o" | grep -q 'FAIL' && [ "$(printf '%s\n' "$o" | grep -c 'PASS')" -eq 4 ]; then
+        pass "TC-1658 a good ISO passes all four OtterTube checks"
+    else
+        fail "TC-1658 a good ISO did not pass cleanly: $o"
+    fi
+    mk_iso none
+    expect_read "TC-1658 no tarball on the ISO fails" none '0 OtterTube tarballs'
+    mk_iso two "$A" 4755 "$FULL" ottertube-bbbbbbb-linux-x64.tar.gz 4755 "$FULL"
+    expect_read "TC-1658 two tarballs on the ISO fail" two '2 OtterTube tarballs'
+    mk_iso dirty ottertube-aaaaaaa-dirty-linux-x64.tar.gz 4755 "$FULL"
+    expect_read "TC-1658 a -dirty name on the ISO fails" dirty 'dirty build'
+    mk_iso nosuid "$A" 755 "$FULL"
+    expect_read "TC-1658 chrome-sandbox without setuid fails" nosuid 'not setuid root'
+    mk_iso other "$A" 4755 bbbbbbb2222222222222222222222222222222bb
+    expect_read "TC-1658 a stamp that disagrees with the name fails" other 'build stamp says'
+    mk_iso nostamp "$A" 4755 none
+    expect_read "TC-1658 a tarball with no stamp fails" nostamp 'build-info.json is not in the tarball'
+else
+    fail "TC-1658 needs xorriso, which the ISO build needs anyway"
 fi
 
 echo "FAILURES=$FAIL"

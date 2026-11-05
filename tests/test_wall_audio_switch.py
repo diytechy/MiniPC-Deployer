@@ -4553,3 +4553,67 @@ def test_the_cli_refuses_anything_else_llr1443(tmp_path, word):
 
 def test_the_applier_accepts_the_request_kind_llr1443(applier):
     assert "set_spdif_level" in applier.ALLOWED_REQUEST_KINDS
+
+
+# ── SR-145: a burst of requests is not fatal, and none is lost ───────────────
+
+def test_the_apply_unit_has_no_start_limit_llr1446():
+    """Five in ten seconds would fail the path unit until a reboot."""
+    unit = read(WALL / "wall-audio-apply.service")
+    head = unit.split("[Service]", 1)[0]
+    assert "\nStartLimitIntervalSec=0\n" in head, "a [Unit] key, or it is ignored"
+
+
+def _requests(applier, tmp_path, monkeypatch, plan):
+    """apply_requests against a request file that `plan` rewrites after each pass."""
+    state = tmp_path / "audio-state.json"
+    request = tmp_path / "request.json"
+    state.write_text(json.dumps({"output": "speaker", "input_muted": False, "request_seq": 1}),
+                     encoding="utf-8")
+    request.write_text(json.dumps({"seq": 2}), encoding="utf-8")
+    passes = []
+
+    def fake_pass(arguments):
+        current = json.loads(state.read_text(encoding="utf-8"))
+        seq = json.loads(request.read_text(encoding="utf-8"))["seq"]
+        passes.append(seq)
+        plan(current, seq, state, request, len(passes))
+        return 0
+
+    monkeypatch.setattr(applier, "_locked_apply", fake_pass)
+    arguments = SimpleNamespace(dry_run=False, value=str(request), state=str(state))
+    assert applier.apply_requests(arguments) == 0
+    return passes
+
+
+def test_a_request_written_during_a_pass_is_picked_up_llr1446(applier, tmp_path, monkeypatch):
+    def plan(current, seq, state, request, count):
+        current["request_seq"] = seq
+        state.write_text(json.dumps(current), encoding="utf-8")
+        if count == 1:
+            request.write_text(json.dumps({"seq": 3}), encoding="utf-8")
+
+    assert _requests(applier, tmp_path, monkeypatch, plan) == [2, 3]
+
+
+def test_a_refused_request_is_not_retried_for_ever_llr1446(applier, tmp_path, monkeypatch):
+    """Refused leaves the mark where it was, so the file still looks newer."""
+    passes = _requests(applier, tmp_path, monkeypatch, lambda *a: None)
+    assert passes == [2, 2]
+
+
+def test_the_drain_is_bounded_llr1446(applier, tmp_path, monkeypatch):
+    def plan(current, seq, state, request, count):
+        current["request_seq"] = seq
+        state.write_text(json.dumps(current), encoding="utf-8")
+        request.write_text(json.dumps({"seq": seq + 1}), encoding="utf-8")
+
+    passes = _requests(applier, tmp_path, monkeypatch, plan)
+    assert len(passes) == applier.REQUEST_DRAIN_PASSES + 1
+
+
+@pytest.mark.parametrize("text", ["not json", "[]", "{}", '{"seq": true}', '{"seq": "9"}'])
+def test_an_unusable_file_is_nothing_waiting_llr1446(applier, tmp_path, text):
+    request = tmp_path / "request.json"
+    request.write_text(text, encoding="utf-8")
+    assert applier.waiting_request_seq(request, tmp_path / "absent.json") is None

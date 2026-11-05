@@ -26,6 +26,9 @@ guards is a panel left permanently pairable:
   3. `close` re-asserts that state at any time, and is the same code path as
      boot, so there is no teardown that can be skipped.
 
+From the glass this runs under wall-bluetooth-pairing.service, whose ExecStopPost
+is that `close`, because the window outlives the request that opened it.
+
 `pairing=off` refuses to open at all. A window is a deliberate act, but it is
 still bounded by the policy the panel was configured with.
 """

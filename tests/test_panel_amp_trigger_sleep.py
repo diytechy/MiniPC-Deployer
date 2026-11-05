@@ -1124,3 +1124,36 @@ def test_a_failed_close_does_not_leave_the_stage_down_llr1440(daemon):
     assert wait_until(lambda: rig.world.index_of("relay", "ON") is not None)
     assert wait_until(lambda: rig.mixer.value == 60)
     rig.stop()
+
+
+def test_the_preference_going_off_cannot_cut_a_wake_settle_short_llr1440():
+    rig = Rig()
+    go_dark(rig, audio=True)
+    rig.world.events.clear()
+    rig.run(1.0, lit=True)                       # relay ON, settling
+    on_at = rig.world.of("relay")[0][0]
+    rig.run(7.0, enabled=False, lit=True)
+    ups = [(t, d) for t, d in rig.world.of("amixer") if d > 0]
+    assert ups and ups[0][0] - on_at >= 5.0, ups[:1]
+    assert rig.fade_values()[-1] == 60
+    assert rig.sleeper.phase == rig.module.SpeakerSleep.LIT
+
+
+def test_a_relay_restarted_after_it_stopped_settles_too_llr1440(daemon):
+    """Restarting proves OFF and closes again, so it is a close like any other."""
+    rig = daemon
+    rig.thread.start()
+    assert wait_until(lambda: rig.world.index_of("relay", "ON") is not None)
+    assert wait_until(lambda: rig.mixer.value == 60)
+    time.sleep(0.05)
+    mark = len(rig.world.events)
+    rig.actuator.running_flag = False
+    assert wait_until(lambda: any(e[1:] == ("relay", "ON") for e in rig.world.events[mark:]))
+    assert wait_until(lambda: rig.mixer.value == 60)
+    rig.stop()
+    tail = rig.world.events[mark:]
+    closed = next(i for i, e in enumerate(tail) if e[1:] == ("relay", "ON"))
+    writes = [e[2] for e in tail[:closed] if e[1] == "amixer"]
+    assert writes and writes[-1] == 0, "silent before the relay closes again"
+    rising = [e[0] for e in tail[closed:] if e[1] == "amixer" and e[2] > 0]
+    assert rising and rising[0] - tail[closed][0] >= 0.25, "and then the settle"

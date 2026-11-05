@@ -57,6 +57,7 @@ install -m 0644 "$payload/wall-bluetooth.service" /etc/systemd/system/wall-bluet
 install -m 0755 "$payload/wall-bluetooth-device.py" /usr/local/sbin/wall-bluetooth-device
 install -m 0644 "$payload/wall-bluetooth-device-apply.path"     /etc/systemd/system/wall-bluetooth-device-apply.path
 install -m 0644 "$payload/wall-bluetooth-device-apply.service"  /etc/systemd/system/wall-bluetooth-device-apply.service
+install -m 0644 "$payload/wall-bluetooth-pairing.service"       /etc/systemd/system/wall-bluetooth-pairing.service
 install -m 0644 "$payload/wall-bluetooth-observe.service"       /etc/systemd/system/wall-bluetooth-observe.service
 install -m 0644 "$payload/wall-bluetooth-observe.timer"         /etc/systemd/system/wall-bluetooth-observe.timer
 install -m 0644 "$payload/wall-bus-bluetooth.service"           /etc/systemd/system/wall-bus-bluetooth.service

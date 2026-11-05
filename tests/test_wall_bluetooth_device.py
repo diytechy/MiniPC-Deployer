@@ -938,3 +938,98 @@ def test_the_class_is_never_published_to_the_broker(applier):
     assert "major_class" not in published
     row = source.split('rows.append(row)', 1)[0].rsplit('row = {', 1)[1]
     assert "major_class" not in row
+
+
+# --- SR-145: the window outlives the request that opened it -------------------
+# Measured on systemd 255, 2026-11-05: a background child of a oneshot is killed
+# when the oneshot exits, and the path unit dies at the sixth start in ten seconds.
+
+WALL = ROOT / "stack" / "autoinstall" / "wall"
+
+
+def _unit(name):
+    return (WALL / name).read_text(encoding="utf-8")
+
+
+class _Done:
+    def __init__(self, returncode=0):
+        self.returncode = returncode
+        self.stdout = self.stderr = ""
+
+
+def _windowed(monkeypatch, tmp_path, answer=0, discoverable=(True,)):
+    tool = tmp_path / "wall-bluetooth-pairing"
+    tool.write_text("", encoding="utf-8")
+    applier = _load_for_window()
+    monkeypatch.setattr(applier, "PAIRING_TOOL", str(tool))
+    monkeypatch.setattr(applier, "PAIRING_OPEN_POLL_SECONDS", 0)
+    calls = []
+    monkeypatch.setattr(applier, "_run", lambda argv, timeout: (calls.append((argv, timeout)), _Done(answer))[1])
+    readings = list(discoverable)
+    monkeypatch.setattr(applier, "adapter", lambda: (
+        "ready", True, readings.pop(0) if len(readings) > 1 else readings[0], True))
+    return applier, calls
+
+
+def _load_for_window():
+    spec = importlib.util.spec_from_file_location("wall_bluetooth_device_window", APPLIER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_opening_starts_the_unit_and_never_blocks_on_the_window_llr1445(monkeypatch, tmp_path):
+    applier, calls = _windowed(monkeypatch, tmp_path, discoverable=(False, False, True))
+    assert applier.pairing_window(True) is True
+    assert [argv for argv, _ in calls] == [
+        ["systemctl", "start", "--no-block", "wall-bluetooth-pairing.service"]]
+
+
+def test_a_window_that_never_opens_is_reported_llr1445(monkeypatch, tmp_path):
+    applier, _calls = _windowed(monkeypatch, tmp_path, discoverable=(False,))
+    monkeypatch.setattr(applier, "PAIRING_OPEN_WAIT_SECONDS", 0.01)
+    assert applier.pairing_window(True) is False
+
+
+def test_closing_stops_the_unit_then_asserts_the_door_llr1445(monkeypatch, tmp_path):
+    """A stop alone would leave a window opened over SSH standing."""
+    applier, calls = _windowed(monkeypatch, tmp_path)
+    assert applier.pairing_window(False) is True
+    assert [argv for argv, _ in calls] == [
+        ["systemctl", "stop", "wall-bluetooth-pairing.service"],
+        [applier.PAIRING_TOOL, "close"]]
+    assert all(timeout > 30 for _, timeout in calls), "the close itself may take 30 s"
+
+
+def test_a_refused_unit_is_a_refusal_llr1445(monkeypatch, tmp_path):
+    applier, _calls = _windowed(monkeypatch, tmp_path, answer=1)
+    assert applier.pairing_window(True) is False
+    assert applier.pairing_window(False) is False
+
+
+def test_the_tool_is_never_asked_to_sleep_the_window_from_here_llr1445():
+    source = APPLIER.read_text(encoding="utf-8")
+    assert source.count("[PAIRING_TOOL,") == 1 and '[PAIRING_TOOL, "close"]' in source
+
+
+def test_the_window_unit_closes_on_every_exit_and_is_never_enabled_llr1445():
+    unit = _unit("wall-bluetooth-pairing.service")
+    assert "ExecStart=/usr/local/sbin/wall-bluetooth-pairing open\n" in unit
+    assert "ExecStopPost=/usr/local/sbin/wall-bluetooth-pairing close\n" in unit
+    assert "[Install]" not in unit, "a window must not open at boot"
+    assert "KillMode" not in unit, "stopping must reach the agent in the same cgroup"
+    assert "Restart=" not in unit.replace("Restart=no", "")
+
+
+def test_the_image_installs_the_window_unit_llr1445():
+    script = _unit("configure-bluetooth.sh")
+    assert ('"$payload/wall-bluetooth-pairing.service"       '
+            '/etc/systemd/system/wall-bluetooth-pairing.service') in script
+
+
+def test_the_scan_survives_the_oneshot_and_a_burst_survives_the_limit_llr1447():
+    unit = _unit("wall-bluetooth-device-apply.service")
+    head, service = unit.split("[Service]", 1)
+    assert "\nKillMode=process\n" in service
+    assert "\nStartLimitBurst=50\n" in head, "a [Unit] key, or it is ignored"
+    assert "\nStartLimitIntervalSec=10\n" in head

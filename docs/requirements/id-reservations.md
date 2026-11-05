@@ -33,6 +33,6 @@ truth for what each id means.
 | 2026-11-01 | Kids kiosk image: OtterTube on the spare mini-PC with a USB touch monitor, TV mirror (branch `kids-kiosk`) | SN-053; SR-138..139; LLR-1414..1419; TC-1621..1629 (used: all) |
 | 2026-11-04 | The library backup schedule knob: a reimage cannot arm the backup (branch `library-backup-timer-knob`) | SR-142; LLR-1438; TC-1656..1657 (used: all) |
 | 2026-11-04 | The built kids ISO is read back (branch `kids-iso-payload-check`) | LLR-1439; TC-1658 (used: all; no new SR, SR-138 covers it) |
-| 2026-11-05 | The relay settle and the desktop's S/PDIF level (branch `panel-owner-items-2026-11-05`) | SR-143..144; LLR-1440..1444; TC-1659..1664 (used: all) |
+| 2026-11-05 | The relay settle and the desktop's S/PDIF level (branch `panel-owner-items-2026-11-05`) | SR-143..145; LLR-1440..1447; TC-1659..1667 (used: all) |
 
 The plan is HomeHub `docs/archive/2026-10-23/IMPLEMENTATION_PLAN_2026-10-22.md`.

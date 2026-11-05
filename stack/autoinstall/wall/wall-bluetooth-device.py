@@ -104,6 +104,12 @@ AUDIO_TOOL = os.environ.get("WALL_AUDIO_TOOL") or "/usr/local/sbin/wall-audio-ou
 # tick's apply-state picks it up regardless.
 AUDIO_TOOL_TIMEOUT_SECONDS = 30
 PAIRING_TOOL = os.environ.get("WALL_BLUETOOTH_PAIRING_TOOL") or "/usr/local/sbin/wall-bluetooth-pairing"
+PAIRING_UNIT = "wall-bluetooth-pairing.service"
+# How long a request waits to see the adapter answer, so what it publishes is the
+# window and not the moment before it. Opening takes about six seconds: the tool
+# holds the door for five to prove the agent registered.
+PAIRING_OPEN_WAIT_SECONDS = 10
+PAIRING_OPEN_POLL_SECONDS = 0.5
 
 # Long enough for a real bond over a radio, short enough that the oneshot unit
 # does not look hung. Measured against the panel's own pairing runs: a Pixel
@@ -111,6 +117,8 @@ PAIRING_TOOL = os.environ.get("WALL_BLUETOOTH_PAIRING_TOOL") or "/usr/local/sbin
 PAIR_TIMEOUT_SECONDS = 40
 # Everything else is a property write or a local D-Bus round trip.
 CONTROL_TIMEOUT_SECONDS = 15
+# Closing a window runs wall-bluetooth-apply, which the pairing tool bounds at 30 s.
+CLOSE_TIMEOUT_SECONDS = 40
 # Reading one device's properties is the cheapest thing here and is done once per
 # device per publish, so it gets the tightest bound: at the control timeout, two
 # stalled devices are already past the broker's staleness budget.
@@ -695,15 +703,37 @@ def start_discovery(seconds):
 
 
 def pairing_window(enabled):
-    """Open or close the bounded pairing window, through the tool that owns it."""
+    """Open or close the bounded pairing window, through the unit that owns it.
+
+    NEVER THE TOOL'S `open` DIRECTLY: it sleeps the whole window, which is longer
+    than any control timeout here and longer than this oneshot lives. See
+    wall-bluetooth-pairing.service. Starting a window that is open already changes
+    nothing. Closing stops the unit and then runs the tool's `close` as well: a
+    stop does nothing to a window opened over SSH, and `close` is idempotent, so
+    `cancel` and "Stop being discoverable" have re-asserted the at-rest state by
+    the time they publish, whoever opened the door.
+    Implements: SR-145, LLR-1445
+    """
     if not Path(PAIRING_TOOL).exists():
         log("no pairing tool at %s; discoverability is unavailable" % PAIRING_TOOL)
         return False
-    done = _run([PAIRING_TOOL, "open" if enabled else "close"], CONTROL_TIMEOUT_SECONDS)
+    verb = ["systemctl", "start", "--no-block"] if enabled else ["systemctl", "stop"]
+    done = _run([*verb, PAIRING_UNIT], CLOSE_TIMEOUT_SECONDS)
+    if not enabled:
+        # Whatever the stop said: the tool is what can shut the door.
+        done = _run([PAIRING_TOOL, "close"], CLOSE_TIMEOUT_SECONDS)
     if done is None or done.returncode != 0:
         log("pairing window %s refused" % ("open" if enabled else "close"))
         return False
-    return True
+    if not enabled:
+        return True
+    deadline = time.monotonic() + PAIRING_OPEN_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        if adapter()[2]:
+            return True
+        time.sleep(PAIRING_OPEN_POLL_SECONDS)
+    log("pairing window did not open within %ds" % PAIRING_OPEN_WAIT_SECONDS)
+    return False
 
 
 def offer_passkey(value):

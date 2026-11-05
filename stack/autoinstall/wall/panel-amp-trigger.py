@@ -1184,18 +1184,19 @@ class SpeakerSleep:
         FADING_IN   Ramp to FADE_UNITY over FADE_IN_SECONDS. Done -> LIT.
                     Dark again -> FADING_OUT.
 
-    Leaving "enabled" in any phase (preference off, output moved, mode change)
+    Leaving "enabled" outside a settle (preference off, output moved, mode change)
     snaps the fade to unity and returns to LIT: the relay is then the existing
     rule's again. The fade is also set to unity by reset_unity() on start-up
     and shutdown, so a crash cannot leave the room silent.
 
-    THE ATTACK RULE'S CLOSE GETS THE SAME SETTLE (SR-143). In the Speaker
-    position the loop calls hold_for_relay() before it closes the relay and
-    relay_closed() once it has, which enters SETTLING from LIT. That hold runs
-    to the end of FADING_IN even when the machine is not "enabled": it is about
-    the amplifier starting, so the sleep preference has no say in it, and if the
-    output moves away during it the ramp reaches a leg nobody is listening to
-    and finishes at unity, where it would have been snapped to.
+    EVERY CLOSE GETS THE SAME SETTLE (SR-143). In the Speaker position the loop
+    calls hold_for_relay() before it closes the relay itself, by the attack rule
+    or by restarting a relay that stopped, and relay_closed() once it has, which
+    enters SETTLING. A settle runs to the end of FADING_IN even if the machine
+    stops being "enabled": it is about the amplifier starting, so the sleep
+    preference has no say in it, and if the output moves away during it the ramp
+    reaches a leg nobody is listening to and finishes at unity, where it would
+    have been snapped to.
 
     Implements: SR-140, LLR-1436, SR-143, LLR-1440
     """
@@ -1346,6 +1347,7 @@ class SpeakerSleep:
                 # still applies, however the fade got interrupted.
                 self._ramp = None
                 self._emit("screen lit mid-settle: finishing the settle")
+                self._relay_hold = True
                 self.phase = self.SETTLING
             elif awake:
                 self._emit("screen lit mid-fade: fading back in")
@@ -1385,6 +1387,7 @@ class SpeakerSleep:
             if now - self._last_relay_try >= beat:
                 self._last_relay_try = now
                 if self._relay_on(now):
+                    self._relay_hold = True
                     self.phase = self.SETTLING
                     self._settle_until = now + WAKE_SETTLE_SECONDS
                     self._emit("speakers waking: relay ON, settling %.1fs"
@@ -1526,7 +1529,15 @@ def main():
                 and at - last_actuator_attempt >= beat_seconds):
             last_actuator_attempt = at
             log("amplifier actuator stopped unexpectedly; restarting")
-            if not actuator.start():
+            # start() proves OFF before it closes, so this is a real close of the
+            # relay and takes the settle like any other (SR-143).
+            settle = sleep_capable and read_sleep_policy()[0]
+            if settle:
+                sleeper.hold_for_relay()
+            if actuator.start():
+                if settle:
+                    sleeper.relay_closed(at)
+            else:
                 on = False
                 # The relay is in an unknown physical state: the loop above
                 # keeps commanding OFF until one is verified.

@@ -1,0 +1,31 @@
+# wall-bluetooth-pairing.service — one bounded pairing window, opened from the glass.
+#
+# A UNIT OF ITS OWN BECAUSE THE WINDOW OUTLIVES THE REQUEST THAT OPENED IT
+# (SR-145). `wall-bluetooth-pairing open` sleeps the whole window with the agent
+# as its child. Run from wall-bluetooth-device-apply.service it was killed at that
+# script's 15 s control timeout, the kill skipped its cleanup, and the oneshot's
+# exit then took the agent: the door stood open on BlueZ's own timers with nobody
+# to answer a phone. Measured on systemd 255, 2026-11-05: a background child of a
+# oneshot is killed when the oneshot exits.
+#
+# The three bounds in wall-bluetooth-pairing's docstring all still hold, and the
+# unit makes the third unskippable: however this ends, by the window running out,
+# `systemctl stop`, or a kill, ExecStopPost re-asserts the at-rest state. Stopping
+# signals the whole cgroup, so the agent cannot outlive the window either.
+#
+# Started and stopped by wall-bluetooth-device; never enabled, because a window is
+# a deliberate act and must not open at boot.
+
+[Unit]
+Description=Wall panel: one bounded Bluetooth pairing window
+Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/wall-bluetooth-pairing open
+ExecStopPost=/usr/local/sbin/wall-bluetooth-pairing close
+SyslogIdentifier=wall-bluetooth-pairing
+StandardOutput=journal
+StandardError=journal

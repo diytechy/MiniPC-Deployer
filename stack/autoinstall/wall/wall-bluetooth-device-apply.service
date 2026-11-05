@@ -20,10 +20,21 @@ Description=Wall panel: apply the pending Bluetooth device request
 Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
 After=bluetooth.service
 Requires=bluetooth.service
+# Raised, not removed (SR-145). The default of five in ten seconds is reachable by a
+# person tapping, and hitting it leaves the path unit failed until a reboot. Unlike
+# the switch's PathChanged, DirectoryNotEmpty re-fires while a file remains, so a
+# request that cannot be consumed WOULD spin: that is what this limit is still for.
+StartLimitIntervalSec=10
+StartLimitBurst=50
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/wall-bluetooth-device apply-request
+# THE SCAN IS A BACKGROUND CHILD ON PURPOSE (start_discovery), and with the default
+# KillMode it died the moment this oneshot exited, so "Scan" found nothing. Measured
+# on systemd 255, 2026-11-05. Every other child here is waited for, so this changes
+# nothing else. The pairing window is not one of them: it has its own unit.
+KillMode=process
 TimeoutStartSec=90
 # The applier's journal lines are the device history; give them a name an
 # operator can grep for without knowing which unit ran the script.

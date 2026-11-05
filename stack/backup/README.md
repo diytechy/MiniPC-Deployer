@@ -604,12 +604,12 @@ to a tracked file (otherwise the stamp is `dirty-tree`), and its engine's
 > **nobody hand-stamps the label**: an image that carried it with the wrong
 > engine would run and look in folders that do not exist.
 
-### The layout knob — `FILEBACKUP_LAYOUT` (legacy until the cutover)
+### The layout knob — `FILEBACKUP_LAYOUT` (`single` on the hub since 2026-11-05)
 
 Two store layouts are installed side by side, and `FILEBACKUP_LAYOUT` in
 `stack/.env` (SR-133; HomeHub's `config.homehub.psd1` pins it) chooses:
 
-| | `legacy` — **the default**, and what an unset value means | `single` |
+| | `legacy` — what an unset value means | `single` — the hub and the template |
 |---|---|---|
 | image | the one the hub runs today (kit 12, `filebackup:local` from FileBackup `4b809d1` — inferred from records, confirm with `docker image inspect`) | one built from FileBackup `88640a0` or a later commit that contains it (the hub's: `45c9a4d`), label `homehub.filebackup.contract=current-history-v3` |
 | store | three mounts: `/state` (system disk), `/backup`, `/changes` (`FILEBACKUP_STATE`/`_BACKUP`/`_CHANGES`) | one mount, `/store` (`FILEBACKUP_STORE`), holding `CurrentBackup/`, `BackupHistory/` and the run files |

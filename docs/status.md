@@ -12,6 +12,11 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-11-05 (morning) - the single-store backup is merged and on the hub; its first real run has not happened.** `filebackup-store-v3` merged at `1ff0be2`, the template followed at `f813103`, both delivered. The entry below is the branch's own record; its "NOT merged, NOT deployed" is superseded.
+- **On the hub:** `filebackup:45c9a4d`, both units read-only on the library (SR-134), `FILEBACKUP_LAYOUT=single`, `FILEBACKUP_MEM_LIMIT=4g`, timer off, `library-store` empty.
+- **Proven:** the ten backup suites under WSL (the layout suite needs `findmnt`, so Git Bash fails three of its cases), the container test on that image, preflight inside the sandbox, a throwaway backup and verify on the hub. Memory on the final image: 2,489 MiB peak, 182,000 synthetic files.
+- **NOT proven:** the real library's memory, time and USB load; the nightly's rsync inside its namespace (first run 2026-11-06 03:00); a reimage. HomeHub `docs/reviews/2026-11-04-filebackup-cutover/cutover-log-2026-11-05.md` has the rest.
+
 **2026-11-05 - the library backup's records follow FileBackup's `CurrentBackup` / `BackupHistory` layout (`filebackup-store-v3`; NOT merged, NOT deployed, nothing sent to the hub).**
 - **What the branch is:** the wrapper, config, compose and tests speak `current-history-v3` (FileBackup `88640a0`, kit 16; the image is built from `45c9a4d`), and both backup units make `/srv/library` read-only (`ReadOnlyPaths=-/srv/library`, with `ReadWritePaths` for the two ingest folders on `homehub-backup.service`). Nightly ingest stays, by the Owner's decision.
 - **Records:** `stack/backup/README.md` now carries the cutover for a fresh store (the old one is already on `/mnt/backup-old`, so no renames), the rollback as "timer off, knob `legacy`, nothing backing up the library" (kit 12 is not a real fallback), the memory cap sized from `anon` and kept at `4g`, dated names in the prune examples, and a section on the read-only library. `--preflight-only` is documented as it behaves: it creates the empty store and chowns `/logs`. `stack/.env.example` follows. SR-132, SR-133, LLR-1381..1383, LLR-1385..1390, TC-1576, TC-1577, TC-1580, TC-1581, TC-1585, TC-1589, TC-1590, TC-1592 and IF-078 amended; new SR-134, LLR-1391..1393, TC-1593..1595.

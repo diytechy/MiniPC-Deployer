@@ -15,6 +15,15 @@ Nice=10
 IOSchedulingClass=idle
 # mount.cifs requires real mount privileges; keep it simple and run as root.
 User=root
+# THE LIBRARY IS READ-ONLY HERE, even to root, except where ingest step 1b lands.
+# This run reads the library and its only writes there are the INGEST_SOURCES
+# mirrors, so each destination is named below. A new ingest line needs a matching
+# entry (HomeHub's Deploy.Contracts.Tests.ps1 asserts they agree), or its rsync
+# fails loudly. `-`: this unit must still start with a drive missing, for the same
+# reason it has no RequiresMountsFor=. Measured on the hub 2026-11-05: the cifs
+# mount works inside this namespace, and the host's own mount is unaffected.
+ReadOnlyPaths=-/srv/library
+ReadWritePaths=-/srv/library/NonDocs/Snapshots -/srv/library/NonDocs/NetworkSync/NetworkShare
 
 [Install]
 WantedBy=multi-user.target

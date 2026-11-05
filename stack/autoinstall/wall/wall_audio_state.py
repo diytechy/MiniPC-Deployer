@@ -43,6 +43,11 @@ VOLUME_STEP = 5
 # What the level lands on when the rocker is released (Owner, 2026-09-15). The
 # Rocker movements are grid steps; RampPlanner carries fractional time debt.
 VOLUME_SNAP = 5
+# THE DESKTOP'S S/PDIF LEVEL, in whole dB against the other sources on the bus
+# (SR-144, Owner 2026-11-05). The range is the softvol's in asound-bus-mode.conf
+# (`pcm.spdif_level`) and the two must agree: the control's value is the level
+# minus SPDIF_LEVEL_MIN_DB. 0 is unity and is what the panel did before this.
+SPDIF_LEVEL_MIN_DB, SPDIF_LEVEL_MAX_DB = -12, 12
 
 # ── the mic legs (step 4, item 23 C / D3 / D4) ─────────────────────────────
 # The two capture devices this panel can select between, named as the ALSA PCMs
@@ -100,6 +105,13 @@ STATE_SCHEMA = {
     # damage rules: an ABSENT key is an older file and reads as true; only a
     # present non-boolean is a repair. The amp trigger reads this key read-only.
     "speaker_sleeps_with_screen": True,
+    # THE DESKTOP'S S/PDIF LEVEL (SR-144, LLR-1442), whole dB, 0 = unity. Persisted
+    # like the preference above and on the same terms: an ABSENT key is an older
+    # file and reads as 0, only a present value that is not an in-range integer is
+    # a repair. It trims one source and not an output, so it is not per-output and
+    # it is deliberately outside _policy_fingerprint: a rocker gesture is about
+    # the output level, and this does not change what that gesture measured.
+    "spdif_level_db": 0,
     # Per-output level memory (Owner ruling F): switching back to an output
     # restores the level it had, rather than shouting at the last one's setting.
     "volume": {"headset": 60, "speaker": 60, "builtin": 60},
@@ -228,6 +240,12 @@ def _policy_fingerprint(state):
             tuple(state["volume"].get(output) for output in LEVELLED_OUTPUTS))
 
 
+def valid_spdif_level(value):
+    """A whole number of dB inside the softvol's range. `True` is not a level."""
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and SPDIF_LEVEL_MIN_DB <= value <= SPDIF_LEVEL_MAX_DB)
+
+
 def default_state():
     """A fresh state: speaker, unmuted, mid level, no headset seen yet."""
     state = dict(STATE_SCHEMA)
@@ -304,6 +322,10 @@ def normalize(raw):
     if isinstance(raw.get("speaker_sleeps_with_screen"), bool):
         state["speaker_sleeps_with_screen"] = raw["speaker_sleeps_with_screen"]
     elif "speaker_sleeps_with_screen" in raw:
+        repaired = True
+    if valid_spdif_level(raw.get("spdif_level_db")):
+        state["spdif_level_db"] = raw["spdif_level_db"]
+    elif "spdif_level_db" in raw:
         repaired = True
     if isinstance(raw.get("headset_present"), bool):
         state["headset_present"] = raw["headset_present"]
@@ -579,6 +601,7 @@ def apply_event(state, event):
                  "set_output"     {"output": one of OUTPUTS}
                  "set_input_mute" {"muted": bool}
                  "set_speaker_sleep" {"enabled": bool}
+                 "set_spdif_level" {"db": int}      -- whole dB, refused out of range
                  "set_volume"     {"level": int}    -- absolute percent, clamped
                  "nudge_volume"   {"louder": bool, "step": int optional}
                                   -- a rocker movement; "step" is its size in
@@ -705,6 +728,22 @@ def _set_speaker_sleep(state, event):
         return state, ["speaker sleep already %s" % ("on" if enabled else "off")]
     state["speaker_sleeps_with_screen"] = enabled
     return state, ["speaker sleep %s" % ("on" if enabled else "off")]
+
+
+def _set_spdif_level(state, event):
+    """Store the desktop's S/PDIF level. Implements: SR-144, LLR-1442."""
+    if set(event) - {"kind", "db"}:
+        raise StateError("set_spdif_level takes only db")
+    db = event.get("db")
+    # Refused rather than clamped, unlike a volume: the rocker runs into its end
+    # stop in normal use, and nothing on the glass can ask for 40 dB.
+    if not valid_spdif_level(db):
+        raise StateError("db must be a whole number in %d..%d"
+                         % (SPDIF_LEVEL_MIN_DB, SPDIF_LEVEL_MAX_DB))
+    if state["spdif_level_db"] == db:
+        return state, ["S/PDIF level already %+d dB" % db]
+    state["spdif_level_db"] = db
+    return state, ["S/PDIF level %+d dB" % db]
 
 
 def _set_volume(state, event):
@@ -988,6 +1027,7 @@ _HANDLERS = {
     "set_output": _set_output,
     "set_input_mute": _set_input_mute,
     "set_speaker_sleep": _set_speaker_sleep,
+    "set_spdif_level": _set_spdif_level,
     "set_volume": _set_volume,
     "nudge_volume": _nudge_volume,
     "snap_volume": _snap_volume,
@@ -1055,6 +1095,7 @@ def plan(state, aec_available=False):
     Outputs: {"legs": {unit name: should be running},
               "builtin_speaker_on": bool,
               "volume": int percent for the bus softvol,
+              "spdif_level_db": int dB for the desktop's softvol,
               "adapter_muted": bool, "headset_muted": bool,
               "input_muted": bool, "mic_live": bool,
               "mic_source": one of MIC_SOURCES, "reason": str | None}
@@ -1162,5 +1203,7 @@ def plan(state, aec_available=False):
         # independent unmute is refused right now and the person must move the
         # output switch first.
         "input_mute_held": state["output"] == "mute",
+        # Not gated on the position: the desktop reaches the bus in all of them.
+        "spdif_level_db": state["spdif_level_db"],
         "reason": unavailable_reason(state),
     }

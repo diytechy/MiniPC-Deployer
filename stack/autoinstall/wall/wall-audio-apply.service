@@ -12,6 +12,14 @@
 Description=Wall panel: apply the pending audio switch request
 Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
 After=sound.target
+# NO START LIMIT (SR-145). The default is five starts in ten seconds, and a sixth
+# does not just fail: it puts wall-audio-apply.path into failed/unit-start-limit-hit,
+# where it stays, so every later switch, mute and level is accepted and never
+# applied until a reboot. Measured on systemd 255, 2026-11-05: writes half a second
+# apart gave 5 runs and a dead path unit, and 9 of 9 with this line. Each start here
+# is a request somebody made and the applier ends by itself, so there is no loop for
+# the limit to stop. Like the other start limits it is a [Unit] key.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot

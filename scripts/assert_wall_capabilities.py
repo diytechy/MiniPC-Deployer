@@ -74,6 +74,8 @@ ALLOWED_SITE_FILES = {
     "css/shell.css",
     "css/touch-feedback.css",
     "index.html",
+    # The padlock in the top row (OfficeWallNaglight WSN-111), imported by js/access.js.
+    "js/access-lock.js",
     "js/access-messages.js",
     "js/access.js",
     "js/ambient-priority.js",
@@ -139,6 +141,7 @@ ALLOWED_SITE_FILES = {
     "js/views/pandora.js",
     "js/views/projectm.js",
     "js/views/settings.js",
+    "js/views/spdif-level.js",
     "js/views/visualizer.js",
     "js/visualizer-core.js",
     "js/visualizer-preference.js",

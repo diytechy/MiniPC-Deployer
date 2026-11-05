@@ -19,6 +19,7 @@ Usage:
   wall-audio-output set {mute|headset|speaker|builtin}
   wall-audio-output input-mute {on|off}
   wall-audio-output speaker-sleep {on|off}   # fade + relay off with the screen (Speaker only)
+  wall-audio-output spdif-level {-12..12}    # the desktop's S/PDIF level in dB, 0 = unity
   wall-audio-output volume {0..100|up|down|up:PCT|down:PCT|snap:PCT}
   wall-audio-output volume set:TARGET:MODE:OUTPUT:EXPECT:REVISION
         one ABSOLUTE level, applied only while the mode, output, level and
@@ -174,6 +175,10 @@ SYS_CLASS_SOUND = Path("/sys/class/sound")
 # The softvol control created by asound-bus-mode.conf. It lives on the Loopback
 # card, which is always present, so the level survives a leg being stopped.
 BUS_CONTROL = "Bus"
+# The desktop's level (SR-144): a softvol of its own on the same card, declared
+# by `pcm.spdif_level`, which wall-spdif-in.service delivers into.
+SPDIF_LEVEL_CONTROL = "Spdif In Playback Volume"
+SPDIF_LEVEL_PCM = "spdif_level"
 
 # ── the centre/sub trim (step 3, D4, review finding 8) ─────────────────────
 # Two files, for the same reason audio-cards has two: ALSA reads one and the
@@ -968,6 +973,28 @@ def set_bus_level(applier, card, level, expected=True, sleep=time.sleep, pcm=Non
         if attempt < attempts - 1:
             sleep(BUS_CONTROL_INTERVAL_SECONDS)
     return not expected
+
+
+def set_spdif_level(applier, card, db):
+    """Set the desktop's softvol. True if it took. Implements: SR-144, LLR-1443.
+
+    The control normally exists: wall-spdif-in holds the PCM open whenever the
+    panel is in bus mode. It will not when that leg is down, a sleeping desktop
+    being the ordinary reason, so a refusal is answered by declaring it and asking
+    once more. The value is the level minus the range's floor; one value fills
+    every channel (measured for this kind of control: see panel-amp-trigger.py
+    FadeStage.argv). A failure is a journal line and not a failed apply, the same
+    judgement set_bus_level's caller makes: the audio plays either way.
+    """
+    argv = ["/usr/bin/amixer", "-c", card, "-q", "cset",
+            "name=%s" % SPDIF_LEVEL_CONTROL, str(db - policy.SPDIF_LEVEL_MIN_DB)]
+    if applier.command(argv, quiet=True) == 0:
+        return True
+    declare_bus_control(applier, SPDIF_LEVEL_PCM)
+    if applier.command(argv, quiet=True) == 0:
+        return True
+    log("S/PDIF level %+d dB could not be applied: the control never appeared" % db)
+    return False
 
 
 def load_trim(path=None):
@@ -2058,6 +2085,9 @@ def apply_plan(state, applier, adapter_ok=True):
         log("the adapter's rear pair could NOT be returned to silence: the "
             "desktop's input is still wired to live channels. The generated "
             "route's explicit zeros are the only barrier left.")
+    # On the Loopback card and about a source, so neither the adapter nor the
+    # position has a say in it.
+    set_spdif_level(applier, loopback, wanted["spdif_level_db"])
     # THE SOFTVOL CONTROL IS DECLARED, AND SET, BEFORE THE LEG STARTS. softvol
     # creates its control when a client opens the PCM that declares it, and a
     # control that does not exist yet cannot be set -- which on 2026-09-13 made
@@ -2201,6 +2231,8 @@ def event_from_arguments(arguments):
         return {"kind": "set_input_mute", "muted": arguments.value == "on"}
     if arguments.command == "speaker-sleep":
         return {"kind": "set_speaker_sleep", "enabled": arguments.value == "on"}
+    if arguments.command == "spdif-level":
+        return {"kind": "set_spdif_level", "db": int(arguments.value)}
     if arguments.command == "volume":
         if arguments.value in ("up", "down"):
             return {"kind": "nudge_volume", "louder": arguments.value == "up"}
@@ -2297,8 +2329,8 @@ def _volume_value_is_valid(value):
 
 
 ALLOWED_REQUEST_KINDS = frozenset(
-    {"set_output", "set_input_mute", "set_speaker_sleep", "set_volume",
-     "nudge_volume", "snap_volume"})
+    {"set_output", "set_input_mute", "set_speaker_sleep", "set_spdif_level",
+     "set_volume", "nudge_volume", "snap_volume"})
 
 
 def read_request(path, last_seq=-1, generation=None, epoch_vouched=True):
@@ -2408,7 +2440,8 @@ def main(argv=None):
     parser.add_argument("--trim-conf", default=None,
                         help="the rendered ALSA trim file (a test seam)")
     parser.add_argument("command", choices=("status", "set", "input-mute",
-                                            "speaker-sleep", "volume", "headset",
+                                            "speaker-sleep", "spdif-level",
+                                            "volume", "headset",
                                             "apply-state", "apply-request",
                                             "trim", "mic", "mic-allowed"))
     # `trim` and `mic` take a whole table's worth of KEY=VALUE; every other takes
@@ -2460,6 +2493,13 @@ def main(argv=None):
         if arguments.value not in expects_value[arguments.command]:
             parser.error("%s takes one of %s"
                          % (arguments.command, "|".join(expects_value[arguments.command])))
+    if arguments.command == "spdif-level":
+        # `-3` parses as an argument only because this parser has no option that
+        # looks like a negative number; a test holds that.
+        if not re.fullmatch(r"[+-]?[0-9]{1,2}", arguments.value or "") \
+                or not policy.valid_spdif_level(int(arguments.value)):
+            parser.error("spdif-level takes a whole number of dB in %d..%d"
+                         % (policy.SPDIF_LEVEL_MIN_DB, policy.SPDIF_LEVEL_MAX_DB))
     if arguments.command == "volume":
         if arguments.value is None or not _volume_value_is_valid(arguments.value):
             parser.error("volume takes 0..100, up, down, up:PCT, down:PCT, "
@@ -2512,8 +2552,63 @@ def main(argv=None):
                          indent=2, sort_keys=True))
         return 0
 
+    if arguments.command == "apply-request":
+        return apply_requests(arguments)
     with apply_lock(dry_run=arguments.dry_run):
         return _locked_apply(arguments)
+
+
+# How many requests one start will pick up behind the first. Sized from the longest
+# thing a person walks through this path, the 24 steps of the S/PDIF level, so a
+# walk that keeps chaining reaches its end inside one start. The bound is here so a
+# loop in the privileged path ends by itself.
+REQUEST_DRAIN_PASSES = 25
+
+
+def waiting_request_seq(path, state_path):
+    """The sequence of a request newer than the state's mark, or None."""
+    try:
+        seq = json.loads(Path(path).read_text(encoding="utf-8")).get("seq")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if isinstance(seq, bool) or not isinstance(seq, int):
+        return None
+    state, _note = load_state(state_path)
+    return seq if seq > state.get("request_seq", -1) else None
+
+
+def apply_requests(arguments):
+    """Apply the waiting request, then any that arrived while it was applied.
+
+    A PATH UNIT DOES NOT WATCH WHILE ITS SERVICE RUNS. wall-audio-apply.path is
+    PathChanged, and a write during this pass fires nothing, then or after. The
+    state is saved before the hardware is touched, so a renderer that takes the
+    report and sends its next step lands exactly there, and that request would sit
+    unread until something else wrote the file. So the file is looked at again
+    before this start ends. A write in the instant between the last look and the
+    exit is still lost, and the renderer says so when its deadline passes.
+
+    THE LOCK IS TAKEN PER PASS, so the rocker's apply is never queued behind a walk.
+    Implements: SR-145, LLR-1446
+    """
+    def one_pass():
+        with apply_lock(dry_run=arguments.dry_run):
+            return _locked_apply(arguments)
+
+    status = one_pass()
+    if arguments.dry_run:
+        return status
+    path = arguments.value or DEFAULT_REQUEST
+    tried = None
+    for _ in range(REQUEST_DRAIN_PASSES):
+        seq = waiting_request_seq(path, arguments.state)
+        # The same sequence again means it was refused and the mark did not move,
+        # and asking twice will not change that.
+        if seq is None or seq == tried:
+            break
+        tried = seq
+        status = one_pass()
+    return status
 
 
 class GuardedVerdict:

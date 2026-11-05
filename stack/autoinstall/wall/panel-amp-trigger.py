@@ -33,7 +33,14 @@ position, with the persisted preference on (the default), this daemon also
 follows the panel's backlight: when the screen goes dark the speaker leg is
 faded to silence through its own softvol, THEN the relay is opened and verified;
 when the screen lights with audio present the relay is closed and verified, the
-boards get a second to start, and the fade comes back up. See SpeakerSleep.
+boards get five seconds to start, and the fade comes back up. See SpeakerSleep.
+
+THE SETTLE IS ABOUT THE RELAY, NOT THE SCREEN (SR-143, Owner 2026-11-05: "wait 5
+seconds after relay turns on before fading in audio, otherwise can fade in as
+soon as presence is detected"). In the Speaker position every close of the relay
+is followed by the same settle and fade, whichever rule closed it, and whether
+or not the sleep preference is on. A relay that is already closed has nothing to
+settle, so the fade starts at once.
 
 Exit codes: 78 configuration unusable.
 """
@@ -244,8 +251,9 @@ AMIXER = "/usr/bin/amixer"
 FADE_OUT_SECONDS = _env("WALL_AMP_SLEEP_FADE_OUT_SECONDS", 2.0, lo=0.1, hi=10.0)
 FADE_IN_SECONDS = _env("WALL_AMP_SLEEP_FADE_IN_SECONDS", 1.0, lo=0.1, hi=10.0)
 # After the relay closes, how long the amplifier boards get before audio
-# returns. A cold start is when they reliably select AUX.
-WAKE_SETTLE_SECONDS = _env("WALL_AMP_SLEEP_WAKE_SETTLE_SECONDS", 1.0, lo=0.0, hi=10.0)
+# returns. A cold start is when they reliably select AUX. Five seconds is the
+# Owner's figure (SR-143, 2026-11-05); it was one until then.
+WAKE_SETTLE_SECONDS = _env("WALL_AMP_SLEEP_WAKE_SETTLE_SECONDS", 5.0, lo=0.0, hi=10.0)
 FADE_STEP_SECONDS = 0.05
 # How often the files above are re-read when no ramp is running.
 SLEEP_SAMPLE_SECONDS = 0.5
@@ -1159,7 +1167,9 @@ class SpeakerSleep:
                     unity. Not awake -> FADING_OUT.
         FADING_OUT  Relay still ON. dB-linear ramp to FADE_FLOOR over
                     FADE_OUT_SECONDS in FADE_STEP_SECONDS steps. Awake again ->
-                    FADING_IN from where it is. Ramp finished -> relay_off ->
+                    FADING_IN from where it is, at once, because the relay never
+                    opened (or SETTLING for what is left of the settle, if it
+                    closed less than WAKE_SETTLE_SECONDS ago). Ramp finished -> relay_off ->
                     DARK. (An unverified OFF is retried by the main loop's
                     reconcile block; it is never skipped, and a failed fade
                     write only cuts the ramp short, never delays the relay.)
@@ -1174,12 +1184,21 @@ class SpeakerSleep:
         FADING_IN   Ramp to FADE_UNITY over FADE_IN_SECONDS. Done -> LIT.
                     Dark again -> FADING_OUT.
 
-    Leaving "enabled" in any phase (preference off, output moved, mode change)
+    Leaving "enabled" outside a settle (preference off, output moved, mode change)
     snaps the fade to unity and returns to LIT: the relay is then the existing
     rule's again. The fade is also set to unity by reset_unity() on start-up
     and shutdown, so a crash cannot leave the room silent.
 
-    Implements: SR-140, LLR-1436
+    EVERY CLOSE GETS THE SAME SETTLE (SR-143). In the Speaker position the loop
+    calls hold_for_relay() before it closes the relay itself, by the attack rule
+    or by restarting a relay that stopped, and relay_closed() once it has, which
+    enters SETTLING. A settle runs to the end of FADING_IN even if the machine
+    stops being "enabled": it is about the amplifier starting, so the sleep
+    preference has no say in it, and if the output moves away during it the ramp
+    reaches a leg nobody is listening to and finishes at unity, where it would
+    have been snapped to.
+
+    Implements: SR-140, LLR-1436, SR-143, LLR-1440
     """
 
     LIT, FADING_OUT, DARK, SETTLING, FADING_IN = (
@@ -1196,6 +1215,7 @@ class SpeakerSleep:
         self._ramp = None
         self._fail_streak = 0
         self._settle_until = 0.0
+        self._relay_hold = False
         self._last_relay_try = -1e9
         self._last_unity_try = -1e9
         self._unity_failure_logged = False
@@ -1270,7 +1290,26 @@ class SpeakerSleep:
     def _snap_to_lit(self, now):
         self._ramp = None
         self.phase = self.LIT
+        self._relay_hold = False
         self.reset_unity(now)
+
+    def hold_for_relay(self):
+        """The attack rule is about to close the relay: silence the leg first.
+
+        A failed write only costs the fade, as it does everywhere here: the
+        relay still closes, and the room gets what it gets today. It is not
+        undone if the close then fails either -- the relay is open, so nothing
+        is heard, and the LIT beat puts unity back.
+        """
+        self._ramp = None
+        self._write(FADE_FLOOR)
+
+    def relay_closed(self, now):
+        """The attack rule closed the relay in the Speaker position: settle."""
+        self._relay_hold = True
+        self.phase = self.SETTLING
+        self._settle_until = now + WAKE_SETTLE_SECONDS
+        self._emit("relay ON: settling %.1fs before the fade" % WAKE_SETTLE_SECONDS)
 
     def step(self, now, enabled, lit, call, audio, beat=ACTUATOR_RETRY_SECONDS,
              *, relay_is_on, relay_changed_at):
@@ -1279,8 +1318,10 @@ class SpeakerSleep:
         MIN_ON_SECONDS / MIN_OFF_SECONDS the attack and hold-off rules do. Both are REQUIRED
         keyword-only arguments on purpose: a default would silently disable
         the dwell for a caller that forgot them."""
-        awake = bool(lit or call)
-        if not enabled:
+        # With the preference off the screen puts nothing to sleep, so the only
+        # way here is an attack-rule hold, and it runs on as if awake.
+        awake = bool(lit or call) or not enabled
+        if not enabled and not self._relay_hold:
             if self.phase != self.LIT:
                 self._emit("speaker sleep inactive; leaving %s, fade to unity"
                            % self.phase)
@@ -1301,7 +1342,14 @@ class SpeakerSleep:
             self.phase = self.FADING_OUT
 
         if self.phase == self.FADING_OUT:
-            if awake:
+            if awake and relay_is_on and now < self._settle_until:
+                # Lit again before the boards had their settle: the rest of it
+                # still applies, however the fade got interrupted.
+                self._ramp = None
+                self._emit("screen lit mid-settle: finishing the settle")
+                self._relay_hold = True
+                self.phase = self.SETTLING
+            elif awake:
                 self._emit("screen lit mid-fade: fading back in")
                 self._begin_ramp(now, FADE_UNITY, FADE_IN_SECONDS)
                 self.phase = self.FADING_IN
@@ -1339,6 +1387,7 @@ class SpeakerSleep:
             if now - self._last_relay_try >= beat:
                 self._last_relay_try = now
                 if self._relay_on(now):
+                    self._relay_hold = True
                     self.phase = self.SETTLING
                     self._settle_until = now + WAKE_SETTLE_SECONDS
                     self._emit("speakers waking: relay ON, settling %.1fs"
@@ -1347,6 +1396,7 @@ class SpeakerSleep:
 
         if self.phase == self.SETTLING:
             if not awake:
+                self._relay_hold = False
                 self._begin_ramp(now, FADE_FLOOR, FADE_OUT_SECONDS)
                 self.phase = self.FADING_OUT
             elif now >= self._settle_until:
@@ -1356,10 +1406,13 @@ class SpeakerSleep:
 
         if self.phase == self.FADING_IN:
             if not awake:
+                self._relay_hold = False
                 self._begin_ramp(now, FADE_FLOOR, FADE_OUT_SECONDS)
                 self.phase = self.FADING_OUT
-            elif self._advance(now):
+            # No ramp: hold_for_relay() took it for a relay restart that failed.
+            elif self._ramp is None or self._advance(now):
                 self.phase = self.LIT
+                self._relay_hold = False
                 self._emit("speakers awake")
                 if not self.unity_known:
                     self.reset_unity(now)
@@ -1477,7 +1530,16 @@ def main():
                 and at - last_actuator_attempt >= beat_seconds):
             last_actuator_attempt = at
             log("amplifier actuator stopped unexpectedly; restarting")
-            if not actuator.start():
+            # start() proves OFF before it closes, so this is a real close of the
+            # relay and takes the settle like any other (SR-143).
+            settle = sleep_capable and read_sleep_policy()[0]
+            if settle:
+                sleeper.hold_for_relay()
+            if actuator.start():
+                changed_at = at
+                if settle:
+                    sleeper.relay_closed(at)
+            else:
                 on = False
                 # The relay is in an unknown physical state: the loop above
                 # keeps commanding OFF until one is verified.
@@ -1548,6 +1610,12 @@ def main():
                 if now - above_since >= ATTACK_SECONDS and now - changed_at >= MIN_OFF_SECONDS:
                     if now - last_actuator_attempt >= beat:
                         record_safe_state(False)
+                        # Read here and not from sleep_facts: those are up to
+                        # half a second old, and a move to Speaker is exactly
+                        # what starts the audio that brought us here. SR-143.
+                        settle = sleep_capable and read_sleep_policy()[0]
+                        if settle:
+                            sleeper.hold_for_relay()
                         if actuator.start():
                             on = True
                             safe = False
@@ -1555,6 +1623,8 @@ def main():
                             below_since = None
                             log("amplifier ON (%s)"
                                 % ", ".join(lv.report() for lv in levels))
+                            if settle:
+                                sleeper.relay_closed(now)
                         else:
                             # Stay off and say so rather than reporting a state
                             # we could not reach; retry on a timer, not every block.

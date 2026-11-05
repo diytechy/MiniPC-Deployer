@@ -18,6 +18,10 @@ After=bluetooth.service
 Requires=bluetooth.service
 
 [Service]
+# `observe` drains the request directory too, so a Scan tapped during a publish is
+# started from this unit, and has to outlive it for the same reason as in
+# wall-bluetooth-device-apply.service.
+KillMode=process
 Type=oneshot
 ExecStart=/usr/local/sbin/wall-bluetooth-device observe
 # THE SAME BOUND AS THE APPLY UNIT, BECAUSE THIS UNIT NOW DRAINS TOO. It was 25

@@ -15,6 +15,7 @@ acceptance in docs/design/audio-routing-2026-09-13.md.
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import importlib.machinery
 import importlib.util
@@ -401,7 +402,9 @@ def test_the_three_sources_land_on_one_bus_sr028():
     assert "bus_mix" in default
     # The desktop's S/PDIF is forwarded onto the same bus by its own unit.
     spdif = read(WALL / "wall-spdif-in.service")
-    assert "--cdevice spdif_in" in spdif and "--pdevice bus" in spdif
+    assert "--cdevice spdif_in" in spdif and "--pdevice spdif_level" in spdif
+    level = conf.split("pcm.spdif_level {", 1)[1].split("\npcm.", 1)[0]
+    assert 'slave.pcm "bus"' in level, "through its own level, onto the same bus"
     assert "'IEC958 In'" in spdif, "the capture selector must leave Line (finding 6)"
 
 
@@ -456,9 +459,9 @@ def test_both_legs_share_one_control_on_an_always_present_card_ruling_f_sr028():
     control on the SAME always-present card."""
     conf = read(BUS_CONF)
     assert conf.count('name "Bus Playback Volume"') == 4
-    # Four volume controls plus the speaker leg's fade stage (SR-140): all on the
-    # always-present card.
-    assert conf.count('card "Loopback"') == 5, "not on an adapter that can be unplugged"
+    # Four volume controls, the speaker leg's fade stage (SR-140) and the
+    # desktop's level (SR-144): all on the always-present card.
+    assert conf.count('card "Loopback"') == 6, "not on an adapter that can be unplugged"
     for chain in ("speaker_out", "headset_out", "bt_headset_out", "builtin_out"):
         block = conf.split("pcm.%s {" % chain, 1)[1].split("\npcm.", 1)[0]
         assert "type softvol" in block, chain
@@ -1621,7 +1624,7 @@ def test_the_generated_alsa_config_parses_sr028(tmp_path):
 
     resolved = names(root)
     for name in ("bus", "bus_monitor", "speaker_tap", "speaker_out", "speaker_multi",
-                 "speaker_stereo", "speaker_hw8", "spdif_in",
+                 "speaker_stereo", "speaker_hw8", "spdif_in", "spdif_level",
                  # step 4: the shared eight-channel dmix, both capture sources,
                  # the one name the AEC step will replace, and the rear route.
                  "usb_out_mix", "mic_panel", "mic_headset", "mic_selected",
@@ -2724,7 +2727,7 @@ def _mixer(applier, initial, cget_text=None):
                 return _Reply(0, cget_text)
             return _Reply(0, "numid=8\n  ; type=INTEGER\n  : values=%s\n"
                           % ",".join(str(v) for v in state["values"]))
-        if argv[0].endswith("amixer") and "cset" in argv:
+        if argv[0].endswith("amixer") and "cset" in argv and "numid=8" in argv:
             log.append(list(argv))
             state["values"] = [int(v) for v in argv[-1].split(",")]
             return _Reply(0)
@@ -4428,3 +4431,202 @@ def test_the_broker_routing_knows_the_new_verb_llr1432():
             routing.validate_action("set_speaker_sleep", params)
     assert routing.switch_only_authorization("set_speaker_sleep", {"enabled": True})
     assert "set_speaker_sleep" in routing.SELF_RECONCILING_METHODS
+
+
+# ── SR-144: the desktop's S/PDIF level ───────────────────────────────────────
+# Owner, 2026-11-05: "there should be a way to adjust the volume of the SPDIF
+# input, as it is a little low right now". The contract with the kiosk half:
+# method `set_spdif_level`, params exactly {"db": int}, state key `spdif_level_db`.
+
+SPDIF_CONTROL_ARGV = ["/usr/bin/amixer", "-c", "Loopback", "-q", "cset",
+                      "name=Spdif In Playback Volume"]
+
+
+def test_the_softvol_range_is_the_policy_range_and_crosses_unity_llr1441(policy):
+    import re
+    conf = read(BUS_CONF)
+    stage = conf.split("pcm.spdif_level {", 1)[1].split("\npcm.", 1)[0]
+    low = float(re.search(r"min_dB\s+(-?[\d.]+)", stage).group(1))
+    high = float(re.search(r"max_dB\s+(-?[\d.]+)", stage).group(1))
+    steps = int(re.search(r"resolution\s+(\d+)", stage).group(1))
+    assert (low, high) == (policy.SPDIF_LEVEL_MIN_DB, policy.SPDIF_LEVEL_MAX_DB)
+    assert (high - low) / (steps - 1) == 1.0, "one step is one dB"
+    assert low < 0 < high, "unity must be a step, so a new control starts there"
+    assert 'name "Spdif In Playback Volume"' in stage
+
+
+def test_the_other_copies_of_the_range_agree_llr1444(policy):
+    sys.path.insert(0, str(ROOT / "stack" / "panel-audio"))
+    import routing
+    import switch_backend
+    wanted = (policy.SPDIF_LEVEL_MIN_DB, policy.SPDIF_LEVEL_MAX_DB)
+    assert (routing.SPDIF_LEVEL_MIN_DB, routing.SPDIF_LEVEL_MAX_DB) == wanted
+    assert (switch_backend.SPDIF_LEVEL_MIN_DB, switch_backend.SPDIF_LEVEL_MAX_DB) == wanted
+
+
+def test_the_level_defaults_to_unity_and_an_older_file_is_not_damage_llr1442(policy):
+    assert policy.default_state()["spdif_level_db"] == 0
+    older = policy.normalize({"output": "speaker", "input_muted": False})
+    assert older["spdif_level_db"] == 0 and older["input_muted"] is False
+
+
+@pytest.mark.parametrize("stored", [13, -13, 1.5, "3", True, None])
+def test_a_bad_stored_level_is_a_repair_llr1442(policy, stored):
+    bad = policy.normalize({"output": "speaker", "input_muted": False,
+                            "spdif_level_db": stored})
+    assert bad["spdif_level_db"] == 0 and bad["input_muted"] is True
+
+
+@pytest.mark.parametrize("db", [-12, -1, 0, 5, 12])
+def test_set_spdif_level_stores_the_level_and_touches_nothing_else_llr1442(policy, db):
+    before = dict(policy.default_state(), spdif_level_db=1)
+    after, lines = policy.apply_event(before, {"kind": "set_spdif_level", "db": db})
+    assert after["spdif_level_db"] == db and lines
+    assert {key for key in after if after[key] != before[key]} <= {"spdif_level_db"}
+
+
+@pytest.mark.parametrize("event", [
+    {"kind": "set_spdif_level"},
+    {"kind": "set_spdif_level", "db": 13},
+    {"kind": "set_spdif_level", "db": -13},
+    {"kind": "set_spdif_level", "db": 1.5},
+    {"kind": "set_spdif_level", "db": "3"},
+    {"kind": "set_spdif_level", "db": True},
+    {"kind": "set_spdif_level", "db": 3, "level": 1},
+])
+def test_set_spdif_level_is_strict_llr1442(policy, event):
+    with pytest.raises(policy.StateError):
+        policy.apply_event(policy.default_state(), event)
+
+
+@pytest.mark.parametrize("output", ["speaker", "headset", "builtin", "mute"])
+def test_the_plan_carries_the_level_in_every_position_llr1442(policy, output):
+    state = dict(policy.default_state(), output=output, spdif_level_db=4)
+    assert policy.plan(state)["spdif_level_db"] == 4
+
+
+@pytest.mark.parametrize("db,value", [(-12, "0"), (0, "12"), (5, "17"), (12, "24")])
+def test_every_apply_sets_the_control_at_level_plus_twelve_llr1443(applier, policy, db, value):
+    recorder = applier.Applier(dry_run=True)
+    applier.apply_plan(dict(policy.default_state(), spdif_level_db=db), recorder)
+    assert SPDIF_CONTROL_ARGV + [value] in recorder.commands
+
+
+def test_the_level_is_applied_with_the_adapter_absent_llr1443(applier, policy):
+    recorder = applier.Applier(dry_run=True)
+    applier.apply_plan(dict(policy.default_state(), output="mute", spdif_level_db=3),
+                       recorder, adapter_ok=False)
+    assert SPDIF_CONTROL_ARGV + ["15"] in recorder.commands
+
+
+def test_a_missing_control_is_declared_then_set_llr1443(applier):
+    """A sleeping desktop leaves no client on the PCM, so no control yet."""
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(list(argv))
+        declared = any("aplay" in call[0] for call in calls)
+        return _Reply(0 if "aplay" in argv[0] or declared else 1)
+
+    assert applier.set_spdif_level(applier.Applier(run=run), "Loopback", 3) is True
+    assert [call[0].rsplit("/", 1)[-1] for call in calls] == ["amixer", "aplay", "amixer"]
+    assert "spdif_level" in calls[1]
+
+
+def test_a_control_that_never_appears_is_not_a_failed_apply_llr1443(applier, capsys):
+    assert applier.set_spdif_level(
+        applier.Applier(run=lambda argv, **kwargs: _Reply(1)), "Loopback", 3) is False
+    assert "could not be applied" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("word,stored", [("-3", -3), ("+4", 4), ("7", 7), ("0", 0)])
+def test_the_cli_spells_the_level_and_persists_it_llr1443(tmp_path, word, stored):
+    done = run_applier(tmp_path, "spdif-level", word)
+    assert done.returncode == 0, done.stderr
+    state = json.loads((tmp_path / "audio-state.json").read_text(encoding="utf-8"))
+    assert state["spdif_level_db"] == stored and state["output"] == "speaker"
+
+
+@pytest.mark.parametrize("word", ["13", "-13", "loud", "1.5", "", "up"])
+def test_the_cli_refuses_anything_else_llr1443(tmp_path, word):
+    assert run_applier(tmp_path, "spdif-level", word).returncode == 2
+
+
+def test_the_applier_accepts_the_request_kind_llr1443(applier):
+    assert "set_spdif_level" in applier.ALLOWED_REQUEST_KINDS
+
+
+# ── SR-145: a burst of requests is not fatal, and none is lost ───────────────
+
+def test_the_apply_unit_has_no_start_limit_llr1446():
+    """Five in ten seconds would fail the path unit until a reboot."""
+    unit = read(WALL / "wall-audio-apply.service")
+    head = unit.split("[Service]", 1)[0]
+    assert "\nStartLimitIntervalSec=0\n" in head, "a [Unit] key, or it is ignored"
+
+
+def _requests(applier, tmp_path, monkeypatch, plan):
+    """apply_requests against a request file that `plan` rewrites after each pass."""
+    state = tmp_path / "audio-state.json"
+    request = tmp_path / "request.json"
+    state.write_text(json.dumps({"output": "speaker", "input_muted": False, "request_seq": 1}),
+                     encoding="utf-8")
+    request.write_text(json.dumps({"seq": 2}), encoding="utf-8")
+    passes = []
+
+    def fake_pass(arguments):
+        current = json.loads(state.read_text(encoding="utf-8"))
+        seq = json.loads(request.read_text(encoding="utf-8"))["seq"]
+        passes.append(seq)
+        plan(current, seq, state, request, len(passes))
+        return 0
+
+    monkeypatch.setattr(applier, "_locked_apply", fake_pass)
+    # The lock is per pass: the rocker must never queue behind a whole walk.
+    held = []
+
+    @contextlib.contextmanager
+    def fake_lock(dry_run=False):
+        assert not held, "the lock must be let go between passes"
+        held.append(1)
+        yield
+        held.clear()
+
+    monkeypatch.setattr(applier, "apply_lock", fake_lock)
+    arguments = SimpleNamespace(dry_run=False, value=str(request), state=str(state))
+    assert applier.apply_requests(arguments) == 0
+    return passes
+
+
+def test_a_request_written_during_a_pass_is_picked_up_llr1446(applier, tmp_path, monkeypatch):
+    def plan(current, seq, state, request, count):
+        current["request_seq"] = seq
+        state.write_text(json.dumps(current), encoding="utf-8")
+        if count == 1:
+            request.write_text(json.dumps({"seq": 3}), encoding="utf-8")
+
+    assert _requests(applier, tmp_path, monkeypatch, plan) == [2, 3]
+
+
+def test_a_refused_request_is_not_retried_for_ever_llr1446(applier, tmp_path, monkeypatch):
+    """Refused leaves the mark where it was, so the file still looks newer."""
+    passes = _requests(applier, tmp_path, monkeypatch, lambda *a: None)
+    assert passes == [2, 2]
+
+
+def test_the_drain_is_bounded_llr1446(applier, tmp_path, monkeypatch):
+    def plan(current, seq, state, request, count):
+        current["request_seq"] = seq
+        state.write_text(json.dumps(current), encoding="utf-8")
+        request.write_text(json.dumps({"seq": seq + 1}), encoding="utf-8")
+
+    passes = _requests(applier, tmp_path, monkeypatch, plan)
+    assert len(passes) == applier.REQUEST_DRAIN_PASSES + 1
+    assert applier.REQUEST_DRAIN_PASSES >= 24, "the whole S/PDIF range in one start"
+
+
+@pytest.mark.parametrize("text", ["not json", "[]", "{}", '{"seq": true}', '{"seq": "9"}'])
+def test_an_unusable_file_is_nothing_waiting_llr1446(applier, tmp_path, text):
+    request = tmp_path / "request.json"
+    request.write_text(text, encoding="utf-8")
+    assert applier.waiting_request_seq(request, tmp_path / "absent.json") is None

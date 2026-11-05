@@ -20,6 +20,9 @@ MUTATING_METHODS = frozenset(
      # SR-140: the speaker-sleeps-with-screen preference. A switch verb: it
      # names no device and moves one persisted boolean.
      "set_speaker_sleep",
+     # SR-144: the desktop's S/PDIF level. A switch verb for the same reason: it
+     # names no device and moves one persisted number.
+     "set_spdif_level",
      # WSN-024, added with the routed-device backend (Owner, 2026-09-19:
      # "need bluetooth to have a method to trust a device, might need a method
      # to ... turn on discoverability").
@@ -56,6 +59,9 @@ LEVELLED_OUTPUTS = ("headset", "speaker", "builtin")
 # the bus softvol 197, so a raw number would mean two different loudnesses on
 # the two outputs; the applier is the only thing that knows either scale.
 VOLUME_MIN, VOLUME_MAX = 0, 100
+# The desktop's S/PDIF level in whole dB (SR-144): the same bounds as
+# wall_audio_state and `pcm.spdif_level`, which this tree cannot import.
+SPDIF_LEVEL_MIN_DB, SPDIF_LEVEL_MAX_DB = -12, 12
 METHODS = MUTATING_METHODS | {"status", "telemetry"}
 
 # SELF-RECONCILING MUTATIONS: journaled, but never sticky.
@@ -71,7 +77,7 @@ METHODS = MUTATING_METHODS | {"status", "telemetry"}
 # than by trusting the journal or an operator. See AudioRouter._reconcile.
 SELF_RECONCILING_METHODS = frozenset(
     {"set_mute", "set_output", "set_input_mute", "set_volume",
-     "set_speaker_sleep"})
+     "set_speaker_sleep", "set_spdif_level"})
 HARDWARE_ADDRESS = re.compile(
     r"(?i)(?<![0-9a-f])(?:(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}|"
     r"(?:[0-9a-f]{2}_){5}[0-9a-f]{2}|(?:[0-9a-f]{4}\.){2}[0-9a-f]{4}|"
@@ -168,6 +174,7 @@ def validate_action(method: str, params: Mapping[str, object]) -> None:
         "set_output": {"output"},
         "set_input_mute": {"muted"},
         "set_speaker_sleep": {"enabled"},
+        "set_spdif_level": {"db"},
         "set_volume": {"level", "output"},
     }[method]
     if set(params) - allowed:
@@ -201,6 +208,15 @@ def validate_action(method: str, params: Mapping[str, object]) -> None:
     # shell that has already stopped the leg that was playing.
     if method == "set_output" and params.get("output") not in SWITCH_OUTPUTS:
         raise PolicyError("output must be one of %s" % ", ".join(SWITCH_OUTPUTS))
+    # Required, and closed here as a level is below. The bounds are the applier's
+    # (wall_audio_state.SPDIF_LEVEL_*), which this tree cannot import; a test
+    # holds the two together.
+    if method == "set_spdif_level":
+        db = params.get("db")
+        if (isinstance(db, bool) or not isinstance(db, int) or
+                not SPDIF_LEVEL_MIN_DB <= db <= SPDIF_LEVEL_MAX_DB):
+            raise PolicyError("db must be a whole number in %d..%d"
+                              % (SPDIF_LEVEL_MIN_DB, SPDIF_LEVEL_MAX_DB))
     # A LEVEL IS A PERCENTAGE AND THE RANGE IS CLOSED HERE, not at the applier.
     # The applier clamps, because a rocker held past the end is not an error;
     # a broker request is different -- a client that asked for 5000 has a bug,
@@ -230,7 +246,7 @@ def validate_action(method: str, params: Mapping[str, object]) -> None:
 # The verbs the panel's own switch is made of. They carry no alias, so none of
 # them can reach a Bluetooth device, and none of them is `select_output`.
 SWITCH_METHODS = frozenset({"set_output", "set_input_mute", "set_volume", "set_mute",
-                            "set_speaker_sleep"})
+                            "set_speaker_sleep", "set_spdif_level"})
 
 
 def switch_only_authorization(method: str, params: Mapping[str, object]) -> bool:

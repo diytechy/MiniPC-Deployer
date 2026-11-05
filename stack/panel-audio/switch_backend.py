@@ -45,6 +45,10 @@ from typing import Mapping
 
 import switch_request
 
+# Mirrored from wall_audio_state, as the rest of `_normalized` is: this sandbox
+# cannot import the applier's tree. A test holds them together.
+SPDIF_LEVEL_MIN_DB, SPDIF_LEVEL_MAX_DB = -12, 12
+
 # Imported lazily inside the methods to avoid a circular import at module load:
 # audio_router imports this module to expose the backend, and this module needs
 # audio_router.BrokerError to speak the broker's error vocabulary.
@@ -210,6 +214,10 @@ class SwitchApplierBackend:
     def _set_speaker_sleep(self, params: Mapping[str, object]) -> dict:
         """Spool the speaker-sleeps-with-screen preference. Implements: SR-140, LLR-1432."""
         return self._submit({"kind": "set_speaker_sleep", "enabled": params["enabled"]})
+
+    def _set_spdif_level(self, params: Mapping[str, object]) -> dict:
+        """Spool the desktop's S/PDIF level. Implements: SR-144, LLR-1444."""
+        return self._submit({"kind": "set_spdif_level", "db": params["db"]})
 
     def _set_volume(self, params: Mapping[str, object]) -> dict:
         """Set the level of the SELECTED output, optionally guarded by name.
@@ -741,6 +749,7 @@ class SwitchApplierBackend:
                 # Null, not true: an unreadable file cannot say which way the
                 # preference is set, and a default here would be a claim.
                 "speakerSleepsWithScreen": None,
+                "spdifLevelDb": None,
             }, muted=False, mute_supported=False)
         output = state["output"]
         # ── B4: Headset RESOLVES, so "is it available" is a priority ────────
@@ -782,6 +791,8 @@ class SwitchApplierBackend:
             "btHeadsetPresent": state["bt_headset_present"],
             # SR-140: the persisted preference, read off the applier's file.
             "speakerSleepsWithScreen": state["speaker_sleeps_with_screen"],
+            # SR-144: the stored level, read off the applier's file.
+            "spdifLevelDb": state["spdif_level_db"],
         }, muted=output == "mute", mute_supported=True)
 
     @staticmethod
@@ -813,7 +824,7 @@ class SwitchApplierBackend:
                  "headset_present": False, "bt_headset_present": False,
                  "request_seq": -1, "volume_event_seq": 0,
                  "generation": 0, "mic_legs_running": True,
-                 "speaker_sleeps_with_screen": True,
+                 "speaker_sleeps_with_screen": True, "spdif_level_db": 0,
                  "volume": dict(DEFAULT_VOLUME)}
         # Same rule as wall_audio_state.normalize (step 4, terra rounds 2-4):
         # the microphone is MUTED unless the document explicitly carries the
@@ -833,6 +844,13 @@ class SwitchApplierBackend:
         if isinstance(raw.get("speaker_sleeps_with_screen"), bool):
             state["speaker_sleeps_with_screen"] = raw["speaker_sleeps_with_screen"]
         elif "speaker_sleeps_with_screen" in raw:
+            repaired = True
+        # SR-144, on the same terms again.
+        spdif = raw.get("spdif_level_db")
+        if (isinstance(spdif, int) and not isinstance(spdif, bool)
+                and SPDIF_LEVEL_MIN_DB <= spdif <= SPDIF_LEVEL_MAX_DB):
+            state["spdif_level_db"] = spdif
+        elif "spdif_level_db" in raw:
             repaired = True
         if isinstance(raw.get("headset_present"), bool):
             state["headset_present"] = raw["headset_present"]

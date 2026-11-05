@@ -784,23 +784,21 @@ fstab_mount_for() {
 #                               RETIRED keys of the old three-mount layout. Read
 #                               only to find an old store not set aside; a materialised
 #                               .env written before the change still carries them.
-#   Outputs: FB_STORE, FB_BACKUP (= $FB_STORE/backup), FB_CHANGES (= $FB_STORE/changes),
+#   Outputs: FB_STORE, FB_BACKUP (= $FB_STORE/CurrentBackup), FB_CHANGES (= $FB_STORE),
 #            FB_LEGACY_BACKUP, FB_LEGACY_CHANGES, FB_LEGACY_STATE
 #
-# WHY ONE MOUNT. A FileBackup image built from its bounded-run-loop work
-# (BoundedRebuild) moves objects between backup/ and changes/ by RENAME only,
-# and refuses (exit 2) a BackupPath/ChangePath pair a rename cannot cross. On
-# Linux a rename between two bind mounts fails even when both are on one
-# filesystem, so the old /backup + /changes pair would be refused on every run.
-# backup/ and changes/ are fixed children of the store because
-# stack/backup/filebackup-store.json fixes them inside the container
-# (BackupPath=/store/backup, ChangePath=/store/changes).
+# WHY ONE MOUNT. A FileBackup image built from BoundedRebuild moves objects
+# between CurrentBackup/ and the snapshots by RENAME only, and refuses (exit 2) a store
+# a rename cannot cross. On Linux a rename between two bind mounts fails even
+# when both are on one filesystem. FileBackup C44 (ConfigVersion 3): the store
+# itself is the change root, so the snapshots and the run files (Temp.lock,
+# backup.log, Incoming/, Building_*, Verify/) sit directly in it, beside CurrentBackup/.
 # shellcheck disable=SC2034  # every FB_* set here is read by the caller
 filebackup_store_layout() {
     FB_STORE="${FILEBACKUP_STORE:-/mnt/backup-drive/library-store}"
     FB_STORE="${FB_STORE%/}"
-    FB_BACKUP="$FB_STORE/backup"
-    FB_CHANGES="$FB_STORE/changes"
+    FB_BACKUP="$FB_STORE/CurrentBackup"
+    FB_CHANGES="$FB_STORE"
     FB_LEGACY_BACKUP="${FILEBACKUP_BACKUP:-/mnt/backup-drive/library}"
     FB_LEGACY_CHANGES="${FILEBACKUP_CHANGES:-/mnt/backup-drive/library-changes}"
     FB_LEGACY_STATE="${FILEBACKUP_STATE:-/var/lib/homehub-filebackup/state}"

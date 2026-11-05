@@ -11,14 +11,12 @@
 # every preflight, every refusal and the whole NagLight report live out here. It
 # is one `docker compose run` in the middle of a lot of proof.
 #
-# REQUIRES a FileBackup image built from BoundedRebuild AS IT IS (7a6a80a, the
-# bounded run loop): ONE writable /store mount holding backup/ (BackupPath) and
-# changes/ (ChangePath, with the run files Temp.lock, backup.log, Incoming/,
-# Building_*, Verify/), filebackup-store.json at ConfigVersion 2, no /state
-# mount, and the backup exit table 0/1/2/4 below (verify 0/1/2). NOT an image
-# with FileBackup's later single-store call C44 (StorePath, Latest/, ConfigVersion
-# 3): that would need its own contract change here first. README "The one-mount
-# store".
+# REQUIRES a FileBackup image built from BoundedRebuild with its single-store
+# call C44 (e28e49d or later): ONE writable /store mount holding CurrentBackup/, the
+# BackupHistory/ of dated snapshots, and the run files Temp.lock, backup.log, Incoming/,
+# Building_*, Verify/; filebackup-store.json at ConfigVersion 3 (StorePath), no
+# /state mount, and the backup exit table 0/1/2/4 below (verify 0/1/2/4).
+# README "The one-mount store".
 #
 # ONLY WHEN FILEBACKUP_LAYOUT=single (stack/.env; SR-133). The default is
 # `legacy`: the run is handed, arguments unchanged, to library-backup-legacy.sh,
@@ -33,14 +31,14 @@
 #                                      anything (finding H / E2 cross-check 1)
 #   2b. store-layout guard           — refuses while the old three-mount store
 #                                      still holds data (set it aside first)
-#   2c. Windows-written manifest     — refuses a latest manifest with a
-#                                      backslash in a path column
+#   2c. manifest not from the container — refuses a backslash in a path column
+#                                      or a time whose offset is not +00:00
 #   3. capacity preflight            — a hard floor, posted RED (Q-FB2 carries
 #                                      the whole space burden here)
 #   4. pre-create the bind paths     — docker's chown-on-create is EPERM on the
 #                                      FAT-family drives and kills the compose.
-#                                      NEVER backup/ or changes/ (FileBackup's)
-#   5. write-probe the store, backup/ and changes/ where present, /logs (Q-FB5)
+#                                      NEVER CurrentBackup/ (FileBackup's)
+#   5. write-probe the store, CurrentBackup/ where present, /logs (Q-FB5)
 #   5b. an old engine's Temp folder  — a NOTE naming the recovery event; the
 #                                      bounded engine leaves Temp alone and runs
 #   6. hold the drive awake for the run, restore standby on exit
@@ -355,12 +353,12 @@ run_state starting
 # speak the one-mount contract would refuse at best, and the knob cannot tell
 # what is loaded under the tag. scripts/ensure-local-images.sh stamps
 # homehub.filebackup.contract at build time from the FileBackup checkout:
-# `one-mount-v2` only when that commit contains BoundedRebuild 7a6a80a and its
-# engine's ConfigSchemaVersion is 2 (so not FileBackup's later C44, which bumps
-# it). No label - a hand-tagged image, the deployed kit-12 one, anything built
-# before the stamp - is a refusal, as is a docker that cannot be asked.
+# `current-history-v3` only when that commit contains BoundedRebuild e28e49d (C44
+# with its review fixes) and its engine's ConfigSchemaVersion is 3. No label - a
+# hand-tagged image, the deployed kit-12 one, anything built before the stamp -
+# is a refusal, as is a docker that cannot be asked.
 FB_IMAGE="filebackup:${FILEBACKUP_IMAGE_TAG:-local}"
-FB_WANT_CONTRACT=one-mount-v2
+FB_WANT_CONTRACT=current-history-v3
 _contract=""
 if ! _contract="$(docker image inspect "$FB_IMAGE" --format '{{index .Config.Labels "homehub.filebackup.contract"}}' 2>/dev/null)"; then
     refuse "cannot inspect the image $FB_IMAGE (not loaded, or docker cannot be asked)." \
@@ -370,7 +368,7 @@ case "$_contract" in
     "$FB_WANT_CONTRACT") log "image: $FB_IMAGE speaks the one-mount contract ($FB_WANT_CONTRACT)" ;;
     *) _rev="$(docker image inspect "$FB_IMAGE" --format '{{index .Config.Labels "homehub.source.revision"}}' 2>/dev/null || true)"
        refuse "the image $FB_IMAGE does not speak the one-mount layout: its homehub.filebackup.contract label is '${_contract:-<none>}' (want $FB_WANT_CONTRACT), source revision '${_rev:-<none>}'." \
-              "Build it from a FileBackup commit that contains BoundedRebuild 7a6a80a and not C44 (scripts/ensure-local-images.sh --rebuild), or set FILEBACKUP_LAYOUT=legacy. Nothing was looked at or created." ;;
+              "Build it from a FileBackup commit that contains BoundedRebuild e28e49d (scripts/ensure-local-images.sh --rebuild), or set FILEBACKUP_LAYOUT=legacy. Nothing was looked at or created." ;;
 esac
 
 # ── 2. MOUNT-IDENTITY PREFLIGHT (E2 cross-check 1 / upstream finding H) ───────
@@ -555,17 +553,18 @@ BACKUP_MOUNT="$(mount_of "$FB_STORE")"
               "Writing there would put the library's whole backup store and snapshot history on the system disk."
 preflight_mount "$BACKUP_MOUNT" backup-drive
 
-# ONE MOUNT FOR backup/ AND changes/. FileBackup moves objects between them by
-# rename only, and refuses (exit 2) a pair a rename cannot cross; inside the
-# container both are under the one /store bind, so the only way to split them is
-# a second mount under the store on the host, which the bind would carry along.
+# ONE MOUNT FOR CurrentBackup/ AND THE STORE. FileBackup moves objects between CurrentBackup/
+# and the snapshots by rename only, and refuses (exit 2) a store a rename cannot
+# cross; inside the container all of it is under the one /store bind, so the only
+# way to split it is a second mount at CurrentBackup/ on the host, which the bind would
+# carry along.
 # Asked here because here it costs nothing and names the host path.
 for _d in "$FB_BACKUP" "$FB_CHANGES"; do
     _m="$(mount_of "$_d")"
     [ "$_m" = "$BACKUP_MOUNT" ] \
         || refuse "$_d is on '$_m' but the library store $FB_STORE is on '$BACKUP_MOUNT'." \
-                  "backup/ and changes/ must be ONE mount: FileBackup moves content between them by rename only, and" \
-                  "refuses (exit 2) a pair a rename cannot cross. Unmount whatever is mounted under $FB_STORE."
+                  "CurrentBackup/ and the snapshots must be ONE mount: FileBackup moves content between them by rename only, and" \
+                  "refuses (exit 2) a store a rename cannot cross. Unmount whatever is mounted under $FB_STORE."
 done
 
 # ── 2b. THE STORE LAYOUT: refuse while the OLD three-mount store holds data ───
@@ -590,40 +589,37 @@ legacy_store_guard() {
         return 0
     fi
     refuse "the old three-mount store is still in place: $old holds the old engine's store." \
-           "This image needs ONE store, $FB_STORE, holding backup/ and changes/, and the old store is set aside first," \
+           "This image needs ONE store, $FB_STORE, holding CurrentBackup/ and its snapshots, and the old store is set aside first," \
            "never migrated or deleted: rename its folders into one folder of their own on the same drive." \
            "Nothing was created and no container ran. README: \"Bringing in a new store\", then start the backup again."
 }
 legacy_store_guard "$FB_LEGACY_BACKUP" "$FB_BACKUP"
 legacy_store_guard "$FB_LEGACY_CHANGES" "$FB_CHANGES"
 
-# ── 2c. A LATEST MANIFEST WRITTEN ON WINDOWS ─────────────────────────────────
-# FileBackup records each row's paths with the separator of the system that
-# wrote it, and finds a file again by its exact path: a store written by a
-# native Windows run holds Shared\a.jpg where this container computes
-# Shared/a.jpg, so the first run here would treat every file as new and every
-# row as gone. A Linux run never writes a backslash in either path column: its
-# portability check (Test-PortableRelativePath) refuses such a name, so the
-# file is not captured at all. So any backslash in DataPath or RelativePath
-# means the store was written on Windows, and that is a refusal, with no false
-# positive.
+# ── 2c. A LATEST MANIFEST NOT WRITTEN BY THE CONTAINER ───────────────────────
+# Since FileBackup C44 (L7) every host records '/' in a path, so a backslash no
+# longer marks a Windows store. Its times do: the container runs in UTC and
+# writes LastWriteTimeStr with a +00:00 offset, while a native Windows run writes
+# the Windows box's own offset. The Owner's rule stands: the store is written by
+# the Linux container, with /source at the library root. A row with any other
+# offset, or a backslash in DataPath or RelativePath, is a refusal. A Windows box
+# set to UTC would pass, which is why this is a guard and not a proof.
 #
 # COST: one sequential, streaming read of the latest manifest (about 180k
 # rows here), byte-wise (LC_ALL=C), splitting each line only at the
-# '","' between quoted fields and looking at the first two, stopping at the
+# '","' between quoted fields and looking at the first four, stopping at the
 # first hit. No other file is opened, nothing is held in memory, and the drive
 # is awake for the run anyway. Every field is written quoted and neither path
 # column can hold a '"' (refused on Windows and Linux alike), so the split is
-# exact for the two columns read. A new store has no manifest yet: nothing to
+# exact for the columns read. A new store has no manifest yet: nothing to
 # read.
 if [ -f "$FB_BACKUP/MANIFEST.csv" ]; then
     # Fails CLOSED: a manifest awk cannot read is not a manifest that passed.
-    if ! _bs_line="$(LC_ALL=C awk -F'","' 'NR > 1 && index($1 FS $2, "\\") { print NR; exit }' "$FB_BACKUP/MANIFEST.csv")"; then
+    if ! _bs_line="$(LC_ALL=C awk -F'","' 'NR > 1 && (index($1 FS $2, "\\") || (NF >= 4 && $4 !~ /\+00:00$/)) { print NR; exit }' "$FB_BACKUP/MANIFEST.csv")"; then
         refuse "cannot read $FB_BACKUP/MANIFEST.csv to check its paths (awk failed) - refusing rather than treating 'could not ask' as 'clean'."
     fi
     if [ -n "$_bs_line" ]; then
-        refuse "$FB_BACKUP/MANIFEST.csv was written on Windows: line $_bs_line has a backslash in a path column." \
-               "This container finds files by their exact Linux path, so continuing it would treat every file as new." \
+        refuse "$FB_BACKUP/MANIFEST.csv was not written by this container: line $_bs_line has a backslash in a path column or a time that is not +00:00." \
                "The store must be written by the Linux container with /source at the library root (README \"Bringing in a new store\")." \
                "Nothing was created and no container ran."
     fi
@@ -655,7 +651,7 @@ if [ "$_avail" -lt $(( MIN_FREE_GB * 1000000000 )) ]; then
         "The manual relief valve, in this order:" \
         "  cd $STACK_DIR && docker compose --profile filebackup run --rm -T $FB_SERVICE snapshots" \
         "  docker compose --profile filebackup run --rm -T -e FILEBACKUP_DRY_RUN=1 $FB_SERVICE prune -Snapshot <name>   # dry run first (-e, not a host variable)" \
-        "NEVER delete a Snapshot_* folder by hand — it is the only copy of the states it holds." \
+        "NEVER delete a folder in BackupHistory by hand — it is the only copy of the states it holds." \
         "Or lower BACKUP_LIBRARY_MIN_FREE_GB in backup.env if this floor is simply too high for this drive."
 fi
 log "capacity: backup drive $(gb "$_avail") GB free of $(gb "$_total") GB (${FILL_PCT} full, floor ${MIN_FREE_GB} GB)"
@@ -682,12 +678,11 @@ log "capacity: logs $(gb "$_sa") GB free (floor ${MIN_FREE_STATE_GB} GB)"
 # mkdir'ing a library over an unmounted drive is exactly the silent green step 2
 # just refused.
 #
-# AND backup/ AND changes/ ARE NEVER CREATED HERE. They are no bind of their
-# own (docker binds the store), FileBackup creates them itself on a new store,
-# and it refuses (exit 2) a store whose backup/ is gone while changes/ holds
-# snapshots - one that lost its latest state must not be answered with a fresh
-# full backup beside its history - which it can only see if backup/ is really
-# missing.
+# AND CurrentBackup/ IS NEVER CREATED HERE. It is no bind of its own (docker binds the
+# store), FileBackup creates it on a new store, and it refuses (exit 2) a store
+# whose CurrentBackup/ is gone while snapshots are there - one that lost its latest
+# state must not be answered with a fresh full backup beside its history - which
+# it can only see if CurrentBackup/ is really missing.
 [ -r "$FB_CONFIG" ] \
     || refuse "the container's config $FB_CONFIG is missing or unreadable." \
               "It is a TRACKED template (stack/backup/filebackup-store.json) installed by autoinstall late-command 5c, and by hand at the cutover (README \"The layout knob\")." \
@@ -856,11 +851,12 @@ fb_run() {
     ( cd "$STACK_DIR" && docker compose --profile filebackup run --rm -T "$FB_SERVICE" "$@" )
 }
 
-# count_snapshots : how many Snapshot_* trees the change root holds. A run that
+# count_snapshots : how many dated folders BackupHistory holds (Building_* and Pruning_* are not snapshots). A run that
 # supersedes nothing creates none, so this is how "was a snapshot created" gets
 # ANSWERED rather than assumed — the feed summary carries the answer.
 count_snapshots() {
-    find "$FB_CHANGES" -mindepth 1 -maxdepth 1 -type d -name 'Snapshot_*' 2>/dev/null | grep -c . || true
+    find "$FB_STORE/BackupHistory" -mindepth 1 -maxdepth 1 -type d \
+        -name '[0-9][0-9][0-9][0-9]_[0-9][0-9]_[0-9][0-9]_[0-9][0-9]_[0-9][0-9]_[0-9][0-9]*' 2>/dev/null | grep -c . || true
 }
 
 # set_log_count TEXT : how many lines of the set log carry TEXT (a fixed
@@ -934,7 +930,7 @@ _total="$(df_field "$_fs" 2)"; _used="$(df_field "$_fs" 3)"; _avail="$(df_field 
 #      C42 includes paths differing only in
 #      letter case), and/or a stored object was
 #      found DAMAGED by its listing and set aside
-#      into changes/Verify/ (C37; [DamagedObject]
+#      into <store>/Verify/ (C37; [DamagedObject]
 #      lines in the set log, counted below)
 #   2  refused before changing anything; a       -> FAIL now, "do not retry"
 #      person must fix it (since the 2026-10-26
@@ -979,7 +975,7 @@ case "$BACKUP_RC" in
            log "  so a snapshot that needed it may no longer restore that file. README \"Damaged objects\"."
        fi
        log "  Not a verified success." ;;
-    2) FAIL_NOTE="FileBackup REFUSED the run before changing anything (exit 2) — a person must fix it; retrying will not help. The causes are: $FB_CONFIG cannot be loaded or violates the closed schema (FileBackup's container/FileBackup.schema.json), a required tool or dependency that cannot be loaded (7-Zip, the hashing package), the source root missing, backup/ and changes/ not on one mount (the rename test failed), a store whose backup/ is missing while changes/ holds snapshots (never answered with a fresh full backup: find out where backup/ went), or a latest manifest that cannot be read (move $FB_BACKUP/MANIFEST.csv aside to rebuild the latest state from the source; the snapshots are untouched). The reason is in the journal, which carries the container's output (journalctl -u homehub-library-backup.service), and in $FB_LOGS/Backup_Global.log; a refusal can come before the set log starts"
+    2) FAIL_NOTE="FileBackup REFUSED the run before changing anything (exit 2) — a person must fix it; retrying will not help. The causes are: $FB_CONFIG cannot be loaded or violates the closed schema (FileBackup's container/FileBackup.schema.json), a required tool or dependency that cannot be loaded (7-Zip, the hashing package), the source root missing, CurrentBackup/ not on the store's mount (the rename test failed), a store in the old backup/ + changes/ or Latest/ layout, a store with CurrentBackup/ but no BackupHistory/ (something moved it: put it back, or create an empty one if it is really gone), a store whose CurrentBackup/ is missing while snapshots are there (never answered with a fresh full backup: find out where CurrentBackup/ went), or a latest manifest that cannot be read (move $FB_BACKUP/MANIFEST.csv aside to rebuild the latest state from the source; the snapshots are untouched). The reason is in the journal, which carries the container's output (journalctl -u homehub-library-backup.service), and in $FB_LOGS/Backup_Global.log; a refusal can come before the set log starts"
        false ;;
     3) FAIL_NOTE="the container exited 3, which a bounded-run-loop FileBackup never returns from a backup (the manifest witness is gone). This is almost certainly an OLDER image: this stack needs one built from FileBackup's BoundedRebuild work. Rebuild it (scripts/ensure-local-images.sh --rebuild) and read $FB_LOGS/Backup_Global.log"
        false ;;
@@ -1031,15 +1027,10 @@ publish_manifest_copy
 # REPORT ONLY: this gate never passes FILEBACKUP_REPAIR. Moving duplicates and
 # damaged objects into $FB_CHANGES/Verify/ is a person's call (README).
 #
-# MEMORY - NOT YET SAFE ON THE HUB'S STORE (FileBackup C43, 2026-10-27). Until
-# FileBackup's follow-up to C43 lands, a verify (its pool-resolve check) still
-# holds every snapshot manifest in memory at once: about 420 MB per HomeHub
-# manifest, the mechanism of the 2026-10-04 outage. This gate is scheduled by
-# the calendar below and NOTHING here stops it yet - deliberately, because
-# disabling it is the Owner's call, recorded in docs/status.md. What would
-# gate it: running the unit with --verify none (ExecStart), or a knob read
-# here, until an image with that follow-up is deployed; FILEBACKUP_MEM_LIMIT
-# would turn a runaway into an OOM kill of this container instead of the box.
+# MEMORY: since FileBackup C43 (15ed359) a verify and a prune read one manifest
+# at a time, so neither holds every snapshot's rows, the mechanism of the
+# 2026-10-04 outage. FILEBACKUP_MEM_LIMIT turns any runaway into an OOM kill of
+# this container instead of the box.
 #
 # `auto` = the FIRST occurrence of BACKUP_LIBRARY_VERIFY_DAY each month is deep,
 # every other occurrence is shallow, and every other day skips. Computed from the
@@ -1075,22 +1066,25 @@ if [ "$VERIFY_RUN" != none ]; then
     fb_run "${VERIFY_ARGS[@]}" || VERIFY_RC=$?
     log_slice_peak "after $VERIFY_RUN verify (exit $VERIFY_RC)"
     # The VERIFY table (FileBackup SR-049/SR-040), a different table from the
-    # backup one above: 0 clean · 1 findings · 2 precondition. Verify reads, so
-    # a host problem stops it before it classifies anything and is reported as
-    # 2; it never returns 3 (no witness) or 4. The findings are a JSON document
+    # backup one above: 0 clean · 1 findings · 2 precondition · 4 the store
+    # drive is not attached, or (a repair) the store lock is held. It never
+    # returns 3 (no witness). The findings are a JSON document
     # on the container's stdout (the journal) and one WARN line each in
     # $FB_LOGS/Backup_Global.log.
     case "$VERIFY_RC" in
         0) VERIFY_NOTE="$VERIFY_RUN ok"
            log "verify: CLEAN (exit 0)" ;;
         1) VERIFY_NOTE="$VERIFY_RUN FINDINGS"
-           FAIL_NOTE="verify exit 1 — FINDINGS: the store disagrees with its manifests somewhere. Read the [Class] lines in $FB_LOGS/Backup_Global.log. PoolUnresolvable is a row with no bytes anywhere (not restorable until the next backup re-stores it from the source); DuplicateObject is a second copy of one object (harmless, costs space — expected once after a store from the old engine); DamagedObject is an object whose length its name rules out (empty, or a raw object of another length — any verify) or, under -Deep, whose bytes do not hash to its name. Moving duplicates and damaged objects aside into $FB_CHANGES/Verify/ (never deleted) is a person's call: README \"Verify findings\"$PARTIAL_SUFFIX"
+           FAIL_NOTE="verify exit 1 — FINDINGS: the store disagrees with its manifests somewhere. Read the [Class] lines in $FB_LOGS/Backup_Global.log. PoolUnresolvable is a row with no bytes anywhere (not restorable until the next backup re-stores it from the source); DuplicateObject is a second copy of one object (harmless, costs space); MisplacedObject is a file in CurrentBackup outside its own shard folder (-RepairStorage puts an only copy back); DamagedObject is an object whose length its name rules out (empty, or a raw object of another length — any verify) or, under -Deep, whose bytes do not hash to its name. Moving duplicates and damaged objects aside into $FB_CHANGES/Verify/ (never deleted) is a person's call: README \"Verify findings\"$PARTIAL_SUFFIX"
            false ;;
         2) VERIFY_NOTE="$VERIFY_RUN REFUSED (precondition)"
            FAIL_NOTE="verify exit 2 — precondition failure: the verify could not run at all (no backup root, no manifest to verify, -Deep without 7-Zip, or a host problem that stopped it). Retrying unchanged will not help. Read $FB_LOGS/Backup_Global.log"
            false ;;
-        3|4) VERIFY_NOTE="$VERIFY_RUN exit $VERIFY_RC"
-           FAIL_NOTE="verify exited $VERIFY_RC, which a bounded-run-loop FileBackup never returns from verify (no witness; host problems are 2). This is almost certainly an OLDER image: rebuild it from FileBackup's BoundedRebuild work"
+        3) VERIFY_NOTE="$VERIFY_RUN exit 3"
+           FAIL_NOTE="verify exited 3, which a bounded-run-loop FileBackup never returns from verify (no witness). This is almost certainly an OLDER image: rebuild it from FileBackup's BoundedRebuild work"
+           false ;;
+        4) VERIFY_NOTE="$VERIFY_RUN stopped (host)"
+           FAIL_NOTE="verify exit 4 — a host problem: the backup drive is not attached, or the store lock is held. Nothing was changed; the next run is the retry. Read $FB_LOGS/Backup_Global.log$PARTIAL_SUFFIX"
            false ;;
         *) VERIFY_NOTE="$VERIFY_RUN exit $VERIFY_RC"
            FAIL_NOTE="verify exited $VERIFY_RC, outside the documented 0/1/2 table"

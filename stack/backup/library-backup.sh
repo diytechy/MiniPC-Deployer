@@ -937,7 +937,7 @@ _total="$(df_field "$_fs" 2)"; _used="$(df_field "$_fs" 3)"; _avail="$(df_field 
 #      C42 includes paths differing only in
 #      letter case), and/or a stored object was
 #      found DAMAGED by its listing and set aside
-#      into <store>/Verify/ (C37; [DamagedObject]
+#      into <store>/Verify/ (C37; "Damaged ..." events
 #      lines in the set log, counted below)
 #   2  refused before changing anything; a       -> FAIL now, "do not retry"
 #      person must fix it (since the 2026-10-26
@@ -1026,12 +1026,12 @@ publish_manifest_copy
 
 # ── 8. THE VERIFY GATE — weekly, deep monthly ────────────────────────────────
 # A backup nobody reads is a hypothesis. `verify` re-proves the stored manifest,
-# reports any object stored twice (DuplicateObject) and, since FileBackup C37,
-# any object whose length its name rules out (DamagedObject: empty, or a raw
+# reports any object stored twice (duplicate_object) and, since FileBackup C37,
+# any object whose length its name rules out (object_damaged: empty, or a raw
 # object of another length); -Deep additionally proves payload identity,
-# hashing every object against its name (a mismatch is also DamagedObject),
+# hashing every object against its name (a mismatch is also object_damaged),
 # which costs real time and so is monthly rather than weekly.
-# REPORT ONLY: this gate never passes FILEBACKUP_REPAIR. Moving duplicates and
+# REPORT ONLY: this gate never passes --repair-storage. Moving duplicates and
 # damaged objects into $FB_CHANGES/Verify/ is a person's call (README).
 #
 # MEMORY: since FileBackup C43 (15ed359) a verify and a prune read one manifest
@@ -1081,7 +1081,7 @@ if [ "$VERIFY_RUN" != none ]; then
         0) VERIFY_NOTE="$VERIFY_RUN ok"
            log "verify: CLEAN (exit 0)" ;;
         1) VERIFY_NOTE="$VERIFY_RUN FINDINGS"
-           FAIL_NOTE="verify exit 1 — FINDINGS: the store disagrees with its manifests somewhere. Read the verify report's events in the journal (journalctl -u homehub-library-backup.service). PoolUnresolvable is a row with no bytes anywhere (not restorable until the next backup re-stores it from the source); DuplicateObject is a second copy of one object (harmless, costs space); MisplacedObject is a file in CurrentBackup outside its own shard folder (-RepairStorage puts an only copy back); DamagedObject is an object whose length its name rules out (empty, or a raw object of another length — any verify) or, under -Deep, whose bytes do not hash to its name. Moving duplicates and damaged objects aside into $FB_CHANGES/Verify/ (never deleted) is a person's call: README \"Verify findings\"$PARTIAL_SUFFIX"
+           FAIL_NOTE="verify exit 1 — FINDINGS: the store disagrees with its manifests somewhere. Read the verify report's events in the journal (journalctl -u homehub-library-backup.service). content_missing is a row with no bytes anywhere (not restorable until the next backup re-stores it from the source); duplicate_object is a second copy of one object (harmless, costs space); object_misplaced is a file in CurrentBackup outside its own shard folder (verify --deep --repair-storage puts an only copy back); object_damaged is an object whose length its name rules out (empty, or a raw object of another length — any verify) or, under --deep, whose bytes do not hash to its name. Moving duplicates and damaged objects aside into $FB_CHANGES/Verify/ (never deleted) is a person's call: README \"Verify findings\"$PARTIAL_SUFFIX"
            false ;;
         2) VERIFY_NOTE="$VERIFY_RUN REFUSED (precondition)"
            FAIL_NOTE="verify exit 2 — precondition failure: the verify could not run at all (no backup root, no manifest to verify, -Deep without 7-Zip, or a host problem that stopped it). Retrying unchanged will not help. Read the journal (journalctl -u homehub-library-backup.service)"

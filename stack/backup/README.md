@@ -1025,7 +1025,7 @@ Bytes already stored were lost here. If a library file still hashes to that
 name, the same run stores it again and every row naming it resolves as before.
 If none does (the file has since changed or gone), the rows naming that object —
 in the latest state or in a snapshot — can no longer restore that file, and a
-verify reports them as `PoolUnresolvable`. `Verify/` is not part of the pool;
+verify reports them as `content_missing`. `Verify/` is not part of the pool;
 look at what it holds before emptying it by hand.
 
 The **verify** action: **0** clean · **1** findings · **2** precondition (no
@@ -1058,16 +1058,16 @@ wrapper's message, not on the wall.
 
 ### Verify findings
 
-The weekly gate is **report only**; it never passes `FILEBACKUP_REPAIR`. Each
-finding is a `[Class]` line in `Backup_Global.log` (and a JSON document on the
-container's stdout, in the journal):
+The weekly gate is **report only**; it never passes `--repair-storage`. Each
+finding is an event with a `cause` in the JSON report on the container's stdout,
+which is the journal:
 
-| Class | Means | What to do |
+| Cause | Means | What to do |
 |---|---|---|
-| `PoolUnresolvable` | a manifest row whose bytes are nowhere in the store | the next backup re-stores it if the source still has the file |
-| `DuplicateObject` | one object stored in more than one folder | harmless, costs space. Rare on a store the bounded engine wrote from the start (residue of an interrupted move) |
-| `MisplacedObject` | a file in `CurrentBackup/` outside its own shard folder | `-RepairStorage` puts an only copy back |
-| `DamagedObject` | an object whose **length** its name rules out — empty, or a raw object of another length (any verify, since FileBackup C37; a backup run sets these aside itself, see [Damaged objects](#damaged-objects)) — or, under `-Deep` (monthly), one whose bytes do not hash to its name | the next backup re-stores the content if the source still has it |
+| `content_missing` | a manifest row whose bytes are nowhere in the store | the next backup re-stores it if the source still has the file |
+| `duplicate_object` | one object stored in more than one folder | harmless, costs space. Rare on a store the bounded engine wrote from the start (residue of an interrupted move) |
+| `object_misplaced` | a file in `CurrentBackup/` outside its own shard folder | `verify --deep --repair-storage` puts an only copy back |
+| `object_damaged` | an object whose **length** its name rules out — empty, or a raw object of another length (any verify, since FileBackup C37; a backup run sets these aside itself, see [Damaged objects](#damaged-objects)) — or, under `--deep` (monthly), one whose bytes do not hash to its name | the next backup re-stores the content if the source still has it |
 
 Moving duplicates and damaged objects aside is a person's call, never the
 timer's. It **moves** them into `<store>/Verify/` — nothing is deleted —

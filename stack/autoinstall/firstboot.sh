@@ -3027,6 +3027,10 @@ if [ -d "$STACK_DIR/monitoring" ]; then
     install -m 0644 "$_mon/homehub-liveness.service"   /etc/systemd/system/homehub-liveness.service   || log "WARN: could not install homehub-liveness.service"
     install -m 0644 "$_mon/homehub-liveness.timer"     /etc/systemd/system/homehub-liveness.timer     || log "WARN: could not install homehub-liveness.timer"
     # The metrics log (SR-122, SR-123; the Owner, 2026-10-26): record only, like the rest.
+    # SR-124 / LLR-1332: the weekly archive writes directly to the backup
+    # drive using HOMEHUB_METRICS_COPY_ROOT/DIR in the materialized stack .env.
+    # Group=filebackup is available from step 3a; storage was mounted there too.
+    # Install both current copy unit files: no Docs folder or Library marker.
     install -m 0644 "$_mon/homehub-metrics-snapshot.service" /etc/systemd/system/homehub-metrics-snapshot.service || log "WARN: could not install homehub-metrics-snapshot.service"
     install -m 0644 "$_mon/homehub-metrics-snapshot.timer"   /etc/systemd/system/homehub-metrics-snapshot.timer   || log "WARN: could not install homehub-metrics-snapshot.timer"
     install -m 0644 "$_mon/homehub-metrics-daily.service"    /etc/systemd/system/homehub-metrics-daily.service    || log "WARN: could not install homehub-metrics-daily.service"

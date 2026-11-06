@@ -193,6 +193,19 @@ and for debugging by the Owner and agents. **Record only: no alert, no action.**
   `stack/monitoring/metrics-site/`): nightly rows, recent snapshots, and a night's
   raw heart rate with its sleep sessions shaded. Static files only.
 
+**Production image / reinstall:** the generic `.env.example` leaves
+`HOMEHUB_METRICS_COPY_DIR` blank (archive off until configured) and defaults
+`HOMEHUB_METRICS_COPY_ROOT` to `/mnt/backup-drive`. HomeHub's production config
+sets the root, destination `/mnt/backup-drive/homehub-metrics`, and
+`HOMEHUB_METRICS_ENABLED=true`; its schema/materializer carry those keys into
+the production payload's `.env`. Hub autoinstall requires and installs that
+file. `autoinstall/firstboot.sh` provisions the backup principal and mounts
+before installing the metrics copy service/timer in its hub-monitoring block,
+then converges the timer to the enabled knob. The copy script creates its own
+archive directory on the first usable run. Build from current integration
+sources; old ISOs/staged payloads retain their old settings. The private HomeHub
+metrics plan section 8 records the static install audit; no ISO/VM run is implied.
+
 Read it: `python3 homehub-metrics.py summary [--hours 24]`,
 `export [--daily] [--since ISO] [--until ISO]`, or `sudo zcat
 /var/lib/homehub-metrics/snapshot-YYYYMMDD.jsonl.gz | jq .` for an old day.

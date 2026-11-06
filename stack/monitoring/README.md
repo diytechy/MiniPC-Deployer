@@ -145,7 +145,7 @@ and for debugging by the Owner and agents. **Record only: no alert, no action.**
 |---|---|---|
 | `homehub-metrics-snapshot.timer` | every 5 min, on the clock | `/var/lib/homehub-metrics/snapshot-YYYYMMDD.jsonl` (UTC day) |
 | `homehub-metrics-daily.timer` | 10:00 and 14:05 America/Chicago, `Persistent=true` | `/var/lib/homehub-metrics/daily.jsonl` |
-| `homehub-metrics-copy.timer` | Sunday 18:30 America/Chicago, `Persistent=true` | a copy in `HOMEHUB_METRICS_COPY_DIR` on the library |
+| `homehub-metrics-copy.timer` | Sunday 18:30 America/Chicago, `Persistent=true` | a cumulative archive in `HOMEHUB_METRICS_COPY_DIR` on the backup drive |
 
 - **The snapshot** (one line, about 3-6 KB): every gauge as the tracker's
   `/api/today` serves it (value, range, target, `observed_at`, the computed
@@ -175,19 +175,20 @@ and for debugging by the Owner and agents. **Record only: no alert, no action.**
   nothing is back-filled for an earlier night.
 - **Retention:** 365 snapshot day files, gzip'd (deterministically) after 7, at
   most 16 MiB a day and 1 GiB in all; `daily.jsonl` for ever (64 MiB cap).
-- **Where it is kept** (the Owner, 2026-10-26): on the hub NOT in the config
-  backups, and never under the tracker's data folder (its git mirror is pushed
-  to GitHub). Once a week `copy` puts the closed snapshot days (gzip'd),
-  `daily.jsonl` and the raw watch samples into `HOMEHUB_METRICS_COPY_DIR`, a
-  folder in the Owner's private Docs tree on the library, which the library's own
-  backup covers. It skips, journalled, unless `/srv/library` is in the mount
-  table and carries `.homehub-library` (root is not stopped by the bare
-  mountpoint's mode 000), and unless the folder's parent already exists. It
-  never copies today's file and never deletes at the destination; a file whose
-  size and mtime already match is skipped. Each run leaves
-  `/var/lib/homehub-metrics/copy-status.json` (last run, result, last success,
-  last skip and why), and every snapshot carries it as `monitors.copy`, so a
-  skipped week shows without the journal.
+- **Where it is kept** (Owner, 2026-11-06, superseding the Library route): on
+  the hub NOT in the config backups, and never under the tracker's data folder
+  (its git mirror is pushed to GitHub). Weekly `copy` puts closed snapshot days
+  (gzip'd), `daily.jsonl` and raw watch files directly into
+  `HOMEHUB_METRICS_COPY_DIR` on the backup drive, outside both the Library and
+  FileBackup's store. The configured root defaults to `/mnt/backup-drive` and
+  must be a real mount. On Linux its device must match mountinfo and the opened
+  root must still match that device; all directory hops refuse symlinks and
+  crossed filesystems. The destination's parent must exist; the destination
+  itself may be a direct child of the mount. No Library marker is needed.
+  The unit uses group `filebackup`, umask `0027`; access is through the existing
+  admin-only Backup share. Never copies today's file, never prunes the archive,
+  and skips unchanged files. Status remains in
+  `/var/lib/homehub-metrics/copy-status.json` and each snapshot's `monitors.copy`.
 - **Charts:** `https://metrics.admin.<domain>/` (Caddy, behind the admin login,
   `stack/monitoring/metrics-site/`): nightly rows, recent snapshots, and a night's
   raw heart rate with its sleep sessions shaded. Static files only.

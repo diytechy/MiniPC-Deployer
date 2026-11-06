@@ -1,7 +1,7 @@
 """Tests for the hub metrics log (SN-048; the Owner's rulings 2026-10-26, HomeHub
 open-items A79): the day-file retention helpers, the 5-minute snapshot, the
 daily row, the panel's `status` verb and its two sources, the raw watch record
-in the heart feeder, the chart page's site, the weekly copy into the library,
+in the heart feeder, the chart page's site, the weekly copy onto the backup drive,
 and the wiring.
 
 Verifies: SR-122, SR-123, SR-124, LLR-1321 .. LLR-1332
@@ -822,43 +822,48 @@ def test_tc1506_the_page_reads_only_its_own_files_and_loads_nothing_from_elsewhe
     assert "<script>" in page and "innerHTML = \"<strong>Now" in page
 
 
-# ── TC-1507..TC-1509: the weekly copy into the library (LLR-1332) ───────────
+# ── TC-1507..TC-1509: the weekly copy onto the backup drive (LLR-1332) ───────────
 
-LIB_MOUNT = "40 29 8:33 / /srv/library rw - fuseblk /dev/sdc1 rw\n"
+BACKUP_MOUNT = "40 29 8:33 / /mnt/backup-drive rw - ext4 /dev/sdc1 rw\n"
 
 
-def _lib(tmp_path):
-    root = tmp_path / "library"
-    (root / "Private" / "Docs").mkdir(parents=True)
-    _w(root / ".homehub-library", "")
-    mounts = mc.parse_mountinfo(LIB_MOUNT.replace("/srv/library", root.as_posix()))
+def _mount_text(root):
+    dev = root.stat().st_dev
+    majmin = "%d:%d" % (os.major(dev), os.minor(dev)) if hasattr(os, "major") else "8:33"
+    return BACKUP_MOUNT.replace("/mnt/backup-drive", root.as_posix()).replace("8:33", majmin)
+
+
+def _archive(tmp_path):
+    root = tmp_path / "backup"
+    root.mkdir()
+    mounts = mc.parse_mountinfo(_mount_text(root))
     knobs = {"HOMEHUB_METRICS_COPY_ROOT": root.as_posix(),
-             "HOMEHUB_METRICS_COPY_DIR": (root / "Private" / "Docs" / "HomeHub-metrics").as_posix()}
+             "HOMEHUB_METRICS_COPY_DIR": (root / "homehub-metrics").as_posix()}
     return root, mounts, knobs
 
 
-def test_tc1507_no_mount_no_marker_no_parent_or_a_path_outside_is_a_skip(tmp_path):
-    root, mounts, knobs = _lib(tmp_path)
+def test_tc1507_no_mount_no_parent_or_a_path_outside_is_a_skip(tmp_path):
+    root, mounts, knobs = _archive(tmp_path)
     real = lambda p: p  # noqa: E731
     assert hm.copy_target(knobs, mounts, realpath=real)[0] == knobs["HOMEHUB_METRICS_COPY_DIR"]
     assert "unset" in hm.copy_target({}, mounts)[1]
     assert "not mounted" in hm.copy_target(knobs, [], realpath=real)[1]
-    (root / ".homehub-library").unlink()
-    assert "marker" in hm.copy_target(knobs, mounts, realpath=real)[1]
-    _w(root / ".homehub-library", "")
     for bad, word in (((root / "Private" / "Nope" / "m").as_posix(), "does not exist"),
                       ((tmp_path / "elsewhere" / "m").as_posix(), "outside"),
                       (root.as_posix(), "outside"), ("relative/m", "absolute"),
                       ((root / "Private" / ".." / "m").as_posix(), "absolute")):
         assert word in hm.copy_target(dict(knobs, HOMEHUB_METRICS_COPY_DIR=bad), mounts, realpath=real)[1], bad
-    assert "does not exist" in hm.copy_target(dict(knobs, HOMEHUB_METRICS_COPY_DIR=(root / "m").as_posix()),
-                                              mounts, realpath=real)[1]
+    assert hm.copy_target(dict(knobs, HOMEHUB_METRICS_COPY_DIR=(root / "m").as_posix()),
+                          mounts, realpath=real)[0] == (root / "m").as_posix()
 
 
-def test_tc1507_review_round1_another_filesystem_under_the_library_is_a_skip(tmp_path):
-    root, mounts, knobs = _lib(tmp_path)
+def test_tc1507_review_round1_another_filesystem_under_the_archive_is_a_skip(tmp_path):
+    root, mounts, knobs = _archive(tmp_path)
+    nested = root / "nested"
+    nested.mkdir()
+    knobs["HOMEHUB_METRICS_COPY_DIR"] = (nested / "metrics").as_posix()
     parent = os.path.dirname(knobs["HOMEHUB_METRICS_COPY_DIR"])
-    dev = lambda p: 2 if p == parent else 1  # noqa: E731
+    dev = lambda p: root.stat().st_dev + 1 if p == parent else root.stat().st_dev  # noqa: E731
     assert "another filesystem" in hm.copy_target(knobs, mounts, realpath=lambda p: p, device=dev)[1]
 
 
@@ -880,22 +885,22 @@ def test_tc1509_review_round1_a_planted_link_under_the_destination_is_refused(tm
 
 
 @pytest.mark.skipif(not hm.DIR_FD_OPENS, reason="the dir-fd walk is the hub's (Linux) path")
-def test_tc1509_review_round2_the_walk_starts_at_the_library_and_stays_on_its_device(tmp_path):
-    root = tmp_path / "library"
+def test_tc1509_review_round2_the_walk_starts_at_the_archive_and_stays_on_its_device(tmp_path):
+    root = tmp_path / "backup"
     (root / "Private" / "Docs").mkdir(parents=True)
     src = _w(tmp_path / "hr-20201001.jsonl", "{}\n")
     dest = root / "Private" / "Docs" / "m"
-    # No marker under the held-open root (unmounted since the check): refused.
-    with pytest.raises(FileNotFoundError):
-        hm._copy_one(str(src), str(dest), "watch-raw/hr-20201001.jsonl", False, library_root=str(root))
+    # The opened root must still be the device checked in mountinfo.
+    with pytest.raises(PermissionError):
+        hm._copy_one(str(src), str(dest), "watch-raw/hr-20201001.jsonl", False,
+                     archive_root=str(root), expected_device=root.stat().st_dev + 1)
     assert not dest.exists()
-    _w(root / ".homehub-library", "")
-    hm._copy_one(str(src), str(dest), "watch-raw/hr-20201001.jsonl", False, library_root=str(root))
+    hm._copy_one(str(src), str(dest), "watch-raw/hr-20201001.jsonl", False, archive_root=str(root), expected_device=root.stat().st_dev)
     assert (dest / "watch-raw" / "hr-20201001.jsonl").read_text() == "{}\n"
     # An existing folder on the way is opened, never made.
     with pytest.raises(FileNotFoundError):
         hm._copy_one(str(src), str(root / "Private" / "Nope" / "m"), "x/hr-20201001.jsonl", False,
-                     library_root=str(root))
+                     archive_root=str(root), expected_device=root.stat().st_dev)
     assert not (root / "Private" / "Nope").exists()
     parent = os.open(str(root), os.O_RDONLY)
     try:
@@ -941,14 +946,14 @@ def test_tc1509_opus_a_source_that_is_not_a_regular_file_is_refused(tmp_path):
 
 
 def test_tc1509_opus_the_copy_leaves_a_status_the_snapshot_carries(tmp_path):
-    root, mounts, knobs = _lib(tmp_path)
+    root, mounts, knobs = _archive(tmp_path)
     args = _args(tmp_path)
     _w(args.env_file, "".join("%s=%s\n" % kv for kv in knobs.items()))
     assert hm.cmd_copy(args, mounts_text="", now=1793000000.0) == 0
     status = json.loads((Path(args.data_dir) / "copy-status.json").read_text())
     assert status["last_result"] == "skipped" and "not mounted" in status["last_skip_reason"]
     assert "last_success" not in status
-    text = LIB_MOUNT.replace("/srv/library", root.as_posix())
+    text = _mount_text(root)
     assert hm.cmd_copy(args, mounts_text=text, now=1793000600.0) == 0
     status = json.loads((Path(args.data_dir) / "copy-status.json").read_text())
     assert status["last_result"] == "ok" and status["last_success"] == 1793000600
@@ -978,7 +983,7 @@ def test_tc1508_the_plan_skips_today_unsettled_and_unchanged_files():
 
 
 def test_tc1509_the_copy_is_idempotent_never_deletes_and_meets_the_later_gzip(tmp_path):
-    root, mounts, knobs = _lib(tmp_path)
+    root, mounts, knobs = _archive(tmp_path)
     args = _args(tmp_path)
     _w(args.env_file, "".join("%s=%s\n" % kv for kv in knobs.items()))
     data, raw = Path(args.data_dir), Path(args.raw_dir)
@@ -988,7 +993,7 @@ def test_tc1509_the_copy_is_idempotent_never_deletes_and_meets_the_later_gzip(tm
         os.utime(str(base / name), (old, old))
     today = mc.day_file_name("snapshot", time.time())
     _w(data / today, '{"epoch": 2}\n')
-    text = LIB_MOUNT.replace("/srv/library", root.as_posix())
+    text = _mount_text(root)
     assert hm.cmd_copy(args, mounts_text=text) == 0
     dest = Path(knobs["HOMEHUB_METRICS_COPY_DIR"])
     got = sorted(str(p.relative_to(dest)).replace("\\", "/") for p in dest.rglob("*") if p.is_file())
@@ -1026,6 +1031,8 @@ def test_tc1510_units_are_bounded_oneshots_whose_deadline_fits():
         assert deadline + hm.SAVE_RESERVE_SEC <= timeout, name
     tim = _live((MON / "homehub-metrics-snapshot.timer").read_text(encoding="utf-8"))
     assert "OnCalendar=*:0/5" in tim
+    copy_svc = _live((MON / "homehub-metrics-copy.service").read_text(encoding="utf-8"))
+    assert "Group=filebackup" in copy_svc and "UMask=0027" in copy_svc
     copy = _live((MON / "homehub-metrics-copy.timer").read_text(encoding="utf-8"))
     assert re.search(r"^OnCalendar=Sun \*-\*-\* 18:30:00 America/Chicago$", copy, re.M)
     assert re.search(r"^Persistent=true$", copy, re.M)
@@ -1069,3 +1076,28 @@ def test_tc1510_the_metrics_log_only_queries_and_never_acts():
     # Never under the tracker's data folder (its git mirror is pushed to GitHub).
     for path in (hm.DEFAULT_DATA_DIR, hm.DEFAULT_RAW_DIR):
         assert "tracker" not in path and path.startswith("/var/lib/homehub-")
+
+
+def test_tc1507_direct_backup_archive_needs_no_library_or_marker(tmp_path):
+    root = tmp_path / "backup"
+    root.mkdir()
+    dev = root.stat().st_dev
+    majmin = "%d:%d" % (os.major(dev), os.minor(dev)) if hasattr(os, "major") else "8:33"
+    mounts = mc.parse_mountinfo("40 29 %s / %s rw - ext4 /dev/test rw\n" % (majmin, root.as_posix()))
+    knobs = {"HOMEHUB_METRICS_COPY_ROOT": root.as_posix(),
+             "HOMEHUB_METRICS_COPY_DIR": (root / "homehub-metrics").as_posix()}
+    assert hm.copy_target(knobs, mounts)[0] == knobs["HOMEHUB_METRICS_COPY_DIR"]
+    assert not (tmp_path / "library").exists()
+    assert hm.ARCHIVE_ROOT == "/mnt/backup-drive"
+    assert "not mounted" in hm.copy_target(knobs, [])[1]
+    if hm.DIR_FD_OPENS:
+        assert "mounted device" in hm.copy_target(knobs, mounts, device=lambda p: dev + 1)[1]
+
+
+@pytest.mark.skipif(not hm.DIR_FD_OPENS, reason="Linux mounted-device check")
+@pytest.mark.parametrize("majmin", ["bad", "8:", "8:1:2", "-1:0"])
+def test_tc1507_malformed_mount_device_is_a_skip(tmp_path, majmin):
+    root, mounts, knobs = _archive(tmp_path)
+    mounts[0]["majmin"] = majmin
+    assert "mounted device" in hm.copy_target(knobs, mounts)[1]
+    assert not Path(knobs["HOMEHUB_METRICS_COPY_DIR"]).exists()

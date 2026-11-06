@@ -351,25 +351,27 @@ run_state starting
 
 # ── 1b. THE IMAGE MUST SPEAK THIS LAYOUT (SR-133) ────────────────────────────
 # Before anything on the drives is looked at or created: an image that does not
-# speak the one-mount contract would refuse at best, and the knob cannot tell
-# what is loaded under the tag. scripts/ensure-local-images.sh stamps
+# speak the native contract would refuse at best, and the knob cannot tell what
+# is loaded under the tag. scripts/ensure-local-images.sh stamps
 # homehub.filebackup.contract at build time from the FileBackup checkout:
-# `current-history-v3` only when that commit contains BoundedRebuild 88640a0 (C44
-# with its review fixes) and its engine's ConfigSchemaVersion is 3. No label - a
-# hand-tagged image, the deployed kit-12 one, anything built before the stamp -
-# is a refusal, as is a docker that cannot be asked.
+# `native-metadata-v1` only when that commit contains the Rust engine and its
+# bundled 7-Zip and still requires ConfigVersion 3. No label - a hand-tagged
+# image, the PowerShell current-history-v3 image, anything built before the
+# stamp - is a refusal, as is a docker that cannot be asked. The PowerShell image
+# must be refused: it takes `-Deep`, not `--deep`, and it cannot read a native
+# store's DIRECTORIES.csv.
 FB_IMAGE="filebackup:${FILEBACKUP_IMAGE_TAG:-local}"
-FB_WANT_CONTRACT=current-history-v3
+FB_WANT_CONTRACT=native-metadata-v1
 _contract=""
 if ! _contract="$(docker image inspect "$FB_IMAGE" --format '{{index .Config.Labels "homehub.filebackup.contract"}}' 2>/dev/null)"; then
     refuse "cannot inspect the image $FB_IMAGE (not loaded, or docker cannot be asked)." \
-           "FILEBACKUP_LAYOUT=single needs an image built from FileBackup BoundedRebuild by scripts/ensure-local-images.sh --rebuild."
+           "FILEBACKUP_LAYOUT=single needs an image built from FileBackup's native engine by scripts/ensure-local-images.sh --rebuild."
 fi
 case "$_contract" in
-    "$FB_WANT_CONTRACT") log "image: $FB_IMAGE speaks the one-mount contract ($FB_WANT_CONTRACT)" ;;
+    "$FB_WANT_CONTRACT") log "image: $FB_IMAGE speaks the native contract ($FB_WANT_CONTRACT)" ;;
     *) _rev="$(docker image inspect "$FB_IMAGE" --format '{{index .Config.Labels "homehub.source.revision"}}' 2>/dev/null || true)"
-       refuse "the image $FB_IMAGE does not speak the one-mount layout: its homehub.filebackup.contract label is '${_contract:-<none>}' (want $FB_WANT_CONTRACT), source revision '${_rev:-<none>}'." \
-              "Build it from a FileBackup commit that contains BoundedRebuild 88640a0 (scripts/ensure-local-images.sh --rebuild), or set FILEBACKUP_LAYOUT=legacy. Nothing was looked at or created." ;;
+       refuse "the image $FB_IMAGE does not speak the native contract: its homehub.filebackup.contract label is '${_contract:-<none>}' (want $FB_WANT_CONTRACT), source revision '${_rev:-<none>}'." \
+              "Build it from a FileBackup commit that contains the native engine (scripts/ensure-local-images.sh --rebuild). Nothing was looked at or created." ;;
 esac
 
 # ── 2. MOUNT-IDENTITY PREFLIGHT (E2 cross-check 1 / upstream finding H) ───────
@@ -603,13 +605,12 @@ legacy_store_guard "$FB_LEGACY_BACKUP" "$FB_BACKUP"
 legacy_store_guard "$FB_LEGACY_CHANGES" "$FB_CHANGES"
 
 # ── 2c. A LATEST MANIFEST NOT WRITTEN BY THE CONTAINER ───────────────────────
-# Since FileBackup C44 (L7) every host records '/' in a path, so a backslash no
-# longer marks a Windows store. Its times do: the container runs in UTC and
-# writes LastWriteTimeStr with a +00:00 offset, while a native Windows run writes
-# the Windows box's own offset. The Owner's rule stands: the store is written by
-# the Linux container, with /source at the library root. A row with any other
-# offset, or a backslash in DataPath or RelativePath, is a refusal. A Windows box
-# set to UTC would pass, which is why this is a guard and not a proof.
+# The Owner's rule stands: the store is written by the Linux container, with
+# /source at the library root. The native engine writes LastWriteTimeStr in UTC
+# with a Z suffix ON EVERY HOST, so this check now refuses a PowerShell store
+# (its +00:00 or local offset) and a backslash in DataPath or RelativePath, and
+# NOTHING MORE: a native Windows run writes the same bytes as this container and
+# passes. It is a guard against the old engine's stores, not a proof of origin.
 #
 # COST: one sequential, streaming read of the latest manifest (about 180k
 # rows here), byte-wise (LC_ALL=C), splitting each line only at the
@@ -621,11 +622,11 @@ legacy_store_guard "$FB_LEGACY_CHANGES" "$FB_CHANGES"
 # read.
 if [ -f "$FB_BACKUP/MANIFEST.csv" ]; then
     # Fails CLOSED: a manifest awk cannot read is not a manifest that passed.
-    if ! _bs_line="$(LC_ALL=C awk -F'","' 'NR > 1 && (index($1 FS $2, "\\") || (NF >= 4 && $4 !~ /\+00:00$/)) { print NR; exit }' "$FB_BACKUP/MANIFEST.csv")"; then
+    if ! _bs_line="$(LC_ALL=C awk -F'","' 'NR > 1 && (index($1 FS $2, "\\") || (NF >= 4 && $4 !~ /Z$/)) { print NR; exit }' "$FB_BACKUP/MANIFEST.csv")"; then
         refuse "cannot read $FB_BACKUP/MANIFEST.csv to check its paths (awk failed) - refusing rather than treating 'could not ask' as 'clean'."
     fi
     if [ -n "$_bs_line" ]; then
-        refuse "$FB_BACKUP/MANIFEST.csv was not written by this container: line $_bs_line has a backslash in a path column or a time that is not +00:00." \
+        refuse "$FB_BACKUP/MANIFEST.csv was not written by this container: line $_bs_line has a backslash in a path column or a time that does not end in Z." \
                "The store must be written by the Linux container with /source at the library root (README \"Bringing in a new store\")." \
                "Nothing was created and no container ran."
     fi
@@ -656,7 +657,7 @@ if [ "$_avail" -lt $(( MIN_FREE_GB * 1000000000 )) ]; then
         "THERE IS NO AUTOMATIC RETENTION (Q-FB2) — nothing here deletes a snapshot, so this will not clear itself." \
         "The manual relief valve, in this order:" \
         "  cd $STACK_DIR && docker compose --profile filebackup run --rm -T $FB_SERVICE snapshots" \
-        "  docker compose --profile filebackup run --rm -T -e FILEBACKUP_DRY_RUN=1 $FB_SERVICE prune -Snapshot <name>   # dry run first (-e, not a host variable)" \
+        "  docker compose --profile filebackup run --rm -T $FB_SERVICE prune --snapshot <name> --dry-run   # dry run first" \
         "NEVER delete a folder in BackupHistory by hand — it is the only copy of the states it holds." \
         "Or lower BACKUP_LIBRARY_MIN_FREE_GB in backup.env if this floor is simply too high for this drive."
 fi
@@ -865,15 +866,15 @@ count_snapshots() {
         -name '[0-9][0-9][0-9][0-9]_[0-9][0-9]_[0-9][0-9]_[0-9][0-9]_[0-9][0-9]_[0-9][0-9]*' 2>/dev/null | grep -c . || true
 }
 
-# set_log_count TEXT : how many lines of the set log carry TEXT (a fixed
-# string). FileBackup starts backup.log afresh in every run that takes its lock,
-# so after a completed run the file holds that run alone. An absent or
-# unreadable log counts 0: the message then says less, and the exit code is
-# unchanged. `|| true` because grep -c exits 1 on no match and errtrace would
-# fire the ERR trap inside the substitution.
+# set_log_count TEXT : how many times the LAST line of the set log carries TEXT
+# (a fixed string). The native engine APPENDS one JSON report per run to
+# backup.log, so only the last line is this run. An absent or unreadable log
+# counts 0: the message then says less, and the exit code is unchanged.
+# `|| true` because grep exits 1 on no match and errtrace would fire the ERR trap
+# inside the substitution.
 set_log_count() {
     local log="$FB_CHANGES/backup.log" n=""
-    [ -r "$log" ] && n="$(grep -cF -- "$1" "$log" 2>/dev/null || true)"
+    [ -r "$log" ] && n="$(tail -n 1 "$log" 2>/dev/null | grep -oF -- "$1" 2>/dev/null | wc -l || true)"
     case "$n" in ''|*[!0-9]*) n=0 ;; esac
     printf '%s' "$n"
 }
@@ -908,7 +909,7 @@ run_state backing-up
 # what compose interpolates, so what it says is what the container gets; unset
 # means compose's inline default (5), and the container's own fallback (9) is
 # only reachable through an older docker-compose.yml.
-log "7-Zip level for compressed files: FILEBACKUP_7Z_LEVEL=${FILEBACKUP_7Z_LEVEL:-<unset: compose defaults it to 5>} (the Owner's ruling is 5 = Normal; FileBackup alone would use 9)"
+log "7-Zip level for compressed files: 5 = Normal, fixed in the native engine (the Owner's ruling); FILEBACKUP_7Z_LEVEL no longer does anything"
 log "running: docker compose --profile filebackup run --rm -T $FB_SERVICE backup"
 BACKUP_RC=0
 fb_run backup || BACKUP_RC=$?
@@ -936,7 +937,7 @@ _total="$(df_field "$_fs" 2)"; _used="$(df_field "$_fs" 3)"; _avail="$(df_field 
 #      C42 includes paths differing only in
 #      letter case), and/or a stored object was
 #      found DAMAGED by its listing and set aside
-#      into <store>/Verify/ (C37; [DamagedObject]
+#      into <store>/Verify/ (C37; "Damaged ..." events
 #      lines in the set log, counted below)
 #   2  refused before changing anything; a       -> FAIL now, "do not retry"
 #      person must fix it (since the 2026-10-26
@@ -958,8 +959,8 @@ _total="$(df_field "$_fs" 2)"; _used="$(df_field "$_fs" 3)"; _avail="$(df_field 
 # A backup never returns 3 any more: the manifest witness is gone. A 3 here
 # means an image OLDER than the one this file is written for.
 #
-# THE ONE THING READ OUT OF THE SET LOG is the count of [DamagedObject] lines,
-# and only after an exit 1. It is the difference between "a file was in use"
+# THE ONE THING READ OUT OF THE SET LOG is the count of damaged-object events
+# in this run's JSON report, and only after an exit 1. It is the difference between "a file was in use"
 # and "the store itself lost bytes" (FileBackup C37: an object a power cut left
 # empty or the wrong length), which the message must not blur: the first is
 # routine, the second means a snapshot may no longer restore that file. Any
@@ -969,27 +970,27 @@ DAMAGED_SET_ASIDE=0
 case "$BACKUP_RC" in
     0) log "container: backup COMPLETE (exit 0) — every file captured; snapshot created: $SNAPSHOT_MADE, drive $FILL_PCT full" ;;
     1) BACKUP_PARTIAL=1
-       DAMAGED_SET_ASIDE="$(set_log_count '[DamagedObject]')"
+       DAMAGED_SET_ASIDE="$(set_log_count '"message":"Damaged ')"
        log "container: backup COMPLETED, NOT A FULL SUCCESS (exit 1) — snapshot created: $SNAPSHOT_MADE, drive $FILL_PCT full."
        log "  Each file it could not capture kept its previous row and is named in $FB_CHANGES/backup.log: a file in"
        log "  use or unreadable, or a name Windows or Linux cannot restore (paths differing only in letter case count)."
        if [ "$DAMAGED_SET_ASIDE" -gt 0 ]; then
-           log "  AND $DAMAGED_SET_ASIDE STORED OBJECT(S) WERE FOUND DAMAGED ([DamagedObject] in that log): empty, or a raw"
+           log "  AND $DAMAGED_SET_ASIDE STORED OBJECT(S) WERE FOUND DAMAGED ('Damaged ...' events in that log): empty, or a raw"
            log "  object of the wrong length, as a power cut can leave one. Each was moved into $FB_CHANGES/Verify/"
            log "  or, where that move failed, left in place (its log line says which); never deleted, never reused."
            log "  Its content is stored again only while a source file still holds it,"
            log "  so a snapshot that needed it may no longer restore that file. README \"Damaged objects\"."
        fi
        log "  Not a verified success." ;;
-    2) FAIL_NOTE="FileBackup REFUSED the run before changing anything (exit 2) — a person must fix it; retrying will not help. The causes are: $FB_CONFIG cannot be loaded or violates the closed schema (FileBackup's container/FileBackup.schema.json), a required tool or dependency that cannot be loaded (7-Zip, the hashing package), the source root missing, CurrentBackup/ not on the store's mount (the rename test failed), a store in the old backup/ + changes/ or Latest/ layout, a store with CurrentBackup/ but no BackupHistory/ (something moved it: put it back, or create an empty one if it is really gone), a store whose CurrentBackup/ is missing while snapshots are there (never answered with a fresh full backup: find out where CurrentBackup/ went), or a latest manifest that cannot be read (move $FB_BACKUP/MANIFEST.csv aside to rebuild the latest state from the source; the snapshots are untouched). The reason is in the journal, which carries the container's output (journalctl -u homehub-library-backup.service), and in $FB_LOGS/Backup_Global.log; a refusal can come before the set log starts"
+    2) FAIL_NOTE="FileBackup REFUSED the run before changing anything (exit 2) — a person must fix it; retrying will not help. The causes are: $FB_CONFIG cannot be loaded or violates the closed schema (FileBackup's container/FileBackup.schema.json), a required tool or dependency that cannot be loaded (7-Zip, the hashing package), the source root missing, CurrentBackup/ not on the store's mount (the rename test failed), a store in the old backup/ + changes/ or Latest/ layout, a store with CurrentBackup/ but no BackupHistory/ (something moved it: put it back, or create an empty one if it is really gone), a store whose CurrentBackup/ is missing while snapshots are there (never answered with a fresh full backup: find out where CurrentBackup/ went), or a latest manifest that cannot be read (move $FB_BACKUP/MANIFEST.csv aside to rebuild the latest state from the source; the snapshots are untouched). The reason is in the journal, which carries the container's output (journalctl -u homehub-library-backup.service), a refusal can come before the set log starts"
        false ;;
-    3) FAIL_NOTE="the container exited 3, which a bounded-run-loop FileBackup never returns from a backup (the manifest witness is gone). This is almost certainly an OLDER image: this stack needs one built from FileBackup's BoundedRebuild work. Rebuild it (scripts/ensure-local-images.sh --rebuild) and read $FB_LOGS/Backup_Global.log"
+    3) FAIL_NOTE="the container exited 3, which a bounded-run-loop FileBackup never returns from a backup (the manifest witness is gone). This is almost certainly an OLDER image: this stack needs one built from FileBackup's BoundedRebuild work. Rebuild it (scripts/ensure-local-images.sh --rebuild) and read the journal (journalctl -u homehub-library-backup.service)"
        false ;;
     4) FAIL_NOTE="FileBackup STOPPED for a host problem (exit 4): the backup drive is full or went away; another FileBackup run holds its lock ($FB_CHANGES/Temp.lock — a manual verify or prune?); or the library source was EMPTY at the start of the run while the latest state holds rows, which is exactly what an unmounted or failed library drive looks like (FileBackup C39 — the latest state was left as it was). Nothing stored is lost; a stop is no worse than a kill, and the next run keeps the progress. Retry later: the next timer run does that by itself, or fix the host (is $FB_SOURCE mounted and populated?) and run systemctl start homehub-library-backup.service. Read $FB_CHANGES/backup.log"
        false ;;
     125|126|127) FAIL_NOTE="docker itself failed (exit $BACKUP_RC) before FileBackup ran — usually a missing image. Is filebackup:\${FILEBACKUP_IMAGE_TAG} loaded? \`docker image ls filebackup\`; it is baked by vmtest/export-images.sh and loaded by firstboot"
        false ;;
-    *) FAIL_NOTE="the container exited $BACKUP_RC, which is outside the documented 0/1/2/4 table — treat it as a failure and read $FB_LOGS/Backup_Global.log"
+    *) FAIL_NOTE="the container exited $BACKUP_RC, which is outside the documented 0/1/2/4 table — treat it as a failure and read the journal (journalctl -u homehub-library-backup.service)"
        false ;;
 esac
 
@@ -1025,12 +1026,12 @@ publish_manifest_copy
 
 # ── 8. THE VERIFY GATE — weekly, deep monthly ────────────────────────────────
 # A backup nobody reads is a hypothesis. `verify` re-proves the stored manifest,
-# reports any object stored twice (DuplicateObject) and, since FileBackup C37,
-# any object whose length its name rules out (DamagedObject: empty, or a raw
+# reports any object stored twice (duplicate_object) and, since FileBackup C37,
+# any object whose length its name rules out (object_damaged: empty, or a raw
 # object of another length); -Deep additionally proves payload identity,
-# hashing every object against its name (a mismatch is also DamagedObject),
+# hashing every object against its name (a mismatch is also object_damaged),
 # which costs real time and so is monthly rather than weekly.
-# REPORT ONLY: this gate never passes FILEBACKUP_REPAIR. Moving duplicates and
+# REPORT ONLY: this gate never passes --repair-storage. Moving duplicates and
 # damaged objects into $FB_CHANGES/Verify/ is a person's call (README).
 #
 # MEMORY: since FileBackup C43 (15ed359) a verify and a prune read one manifest
@@ -1063,7 +1064,7 @@ if [ "$BACKUP_PARTIAL" = 1 ]; then
 fi
 if [ "$VERIFY_RUN" != none ]; then
     VERIFY_ARGS=(verify)
-    [ "$VERIFY_RUN" = deep ] && VERIFY_ARGS+=(-Deep)
+    [ "$VERIFY_RUN" = deep ] && VERIFY_ARGS+=(--deep)
     log "verify gate: running ${VERIFY_ARGS[*]} (mode=$VERIFY_RUN, weekday $(date +%u), day $(date +%-d))"
     # A deep verify on the monthly pass is the long half of the bimodal runtime.
     # Naming the phase is what stops that looking like a hung backup.
@@ -1074,23 +1075,22 @@ if [ "$VERIFY_RUN" != none ]; then
     # The VERIFY table (FileBackup SR-049/SR-040), a different table from the
     # backup one above: 0 clean · 1 findings · 2 precondition · 4 the store
     # drive is not attached, or (a repair) the store lock is held. It never
-    # returns 3 (no witness). The findings are a JSON document
-    # on the container's stdout (the journal) and one WARN line each in
-    # $FB_LOGS/Backup_Global.log.
+    # returns 3 (no witness). The findings are a JSON document on the
+    # container's stdout, which is the journal; a native verify writes no log.
     case "$VERIFY_RC" in
         0) VERIFY_NOTE="$VERIFY_RUN ok"
            log "verify: CLEAN (exit 0)" ;;
         1) VERIFY_NOTE="$VERIFY_RUN FINDINGS"
-           FAIL_NOTE="verify exit 1 — FINDINGS: the store disagrees with its manifests somewhere. Read the [Class] lines in $FB_LOGS/Backup_Global.log. PoolUnresolvable is a row with no bytes anywhere (not restorable until the next backup re-stores it from the source); DuplicateObject is a second copy of one object (harmless, costs space); MisplacedObject is a file in CurrentBackup outside its own shard folder (-RepairStorage puts an only copy back); DamagedObject is an object whose length its name rules out (empty, or a raw object of another length — any verify) or, under -Deep, whose bytes do not hash to its name. Moving duplicates and damaged objects aside into $FB_CHANGES/Verify/ (never deleted) is a person's call: README \"Verify findings\"$PARTIAL_SUFFIX"
+           FAIL_NOTE="verify exit 1 — FINDINGS: the store disagrees with its manifests somewhere. Read the verify report's events in the journal (journalctl -u homehub-library-backup.service). content_missing is a row with no bytes anywhere (not restorable until the next backup re-stores it from the source); duplicate_object is a second copy of one object (harmless, costs space); object_misplaced is a file in CurrentBackup outside its own shard folder (verify --deep --repair-storage puts an only copy back); object_damaged is an object whose length its name rules out (empty, or a raw object of another length — any verify) or, under --deep, whose bytes do not hash to its name. Moving duplicates and damaged objects aside into $FB_CHANGES/Verify/ (never deleted) is a person's call: README \"Verify findings\"$PARTIAL_SUFFIX"
            false ;;
         2) VERIFY_NOTE="$VERIFY_RUN REFUSED (precondition)"
-           FAIL_NOTE="verify exit 2 — precondition failure: the verify could not run at all (no backup root, no manifest to verify, -Deep without 7-Zip, or a host problem that stopped it). Retrying unchanged will not help. Read $FB_LOGS/Backup_Global.log"
+           FAIL_NOTE="verify exit 2 — precondition failure: the verify could not run at all (no backup root, no manifest to verify, -Deep without 7-Zip, or a host problem that stopped it). Retrying unchanged will not help. Read the journal (journalctl -u homehub-library-backup.service)"
            false ;;
         3) VERIFY_NOTE="$VERIFY_RUN exit 3"
            FAIL_NOTE="verify exited 3, which a bounded-run-loop FileBackup never returns from verify (no witness). This is almost certainly an OLDER image: rebuild it from FileBackup's BoundedRebuild work"
            false ;;
         4) VERIFY_NOTE="$VERIFY_RUN stopped (host)"
-           FAIL_NOTE="verify exit 4 — a host problem: the backup drive is not attached, or the store lock is held. Nothing was changed; the next run is the retry. Read $FB_LOGS/Backup_Global.log$PARTIAL_SUFFIX"
+           FAIL_NOTE="verify exit 4 — a host problem: the backup drive is not attached, or the store lock is held. Nothing was changed; the next run is the retry. Read the journal (journalctl -u homehub-library-backup.service)$PARTIAL_SUFFIX"
            false ;;
         *) VERIFY_NOTE="$VERIFY_RUN exit $VERIFY_RC"
            FAIL_NOTE="verify exited $VERIFY_RC, outside the documented 0/1/2 table"
@@ -1106,7 +1106,7 @@ fi
 # show it. The data already stored is safe, and the message says so.
 if [ "$BACKUP_PARTIAL" = 1 ]; then
     if [ "$DAMAGED_SET_ASIDE" -gt 0 ]; then
-        FAIL_NOTE="the backup COMPLETED BUT FOUND $DAMAGED_SET_ASIDE DAMAGED STORED OBJECT(S) (container exit 1; verify=$VERIFY_NOTE). Each [DamagedObject] line in $FB_CHANGES/backup.log names an object that was empty or the wrong length — what a power cut can leave — and was moved into $FB_CHANGES/Verify/ (or, where that move failed, left in place; the line says which), never deleted and never reused. Its content is stored again only while a source file still holds it, so a snapshot that needed it may no longer restore that file. Any file not captured is named in the same log. This is not a verified success and lastSuccess is NOT advanced. README \"Damaged objects\""
+        FAIL_NOTE="the backup COMPLETED BUT FOUND $DAMAGED_SET_ASIDE DAMAGED STORED OBJECT(S) (container exit 1; verify=$VERIFY_NOTE). Each 'Damaged ...' event in the last line of $FB_CHANGES/backup.log names an object that was empty or the wrong length — what a power cut can leave — and was moved into $FB_CHANGES/Verify/ (or, where that move failed, left in place; the line says which), never deleted and never reused. Its content is stored again only while a source file still holds it, so a snapshot that needed it may no longer restore that file. Any file not captured is named in the same log. This is not a verified success and lastSuccess is NOT advanced. README \"Damaged objects\""
     else
         FAIL_NOTE="the backup COMPLETED WITH FILES NOT CAPTURED (container exit 1; verify=$VERIFY_NOTE). Every file it could read is stored and nothing already stored was lost, but at least one file was not captured, so this is not a verified success and lastSuccess is NOT advanced. Each file is named in $FB_CHANGES/backup.log — usually a file in use or unreadable, or a name Windows or Linux cannot restore (paths differing only in letter case count); the next run tries it again"
     fi

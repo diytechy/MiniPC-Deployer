@@ -195,20 +195,19 @@ ensure_image "finance-auditor:${FINANCE_AUDITOR_IMAGE_TAG:-local}" "Finance-Audi
 #
 # THE CONTRACT LABEL (SR-133). stack/backup/library-backup.sh refuses to run
 # the one-mount layout (FILEBACKUP_LAYOUT=single) on an image that does not
-# carry homehub.filebackup.contract=current-history-v3. It is decided HERE, from the
+# carry homehub.filebackup.contract=native-metadata-v1. It is decided HERE, from the
 # checkout being built, because the hub has no FileBackup history to ask:
-#   current-history-v3   HEAD contains the commit that built L9-L11 (StorePath,
-#                     CurrentBackup/, BackupHistory/) AND the engine's
-#                     ConfigSchemaVersion is 3;
-#   pre-single-store  HEAD does not contain it (kit 12, 7a6a80a's backup/ +
-#                     changes/, fae17c1's Latest/: same schema version, other layout);
+#   native-metadata-v1  HEAD contains the commit that bundled 7-Zip with the Rust
+#                     engine, and rust/src/config.rs still requires ConfigVersion 3;
+#   pre-native        HEAD does not contain it (every PowerShell image);
 #   unknown-history   the checkout does not have that commit at all (shallow/older);
-#   configversion-N   it does, but the engine says another ConfigSchemaVersion.
+#   configversion-other  it does, but the engine no longer requires version 3;
 #   unknown           git could not be asked about the checkout at all.
-# The schema line is read from the WORKING TREE, which is what gets built.
-FILEBACKUP_CONTRACT_BASE=88640a030f000f7ce8958a9b7cf1ebe97dba9e31
+# The version line is read from the WORKING TREE, which is what gets built. The
+# image comes from container/native.Dockerfile, not the repo-root PowerShell one.
+FILEBACKUP_CONTRACT_BASE=ea9126fdc47c8584277a6c92a5d6f94f2cf1605a
 filebackup_contract() {
-    local fb="$SIBLING_ROOT/FileBackup" v
+    local fb="$SIBLING_ROOT/FileBackup"
     # git that cannot be asked (no checkout, safe.directory) is not an answer.
     if ! repo_git "$fb" rev-parse --verify -q HEAD >/dev/null 2>&1; then
         printf 'unknown'; return 0
@@ -219,7 +218,7 @@ filebackup_contract() {
         printf 'unknown-history'; return 0
     fi
     if ! repo_git "$fb" merge-base --is-ancestor "$FILEBACKUP_CONTRACT_BASE" HEAD 2>/dev/null; then
-        printf 'pre-single-store'; return 0
+        printf 'pre-native'; return 0
     fi
     # Uncommitted work in a tracked file is not the commit this answer is about:
     # the build takes the working tree. Untracked files do not count, because the
@@ -227,11 +226,14 @@ filebackup_contract() {
     if [ -n "$(repo_git "$fb" status --porcelain --untracked-files=no -- . 2>/dev/null)" ]; then
         printf 'dirty-tree'; return 0
     fi
-    # shellcheck disable=SC2016  # $script: is PowerShell text, matched literally
-    v="$(sed -n 's/^\$script:ConfigSchemaVersion = \([0-9][0-9]*\).*/\1/p' "$fb/Modules/FileBackup.Engine.psm1" 2>/dev/null | head -1)"
-    if [ "$v" = 3 ]; then printf 'current-history-v3'; else printf 'configversion-%s' "${v:-unknown}"; fi
+    if grep -qF 'native engine requires version 3' "$fb/rust/src/config.rs" 2>/dev/null; then
+        printf 'native-metadata-v1'
+    else
+        printf 'configversion-other'
+    fi
 }
 ensure_image "filebackup:${FILEBACKUP_IMAGE_TAG:-local}" "FileBackup" "" \
+    -f "$SIBLING_ROOT/FileBackup/container/native.Dockerfile" \
     --label "homehub.filebackup.contract=$(filebackup_contract)"
 [ "$ONLY_FILEBACKUP" = 0 ] || exit 0
 

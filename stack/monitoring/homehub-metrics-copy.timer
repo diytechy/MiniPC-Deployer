@@ -4,7 +4,7 @@
 # 02:10 IceDrive profile capture. Persistent: a hub that was off then copies
 # when it comes back. A copy that finds nothing new writes nothing.
 [Unit]
-Description=HomeHub metrics log weekly copy to the library, Sunday 18:30 America/Chicago
+Description=HomeHub metrics log weekly archive to the backup drive, Sunday 18:30 America/Chicago
 
 [Timer]
 OnCalendar=Sun *-*-* 18:30:00 America/Chicago

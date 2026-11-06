@@ -12,6 +12,9 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-11-06 - direct metrics archive (`metrics-direct-backup-20261106`, implementation under verification).** The Owner explicitly amended A79 to send the weekly cumulative log straight to the backup drive, outside the Library and FileBackup store. SR-124/LLR-1332/TC-1507/TC-1509/TC-1510 amended; mounted-device and no-follow guards retained, copy unit group filebackup/umask 0027. New direct-child regression failed against the old code; final metrics suite 62 passed under ordinary-user WSL after implementation. Independent source/deployment review GO; root-device, no-follow and permissions checks covered. No formal gate advanced; active gate remains G1. Deployment and final checks pending; HomeHub FOLLOWUPS will carry the result.
+
+
 **2026-11-05 (morning) - the single-store backup is merged and on the hub; its first real run has not happened.** `filebackup-store-v3` merged at `1ff0be2`, the template followed at `f813103`, both delivered. The entry below is the branch's own record; its "NOT merged, NOT deployed" is superseded.
 - **On the hub:** `filebackup:45c9a4d`, both units read-only on the library (SR-134), `FILEBACKUP_LAYOUT=single`, `FILEBACKUP_MEM_LIMIT=4g`, timer off, `library-store` empty.
 - **Proven:** the ten backup suites under WSL (the layout suite needs `findmnt`, so Git Bash fails three of its cases), the container test on that image, preflight inside the sandbox, a throwaway backup and verify on the hub. Memory on the final image: 2,489 MiB peak, 182,000 synthetic files.

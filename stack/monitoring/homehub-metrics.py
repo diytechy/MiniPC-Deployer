@@ -43,10 +43,9 @@ RETENTION (the Owner, 2026-10-26): snapshots 365 day files, gzip'd after 7;
 daily rows forever (one small file). Bounded like its neighbours: a day file
 stops at 16 MiB, the whole snapshot record at 1 GiB, daily.jsonl at 64 MiB.
 On the hub NOT in the config backups, and never under the tracker's data folder,
-whose git mirror is pushed to GitHub; copied weekly into the Owner's Docs folder
-on the library instead (`copy`, below; HomeHub scripts/deploy/storage-map.md).
+whose git mirror is pushed to GitHub; copied weekly directly to the backup drive (`copy`, below; HomeHub scripts/deploy/storage-map.md).
 
-NEVER WAKES A DISK. The host figures come from the telemetry record, which reads
+SNAPSHOTS AND DAILY ROWS NEVER WAKE A DATA DISK. The host figures come from the telemetry record, which reads
 the NVMe only; SMART is asked of /dev/nvme0 alone.
 
 NETWORK: the tracker on loopback (refused anywhere else) and the panel over the
@@ -56,11 +55,10 @@ or a urllib timeout) inside one run deadline that fits TimeoutStartSec.
   copy      homehub-metrics-copy.timer, weekly (Sunday 18:30 America/Chicago,
             clear of the 03:00 nightly library backup and its long hash-recalc
             nights). Copies the closed snapshot day files (gzip'd), daily.jsonl
-            and the raw watch samples into HOMEHUB_METRICS_COPY_DIR, a folder
-            in the Owner's private Docs tree on the library, so the library's
-            own backup carries them (the Owner, 2026-10-26). Skipped, with the
-            reason logged, unless the library is really mounted and carries
-            its marker. Never deletes at the destination.
+            and the raw watch samples directly into HOMEHUB_METRICS_COPY_DIR on
+            the backup drive (the Owner, 2026-11-06). Skipped, with the reason
+            logged, unless the archive root is really mounted. Its device is
+            pinned again after opening root. Never deletes at the destination.
 
 Subcommands: snapshot, daily, copy, export [--daily] [--since ISO] [--until ISO],
 summary [--hours N].
@@ -879,64 +877,65 @@ def cmd_daily(args, fetch=fetch_today, run=mc.run_bounded, zone=None, now=None) 
     return rc
 
 
-# ── the weekly copy into the Owner's Docs on the library (LLR-1332) ─────────
-#
-# The Owner's ruling 2026-10-26, which supersedes "not backed up" in part: once a
-# week the closed day files, the daily rows and the raw watch samples are copied
-# into a folder of the Owner's private Docs tree on the library drive, so the
-# library's own backup carries them. ON THE HUB the files stay out of the config
-# backups. The copy is rsync-shaped and never deletes: a file whose size and
-# mtime already match at the destination is skipped, anything else is written to
-# a temporary name and renamed over, and nothing at the destination is removed.
-# Today's UTC files are never copied (still being written), and the snapshot day
-# files go across gzip'd - a closed day not yet compressed on the hub is gzip'd
-# on the way, to the same bytes the hub will later make (monitor_common's
-# deterministic gzip) - so the destination holds one file per day either way.
+# ── the weekly archive on the backup drive (LLR-1332) ────────────────────
+# The Owner, 2026-11-06: copy directly to PriBackup, outside the Library and
+# FileBackup's store, avoiding a second backup of an accumulating archive.
+# Closed days are gzip'd deterministically. Unchanged files are skipped,
+# replacements use a temporary file plus atomic rename, and nothing is pruned.
 
-LIBRARY_ROOT = "/srv/library"
+ARCHIVE_ROOT = "/mnt/backup-drive"
 # The copy's own record, beside the log, carried in every snapshot (monitors.copy):
 # a skipped week is visible without the journal.
 COPY_STATUS_FILE = "copy-status.json"
-LIBRARY_MARKER = ".homehub-library"
 COPY_SETTLE_SEC = 600            # a day file last written this recently is not closed yet
 COPY_DEADLINE_SEC = 1500
 MTIME_SLACK_SEC = 2.0
 
 
+def _mount_device(entry: Optional[Dict[str, str]]) -> Optional[int]:
+    """Kernel device id for a mount; None for missing/malformed metadata.
+
+    Linux uses it to pin the archive filesystem across validation and opening.
+    The Windows-only test fallback does not have os.makedev or dir-fd opens.
+    """
+    try:
+        major, minor = (int(part) for part in entry["majmin"].split(":"))
+        return os.makedev(major, minor) if hasattr(os, "makedev") else None
+    except (TypeError, KeyError, ValueError, OverflowError):
+        return None
+
+
 def copy_target(knobs: Dict[str, str], mounts: List[Dict[str, str]], exists=os.path.exists,
                 realpath=os.path.realpath, device=None) -> Tuple[Optional[str], str]:
-    """(destination, refusal). Pure apart from the injected checks.
+    """Validate a destination on the mounted backup filesystem. LLR-1332.
 
-    The destination is HOMEHUB_METRICS_COPY_DIR (blank: the copy is off). It
-    must be a folder directly inside an EXISTING folder under the library root;
-    the library root must be a mount point in the mount table (the bare
-    mountpoint underneath is chmod 000 and must never be written into, and root
-    is not stopped by a mode) and must carry the library's marker file (a
-    blank or stand-in disk is mounted, writable and empty), and the folder
-    the destination sits in must be on the library's own filesystem. The copy
-    never creates the Owner's folder itself, only its own folder inside it.
+    Blank disables copying. The destination must be below the archive root,
+    its parent must exist on that filesystem, and (on Linux) the root's device
+    must match mountinfo. The copy pins that device again after opening root.
+    No Library folder or Library marker is consulted.
     """
     dest = (knobs.get("HOMEHUB_METRICS_COPY_DIR") or "").strip()
     if not dest:
         return None, "HOMEHUB_METRICS_COPY_DIR is unset; the weekly copy is off"
-    root = (knobs.get("HOMEHUB_METRICS_COPY_ROOT") or LIBRARY_ROOT).rstrip("/") or "/"
+    root = (knobs.get("HOMEHUB_METRICS_COPY_ROOT") or ARCHIVE_ROOT).rstrip("/") or "/"
     if not os.path.isabs(dest) or ".." in dest.split("/"):
         return None, "HOMEHUB_METRICS_COPY_DIR is not a plain absolute path"
-    if mc.mount_entry(mounts, root) is None:
+    entry = mc.mount_entry(mounts, root)
+    if entry is None:
         return None, "%s is not mounted; nothing copied (the bare mountpoint is never written)" % root
-    if not exists(os.path.join(root, LIBRARY_MARKER)):
-        return None, "%s carries no %s marker; not the library, nothing copied" % (root, LIBRARY_MARKER)
     real = realpath(dest).rstrip("/\\")
     root_real = _norm(realpath(root))
     if not _norm(real).startswith(root_real + "/"):
         return None, "HOMEHUB_METRICS_COPY_DIR resolves outside %s; nothing copied" % root
     parent = os.path.dirname(real)
-    if _norm(parent) == root_real or not exists(parent):
+    if not exists(parent):
         return None, "the folder HOMEHUB_METRICS_COPY_DIR should be in does not exist; nothing copied"
-    # Not a different disk mounted somewhere under the library (review F9).
     device = device or (lambda path: os.stat(path).st_dev)
     try:
-        if device(parent) != device(root):
+        root_device = device(root)
+        if DIR_FD_OPENS and (_mount_device(entry) is None or root_device != _mount_device(entry)):
+            return None, "the archive root does not match its mounted device; nothing copied"
+        if device(parent) != root_device:
             return None, "HOMEHUB_METRICS_COPY_DIR is on another filesystem than %s; nothing copied" % root
     except OSError:
         return None, "the destination's folder could not be examined; nothing copied"
@@ -988,8 +987,8 @@ def copy_plan(sources: List[Tuple[str, str, int, float]], dest_stat, today: str,
     return plan
 
 
-# The destination is group-writable for the household (the library mount's
-# gid and umask), and this copy runs as root, so nothing under it is trusted:
+# This copy runs as root on the backup drive. Treat every destination
+# component as untrusted, including folders writable through the admin share:
 # every hop is opened relative to the one before with O_NOFOLLOW, a component
 # that is a symlink is refused, and the file is created O_EXCL under a temporary
 # name and renamed over the target (a rename replaces a link, never follows it).
@@ -1009,15 +1008,16 @@ def _open_dir(name: str, parent_fd: int, create: bool, device: Optional[int]) ->
     fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW, dir_fd=parent_fd)
     if device is not None and os.fstat(fd).st_dev != device:
         os.close(fd)
-        raise PermissionError("REFUSED: %s is on another filesystem than the library" % name)
+        raise PermissionError("REFUSED: %s is on another filesystem than the archive root" % name)
     return fd
 
 
-def _copy_one(src: str, dest_root: str, rel: str, pack: bool, library_root: Optional[str] = None) -> None:
-    """Copy one file to `dest_root/rel`. With `library_root` (the trusted mount
+def _copy_one(src: str, dest_root: str, rel: str, pack: bool, archive_root: Optional[str] = None,
+              expected_device: Optional[int] = None) -> None:
+    """Copy one file to `dest_root/rel`. With `archive_root` (the trusted mount
     point) the walk starts THERE, so no component between it and the file is
     resolved by name: each is opened O_NOFOLLOW relative to the one before and
-    must be on the library's filesystem (review round 2, items 2 and 3)."""
+    must be on the validated archive device (review round 2, items 2 and 3)."""
     import gzip
     import shutil
 
@@ -1034,12 +1034,12 @@ def _copy_one(src: str, dest_root: str, rel: str, pack: bool, library_root: Opti
         raise PermissionError("REFUSED: %s is not a regular file" % src)
     raw = os.fdopen(sfd, "rb")
     try:
-        _copy_from(raw, os.fstat(raw.fileno()).st_mtime, dest_root, parts, pack, library_root, gzip, shutil)
+        _copy_from(raw, os.fstat(raw.fileno()).st_mtime, dest_root, parts, pack, archive_root, expected_device, gzip, shutil)
     finally:
         raw.close()
 
 
-def _copy_from(raw, stamp, dest_root, parts, pack, library_root, gzip, shutil) -> None:
+def _copy_from(raw, stamp, dest_root, parts, pack, archive_root, expected_device, gzip, shutil) -> None:
     leaf, tmp = parts[-1], "." + parts[-1] + ".part"
     if not DIR_FD_OPENS:                      # pragma: no cover - the Windows dev PC
         walked = dest_root
@@ -1060,8 +1060,8 @@ def _copy_from(raw, stamp, dest_root, parts, pack, library_root, gzip, shutil) -
         dir_fd = None
     else:
         dest = dest_root.rstrip("/")
-        if library_root:
-            base_dir = library_root.rstrip("/") or "/"
+        if archive_root:
+            base_dir = archive_root.rstrip("/") or "/"
             between = os.path.relpath(dest, base_dir).split("/")
             if any(p in ("", ".", "..") for p in between):
                 raise PermissionError("REFUSED: %s is not inside %s" % (dest, base_dir))
@@ -1074,12 +1074,10 @@ def _copy_from(raw, stamp, dest_root, parts, pack, library_root, gzip, shutil) -
         dir_fd = os.open(base_dir, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW)
         try:
             device = None
-            if library_root:
-                device = os.fstat(dir_fd).st_dev
-                # The marker again, relative to the directory now held open: a
-                # library unmounted since copy_target looked leaves the bare
-                # mountpoint, which has no marker (review round 3, item 3).
-                os.stat(LIBRARY_MARKER, dir_fd=dir_fd)
+            if archive_root:
+                device = expected_device
+                if device is None or os.fstat(dir_fd).st_dev != device:
+                    raise PermissionError("REFUSED: archive root changed since its mount was checked")
             for name, create in hops:
                 hop = _open_dir(name, dir_fd, create, device)
                 os.close(dir_fd)
@@ -1154,8 +1152,11 @@ def cmd_copy(args, mounts_text: Optional[str] = None, now: Optional[float] = Non
                 mounts_text = h.read()
         except OSError:
             mounts_text = ""
-    dest, refusal = copy_target(knobs, mc.parse_mountinfo(mounts_text))
-    library_root = os.path.realpath((knobs.get("HOMEHUB_METRICS_COPY_ROOT") or LIBRARY_ROOT).rstrip("/") or "/")
+    mounts = mc.parse_mountinfo(mounts_text)
+    dest, refusal = copy_target(knobs, mounts)
+    archive_root = os.path.realpath((knobs.get("HOMEHUB_METRICS_COPY_ROOT") or ARCHIVE_ROOT).rstrip("/") or "/")
+    root_path = (knobs.get("HOMEHUB_METRICS_COPY_ROOT") or ARCHIVE_ROOT).rstrip("/") or "/"
+    expected_device = _mount_device(mc.mount_entry(mounts, root_path))
     now = time.time() if now is None else now
     status_path = os.path.join(args.data_dir, COPY_STATUS_FILE)
     status = mc.load_json(status_path, {})
@@ -1184,12 +1185,12 @@ def cmd_copy(args, mounts_text: Optional[str] = None, now: Optional[float] = Non
             mc.log("metrics: weekly copy stopped at its deadline; %d left for next week" % (len(plan) - written - failed), True)
             break
         try:
-            _copy_one(src, dest, rel, pack, library_root=library_root)
+            _copy_one(src, dest, rel, pack, archive_root=archive_root, expected_device=expected_device)
             written += 1
         except OSError as exc:
             failed += 1
             mc.log("metrics: weekly copy could not write %s (%s)" % (rel, type(exc).__name__), True)
-    mc.log("metrics: weekly copy to the library: %d written, %d skipped (already there, or still open), %d failed"
+    mc.log("metrics: weekly copy to the backup drive: %d written, %d skipped (already there, or still open), %d failed"
            % (written, len(copy_sources(args.data_dir, args.raw_dir)) - len(plan), failed), warning=bool(failed))
     status.update({"last_result": "failed" if failed else "ok", "written": written, "failed": failed})
     if not failed:
@@ -1266,7 +1267,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd")
     sub.add_parser("snapshot", help="take one snapshot (what the 5-minute timer runs)")
     sub.add_parser("daily", help="write the daily row(s) now due (what the 10:00/14:05 timer runs)")
-    sub.add_parser("copy", help="copy closed day files into the library folder (what the weekly timer runs)")
+    sub.add_parser("copy", help="archive closed day files directly to the backup drive (weekly timer)")
     e = sub.add_parser("export", help="print snapshots (or --daily rows) as JSONL")
     e.add_argument("--daily", action="store_true")
     e.add_argument("--since")

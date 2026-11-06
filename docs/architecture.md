@@ -181,7 +181,7 @@ graph LR
 | `stack/remote-ui/` | OPT-IN light RDP layer for GUI-only vendor apps (SR-015). **Nothing installs or calls it since 2026-08-27** — its only tenant moved to `stack/icedrive/` |
 | `stack/icedrive/` | the headless IceDrive CLI: pinned binary, one-time non-interactive sign-in, FUSE mount unit |
 | `stack/tracker/` | deprecated reference copies (NagLight owns the build) |
-| `stack/monitoring/` | SN-048: the hub's record-and-alert monitors (telemetry, low-disk alarm, watched jobs, liveness with evidence) and the one alert helper (SR-085..SR-091) |
+| `stack/monitoring/` | SN-048: the hub's record-and-alert monitors (telemetry, low-disk alarm, watched jobs, liveness with evidence) and the one alert helper (SR-085..SR-091), plus the metrics log and its direct backup-drive archive (SR-122..SR-124) |
 | [`stack/scratch/`](../stack/scratch/README.md) | SN-050: the NVMe scratch volume (18 GiB ext4 LV with one hard project quota per writer), its non-destructive provisioner and the mount guard every writer runs before each new file (SR-102..SR-104, IF-071) |
 | [`stack/door/`](../stack/door/README.md) | SN-050: the door relay (go2rtc pinned by digest; the doorbell's one RTSP session re-served on the LAN), the copy-only recorder onto `/srv/scratch/door`, and the gate/cutover/cost tooling (SR-105..SR-107, IF-070) |
 | [`stack/ottertube/`](../stack/ottertube/README.md) | SN-051: OtterTube on the hub - the daily per-item ytdl-sub run of the private curated list onto `/srv/scratch/ottertube`, OtterTube's own indexer (hard-linked publication), the read-only media server and Caddy's LAN-only OtterTube site (SR-113..SR-117, IF-072, IF-073); the site also serves the desktop app's signed update channel from `updates/` (SR-125, SR-127, IF-075), and the site and the library are switched separately (`OTTERTUBE_SITE_ENABLED`, empty following `OTTERTUBE_ENABLED`; SR-126) |
@@ -1200,4 +1200,30 @@ sequenceDiagram
         end
     end
     Note over O,R: a manual apt run reaches needrestart the same way and gets the same answer.<br/>NOT covered: a package's maintainer script restarting its own daemon.
+```
+
+### Weekly direct metrics archive (SR-124, LLR-1332)
+
+The backup drive owns the cumulative archive outside the Library and FileBackup
+store. See monitoring/README.md for file layout and operational details.
+
+```mermaid
+sequenceDiagram
+    participant T as weekly timer
+    participant C as homehub-metrics copy
+    participant K as mountinfo and opened root
+    participant S as system-disk logs
+    participant B as backup-drive archive
+    T->>C: Sunday 18:30 (SR-124)
+    C->>K: validate mount and pin device (LLR-1332)
+    alt missing mount or invalid destination
+        C->>C: record skipped, write no archive files
+    else usable backup mount
+        C->>S: list closed, settled files
+        loop changed files only
+            C->>K: open root and directory hops on pinned device
+            C->>B: write temp, fsync, atomic replace
+        end
+        C->>C: save copy status; never prune archive
+    end
 ```

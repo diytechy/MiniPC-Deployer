@@ -12,7 +12,7 @@ What does not: real ffmpeg and VA-API. The integration test at the bottom
 (TC-1569, release tier) cuts real recorded segments through the pinned image
 when HOMEHUB_CLIPS_SEGMENTS names a directory of them and docker answers;
 VA-API is measured on the hub (stack/clips/README.md, deploy steps).
-Implements: TC-1541, TC-1542, TC-1551..TC-1566, TC-1568, TC-1569.
+Implements: TC-1541, TC-1542, TC-1551..TC-1566, TC-1568, TC-1569, TC-1686..TC-1693.
 """
 
 from __future__ import annotations
@@ -279,9 +279,12 @@ def test_tc1558_the_scratch_root_is_the_clips_writer_with_its_own_project():
 
 
 def test_tc1558_the_media_root_needs_a_separate_ext4_prjquota_mount(tmp_path, monkeypatch):
-    paths = hs.Paths(str(tmp_path))
+    monkeypatch.setattr(hc, "media_device_state", lambda majmin, expected, paths: "ok")
+    paths = hc.MediaPaths(str(tmp_path))
     paths.status = str(tmp_path / "status")
     (tmp_path / "status").write_text("CapBnd:\t0000000000000000\n")
+    paths.identity = str(tmp_path / "drive-identity.conf")
+    (tmp_path / "drive-identity.conf").write_text("/srv/media\tusb-Fake_Disk_0-0:0\tMediaDrive\n")
 
     def mounts(line):
         paths.mountinfo = str(tmp_path / "mountinfo")
@@ -1626,3 +1629,463 @@ def test_tc1563_the_stale_sweep_reads_links_themselves_not_their_targets(tmp_pat
     s.root = str(root)
     hc.apply_retention(s, str(tmp_path / "state"), int(time.time() * 1000))
     assert os.path.lexists(str(day / "door_x.mp4.part")) and (day / "door_y.json").exists() and old.exists()
+
+
+# ── TC-1686..TC-1694 clips on the media drive (SR-148, SR-149) ───────────────
+#
+# What runs here: every verdict and every file movement, against facts handed in.
+# What does not: the kernel. The real ext4, its project quota, sysfs for a real
+# partition, the account and the folder's modes are stack/clips/tests/
+# clips-media.root-test.sh (TC-1695, under the hub's kernel in QEMU).
+
+MEDIA_LINE = "40 25 8:33 / /srv/media rw,noatime - ext4 /dev/sdc1 rw,prjquota,errors=remount-ro\n"
+CAP_FREE = "CapEff:\t0000000000000000\n"
+
+
+def media_paths(tmp_path, line=MEDIA_LINE, identity="/srv/media\tusb-Fake_Disk_0-0:0\tMediaDrive\n", status=CAP_FREE):
+    paths = hc.MediaPaths(str(tmp_path))
+    paths.mountinfo = str(tmp_path / "mountinfo")
+    (tmp_path / "mountinfo").write_text(line)
+    paths.status = str(tmp_path / "status")
+    (tmp_path / "status").write_text(status)
+    paths.identity = str(tmp_path / "drive-identity.conf")
+    if identity is not None:
+        (tmp_path / "drive-identity.conf").write_text("# mountpoint<TAB>by-id<TAB>label\n" + identity)
+    return paths
+
+
+def right_disk(monkeypatch):
+    monkeypatch.setattr(hc, "media_device_state", lambda majmin, expected, paths: "ok")
+
+
+def test_tc1686_the_mount_must_be_the_disk_the_identity_file_names(tmp_path, monkeypatch):
+    # /srv/backup-style neighbours in the file are not the media drive's row
+    other = "/srv/library\tusb-Other_0-0:0\tLibrary\n"
+    assert hc.expected_media_drive(media_paths(tmp_path, identity=other).identity) is None
+    paths = media_paths(tmp_path)
+    assert hc.expected_media_drive(paths.identity) == "usb-Fake_Disk_0-0:0"
+    assert hc.expected_media_drive(str(tmp_path / "nothing-here")) is None
+    (tmp_path / "drive-identity.conf").write_text("/srv/media\t$(reboot)\tMediaDrive\n")
+    assert hc.expected_media_drive(paths.identity) is None      # a value that is not a by-id name is no answer
+    ok, reason, _entry = hc.media_mount_state(paths)
+    assert not ok and "drive-identity.conf has no /srv/media row" in reason
+
+    # the mounted device against the by-id name: a partition of it, the whole disk,
+    # another disk, the disk detached, the mounted device itself gone
+    paths = media_paths(tmp_path)
+    alive = {"device": True}
+    monkeypatch.setattr(hc.os.path, "exists", lambda p: alive["device"])
+    monkeypatch.setattr(hc.scratch, "majmin_of_rdev", lambda p: "8:32")
+    monkeypatch.setattr(hc, "parent_majmin", lambda mm, _p: "8:32")
+    assert hc.media_device_state("8:33", "x", paths) == "ok"
+    monkeypatch.setattr(hc.scratch, "majmin_of_rdev", lambda p: "8:33")
+    monkeypatch.setattr(hc, "parent_majmin", lambda mm, _p: None)
+    assert hc.media_device_state("8:33", "x", paths) == "ok"
+    monkeypatch.setattr(hc.scratch, "majmin_of_rdev", lambda p: "8:16")
+    monkeypatch.setattr(hc, "parent_majmin", lambda mm, _p: "8:32")
+    assert "which is not the disk" in hc.media_device_state("8:33", "x", paths)
+    monkeypatch.setattr(hc.scratch, "majmin_of_rdev", lambda p: None)
+    assert "not attached" in hc.media_device_state("8:33", "x", paths)
+    alive["device"] = False
+    assert "the drive dropped" in hc.media_device_state("8:33", "x", paths)
+
+
+def test_tc1686_no_reason_carries_the_disk_name_it_goes_to_an_alert(tmp_path, monkeypatch):
+    paths = media_paths(tmp_path)
+    monkeypatch.setattr(hc.scratch, "majmin_of_rdev", lambda p: None)
+    monkeypatch.setattr(hc.os.path, "exists", lambda p: True)
+    ok, reason, _entry = hc.media_mount_state(paths)
+    assert not ok and "Fake_Disk" not in reason
+    monkeypatch.setattr(hc.scratch, "majmin_of_rdev", lambda p: "8:16")
+    monkeypatch.setattr(hc, "parent_majmin", lambda mm, _p: "8:32")
+    ok, reason, _entry = hc.media_mount_state(paths)
+    assert not ok and "Fake_Disk" not in reason
+
+
+def test_tc1687_the_guard_wants_the_root_on_the_drive_in_its_own_project(tmp_path, monkeypatch):
+    right_disk(monkeypatch)
+    paths = media_paths(tmp_path)
+    root = tmp_path / "Clips"
+    root.mkdir()
+    monkeypatch.setattr(hc.os, "makedev", lambda a, b: os.lstat(str(root)).st_dev, raising=False)
+    monkeypatch.setattr(hc.scratch, "get_project", lambda p: (hc.MEDIA_PROJECT, True))
+    assert hc.media_guard(str(root), paths) == (True, "ok")
+    monkeypatch.setattr(hc.scratch, "get_project", lambda p: (0, False))
+    assert "quota project 0" in hc.media_guard(str(root), paths)[1]
+    monkeypatch.setattr(hc.scratch, "get_project", lambda p: (hc.MEDIA_PROJECT, False))   # inherit lost: new folders escape
+    assert "inherit False" in hc.media_guard(str(root), paths)[1]
+    monkeypatch.setattr(hc.scratch, "get_project", lambda p: (hc.MEDIA_PROJECT, True))
+    monkeypatch.setattr(hc.os, "makedev", lambda a, b: -1, raising=False)
+    assert "not on the media drive" in hc.media_guard(str(root), paths)[1]
+    monkeypatch.setattr(hc.os, "makedev", lambda a, b: os.lstat(str(root)).st_dev, raising=False)
+    assert "run homehub_clips.py ensure" in hc.media_guard(str(tmp_path / "gone"), paths)[1]
+    held = media_paths(tmp_path, status="CapEff:\t0000000001000000\n")
+    assert "CAP_SYS_RESOURCE" in hc.media_guard(str(root), held)[1]
+    assert hc.media_guard(str(root), held, check_cap=False) == (True, "ok")   # `ensure`'s own check
+
+
+def test_tc1687_a_stopped_filesystem_is_refused_and_a_full_quota_is_not(tmp_path, monkeypatch):
+    right_disk(monkeypatch)
+    paths = media_paths(tmp_path)
+    root = tmp_path / "Clips"
+    root.mkdir()
+    monkeypatch.setattr(hc.os, "makedev", lambda a, b: os.lstat(str(root)).st_dev, raising=False)
+    monkeypatch.setattr(hc.scratch, "get_project", lambda p: (hc.MEDIA_PROJECT, True))
+    assert hc.media_guard(str(root), paths) == (True, "ok") and os.listdir(str(root)) == []   # the probe left nothing
+    real = hc.os.open
+
+    def refuse(code):
+        def fake(path, *a, **k):
+            if ".clips-guard-" in path:
+                raise OSError(code, "no")
+            return real(path, *a, **k)
+        return fake
+    monkeypatch.setattr(hc.os, "open", refuse(errno.EIO))
+    ok, reason = hc.media_guard(str(root), paths)
+    assert not ok and "not writable (EIO)" in reason
+    monkeypatch.setattr(hc.os, "open", refuse(errno.ENOSPC))
+    assert hc.media_guard(str(root), paths) == (True, "ok")   # retention must still get in
+
+
+def test_tc1692_a_drive_that_goes_during_the_cut_costs_the_episode_no_attempt(tmp_path, monkeypatch):
+    settings, cam, seg, root = cut_setup(tmp_path, monkeypatch)
+    ep = hc.build_episodes([rec(1, "approach", "event", T0)], cam.causes, cam.pre_ms, cam.lease_ms, cam.max_ms)[0][0]
+    plan = hc.plan_window([seg], ep.window[0] / 1000.0, ep.window[1] / 1000.0, 10)
+    fake = FakeFfmpeg(rc=1)
+    answers = iter([(True, "ok"), (False, "the filesystem has stopped")])
+    monkeypatch.setattr(hc, "guard", lambda s: next(answers))
+    with pytest.raises(hc.GuardStop, match="stopped"):
+        hc.cut_episode(settings, cam, ep, plan, str(tmp_path / "state"), runner=fake, prober=lambda *a: None)
+    fake = FakeFfmpeg(rc=1)
+    monkeypatch.setattr(hc, "guard", lambda s: (True, "ok"))
+    got = hc.cut_episode(settings, cam, ep, plan, str(tmp_path / "state"), runner=fake, prober=lambda *a: None)
+    assert got["status"] == "failed"   # the area is fine: this one is the cut's own failure
+
+
+def test_tc1688_the_quota_sits_above_the_cap_so_the_cap_acts_first():
+    limit = hc.media_quota_mib(95367, 90)
+    assert limit == 112197
+    assert limit * 90 // 100 == 100977 and limit * 85 // 100 >= 95367   # the rule starts 5.6 GiB over the cap, ends on it
+    mib = lambda n: n * MIB  # noqa: E731
+    clips = [(T0 + i, "d", "c%d" % i, mib(10)) for i in range(20)]       # 200 MiB
+    now = T0 + 1000
+    cap = 150
+    wall = hc.media_quota_mib(cap, 90)
+    # over the cap, under the quota rule: the cap alone decides
+    doomed = hc.retention_plan(clips, now, 365, mib(cap), mib(200), mib(wall), 90)
+    assert sum(c[3] for c in clips) - sum(c[3] for c in doomed) <= mib(cap)
+    assert len(doomed) == 5
+    assert hc.retention_plan(clips, now, 365, mib(200), mib(200), mib(hc.media_quota_mib(200, 90)), 90) == []
+    # the quota rule, when it ever fires (bytes the cap does not count), trims to the cap and no further
+    used = wall * 95 // 100
+    doomed = hc.retention_plan(clips, now, 365, mib(200), mib(used), mib(wall), 90)
+    assert mib(used) - sum(c[3] for c in doomed) <= mib(wall) * 85 // 100
+    assert mib(used) - sum(c[3] for c in doomed) > mib(wall) * 85 // 100 - mib(10)
+
+
+def test_tc1689_the_quota_is_read_from_the_media_project_on_the_media_mount(tmp_path, monkeypatch):
+    asked = []
+    monkeypatch.setattr(hc.scratch, "get_project_quota", lambda dev, pid: asked.append((dev, pid)) or (5 * MIB, 50 * MIB))
+    real_open = open
+
+    def mountinfo(path, *a, **k):
+        if path == "/proc/self/mountinfo":
+            import io
+            return io.StringIO(MEDIA_LINE)
+        return real_open(path, *a, **k)
+    monkeypatch.setattr("builtins.open", mountinfo)
+    settings = hc.ClipsSettings({"CLIPS_ROOT": hc.MEDIA_ROOT})
+    assert hc.clips_quota(settings) == (5 * MIB, 50 * MIB) and asked == [("/dev/sdc1", hc.MEDIA_PROJECT)]
+    # so make_room has a limit to work with on the drive, where it had none
+    assert hc.make_room(settings, "", T0, MIB, lambda: hc.clips_quota(settings)) == 0
+    monkeypatch.setattr(hc.scratch, "get_project_quota", lambda dev, pid: (_ for _ in ()).throw(OSError(19, "gone")))
+    assert hc.clips_quota(settings) == (None, None)     # the drive went: no number, not an exception
+
+
+@pytest.mark.parametrize("line,identity,why", [
+    ("25 1 8:1 / / rw - ext4 /dev/sda1 rw\n", "/srv/media\tusb-Fake_Disk_0-0:0\tMediaDrive\n", "not a mount point"),
+    ("40 25 8:33 / /srv/media rw - ntfs3 /dev/sdc1 rw\n", "/srv/media\tusb-Fake_Disk_0-0:0\tMediaDrive\n", "not ext4 with prjquota"),
+    ("40 25 8:33 / /srv/media rw - ext4 /dev/sdc1 rw\n", "/srv/media\tusb-Fake_Disk_0-0:0\tMediaDrive\n", "not ext4 with prjquota"),
+    ("40 25 8:33 / /srv/media ro - ext4 /dev/sdc1 ro,prjquota\n", "/srv/media\tusb-Fake_Disk_0-0:0\tMediaDrive\n", "read-only"),
+    (MEDIA_LINE, None, "no /srv/media row"),
+])
+def test_tc1690_ensure_refuses_before_it_touches_anything(tmp_path, monkeypatch, line, identity, why):
+    right_disk(monkeypatch)
+    touched = []
+    for name in ("ensure_account", "ensure_folder", "ensure_quota"):
+        monkeypatch.setattr(hc, name, lambda *a, **k: touched.append(a))
+    paths = media_paths(tmp_path, line=line, identity=identity)
+    with pytest.raises(hs.Refused, match=why):
+        hc.ensure_media(hc.ClipsSettings({}), True, paths)
+    assert touched == []
+
+
+def test_tc1690_ensure_refused_is_exit_4_and_says_why(tmp_path, monkeypatch, capsys):
+    env = tmp_path / "env"
+    env.write_text("CLIPS_ENABLED=false\n")   # ensure does not wait for the switch: it comes first
+
+    def refused(settings, apply):
+        raise hs.Refused("/srv/media is not a mount point")
+    monkeypatch.setattr(hc, "ensure_media", refused)
+    assert hc.main(["--env-file", str(env), "--state-dir", str(tmp_path / "s"), "ensure"]) == hs.EXIT_REFUSE
+    assert "ensure REFUSED - /srv/media is not a mount point" in capsys.readouterr().out
+    applied = []
+    monkeypatch.setattr(hc, "ensure_media", lambda s, apply: applied.append(apply) or {"actions": []})
+    assert hc.main(["--env-file", str(env), "--state-dir", str(tmp_path / "s"), "ensure", "--plan"]) == 0
+    assert hc.main(["--env-file", str(env), "--state-dir", str(tmp_path / "s"), "ensure"]) == 0
+    assert applied == [False, True]
+
+
+def old_clip(root, stem="door_2026-11-06_09-00-00-0600_approach_11s", day="2026-11-06", body=b"mp4 bytes"):
+    folder = root / "door" / day
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / (stem + ".mp4")).write_bytes(body)
+    side = {"v": 1, "camera": "door", "clip": stem + ".mp4", "cause": "approach", "coverage": "full",
+            "actual": {"start_utc_ms": T0, "end_utc_ms": T0 + 11000}, "events": [{"utc_ms": T0}]}
+    (folder / (stem + ".json")).write_text(json.dumps(side))
+    return folder / (stem + ".mp4")
+
+
+def move_setup(tmp_path, monkeypatch):
+    old, new = tmp_path / "scratch-clips", tmp_path / "media-clips"
+    old.mkdir()
+    new.mkdir()
+    monkeypatch.setattr(hc, "SCRATCH_ROOT", str(old))
+    monkeypatch.setattr(hc, "MEDIA_ROOT", str(new))
+    monkeypatch.setattr(hc, "sync_dir", lambda path: None)
+    settings = hc.ClipsSettings({"CLIPS_ROOT": str(new)})
+    return settings, old, new
+
+
+def test_tc1691_the_plan_moves_nothing_and_needs_clips_root_switched_first(tmp_path, monkeypatch):
+    settings, old, new = move_setup(tmp_path, monkeypatch)
+    clip = old_clip(old)
+    report = hc.move_from_scratch(settings, False, quota_fn=lambda: (None, None))
+    assert report["clips"] == 1 and report["moved"] == 0 and report["left"] == 1 and clip.exists()
+    assert not (new / "door").exists()
+    with pytest.raises(hc.Invalid, match="CLIPS_ROOT must be"):
+        hc.move_from_scratch(hc.ClipsSettings({}), True, quota_fn=lambda: (None, None))
+    assert clip.exists()
+
+
+def test_tc1691_clips_and_records_move_and_the_index_is_rebuilt_merging_what_was_cut_there(tmp_path, monkeypatch):
+    settings, old, new = move_setup(tmp_path, monkeypatch)
+    old_clip(old)
+    old_clip(old, stem="door_2026-11-05_08-00-00-0600_road-stop_29s", day="2026-11-05", body=b"other bytes")
+    (old / "door" / "index.jsonl").write_text('{"clip":"2026-11-06/x.mp4"}\n')
+    old_clip(new, stem="door_2026-11-06_10-00-00-0600_approach_12s", body=b"cut after the switch")
+    report = hc.move_from_scratch(settings, True, quota_fn=lambda: (None, None))
+    assert report["moved"] == 2 and report["left"] == 0
+    day = new / "door" / "2026-11-06"
+    assert (day / "door_2026-11-06_09-00-00-0600_approach_11s.mp4").read_bytes() == b"mp4 bytes"
+    assert (day / "door_2026-11-06_09-00-00-0600_approach_11s.json").exists()
+    assert [n for n in os.listdir(str(day)) if n.endswith(".part")] == []
+    index = [json.loads(x)["clip"] for x in (new / "door" / "index.jsonl").read_text().splitlines()]
+    assert sorted(index) == ["2026-11-05/door_2026-11-05_08-00-00-0600_road-stop_29s.mp4",
+                             "2026-11-06/door_2026-11-06_09-00-00-0600_approach_11s.mp4",
+                             "2026-11-06/door_2026-11-06_10-00-00-0600_approach_12s.mp4"]
+    assert os.listdir(str(old)) == []          # the old area's camera folder, its days and its index are gone
+    assert hc.move_from_scratch(settings, True, quota_fn=lambda: (None, None))["clips"] == 0    # a second run: nothing
+
+
+def test_tc1691_the_source_goes_only_after_the_clip_and_its_record_are_across(tmp_path, monkeypatch):
+    settings, old, new = move_setup(tmp_path, monkeypatch)
+    clip = old_clip(old)
+    real = hc.copy_verified
+    seen = []
+
+    def copy(src, dst):
+        real(src, dst)
+        seen.append((os.path.basename(dst), os.path.exists(src)))
+    monkeypatch.setattr(hc, "copy_verified", copy)
+    hc.move_from_scratch(settings, True, quota_fn=lambda: (None, None))
+    assert [n[-4:] for n, _alive in seen] == ["json", ".mp4"]     # the record first
+    assert all(alive for _n, alive in seen) and not clip.exists()
+
+
+def test_tc1691_a_failed_copy_leaves_the_source_and_a_rerun_finishes(tmp_path, monkeypatch):
+    settings, old, new = move_setup(tmp_path, monkeypatch)
+    clip = old_clip(old)
+    real = hc.sha256_file
+    monkeypatch.setattr(hc, "sha256_file", lambda p: "torn" if p.endswith(".mp4.part") else real(p))
+    with pytest.raises(OSError, match="does not match"):
+        hc.move_from_scratch(settings, True, quota_fn=lambda: (None, None))
+    assert clip.exists() and clip.with_suffix(".json").exists()
+    dest = new / "door" / "2026-11-06"
+    assert not (dest / clip.name).exists() and not (dest / (clip.name + ".part")).exists()
+    monkeypatch.setattr(hc, "sha256_file", real)
+    assert hc.move_from_scratch(settings, True, quota_fn=lambda: (None, None))["left"] == 0   # the record already there is kept
+    assert (dest / clip.name).read_bytes() == b"mp4 bytes" and not clip.exists()
+
+
+def test_tc1691_a_different_clip_of_the_same_name_is_left_alone(tmp_path, monkeypatch):
+    settings, old, new = move_setup(tmp_path, monkeypatch)
+    clip = old_clip(old)
+    there = old_clip(new, body=b"a different clip")
+    report = hc.move_from_scratch(settings, True, quota_fn=lambda: (None, None))
+    assert report["moved"] == 0 and report["left"] == 1 and clip.exists() and there.read_bytes() == b"a different clip"
+
+
+def test_tc1691_the_guard_stops_the_move_between_clips_and_nothing_is_half_there(tmp_path, monkeypatch):
+    settings, old, new = move_setup(tmp_path, monkeypatch)
+    old_clip(old)
+    old_clip(old, stem="door_2026-11-07_08-00-00-0600_approach_11s", day="2026-11-07")
+    answers = iter([(True, "ok"), (True, "ok"), (False, "/srv/media is not a mount point")])
+    monkeypatch.setattr(hc, "guard", lambda s: next(answers, (False, "gone")))
+    with pytest.raises(hc.GuardStop):
+        hc.move_from_scratch(settings, True, quota_fn=lambda: (None, None))
+    assert len(hc.list_clips(str(old))) == 1 and len(hc.list_clips(str(new))) == 1
+
+
+def test_tc1691_a_move_that_would_not_fit_moves_nothing(tmp_path, monkeypatch):
+    settings, old, new = move_setup(tmp_path, monkeypatch)
+    clip = old_clip(old, body=b"x" * 1000)
+    with pytest.raises(hc.QuotaStop):
+        hc.move_from_scratch(settings, True, quota_fn=lambda: (900, 1000))
+    assert clip.exists() and not (new / "door").exists()
+
+
+def test_tc1691_the_verb_keeps_the_units_umask_and_says_how_to_run_it(tmp_path, monkeypatch, capsys):
+    settings, old, new = move_setup(tmp_path, monkeypatch)
+    old_clip(old)
+    env = tmp_path / "env"
+    env.write_text("CLIPS_ROOT=%s\n" % new)
+    monkeypatch.setattr(hc, "guard", lambda s: (False, "this process holds CAP_SYS_RESOURCE, which ignores quota hard limits"))
+    argv = ["--env-file", str(env), "--state-dir", str(tmp_path / "s"), "move-from-scratch"]
+    assert hc.main(argv + ["--apply"]) == hc.EXIT_GUARD
+    assert "systemd-run" in capsys.readouterr().out
+    assert hc.main(argv) == 0 and json.loads(capsys.readouterr().out)["clips"] == 1
+    monkeypatch.setattr(hc, "guard", lambda s: (True, "ok"))
+    masks = []
+    real = hc.os.umask
+    monkeypatch.setattr(hc.os, "umask", lambda m: masks.append(m) or real(m))
+    monkeypatch.setattr(hc, "clips_quota", lambda s: (None, None))
+    assert hc.main(argv + ["--apply"]) == 0 and 0o027 in masks
+    real(0o022)
+
+
+def test_tc1691_nothing_a_clip_is_known_by_names_the_root_so_a_moved_clip_is_not_cut_again(tmp_path, monkeypatch):
+    state, seg_dir = str(tmp_path / "state"), str(tmp_path / "segs")
+    settings, old, new = move_setup(tmp_path, monkeypatch)
+    settings = hc.ClipsSettings({"CAMERA_DOOR_SEGMENT_DIR": seg_dir})
+    settings.root = str(old)
+    cam = settings.cameras[0]
+    monkeypatch.setattr(hc.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, b"", b""))
+    write_segment(seg_dir, T0 / 1000.0 - 60, 1200)
+    ev.append(state, rec(1, "approach", "event", T0))
+    frames = {}
+    real_cut = hc.cut_episode
+
+    def cut(settings_, cam_, ep, plan, state_dir, runner_=None, prober=None, localtime=time.localtime):
+        frames["want"] = plan.frames
+        return real_cut(settings_, cam_, ep, plan, state_dir, runner=FakeFfmpeg(),
+                        prober=lambda c, d, n: {"frames": frames["want"]})
+    monkeypatch.setattr(hc, "cut_episode", cut)
+    assert hc.cut_camera(settings, cam, state, T0 + 60000)["cut"] == 1
+    ledger = (tmp_path / "state" / "ledger" / "door.json").read_text()
+    sidecars = [p.read_text() for p in old.rglob("*.json")]
+    index = (old / "door" / "index.jsonl").read_text()
+    for text in [ledger, index] + sidecars:
+        assert str(old).replace("\\", "/") not in text.replace("\\\\", "/") and "scratch" not in text
+    settings.root = str(new)
+    assert hc.move_from_scratch(settings, True, quota_fn=lambda: (None, None))["moved"] == 1
+    assert hc.cut_camera(settings, cam, state, T0 + 120000)["cut"] == 0     # the ledger still knows it
+    assert len(hc.list_clips(str(new))) == 1
+
+
+def drop_setup(tmp_path, monkeypatch):
+    state, seg_dir = str(tmp_path / "state"), str(tmp_path / "segs")
+    root = tmp_path / "clips"
+    root.mkdir()
+    monkeypatch.setattr(hc.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, b"", b""))
+    settings = hc.ClipsSettings({"CAMERA_DOOR_SEGMENT_DIR": seg_dir})
+    settings.root = str(root)
+    frames = {}
+    real_cut = hc.cut_episode
+
+    def cut(settings_, cam_, ep, plan, state_dir, runner_=None, prober=None, localtime=time.localtime):
+        frames["want"] = plan.frames
+        return real_cut(settings_, cam_, ep, plan, state_dir, runner=FakeFfmpeg(),
+                        prober=lambda c, d, n: {"frames": frames["want"]})
+    monkeypatch.setattr(hc, "cut_episode", cut)
+    return settings, settings.cameras[0], state, seg_dir
+
+
+def test_tc1692_a_dropped_drive_leaves_the_episode_uncut_and_unlost_until_it_returns(tmp_path, monkeypatch):
+    settings, cam, state, seg_dir = drop_setup(tmp_path, monkeypatch)
+    write_segment(seg_dir, T0 / 1000.0 - 60, 1200)
+    ev.append(state, rec(1, "approach", "event", T0))
+    monkeypatch.setattr(hc, "guard", lambda s: (False, "/srv/media is not a mount point"))
+    for minute in (1, 2, 3, 60):       # past the 3-minute cover wait: a refused guard is not a loss
+        with pytest.raises(hc.GuardStop):
+            hc.cut_camera(settings, cam, state, T0 + minute * 60000)
+    assert json.load(open(hc.ledger_path(state, "door")))["episodes"] == {}
+    assert len(ev.read(state, "door", cam.sources, T0 - 1000)[0]) == 1      # the record is where it was
+    monkeypatch.setattr(hc, "guard", lambda s: (True, "ok"))
+    assert hc.cut_camera(settings, cam, state, T0 + 3600 * 1000 + 60000)["cut"] == 1
+    assert len(hc.list_clips(str(settings.root))) == 1
+
+
+def test_tc1692_a_drive_away_past_the_rotation_loses_the_clip_and_says_so(tmp_path, monkeypatch):
+    settings, cam, state, seg_dir = drop_setup(tmp_path, monkeypatch)
+    ledger_since = T0 - 30 * 3600 * 1000
+    os.makedirs(os.path.dirname(hc.ledger_path(state, "door")))
+    with open(hc.ledger_path(state, "door"), "w") as handle:
+        json.dump({"since_ms": ledger_since, "episodes": {}}, handle)
+    # the recording now starts after the first visit (rotated away) and covers the second
+    write_segment(seg_dir, T0 / 1000.0 + 3600 - 60, 1200)
+    ev.append(state, rec(1, "approach", "event", T0))
+    ev.append(state, rec(2, "approach", "event", T0 + 3600 * 1000))
+    monkeypatch.setattr(hc, "guard", lambda s: (False, "the drive dropped"))
+    alerts = []
+    with pytest.raises(hc.GuardStop):       # the second visit meets the refusal: the first's alert must still go
+        hc.cut_camera(settings, cam, state, T0 + 3600 * 1000 + 60000, alert=lambda *a: alerts.append(a))
+    assert [a[0] for a in alerts] == ["clips-lost-door"]
+    ledger = json.load(open(hc.ledger_path(state, "door")))["episodes"]
+    assert [e["status"] for e in ledger.values()] == ["lost"]
+
+
+def test_tc1692_a_refused_guard_is_the_clips_guard_alert_at_most_daily(tmp_path, monkeypatch):
+    env = tmp_path / "env"
+    env.write_text("CLIPS_ENABLED=true\n")
+    sent = []
+    monkeypatch.setattr(hc, "make_alert", lambda env_file: lambda *a: sent.append(a))
+    monkeypatch.setattr(hc, "cut_camera", lambda *a, **k: (_ for _ in ()).throw(hc.GuardStop("the drive dropped")))
+    assert hc.main(["--env-file", str(env), "--state-dir", str(tmp_path / "s"), "cut"]) == hc.EXIT_GUARD
+    assert sent[0][0] == "clips-guard" and sent[0][2] == "the drive dropped"
+    monkeypatch.undo()
+    calls = {}
+    monkeypatch.setattr(hc.mc, "send_alert", lambda *a, **k: calls.update(k))
+    hc.make_alert(str(env))("clips-guard", "t", "b")
+    assert calls["repeat_sec"] == 86400
+
+
+def test_tc1693_firstboot_runs_ensure_only_for_the_drive_and_only_as_a_warning():
+    fb = (STACK / "autoinstall" / "firstboot.sh").read_text(encoding="utf-8")
+    block = fb[fb.index("# BEGIN camera-clips"):fb.index("# END camera-clips")]
+    at = block.index('[ "$(__last CLIPS_ROOT)" = /srv/media/Clips ]')
+    line = block[at:block.index("__clips_on=", at)]
+    assert 'if timeout 120 python3 "$STACK_DIR/clips/homehub_clips.py" --env-file "$STACK_DIR/.env" ensure; then' in line
+    assert "log \"WARN: homehub_clips.py ensure" in line      # never fatal: a hub boots without its USB drives
+    assert fb.index("provision-mounts.sh") < fb.index("# BEGIN camera-clips")  # the drive has its chance first
+
+
+def test_tc1693_the_health_timer_reattaches_the_media_drive_and_cannot_be_failed_by_it():
+    unit = (STACK / "samba" / "homehub-library-health.service").read_text(encoding="utf-8")
+    assert "ExecStartPre=-/usr/local/sbin/homehub-library-guard --reattach --library /srv/media --label media" in unit
+    assert "ExecStart=/usr/local/sbin/homehub-library-guard --report --label library" in unit
+
+
+def test_tc1693_the_public_tree_names_the_drive_by_path_only():
+    source = (STACK / "clips" / "homehub_clips.py").read_text(encoding="utf-8")
+    assert hc.IDENTITY_FILE == "/etc/homehub-samba/drive-identity.conf"
+    assert not re.search(r"(?i)(usb|ata|wwn)-[A-Za-z0-9_]+[0-9]{4,}", source)
+    assert not re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", source)
+
+
+def test_tc1693_the_backup_scripts_never_name_the_media_drive():
+    # The share is the only way out for footage; the sources are HomeHub's to refuse.
+    for name in ("backup.env.example",):
+        text = (STACK / "backup" / name).read_text(encoding="utf-8")
+        for line in text.splitlines():
+            assert line.lstrip().startswith("#") or "/srv/media" not in line

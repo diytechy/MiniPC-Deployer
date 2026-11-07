@@ -3140,6 +3140,10 @@ fi
 # are disabled again when it is not (this step runs on every boot). No BindsTo=
 # a mount: CLIPS_ROOT is a knob, and the cutter's guard refuses before every
 # file instead. Started with --no-block (the 2026-08-27 deadlock).
+# WITH CLIPS_ROOT ON THE MEDIA DRIVE, `ensure` makes what a reimage loses (the
+# homehub-clips account) and what a new drive lacks (the folder, its quota). It
+# refuses when /srv/media is not the real drive, and a boot without the drive
+# carries on: clips queue, and it runs again at the next boot or by hand.
 # BEGIN camera-clips
 if [ -d "$STACK_DIR/camera-motion" ] && [ -d "$STACK_DIR/clips" ]; then
     install -m 0644 "$STACK_DIR/camera-motion/homehub-camera-motion@.service" /etc/systemd/system/homehub-camera-motion@.service \
@@ -3183,6 +3187,13 @@ if [ -d "$STACK_DIR/camera-motion" ] && [ -d "$STACK_DIR/clips" ]; then
             || log "WARN: could not queue homehub-camera-motion@$__c.service"
         log "camera $__c: motion detector unit enabled (CAMERA_${__C}_MOTION_ENABLED=$(__last "CAMERA_${__C}_MOTION_ENABLED"))"
     done
+    if [ "$(__last CLIPS_ROOT)" = /srv/media/Clips ]; then
+        if timeout 120 python3 "$STACK_DIR/clips/homehub_clips.py" --env-file "$STACK_DIR/.env" ensure; then
+            log "motion clips: the media drive's Clips folder is ready"
+        else
+            log "WARN: homehub_clips.py ensure refused or failed - clips wait until the drive is right (stack/clips/README.md)"
+        fi
+    fi
     __clips_on="$(__last CLIPS_ENABLED)"
     __enc_on="$(__last CLIPS_ENCODE_ENABLED)"
     case "${__clips_on:-false}" in

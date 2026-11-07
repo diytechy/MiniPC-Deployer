@@ -10,7 +10,9 @@
 #                  from /lib/modules/<release>/kernel/fs/quota/
 #     SUITE        the root suite to run, relative to stack/ (default
 #                  scratch/tests/scratch-fs.root-test.sh; also
-#                  ottertube/tests/ottertube-quota.root-test.sh)
+#                  ottertube/tests/ottertube-quota.root-test.sh, and
+#                  clips/tests/clips-media.root-test.sh, which is given a spare
+#                  virtio-scsi disk to format, unplug and bring back)
 #
 # Needs root and docker (WSL Ubuntu is fine). Everything happens inside one
 # throwaway Alpine container: QEMU (TCG, no KVM needed), an initramfs built
@@ -32,9 +34,9 @@ apk add -q --no-cache qemu-system-x86_64 cpio zstd >/dev/null
 R=/rootfs
 mkdir -p $R/etc/apk && cp -r /etc/apk/keys $R/etc/apk/ && cp /etc/apk/repositories $R/etc/apk/
 apk add -q --root $R --initdb --no-cache alpine-base bash python3 e2fsprogs e2fsprogs-extra lvm2 \
-    util-linux coreutils findutils grep sed gawk kmod >/dev/null
+    util-linux coreutils findutils grep sed gawk kmod acl shadow >/dev/null
 mkdir -p $R/w4/stack $R/w4/mods
-cp -r /in/stack/scratch /in/stack/door /in/stack/monitoring /in/stack/ottertube $R/w4/stack/
+cp -r /in/stack/scratch /in/stack/door /in/stack/monitoring /in/stack/ottertube /in/stack/clips /in/stack/samba $R/w4/stack/
 echo "$SUITE" >$R/w4/suite
 for m in quota_tree quota_v2; do
     if [ -f /in/mods/$m.ko.zst ]; then zstd -q -d -o $R/w4/mods/$m.ko /in/mods/$m.ko.zst; else cp /in/mods/$m.ko $R/w4/mods/; fi
@@ -54,7 +56,12 @@ poweroff -f
 INIT
 chmod 0755 $R/init
 (cd $R && find . | cpio -o -H newc 2>/dev/null | gzip -1) >/initrd.gz
-timeout 1500 qemu-system-x86_64 -m 2560 -smp 2 -nographic -no-reboot -kernel /in/vmlinuz -initrd /initrd.gz \
-    -append "console=ttyS0 quiet panic=-1 rdinit=/init" | tr -d '\r' | tee /console.log | grep -E '^(KERNEL|PASS|FAIL|SKIP|SUITE-EXIT|scratch-fs|ottertube-quota|     )'
+DISK=""
+case "$SUITE" in
+    clips/*) truncate -s 512M /disk.img
+             DISK="-device virtio-scsi-pci -drive file=/disk.img,if=none,format=raw,id=hd0 -device scsi-hd,drive=hd0" ;;
+esac
+timeout 1500 qemu-system-x86_64 -m 2560 -smp 2 -nographic -no-reboot $DISK -kernel /in/vmlinuz -initrd /initrd.gz \
+    -append "console=ttyS0 quiet panic=-1 rdinit=/init" | tr -d '\r' | tee /console.log | grep -E '^(KERNEL|PASS|FAIL|SKIP|SUITE-EXIT|scratch-fs|ottertube-quota|clips-media|     )'
 grep -q '^SUITE-EXIT 0' /console.log || { echo '--- console tail ---'; tail -60 /console.log; exit 1; }
 EOF

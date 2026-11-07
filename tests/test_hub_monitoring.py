@@ -619,6 +619,42 @@ def test_disk_never_statfs_a_usb_drive_and_reports_absent_tc1287():
     assert [r["state"] for r in res] == ["ok", "skipped", "absent"]
 
 
+def test_disk_a_mount_whose_device_went_is_absent_and_never_statfsd_tc1694():
+    asked = []
+    mounts = MOUNTS + [{"mount": "/srv/media", "majmin": "8:33", "fstype": "ext4", "source": "/dev/sdc1"}]
+    specs = [("/", None), ("/srv/media", None)]
+
+    def statfs(path):
+        asked.append(path)
+        return 100 * 10**9, 50 * 10**9
+
+    # the drive there: on USB, so skipped; nothing about its space is read
+    nvme = lambda mm: mm != "8:33"  # noqa: E731
+    res = disk.evaluate(specs, mounts, nvme, statfs, lambda mm: True)
+    assert [r["state"] for r in res] == ["ok", "skipped"]
+    # the drive dropped and its mountinfo line stayed
+    res = disk.evaluate(specs, mounts, nvme, statfs, lambda mm: mm != "8:33")
+    assert [r["state"] for r in res] == ["ok", "absent"] and "8:33" in res[1]["why"]
+    assert asked == ["/", "/"]
+    # a caller that says nothing about devices gets what it always did
+    assert [r["state"] for r in disk.evaluate(specs, mounts, nvme, statfs)] == ["ok", "skipped"]
+
+
+def test_disk_a_dead_device_raises_the_not_mounted_alert_tc1694(tmp_path, monkeypatch):
+    sent = []
+    monkeypatch.setattr(disk.mc, "send_alert", lambda key, prio, title, body, *a, **k: sent.append((key, title, body))
+                        or mc.ALERT_DELIVERED)  # fmt: skip
+    monkeypatch.setattr(disk.mc, "is_nvme_backed", lambda mm, root: False)
+    _w(tmp_path / "proc/self/mountinfo", "40 29 8:33 / /srv/media rw - ext4 /dev/sdc1 rw,prjquota\n")
+    _w(tmp_path / "env", "HOMEHUB_DISK_MOUNTS=/srv/media\n")
+    (tmp_path / "sys" / "dev" / "block").mkdir(parents=True)
+    monkeypatch.setenv("HOMEHUB_MONITOR_OVERRIDE_FILE", str(tmp_path / "no-override"))
+    rc = disk.main(["--state-dir", str(tmp_path / "st"), "--env-file", str(tmp_path / "env"),
+                    "--proc-root", str(tmp_path / "proc"), "--sys-root", str(tmp_path / "sys")])  # fmt: skip
+    assert rc == 0 and [s[0] for s in sent] == ["disk-absent-srv-media"]
+    assert "is not mounted" in sent[0][1] and "device 8:33 is gone" in sent[0][2]
+
+
 def _disk_main(tmp_path, monkeypatch, free, mounts_knob='"/ /boot"'):
     sent = []
     monkeypatch.setattr(disk.mc, "send_alert", lambda key, prio, title, *a, **k: sent.append((key, title))

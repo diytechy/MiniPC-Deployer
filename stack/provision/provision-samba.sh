@@ -110,6 +110,15 @@ log "installed /etc/samba/smb.conf (global + $(grep -c '^\[' "$FRAGMENT") share 
 # Paths come from the fragment itself, so this cannot drift from the map.
 while IFS= read -r p; do
     [ -n "$p" ] || continue
+    # ONLY THE LIBRARY, checked mounted above. A §3c share sits on its own drive
+    # and nothing here knows that drive is mounted: creating /srv/media/Clips
+    # with the media drive away would put the folder on the system disk. Its
+    # own provisioner makes it, on the drive it has proved.
+    case "$p" in
+        "$LIBRARY_ROOT"|"$LIBRARY_ROOT"/*) ;;
+        *) [ -d "$p" ] || log "WARNING: share path $p does not exist and is not on the library; left for its own provisioner."
+           continue ;;
+    esac
     if [ ! -d "$p" ]; then
         # LOUD, not quiet. The library IS mounted at this point (checked above),
         # so a missing share path means the storage map disagrees with the

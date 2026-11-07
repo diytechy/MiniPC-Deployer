@@ -1,7 +1,8 @@
 # clips — the hub's motion detector and motion clips (SN-050)
 
 Implements **SR-128** (the detector, `../camera-motion/`), **SR-129** (the cut),
-**SR-130** (the re-encode batch) and **SR-131** (storage, guard, retention).
+**SR-130** (the re-encode batch), **SR-131** (storage, guard, retention),
+**SR-148** (clips on the media drive) and **SR-149** (when that drive drops).
 Interfaces: **IF-076** (the motion-event record) and **IF-077** (the clips tree).
 
 The Owner ruled on 2026-10-26 (HomeHub open-items A78; HomeHub
@@ -19,10 +20,10 @@ The Owner ruled on 2026-10-26 (HomeHub open-items A78; HomeHub
 * clips are **cut copy-only** from the rolling recording, then **re-encoded** on
   the iGPU in a low-priority batch (measured before it is switched on);
 * **1 year, capped at 100 GB**, the cap winning;
-* the media drive is not bought yet (C111), so clips go to a **small,
-  quota-capped area on the NVMe scratch volume**, switched to the drive later by
-  one knob. The `Clips` share, the drive, Jellyfin and the drive's storage-map
-  rows are not part of this.
+* clips started on a **small, quota-capped area on the NVMe scratch volume**
+  while there was no drive, and go to **the media drive** (the Owner, 2026-11-06):
+  `/srv/media/Clips`, with the hidden, admin-only, read-only `Clips` share.
+  Jellyfin never reads them.
 
 Nothing here talks to the camera. The relay (`../door/`) holds the camera's only
 connection; the detector is one more relay consumer, and the cutter reads the
@@ -35,7 +36,7 @@ camera ──1 conn── go2rtc relay ──┬── recorder ── /srv/scra
                                        pinned engine ── IF-076 records                  │
                                        /var/lib/homehub-clips/events/door/ ──► cut ◄────┘
                                                                               │ copy-only
-                                       /srv/scratch/clips/door/YYYY-MM-DD/*.mp4 + .json (IF-077)
+                                       /srv/media/Clips/door/YYYY-MM-DD/*.mp4 + .json (IF-077)
                                                     ▲ encode (VA-API, batch)   ▲ retention (hourly)
 ```
 
@@ -50,6 +51,8 @@ camera ──1 conn── go2rtc relay ──┬── recorder ── /srv/scra
 | re-encode | `homehub_clips.py encode`, `homehub-clips-encode.timer` | `CLIPS_ENCODE_ENABLED` (**false**) | every 15 min, Nice 19, idle I/O, container `--cpu-shares 2` |
 | retention | `homehub_clips.py retention`, `homehub-clips-retention.timer` | `CLIPS_ENABLED` | hourly |
 | status | `homehub_clips.py status`, `episodes --camera door` | — | by hand |
+| the drive's folder | `homehub_clips.py ensure [--plan]` | `CLIPS_ROOT` | firstboot step 6k, and by hand |
+| the move off scratch | `homehub_clips.py move-from-scratch [--apply]` | — | once, by hand |
 
 firstboot step 6k installs every unit, enables one detector instance per name in
 `CAMERAS` (inert while its knob is off), installs `python3-opencv` when a
@@ -207,21 +210,109 @@ camera's `index.jsonl` from the sidecars.
 
 **Switching `CLIPS_ROOT` strands the old area.** Retention, status and the
 encode look only at the current root, so the clips already in the old one no
-longer age out or count. At the switch, move them into the new root's camera
-folders (keeping the day folders and sidecars together), or delete them.
+longer age out or count. `move-from-scratch` takes them across, once. Nothing
+needs rewriting, because no record names the root: the sidecar's `clip`, the
+`clip` in `index.jsonl` and the ledger's `clip` are all relative to the camera
+folder, and the ledger stays in `/var/lib/homehub-clips`, so an episode already
+cut stays cut and is not cut again. Per clip it copies the sidecar and then the
+clip through a `.part`, syncs, compares, renames, and only then removes the
+source, with the guard asked before each. A name already there with the same
+bytes is the rest of a killed run; with other bytes it is left alone and reported.
+The index is rebuilt from the sidecars at the end, which also merges anything
+already cut on the drive. Run it again after any failure. Moving is the only thing
+it does: it removes no clip to make room, and refuses if they do not all fit.
 
-**Where**: `CLIPS_ROOT=/srv/scratch/clips` - the scratch volume's `clips`
+**Where, on the media drive**: `CLIPS_ROOT=/srv/media/Clips`. "Clips on the media
+drive" below.
+
+**Where, on scratch**: `CLIPS_ROOT=/srv/scratch/clips` - the scratch volume's `clips`
 project 7104, 5 GiB (`HOMEHUB_SCRATCH_QUOTA_CLIPS_MIB`) once the volume is grown
 from 18 to 22 GiB (deploy step 2), behind the scratch guard as writer `clips`. It
 is sized before ottertube, so ottertube is reduced first: about 4800 MiB granted
-on the grown volume (it holds under 1 GiB of a 3 GiB list budget). `/srv/media/Clips` is the only other accepted value; its
-guard checks a separate ext4 mount with project quotas, writable - the drive's
-identity check comes with the drive (C111). A quota hit stops cut and encode
+on the grown volume (it holds under 1 GiB of a 3 GiB list budget). A quota hit stops cut and encode
 (exit 75, `clips-quota` alert, a stop file) until retention has made room.
+
+## Clips on the media drive
+
+**1 year, capped at 100 GB, the cap winning, oldest first** (the Owner, 2026-10-26).
+Nothing here is backed up, and nothing leaves the house.
+
+**The cap acts; the quota is a wall behind it.** `CLIPS_CAP_MIB` (95367) is what
+retention keeps to, hourly, counting bytes. The quota project (7105, one for the
+tree, because the cap is one number over all cameras) has a hard limit `ensure`
+derives from it: cap / (`CLIPS_QUOTA_HIGH_PCT` - 5 %), 112197 MiB. So the quota
+rule starts at 100977 MiB, 5.6 GiB past the cap, and when it fires it trims to the
+cap and no further. That room is what the cap does not count: whole blocks, folders,
+an hour of new clips, the encode trial. `make_room` works from the same project, so
+a burst between two hourly passes is handled before the cut. Change the cap and run
+`ensure` again.
+
+**`ensure`** (root, idempotent, firstboot step 6k when `CLIPS_ROOT` is the drive):
+
+* refuses, exit 4 and nothing touched, unless `/srv/media` is a mount point, ext4,
+  `prjquota`, writable, and the device mounted there is the disk
+  `/etc/homehub-samba/drive-identity.conf` names, or a partition of it (sysfs, so no
+  read reaches the drive). A label is not enough, and a missing row is a refusal.
+  The folder is made through a descriptor of the mount, so a drive that goes between
+  the check and the `mkdir` cannot put it on `/`;
+* makes the `homehub-clips` account, uid and gid 3100, no home, nologin. Fixed, because
+  the group is on the drive as a number. A name or id that means something else is refused;
+* makes `/srv/media/Clips` `root:homehub-clips 2750` and removes the `/srv/media`
+  default ACL it would inherit (group write, other read);
+* puts it in project 7105 with inherit and sets the hard limit. A folder that already
+  holds files in another project is refused: they would not be counted.
+
+**What clips land with.** The cutter's ffmpeg is uid 0 in a container with every
+capability dropped, so it can write only where uid 0 is the owner, and the units run
+as root. That is why the folder is root's, not `homehub-clips`'s as the plan had it.
+The group does the reading: setgid puts every file and folder in `homehub-clips`
+whoever made it, sidecars land 0640 (the units' umask 0027), clips 0644 (docker's
+0022), day folders 2750. No default ACL is needed. The `other` bit on a clip reaches
+nobody: nothing outside the group gets past the 2750 folder. `homehub-clips` can read
+everything and write nothing, so the share is read-only twice.
+
+**The guard** adds, to what `ensure` checks: the process without CAP_SYS_RESOURCE, the
+root a real directory on that device, in project 7105 with inherit, and the filesystem
+still taking writes (an empty file, made and removed). A full quota is not a refusal, or
+retention could never run to clear it. No reason names the disk: they go to alerts.
+
+**The `Clips` share** (HomeHub `storage-map.md` section 3c): `/srv/media/Clips`,
+hidden, `admin` only, read-only to `admin` too, `force user = homehub-clips`,
+`root preexec` the library guard with `--library /srv/media`, so a missing, stale or
+read-only drive refuses the connection instead of serving an empty folder.
+
+**When the drive drops.** Nothing here can reach the door link, the recorder or the
+detector: they write only to the scratch volume and `/var/lib/homehub-clips`, and only
+the cut, encode and retention units read `CLIPS_ROOT`, under their own CPU and memory
+limits. What happens, in order:
+
+| When | What | Alert |
+|---|---|---|
+| at once | ext4 shuts down. The mount's line stays in mountinfo with its device gone (measured, 6.8 kernel, `TC-1695`), and the share refuses | — |
+| within 15 min | `homehub-disk-check`: `/srv/media` is absent, whether the line went or stayed | `disk-absent-srv-media`, high, "/srv/media is not mounted"; once again on recovery. **Not** for a read-only mount: the device is alive, and a USB path is never statfs'd |
+| the next ready episode | the cut's guard refuses, exit 76, the unit shows failed, the timer carries on | `clips-guard`, high, at most daily, the reason in the body. A pass that finds no ready episode says nothing |
+| hourly | retention refuses, exit 76, a journal warning, nothing deleted | none of its own |
+| until it returns | **events are untouched**: they stay in `/var/lib/homehub-clips/events`, no ledger entry is written, and a refused guard is not a loss. Each minute's pass re-reads the oldest episode's segments (about 50 MB each), then stops at the guard | — |
+| from 10 min after it returns | the health timer's `--reattach` (`umount -l` if stale, then `systemctl start srv-media.mount`, so fsck runs) puts it back, unless `/run/homehub-no-remount` exists. The next cut pass takes every waiting episode, oldest first | the disk check's recovery line |
+| about 27 h after an event | its segments rotate out, it is recorded `lost` | `clips-lost-door`, high, at most daily |
+
+**An I/O error short of a disconnect is a different case.** `errors=remount-ro` does
+not do what it says on this kernel: ext4 logs "Remounting filesystem read-only" and
+shuts itself down without setting the flag, so mountinfo and statvfs still say `rw`
+(measured on 6.8, `TC-1695`). The disk check and the share's guard read those, so
+neither sees it: reads through the share simply fail. The clips guard sees it, because it
+makes and removes an empty file, and refuses with `clips-guard`. A cut caught mid-way
+costs the episode none of its three attempts. Nothing re-attaches a drive whose device is
+alive, so this one needs a hand: `sudo umount /srv/media && sudo systemctl start
+srv-media.mount`, which is also what makes the unit's fsck run.
+
+The plan's "alert at 6 h of absence" and its `N unhealthy in M hours` escalation are
+not built; the "not mounted" alert covers the first, and repeats every
+`HOMEHUB_ALERT_REPEAT_SEC` while the state holds.
 
 ## Tests
 
-* `tests/test_hub_clips.py` (TC-1541, 1542, 1551-1566, 1568). TC-1569 runs
+* `tests/test_hub_clips.py` (TC-1541, 1542, 1551-1566, 1568, 1686-1693). TC-1569 runs
   only on Linux with docker (WSL on the dev PC), with
   `HOMEHUB_CLIPS_SEGMENTS=<a door segment tree>` and `-m release`; the DST
   check of TC-1557 needs `time.tzset` (POSIX) and is skipped on Windows.
@@ -229,6 +320,14 @@ identity check comes with the drive (C111). A quota hit stops cut and encode
   synthetic frames; the panel's filter and the engine's code against the sibling
   OfficeWallNaglight checkout; no private zone in this repository.
 * `../scratch/tests/scratch-fs.root-test.sh` check 7: `clips` stops at its quota.
+* `tests/clips-media.root-test.sh` (TC-1695, 17 checks): real ext4, real project
+  quota, a real virtio-scsi disk formatted as plan section 3.2 says, deleted under the
+  mount and brought back. Only in the throwaway guest, because it uses the hub's real
+  paths: `bash stack/scratch/tests/run-root-suite-in-qemu.sh <vmlinuz> <quota modules>
+  clips/tests/clips-media.root-test.sh`. WSL2 cannot run it (no `CONFIG_QFMT_V2`).
+* `../samba/tests/library-guard-media.test.sh` (TC-1696) and
+  `../provision/tests/provision-samba-paths.test.sh` (TC-1697), both in
+  `../run-hermetic-tests.sh`.
 
 ---
 
@@ -392,6 +491,93 @@ would leave Door motion silent until the hub lands, so:
    `wall-door-stream` (or reboot). The panel decodes for itself again; the hub's
    feed may stay on. Turning the hub's feed off first would leave a `hub` panel
    with no door events: do the panel first when going back.
+
+**10. Clips on the media drive** (the Owner, 2026-11-06). Run in order; stop at any
+line that does not read as written. It changes nothing for the detector, the recorder
+or the door link, and steps 10.1 to 10.4 change nothing for clips either. `<rev>`
+is the merged MiniPC-Deployer revision and `<hub>` the hub's address.
+
+1. Deliver. On the dev PC, from the merged integration branches:
+   `python scripts/deploy_stack.py --target hub@<hub> --revision <rev>` (dry run; read
+   it), then again with `--apply`. Then in HomeHub:
+   `pwsh scripts\deploy\Generate-FromStorageMap.ps1`, and
+   `scp scripts\deploy\out\generated\smb.conf.fragment scripts\deploy\out\generated\drive-identity.conf hub@<hub>:/tmp/`.
+   On the hub:
+
+   ```sh
+   sudo install -m 0755 /opt/homehub/stack/samba/library-guard.sh /usr/local/sbin/homehub-library-guard
+   sudo install -m 0644 /opt/homehub/stack/samba/homehub-library-health.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   systemctl cat srv-media.mount | sed -n 1,3p       # the unit exists: the reattach starts it
+   ```
+
+2. The identity. It is generated, not typed.
+
+   ```sh
+   grep -c '^/srv/media' /etc/homehub-samba/drive-identity.conf   # 1. If 0, and only then:
+   sudo install -m 0644 /tmp/drive-identity.conf /etc/homehub-samba/drive-identity.conf
+   ```
+
+3. The folder, account and quota, with `CLIPS_ROOT` still on scratch.
+
+   ```sh
+   sudo python3 /opt/homehub/stack/clips/homehub_clips.py ensure --plan
+   #   would: create group, create user, create /srv/media/Clips, ..., set the hard quota to 112197 MiB
+   sudo python3 /opt/homehub/stack/clips/homehub_clips.py ensure
+   sudo python3 /opt/homehub/stack/clips/homehub_clips.py ensure     # "actions": []
+   stat -c '%u %g %a' /srv/media/Clips                               # 0 3100 2750
+   getent passwd homehub-clips                                       # homehub-clips:x:3100:3100::...:/usr/sbin/nologin
+   ```
+
+   `REFUSED` with exit 4 means `/srv/media` is not the drive: read the reason, fix that,
+   go no further.
+
+4. The share. The hub's `smb.conf` is a concatenated copy, so the stanza is appended;
+   `[Clips]` is the last one in the fragment.
+
+   ```sh
+   sudo diff /etc/homehub-samba/smb.conf.fragment /tmp/smb.conf.fragment   # the header's hash and [Clips], nothing else
+   sudo cp -a /etc/samba/smb.conf /etc/samba/smb.conf.pre-clips
+   sudo install -m 0644 /tmp/smb.conf.fragment /etc/homehub-samba/smb.conf.fragment
+   sudo sh -c "sed -n '/^\[Clips\]/,\$p' /etc/homehub-samba/smb.conf.fragment >>/etc/samba/smb.conf"
+   testparm -s --section-name=Clips 2>/dev/null   # path, force user, read only, valid users, root preexec
+   sudo smbcontrol smbd reload-config
+   ```
+
+   Anything else in the diff, or a `testparm` complaint: restore `smb.conf.pre-clips`,
+   reload, and stop. `Backup` and the backup itself are not touched: this is a reload.
+
+5. The switch. Events keep queueing while the timers are stopped, and are cut afterwards.
+
+   ```sh
+   sudo systemctl stop homehub-clips-cut.timer homehub-clips-retention.timer homehub-clips-encode.timer
+   systemctl is-active homehub-clips-cut.service homehub-clips-retention.service   # inactive, inactive (or failed); wait if activating
+   sudo sed -i 's|^CLIPS_ROOT=.*|CLIPS_ROOT=/srv/media/Clips|' /opt/homehub/stack/.env
+   sudo sed -i 's|^HOMEHUB_DISK_MOUNTS=.*|HOMEHUB_DISK_MOUNTS="/ /var/lib/docker /boot /srv/scratch /srv/media"|' /opt/homehub/stack/.env
+   grep -E '^(CLIPS_ROOT|HOMEHUB_DISK_MOUNTS)=' /opt/homehub/stack/.env
+   sudo systemd-run --wait --pipe --quiet -p CapabilityBoundingSet=~CAP_SYS_RESOURCE -p NoNewPrivileges=yes -p Nice=19 -p IOSchedulingClass=idle -p CPUQuota=25% /usr/bin/python3 /opt/homehub/stack/clips/homehub_clips.py move-from-scratch           # {"clips": 12, ... "moved": 0}
+   sudo systemd-run --wait --pipe --quiet -p CapabilityBoundingSet=~CAP_SYS_RESOURCE -p NoNewPrivileges=yes -p Nice=19 -p IOSchedulingClass=idle -p CPUQuota=25% /usr/bin/python3 /opt/homehub/stack/clips/homehub_clips.py move-from-scratch --apply   # "moved": 12, "left": 0
+   sudo python3 /opt/homehub/stack/clips/homehub_clips.py status   # "root": "/srv/media/Clips", "clips": 12, "quota": {"limit_mib": 112197, ...}
+   wc -l /srv/media/Clips/door/index.jsonl                         # 12
+   sudo find /srv/scratch/clips -type f                            # nothing
+   sudo systemctl start homehub-clips-cut.timer homehub-clips-retention.timer
+   ```
+
+   Not `sudo python3` for the move: a root shell holds CAP_SYS_RESOURCE and the guard
+   refuses it (and says this command). The encode timer stays stopped while
+   `CLIPS_ENCODE_ENABLED=false`, which it is. `"left"` above 0 means a name clash: the log
+   says which, the source is intact.
+
+6. Look at it. `sudo systemctl start homehub-disk-check.service; journalctl -t homehub-disk-check -n 6`
+   shows `disk: skipped /srv/media`. From the dev PC, `\\homehub.<domain>\Clips` as `admin`
+   lists `door` and a clip plays, and a copy into it is refused. After the next visitor,
+   `stat -c '%U %G %a %n' /srv/media/Clips/door/<day>/*.mp4` says `root homehub-clips 644`,
+   and `homehub_clips.py status` shows `last_clip` moving.
+
+**Back:** stop the timers, set `CLIPS_ROOT=/srv/scratch/clips`, start them. New clips go
+to scratch; the ones on the drive stay readable through the share, and nothing ages them
+out until the switch comes back. `HOMEHUB_DISK_MOUNTS` can stay. The share, the account
+and the folder cost nothing left in place.
 
 **Rollback**: the knobs to false; `sudo systemctl disable --now homehub-camera-motion@door homehub-clips-cut.timer homehub-clips-retention.timer homehub-clips-encode.timer`.
 The clips area and its clips stay until removed by hand.

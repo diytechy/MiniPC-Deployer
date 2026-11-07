@@ -188,6 +188,34 @@ STATE_SCHEMA = {
     # unconfirmed mute shown as confirmed is the one error in this design that
     # nobody in the room can hear.
     "mic_legs_running": True,
+    # WHERE THE MUTE BUTTON GOES BACK TO (Owner, 2026-11-07). The USB audio
+    # adapter carries a hardware Mute button, and the Owner chose "toggle, mic
+    # follows": the first press selects Mute exactly as the on-glass position
+    # does (item J still latches the microphone muted), and the second press
+    # returns to the position that was selected before AND puts the microphone
+    # back the way it was at that moment.
+    #
+    # So entering Mute -- by ANY path, glass or button -- records
+    # `{"output": <the position left>, "input_muted": ...}` here, and leaving
+    # Mute by any path clears it. Only the BUTTON's exit (`toggle_mute`) reads
+    # it; leaving Mute from the glass still keeps the microphone muted, as item
+    # J (b) says.
+    #
+    # THE MICROPHONE HALF IS THE BUTTON'S ALONE (review, 2026-11-07). The Owner
+    # chose to restore the mic "to how it was before the FIRST PRESS". A Mute
+    # entered from the glass had no first press, so it records `input_muted:
+    # true` and the button brings the position back with the mic still muted;
+    # only `toggle_mute`'s own entry records the mic as it really was.
+    #
+    # None outside Mute, always (normalize enforces it), and None in a document
+    # that needed any repair, on the rule that a damaged file never opens a
+    # microphone. A damaged record is reset to None and is NOT itself a repair:
+    # the record can only ever widen what the microphone does when the button is
+    # pressed, and None narrows it -- the button then returns to Speaker with
+    # the microphone still muted. Not being a repair is also what keeps the
+    # switch backend's mirror of `normalize` (stack/panel-audio/switch_backend.py)
+    # agreeing without learning the field.
+    "mute_return": None,
     "version": STATE_VERSION,
 }
 
@@ -423,7 +451,27 @@ def normalize(raw):
     # request would ever be made to notice.
     if state["output"] == "mute":
         state["input_muted"] = True
+        # The mute button's return record, read only while it can mean
+        # something. Not a repair either way: see STATE_SCHEMA["mute_return"].
+        state["mute_return"] = (None if repaired
+                                else valid_mute_return(raw.get("mute_return")))
     return state
+
+
+def valid_mute_return(value):
+    """A copy of a well-formed mute-button return record, or None.
+
+    Well-formed is exactly `{"output": one of LEVELLED_OUTPUTS, "input_muted":
+    bool}`. Mute itself is not a place to return to, and a record with any
+    other key, or a non-bool microphone, is not trusted to decide whether the
+    microphone comes back live.
+    """
+    if not isinstance(value, dict) or set(value) != {"output", "input_muted"}:
+        return None
+    if value["output"] not in LEVELLED_OUTPUTS \
+            or not isinstance(value["input_muted"], bool):
+        return None
+    return {"output": value["output"], "input_muted": value["input_muted"]}
 
 
 def clamp_volume(level):
@@ -599,6 +647,9 @@ def apply_event(state, event):
     Inputs:  state: any loaded state (normalized here)
              event: {"kind": one of
                  "set_output"     {"output": one of OUTPUTS}
+                 "toggle_mute"    {} -- the adapter's Mute button: into Mute,
+                                  or back out to the recorded position with
+                                  the microphone as it was (Owner 2026-11-07)
                  "set_input_mute" {"muted": bool}
                  "set_speaker_sleep" {"enabled": bool}
                  "set_spdif_level" {"db": int}      -- whole dB, refused out of range
@@ -659,6 +710,14 @@ def _set_output(state, event):
     previous = state["output"]
     state["output"] = output
     lines = ["output %s -> %s (level %d%%)" % (previous, output, volume_of(state))]
+    # THE MUTE BUTTON'S RETURN RECORD (see STATE_SCHEMA["mute_return"]). The
+    # position is recorded on every path; the microphone is recorded muted, and
+    # only `_toggle_mute` -- the button's own entry -- overwrites it with the
+    # microphone as the person left it.
+    if output == "mute":
+        state["mute_return"] = {"output": previous, "input_muted": True}
+    else:
+        state["mute_return"] = None
     # ── ITEM J: SELECTING MUTE LATCHES THE INPUT MUTE ─────────────────────────
     # The Owner's 2026-09-14 ruling has two halves and they are only consistent
     # if the coupling is a LATCH on the stored flag rather than a mask over it:
@@ -689,6 +748,44 @@ def _set_output(state, event):
         # Said out loud because the panel is about to be silent ON PURPOSE, and
         # a silent panel with no journal line looks exactly like a broken one.
         lines.append("headset selected but the adapter is absent: every output silent")
+    return state, lines
+
+
+def _toggle_mute(state, event):
+    """The USB adapter's hardware Mute button (Owner, 2026-11-07).
+
+    Into Mute exactly as the on-glass position goes there, item J included.
+    Out of Mute to the position recorded on the way in, with the microphone put
+    back as it was then -- the Owner's "toggle, mic follows". That is the ONE
+    exit from Mute that may un-mute the microphone, and it can do so only from
+    a record that says the boolean false; anything else leaves it muted.
+
+    WHY IT WAS INERT BEFORE, AND WHY THIS IS NOT THAT. panel-volume-keys.py
+    refused the key in bus mode because a one-way `set mute` from a button
+    that cannot un-mute would strand the panel silent for anyone not at the
+    glass. A toggle can always undo itself, so the reason no longer holds.
+    """
+    if set(event) - {"kind"}:
+        raise StateError("toggle_mute takes no arguments")
+    if state["output"] != "mute":
+        mic_before = state["input_muted"]
+        state, lines = _set_output(state, {"kind": "set_output", "output": "mute"})
+        # The button's own entry: the record keeps the microphone as it was,
+        # which `_set_output` (shared with the glass) deliberately does not.
+        state["mute_return"]["input_muted"] = mic_before
+        return state, ["mute button: " + lines[0]] + lines[1:]
+    record = valid_mute_return(state.get("mute_return"))
+    target = record["output"] if record is not None else "speaker"
+    state, lines = _set_output(state, {"kind": "set_output", "output": target})
+    lines[0] = "mute button: " + lines[0]
+    if record is None:
+        lines.append("mute button: no recorded position to return to; speaker, "
+                     "with the microphone still muted")
+    elif record["input_muted"] is False and state["input_muted"]:
+        state["input_muted"] = False
+        lines = [line for line in lines if "(item J)" not in line]
+        lines.append("input mute off: the mute button returns the microphone "
+                     "as it was before Mute (Owner 2026-11-07)")
     return state, lines
 
 
@@ -1025,6 +1122,7 @@ def _headset_left_selected(state):
 
 _HANDLERS = {
     "set_output": _set_output,
+    "toggle_mute": _toggle_mute,
     "set_input_mute": _set_input_mute,
     "set_speaker_sleep": _set_speaker_sleep,
     "set_spdif_level": _set_spdif_level,

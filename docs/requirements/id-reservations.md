@@ -36,5 +36,6 @@ truth for what each id means.
 | 2026-11-05 | The relay settle and the desktop's S/PDIF level (branch `panel-owner-items-2026-11-05`) | SR-143..145; LLR-1440..1447; TC-1659..1667 (used: all) |
 | 2026-11-06 | Hub-to-panel door events: the hub detector's feed and the image's source/port credentials (branch `hub-door-feed`; the panel half is OfficeWallNaglight's, HomeHub open-items A78) | SR-146..147; LLR-1448..1459; TC-1668..1685; IF-079 (used: SR-146..147, LLR-1448..1457, TC-1668..1685, IF-079; LLR-1458..1459 unused) |
 | 2026-11-06 | Door clip storage on the media drive: ensure, guard, quota, Clips share support, the move off scratch, a dropped drive (branch `clips-media-drive`; HomeHub media plan) | SR-148..149; LLR-1460..1475; TC-1686..1705 (used: SR-148..149, LLR-1460..1475, TC-1686..1700; IF-077 amended, SR-131 and LLR-1370 amended) |
+| 2026-11-07 | The USB audio adapter's Mute / Volume buttons: rocker-only swap, timed holds, Mute as a toggle that restores the mic, replug re-enumeration (branch `adapter-volume-buttons`) | SR-150; LLR-1476..1480; TC-1706..1715 (used: SR-150, LLR-1476..1478, TC-1706..1713) |
 
 The plan is HomeHub `docs/archive/2026-10-23/IMPLEMENTATION_PLAN_2026-10-22.md`.

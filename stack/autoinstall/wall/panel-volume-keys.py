@@ -143,7 +143,41 @@ HOLD_GAP_S = 0.250
 # volume control can be wrong, so the two keycodes are swapped here. This is a
 # property of how the panel hangs, not of the hardware: if it is ever remounted
 # the right way up, set this back to False rather than rewiring anything.
+#
+# THE SIDE ROCKER ONLY (2026-11-07). This used to apply to every device, which
+# was harmless while the rocker was the only one that ever pressed anything.
+# The USB audio adapter's buttons report KEY_VOLUMEUP for the button marked +
+# (captured from the hardware 2026-11-07), so swapping them too would make its
+# + button turn the room down. See `device_kind`.
 SWAP_FOR_PANEL_ORIENTATION = True
+
+# TWO KINDS OF VOLUME KEY, AND THEY MUST BE COUNTED DIFFERENTLY (2026-11-07).
+#
+#   KIND_ROCKER  the side rocker: the keyboard controller's firmware sends
+#                whole press/release PAIRS ~106 ms apart while it is held, so
+#                each release is one complete pulse (PulsePlanner below).
+#   KIND_HELD    everything else -- the USB audio adapter's buttons, a USB
+#                keyboard. A press stays down until the finger lifts. Captured
+#                from the adapter 2026-11-07: a 1.8 s hold is ONE press and ONE
+#                release with nothing between (no EV_REP at all; a keyboard
+#                would add kernel autorepeats, which are ignored either way).
+#                Counted on the rocker's rule that is 5% however long it is
+#                held, so for these the hold is TIMED here instead: one step on
+#                the press, then -- once held past HELD_REPEAT_DELAY_S -- one
+#                step every HELD_REPEAT_PERIOD_S, the rocker's own measured
+#                pulse period, so a hold feels the same on either control
+#                (Owner, 2026-11-07: "match the side rocker").
+#
+# The adapter's taps measured 288-320 ms press-to-release, which is why the
+# delay is half a second: shorter, and an ordinary tap would earn three steps.
+KIND_ROCKER = "rocker"
+KIND_HELD = "held"
+HELD_REPEAT_DELAY_S = 0.500
+HELD_REPEAT_PERIOD_S = 0.106
+# The rocker is the i8042 keyboard controller's port (`isa0060/serio0` on the
+# panel). Matched by phys, not by name: the name is the generic "AT Translated
+# Set 2 keyboard" and the phys is the wiring, which is what the swap is about.
+ROCKER_PHYS_PREFIX = "isa0060/serio"
 
 # THE OWNER'S SPECIFICATION, AS AMENDED 2026-09-18 (strategy B):
 #
@@ -285,6 +319,23 @@ def find_devices():
     return found
 
 
+def device_kind(path, sys_class_input="/sys/class/input"):
+    """KIND_ROCKER for the side rocker's port, KIND_HELD for anything else.
+
+    An unreadable phys is KIND_HELD: the rocker's port always has one, and
+    getting it wrong the other way would swap a device that is not mounted
+    upside down.
+    """
+    phys_file = os.path.join(sys_class_input, os.path.basename(path),
+                             "device", "phys")
+    try:
+        with open(phys_file) as fh:
+            phys = fh.read().strip()
+    except OSError:
+        return KIND_HELD
+    return KIND_ROCKER if phys.startswith(ROCKER_PHYS_PREFIX) else KIND_HELD
+
+
 def _run(card, args):
     """Best-effort amixer call. A failed volume nudge must never kill the daemon."""
     try:
@@ -357,6 +408,63 @@ class PulsePlanner:
         self.open = False       # is a gesture in progress
         self.contact = None     # the last pulse edge the DEVICE sent
         self.pulses = 0         # break pulses counted in this gesture
+        # A KIND_HELD key that is down right now: (louder, when the next timed
+        # step is due), or None. See `hold`.
+        self.holding = None
+
+    def hold(self, louder, now):
+        """Take a KIND_HELD key going down: (opened, signed percents).
+
+        The press itself is the first step -- a held key sends nothing more
+        until it is let go, so this is the only edge a tap has. `opened` is
+        `press`'s answer, the caller's cue to capture a baseline. Further steps
+        are timed by `due`; the gesture stays open for as long as the key is
+        down, however long that is, because no quiet gap can mean "let go" for
+        a device that is silent while it is held.
+
+        A key that was ALREADY held (a second button pressed over the first)
+        is paid what it earned up to this press before it is replaced, for the
+        same reason `let_go` pays first.
+        """
+        owed = self.due(now)
+        opened = self.press(now)
+        self.holding = (louder, now + HELD_REPEAT_DELAY_S)
+        return opened, owed + [self.release(louder, now)]
+
+    def let_go(self, louder, now):
+        """Take a KIND_HELD key coming up: the steps it earned before `now`.
+
+        Only the key that is HELD can be let go. With + down, then - pressed
+        over it, the hold is now -'s; +'s release must not stop it (review,
+        2026-11-07), so a release in the other direction is ignored here.
+
+        The release adds no step of its own, and the gap runs from here. But it
+        PAYS FIRST (Codex Sol, 2026-11-07): `now` is the kernel's timestamp of
+        the release, and a loop that woke late can drain the release before
+        `due` ran -- a 650 ms hold whose repeats at 500 and 606 ms were never
+        charged would move 5% instead of 15%, so the hold's speed would depend
+        on how busy the loop was.
+        """
+        if self.holding is None or self.holding[0] != louder:
+            return []
+        owed = self.due(now)
+        self.holding = None
+        if self.open:
+            self.contact = now
+        return owed
+
+    def due(self, now):
+        """The signed steps a held key has earned by `now`, oldest first.
+
+        Each is stamped at the moment it fell due rather than at `now`, so a
+        loop that woke late pays what it owes and no more.
+        """
+        steps = []
+        while self.holding is not None and self.open and now >= self.holding[1]:
+            louder, at = self.holding
+            steps.append(self.release(louder, at))
+            self.holding = (louder, at + HELD_REPEAT_PERIOD_S)
+        return steps
 
     def press(self, now):
         """Take a make. Opens a gesture if none is open; earns nothing.
@@ -400,6 +508,8 @@ class PulsePlanner:
         three attempts. There is no debt here: every step was handed out whole
         at the moment its pulse arrived, so quiet means over.
         """
+        if self.holding is not None:
+            return False
         if not self.open or now - self.contact <= self.gap:
             return False
         self.open = False
@@ -409,6 +519,7 @@ class PulsePlanner:
         """Drop the gesture outright: the device vanished, so there is no doubt."""
         self.open = False
         self.contact = None
+        self.holding = None
 
     def held(self):
         return self.open
@@ -424,6 +535,8 @@ class PulsePlanner:
         """
         if not self.open:
             return None
+        if self.holding is not None:
+            return max(0.0, min(LOOP_WAKE_S, self.holding[1] - now))
         return max(0.0, min(LOOP_WAKE_S, self.contact + self.gap - now))
 
 
@@ -1090,6 +1203,65 @@ class Gesture:
         return self.terminal_at is None and now - self.started > GESTURE_TIMEOUT_S
 
 
+# A switch of output is a whole apply -- units stopped and started, mixers
+# re-asserted -- so the reply can take longer than a volume step. The socket
+# side gives the applier 20 s; this waits a little longer so a slow but
+# successful toggle is not journalled as lost.
+MUTE_TOGGLE_TIMEOUT_S = 25
+# Toggles that may wait behind the one in flight. Two presses are a real
+# request (mute, then back), so two are kept; a third press while two are
+# still waiting is dropped and said out loud rather than queued without bound.
+MUTE_TOGGLE_QUEUE = 2
+
+
+class MuteToggler:
+    """Send the adapter's Mute button to the applier, OFF the input loop.
+
+    The key used to be inert in bus mode: mute became a position of the
+    on-glass switch, and a one-way `set mute` from a key that could not undo it
+    would strand the panel silent for anyone not standing at it. The Owner
+    asked for the button to work (2026-11-07) and chose a TOGGLE whose second
+    press returns to the previous position with the microphone as it was. The
+    applier owns that decision (`toggle_mute` in wall_audio_state.py); this only
+    delivers the press, as fixed bytes that carry no choice of their own.
+    """
+
+    def __init__(self, socket_path=VOLUME_SOCKET, timeout=MUTE_TOGGLE_TIMEOUT_S):
+        self.backend = BusBackend(socket_path, timeout)
+        self.pending = queue.Queue(maxsize=MUTE_TOGGLE_QUEUE)
+        self.thread = None
+
+    def request(self):
+        """Queue one toggle; False if it had to be dropped."""
+        try:
+            self.pending.put_nowait(True)
+        except queue.Full:
+            print("mute button: %d toggles already waiting; this press dropped"
+                  % MUTE_TOGGLE_QUEUE, file=sys.stderr, flush=True)
+            return False
+        if self.thread is None:
+            self.thread = threading.Thread(target=self._serve, name="mute-toggle",
+                                           daemon=True)
+            self.thread.start()
+        return True
+
+    def _serve(self):
+        while True:
+            self.pending.get()
+            answer = self.backend._round_trip(b"mute-toggle")
+            if answer != b"ok\n":
+                print("mute button: applier answered %r" % (answer,),
+                      file=sys.stderr, flush=True)
+
+
+def _charge(gesture, actor, percent):
+    """Fold one signed step into the gesture and hand its target to the actor."""
+    if percent and gesture is not None:
+        level = gesture.pulse(percent)
+        if level is not None and actor is not None:
+            actor.request(level)
+
+
 def _open_devices(paths):
     """Every readable volume-key device, with its timestamp fallback marker."""
     handles, monotonic = {}, {}
@@ -1123,8 +1295,12 @@ def main():
     poller = select.poll()
     for handle in handles:
         poller.register(handle, select.POLLIN)
+    kinds = {handle: device_kind(path) for handle, path in handles.items()}
+    for handle, path in sorted(handles.items(), key=lambda item: item[1]):
+        print("watching %s (%s)" % (path, kinds[handle]), file=sys.stderr, flush=True)
 
     planner = PulsePlanner()
+    muter = MuteToggler()
     preview = GesturePreview()
     # ANY DOCUMENT HERE AT STARTUP IS NOT OURS, and it has to go (terra,
     # 2026-09-19). RuntimeDirectoryPreserve=yes keeps the directory across a
@@ -1224,6 +1400,7 @@ def main():
                 os.close(handle)
                 del handles[handle]
                 monotonic.pop(handle, None)
+                kinds.pop(handle, None)
                 # A rocker cannot still be held on a device that just vanished.
                 planner.cancel()
                 if gesture is not None and gesture.live():
@@ -1235,8 +1412,23 @@ def main():
                     _close_wakeup(poller, wake_read, wake_write)
                     return 69
                 continue
+            kind = kinds.get(handle, KIND_HELD)
             for code, value, when in _drain(handle, monotonic[handle]):
-                if code in (KEY_VOLUMEUP, KEY_VOLUMEDOWN):
+                if code in (KEY_VOLUMEUP, KEY_VOLUMEDOWN) and kind == KIND_HELD:
+                    # A key that stays down: one step on the press, the rest
+                    # timed by the planner (`due`, below), nothing on the
+                    # release. Kernel autorepeats (a USB keyboard) are ignored:
+                    # the timing here is the only repeat that counts.
+                    if value == KEY_PRESS:
+                        opened, steps = planner.hold(code == KEY_VOLUMEUP, when)
+                        if opened:
+                            gesture, actor = _begin(preview, actor, gesture)
+                        for percent in steps:
+                            _charge(gesture, actor, percent)
+                    elif value == KEY_RELEASE:
+                        for percent in planner.let_go(code == KEY_VOLUMEUP, when):
+                            _charge(gesture, actor, percent)
+                elif code in (KEY_VOLUMEUP, KEY_VOLUMEDOWN):
                     louder = (code == KEY_VOLUMEUP)
                     if SWAP_FOR_PANEL_ORIENTATION:
                         louder = not louder
@@ -1249,23 +1441,16 @@ def main():
                         # complete contact pulse the firmware really produced
                         # -- so each one is 5%, including the first. It is NOT
                         # "the finger came up"; only the quiet gap says that.
-                        percent = planner.release(louder, when)
-                        if percent and gesture is not None:
-                            level = gesture.pulse(percent)
-                            if level is not None and actor is not None:
-                                actor.request(level)
+                        _charge(gesture, actor, planner.release(louder, when))
                     # KEY_AUTOREPEAT is accepted and ignored. This rocker never
                     # sends one, but an attached USB keyboard would, and its
                     # repeats must not be charged as steps either.
                 elif value != KEY_PRESS:
                     continue
                 elif code == KEY_MUTE and current_mode() == "bus":
-                    # DELIBERATELY INERT IN BUS MODE, and said out loud. Mute is
-                    # a position of the on-glass switch now, and a one-way
-                    # `set mute` from a key that cannot un-mute would strand the
-                    # panel silent for anyone not standing at it.
-                    print("mute key ignored in bus mode: use the on-glass switch",
-                          file=sys.stderr, flush=True)
+                    # A TOGGLE IN BUS MODE since 2026-11-07 (it was inert: a
+                    # one-way mute would strand the panel). See MuteToggler.
+                    muter.request()
                 elif code == KEY_MUTE:
                     # NOTE: the switch is joined across all channels, so this
                     # silences the trigger line too and the amplifier will power
@@ -1273,6 +1458,11 @@ def main():
                     # daemon gets to make separately.
                     card, control, _ = target()
                     _run(card, ["-q", "sset", control, "toggle"])
+
+        # A HELD KEY'S TIMED STEPS, after the drain so a release that has
+        # already arrived stops them first.
+        for percent in planner.due(time.monotonic()):
+            _charge(gesture, actor, percent)
 
         # The quiet gap. Done AFTER the drain, so a pulse that has already
         # arrived is always counted before the gesture is declared over, and

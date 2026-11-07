@@ -1,0 +1,17 @@
+# The USB audio adapter's BUTTONS, re-enumerated when it comes back (2026-11-07).
+#
+# The adapter (C-Media 0d8c:0102, the ICUSBAUDIO7D) carries a HID interface with
+# Mute / Volume- / Volume+, and wall-volume-keys reads it. That daemon enumerates
+# its devices ONCE, at startup, and its sandbox (RestrictAddressFamilies=AF_UNIX)
+# cannot listen for uevents itself -- so a replugged adapter, or a hub moved to
+# another port, came back with its buttons dead until the next reboot.
+#
+# A try-restart on the input node's arrival re-enumerates. It does nothing when
+# the daemon is not running, and a restart during coldplug costs nothing.
+#
+# A SEPARATE FILE FROM 90-wall-audio-adapter.rules ON PURPOSE. That file must
+# never say ACTION=="add" (its tag and alias go stale on the next non-add event,
+# and a test holds the line); this is the opposite case, an action taken once
+# per arrival, so it lives where that rule is not in force.
+ACTION=="add", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{idVendor}=="0d8c", ATTRS{idProduct}=="0102", \
+    RUN+="/usr/bin/systemctl --no-block try-restart wall-volume-keys.service"

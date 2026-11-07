@@ -1642,6 +1642,13 @@ if [ -f "$PAYLOAD/91-wall-headset-adapter.rules" ]; then
     udevadm control --reload-rules >/dev/null 2>&1 || true
     udevadm trigger --subsystem-match=sound >/dev/null 2>&1 || true
 fi
+# The 5.1 adapter's buttons (2026-11-07): restart wall-volume-keys when the
+# adapter's input node arrives, so a replug does not leave them dead. No
+# trigger: an adapter already present was enumerated by the daemon at start.
+if [ -f "$PAYLOAD/92-wall-volume-keys.rules" ]; then
+    install -m 0644 "$PAYLOAD/92-wall-volume-keys.rules" /etc/udev/rules.d/92-wall-volume-keys.rules
+    udevadm control --reload-rules >/dev/null 2>&1 || true
+fi
 if [ -f "$PAYLOAD/99-wall-amp-lcus2.rules" ]; then
     install -m 0644 "$PAYLOAD/99-wall-amp-lcus2.rules" /etc/udev/rules.d/99-wall-amp-lcus2.rules
     udevadm control --reload-rules >/dev/null 2>&1 || true

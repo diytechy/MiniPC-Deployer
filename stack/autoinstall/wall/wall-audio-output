@@ -2227,6 +2227,11 @@ def event_from_arguments(arguments):
     """
     if arguments.command == "set":
         return {"kind": "set_output", "output": arguments.value}
+    if arguments.command == "mute-toggle":
+        # The USB adapter's hardware Mute button, via the volume socket. It is
+        # deliberately NOT in ALLOWED_REQUEST_KINDS: the glass has its own Mute
+        # position, and the renderer has no business un-muting a microphone.
+        return {"kind": "toggle_mute"}
     if arguments.command == "input-mute":
         return {"kind": "set_input_mute", "muted": arguments.value == "on"}
     if arguments.command == "speaker-sleep":
@@ -2439,7 +2444,8 @@ def main(argv=None):
                         help="the trim values file (a test seam)")
     parser.add_argument("--trim-conf", default=None,
                         help="the rendered ALSA trim file (a test seam)")
-    parser.add_argument("command", choices=("status", "set", "input-mute",
+    parser.add_argument("command", choices=("status", "set", "mute-toggle",
+                                            "input-mute",
                                             "speaker-sleep", "spdif-level",
                                             "volume", "headset",
                                             "apply-state", "apply-request",
@@ -2500,6 +2506,8 @@ def main(argv=None):
                 or not policy.valid_spdif_level(int(arguments.value)):
             parser.error("spdif-level takes a whole number of dB in %d..%d"
                          % (policy.SPDIF_LEVEL_MIN_DB, policy.SPDIF_LEVEL_MAX_DB))
+    if arguments.command == "mute-toggle" and arguments.value is not None:
+        parser.error("mute-toggle takes no argument")
     if arguments.command == "volume":
         if arguments.value is None or not _volume_value_is_valid(arguments.value):
             parser.error("volume takes 0..100, up, down, up:PCT, down:PCT, "

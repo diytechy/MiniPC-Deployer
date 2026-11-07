@@ -368,6 +368,11 @@ to this file plus volume-aware thresholds in the detector.
 than mapping to the Mute position — a one-way mute from a key that cannot un-mute would strand the
   panel silent for anyone not standing at it. Step 5 gives the state a
   previous-output memory and the key a real toggle.
+  **Done 2026-11-07 (SR-150, branch `adapter-volume-buttons`):** the USB
+  adapter's Mute button is the key that needed it. The state carries
+  `mute_return`, and `KEY_MUTE` in bus mode is a toggle whose second press
+  returns to the recorded position with the microphone as it was (the Owner's
+  "toggle, mic follows"); leaving Mute from the glass still keeps the mic muted.
 
 ## Things the first review caught, and where they landed
 

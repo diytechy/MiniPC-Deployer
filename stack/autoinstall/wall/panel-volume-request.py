@@ -100,7 +100,8 @@ def handle_request(data, apply, capture=None):
     Inputs: bytes; apply(argv) returns an exit code. Unknown requests perform
     no action. Outputs: fixed ASCII success/error line. Implements: LLR-014.
 
-    Four spellings, and NOTHING ELSE reaches the applier:
+    Five spellings, and NOTHING ELSE reaches the applier (the fifth,
+    b"mute-toggle\\n", is the adapter's Mute button; see below):
       b"set:T:MODE:OUT:EXPECT:REV\n"
                                    ONE ABSOLUTE LEVEL, applied only while the
                                    mode, output, level and state revision it
@@ -128,6 +129,12 @@ def handle_request(data, apply, capture=None):
     """
     if data in (b"up\n", b"down\n"):
         return b"ok\n" if apply(["volume", data[:-1].decode("ascii")]) == 0 else b"error\n"
+    # THE FIFTH SPELLING (Owner, 2026-11-07): the USB adapter's Mute button.
+    # Exact bytes, a fixed argv, no parameter at all -- the applier decides
+    # which way it goes from its own state, so nothing the caller says can
+    # choose to open a microphone.
+    if data == b"mute-toggle\n":
+        return b"ok\n" if apply(["mute-toggle"]) == 0 else b"error\n"
     if not data.endswith(b"\n") or len(data) > MAX_REQUEST:
         return b"error\n"
     # THE GUARDED FORM IS ANSWERED DIFFERENTLY, and it has to be: its whole

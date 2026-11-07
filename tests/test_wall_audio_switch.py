@@ -640,10 +640,14 @@ def test_the_rocker_asks_the_switch_rather_than_a_card_in_bus_mode_ruling_f_sr02
     assert 'payload = ("set:%d:%s:%s:%d:%d"' in keys
     assert "def make_backend():" in keys
     assert 'return BusBackend() if mode == "bus" else PhysicalBackend(mode)' in keys
-    # The mute key is inert in bus mode until the switch has a previous-output
+    # The mute key WAS inert in bus mode until the switch had a previous-output
     # memory (step 5); a one-way mute from a key that cannot un-mute would
-    # strand the panel silent for anyone not standing at it.
-    assert "mute key ignored in bus mode" in keys
+    # strand the panel silent for anyone not standing at it. Since 2026-11-07
+    # the state carries `mute_return`, so the key is a TOGGLE, sent as fixed
+    # bytes that only the applier interprets.
+    assert "mute key ignored in bus mode" not in keys
+    assert 'self.backend._round_trip(b"mute-toggle")' in keys
+    assert "muter.request()" in keys
 
 
 # ── the broker's half of the switch ────────────────────────────────────────

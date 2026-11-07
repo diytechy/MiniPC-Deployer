@@ -261,9 +261,12 @@ PATH="$W/bin:$PATH" FSTAB_FILE="$W/fstab" NO_REMOUNT_FILE="$W/no-such" /bin/bash
 g_back="$(nocap "$PY" "$W/h.py" "$CLIPS" "$W/env" guard)"
 back_sums="$(cd /srv/media/Clips/door 2>/dev/null && sha256sum */*.mp4 | sort)"
 /bin/bash "$SAMBA/library-guard.sh" --check Clips --library /srv/media >/dev/null 2>&1; rc_share=$?
-if [ "$rc" = 0 ] && grep -q 'start srv-media.mount' "$W/systemctl.log" && [ "$g_back" = ok ] && [ "$back_sums" = "$moved_sums" ] && [ "$rc_share" = 0 ]; then
+# One line: the dead mount was detached. A mount stacked over it would pass everything
+# else here, and on the hub systemd would call the unit active and start nothing.
+lines="$(grep -c ' /srv/media ' /proc/self/mountinfo)"
+if [ "$rc" = 0 ] && [ "$lines" = 1 ] && grep -q 'start srv-media.mount' "$W/systemctl.log" && [ "$g_back" = ok ] && [ "$back_sums" = "$moved_sums" ] && [ "$rc_share" = 0 ]; then
     ok "15 returned as $NEW: reattached through the unit, the guard and the share pass, the clips are intact"
-else bad "15 reattach: rc=$rc guard='$g_back' share=$rc_share $(tail -3 "$W/15.log")"; fi
+else bad "15 reattach: rc=$rc lines=$lines guard='$g_back' share=$rc_share $(tail -3 "$W/15.log")"; fi
 
 # 16 I/O errors on a live mount. errors=remount-ro: the kernel says "Remounting
 # filesystem read-only" and shuts ext4 down WITHOUT setting the flag, so mountinfo

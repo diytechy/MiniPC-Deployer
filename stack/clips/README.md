@@ -515,7 +515,7 @@ is the merged MiniPC-Deployer revision and `<hub>` the hub's address.
 
    ```sh
    grep -c '^/srv/media' /etc/homehub-samba/drive-identity.conf   # 1. If 0, and only then:
-   sudo install -m 0644 /tmp/drive-identity.conf /etc/homehub-samba/drive-identity.conf
+   sudo sh -c 'cat /tmp/drive-identity.conf >/etc/homehub-samba/drive-identity.conf'
    ```
 
 3. The folder, account and quota, with `CLIPS_ROOT` still on scratch.
@@ -538,7 +538,7 @@ is the merged MiniPC-Deployer revision and `<hub>` the hub's address.
    ```sh
    sudo diff /etc/homehub-samba/smb.conf.fragment /tmp/smb.conf.fragment   # the header's hash and [Clips], nothing else
    sudo cp -a /etc/samba/smb.conf /etc/samba/smb.conf.pre-clips
-   sudo install -m 0644 /tmp/smb.conf.fragment /etc/homehub-samba/smb.conf.fragment
+   sudo sh -c 'cat /tmp/smb.conf.fragment >/etc/homehub-samba/smb.conf.fragment'   # keeps its owner and mode
    sudo sh -c "sed -n '/^\[Clips\]/,\$p' /etc/homehub-samba/smb.conf.fragment >>/etc/samba/smb.conf"
    testparm -s --section-name=Clips 2>/dev/null   # path, force user, read only, valid users, root preexec
    sudo smbcontrol smbd reload-config
@@ -546,6 +546,7 @@ is the merged MiniPC-Deployer revision and `<hub>` the hub's address.
 
    Anything else in the diff, or a `testparm` complaint: restore `smb.conf.pre-clips`,
    reload, and stop. `Backup` and the backup itself are not touched: this is a reload.
+   Then `rm /tmp/smb.conf.fragment /tmp/drive-identity.conf`.
 
 5. The switch. Events keep queueing while the timers are stopped, and are cut afterwards.
 

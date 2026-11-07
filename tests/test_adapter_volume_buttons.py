@@ -360,6 +360,10 @@ def test_a_replugged_adapter_restarts_the_daemon_tc1713():
     firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
     assert ('install -m 0644 "$PAYLOAD/92-wall-volume-keys.rules" '
             '/etc/udev/rules.d/92-wall-volume-keys.rules') in firstboot
+    # A paired release runs firstboot against a RUNNING daemon; enable alone
+    # would leave the old key reader in place until a reboot, unlike an image.
+    keys_block = firstboot.split('case "${WALL_VOLUME_KEYS_ENABLED:-true}" in', 1)[1].split("esac", 1)[0]
+    assert "systemctl try-restart wall-volume-keys.service" in keys_block
     # The adapter's own rule keeps its never-add invariant.
     adapter = (WALL / "90-wall-audio-adapter.rules").read_text(encoding="utf-8")
     assert "wall-volume-keys" not in adapter

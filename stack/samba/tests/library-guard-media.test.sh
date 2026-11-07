@@ -94,6 +94,30 @@ if run_guard --reattach --library /srv/media --label media; then fail 'no fstab 
 [ ! -s "$TMP/actions" ] || fail 'it mounted with no fstab row: this never guesses a device'
 cp "$TMP/fstab.keep" "$TMP/fstab"
 
+# --reattach serves /srv/media and nothing else, whatever is asked of it
+for target in /srv/library /mnt/backup-drive /mnt/backup-old /srv/media/ /srv/media/Clips /srv/media/../library /srv; do
+    fresh
+    printf '24 22 8:2 / %s rw - ext4 /dev/sdd1 rw\n' "$target" >"$TMP/mountinfo"   # stale: no 8:2 in sysfs
+    printf 'LABEL=X %s ext4 nofail 0 2\n' "$target" >"$TMP/fstab"
+    set +e
+    run_guard --reattach --library "$target"; rc=$?
+    set -e
+    [ "$rc" = 2 ] || fail "--reattach on $target exited $rc, not 2"
+    grep -q 'REFUSED --reattach' "$TMP/out" || fail "--reattach on $target did not say it refused"
+    [ ! -s "$TMP/actions" ] || fail "--reattach on $target acted: $(cat "$TMP/actions")"
+done
+cp "$TMP/fstab.keep" "$TMP/fstab"
+fresh
+printf '24 22 8:2 / /srv/library rw - ext4 /dev/sdd1 rw\n' >"$TMP/mountinfo"
+printf 'LABEL=Library /srv/library ext4 nofail 0 2\n' >"$TMP/fstab"
+set +e
+run_guard --reattach; rc=$?                                   # the default is the library
+LIBRARY_ROOT=/srv/library run_guard --reattach; rc_env=$?     # and so is the environment's
+set -e
+[ "$rc" = 2 ] && [ "$rc_env" = 2 ] || fail "--reattach with no --library exited $rc and $rc_env, not 2"
+[ ! -s "$TMP/actions" ] || fail "--reattach with no --library acted: $(cat "$TMP/actions")"
+cp "$TMP/fstab.keep" "$TMP/fstab"
+
 # --report stays the library's alone
 fresh; mounted
 set +e

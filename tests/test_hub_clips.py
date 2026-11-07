@@ -12,7 +12,7 @@ What does not: real ffmpeg and VA-API. The integration test at the bottom
 (TC-1569, release tier) cuts real recorded segments through the pinned image
 when HOMEHUB_CLIPS_SEGMENTS names a directory of them and docker answers;
 VA-API is measured on the hub (stack/clips/README.md, deploy steps).
-Implements: TC-1541, TC-1542, TC-1551..TC-1566, TC-1568, TC-1569, TC-1686..TC-1693.
+Implements: TC-1541, TC-1542, TC-1551..TC-1566, TC-1568, TC-1569, TC-1686..TC-1693, TC-1698, TC-1699.
 """
 
 from __future__ import annotations
@@ -1863,7 +1863,7 @@ def test_tc1691_the_plan_moves_nothing_and_needs_clips_root_switched_first(tmp_p
     report = hc.move_from_scratch(settings, False, quota_fn=lambda: (None, None))
     assert report["clips"] == 1 and report["moved"] == 0 and report["left"] == 1 and clip.exists()
     assert not (new / "door").exists()
-    with pytest.raises(hc.Invalid, match="CLIPS_ROOT must be"):
+    with pytest.raises(hc.Invalid, match="can only move to"):
         hc.move_from_scratch(hc.ClipsSettings({}), True, quota_fn=lambda: (None, None))
     assert clip.exists()
 
@@ -1945,25 +1945,6 @@ def test_tc1691_a_move_that_would_not_fit_moves_nothing(tmp_path, monkeypatch):
     assert clip.exists() and not (new / "door").exists()
 
 
-def test_tc1691_the_verb_keeps_the_units_umask_and_says_how_to_run_it(tmp_path, monkeypatch, capsys):
-    settings, old, new = move_setup(tmp_path, monkeypatch)
-    old_clip(old)
-    env = tmp_path / "env"
-    env.write_text("CLIPS_ROOT=%s\n" % new)
-    monkeypatch.setattr(hc, "guard", lambda s: (False, "this process holds CAP_SYS_RESOURCE, which ignores quota hard limits"))
-    argv = ["--env-file", str(env), "--state-dir", str(tmp_path / "s"), "move-from-scratch"]
-    assert hc.main(argv + ["--apply"]) == hc.EXIT_GUARD
-    assert "systemd-run" in capsys.readouterr().out
-    assert hc.main(argv) == 0 and json.loads(capsys.readouterr().out)["clips"] == 1
-    monkeypatch.setattr(hc, "guard", lambda s: (True, "ok"))
-    masks = []
-    real = hc.os.umask
-    monkeypatch.setattr(hc.os, "umask", lambda m: masks.append(m) or real(m))
-    monkeypatch.setattr(hc, "clips_quota", lambda s: (None, None))
-    assert hc.main(argv + ["--apply"]) == 0 and 0o027 in masks
-    real(0o022)
-
-
 def test_tc1691_nothing_a_clip_is_known_by_names_the_root_so_a_moved_clip_is_not_cut_again(tmp_path, monkeypatch):
     state, seg_dir = str(tmp_path / "state"), str(tmp_path / "segs")
     settings, old, new = move_setup(tmp_path, monkeypatch)
@@ -1991,6 +1972,257 @@ def test_tc1691_nothing_a_clip_is_known_by_names_the_root_so_a_moved_clip_is_not
     assert hc.move_from_scratch(settings, True, quota_fn=lambda: (None, None))["moved"] == 1
     assert hc.cut_camera(settings, cam, state, T0 + 120000)["cut"] == 0     # the ledger still knows it
     assert len(hc.list_clips(str(new))) == 1
+
+
+# ── TC-1698 the index across a broken move ───────────────────────────────────
+
+
+def test_tc1698_a_failed_rebuild_is_a_failed_move_and_the_retry_with_no_source_repairs_it(tmp_path, monkeypatch):
+    settings, old, new = move_setup(tmp_path, monkeypatch)
+    clip = old_clip(old)
+    real = hc.rebuild_index
+    monkeypatch.setattr(hc, "rebuild_index", lambda cam_dir: False)
+    with pytest.raises(hc.MoveFailed, match="could not be rebuilt"):
+        hc.move_from_scratch(settings, True, quota_fn=lambda: (None, None))
+    marker, index = new / "door" / hc.INDEX_DIRTY, new / "door" / "index.jsonl"
+    assert not clip.exists() and marker.exists() and not index.exists()    # the clip moved, the debt is on disk
+    monkeypatch.setattr(hc, "rebuild_index", real)
+    report = hc.move_from_scratch(settings, True, quota_fn=lambda: (None, None))
+    assert report["clips"] == 0 and report["indexes_repaired"] == 1
+    assert not marker.exists() and "2026-11-06/" + clip.name in index.read_text()
+
+
+def test_tc1698_the_marker_is_on_disk_before_the_first_clip_moves(tmp_path, monkeypatch):
+    settings, old, new = move_setup(tmp_path, monkeypatch)
+    old_clip(old)
+    seen = []
+    real = hc.move_one
+    monkeypatch.setattr(hc, "move_one", lambda *a: seen.append((new / "door" / hc.INDEX_DIRTY).exists()) or real(*a))
+    hc.move_from_scratch(settings, True, quota_fn=lambda: (None, None))
+    assert seen == [True]
+
+
+def test_tc1698_no_marker_no_move(tmp_path, monkeypatch):
+    settings, old, new = move_setup(tmp_path, monkeypatch)
+    clip = old_clip(old)
+    monkeypatch.setattr(hc, "persist_index_dirty", lambda cam_dir: (_ for _ in ()).throw(OSError(30, "read-only")))
+    with pytest.raises(OSError):
+        hc.move_from_scratch(settings, True, quota_fn=lambda: (None, None))
+    assert clip.exists() and hc.list_clips(str(new)) == []
+
+
+def test_tc1698_a_move_stopped_part_way_leaves_the_marker_and_the_next_run_clears_it(tmp_path, monkeypatch):
+    settings, old, new = move_setup(tmp_path, monkeypatch)
+    old_clip(old)
+    old_clip(old, stem="door_2026-11-07_08-00-00-0600_approach_11s", day="2026-11-07")
+    real = hc.move_one
+    calls = []
+
+    def stop(*a):
+        if calls:
+            raise OSError(5, "I/O error")
+        calls.append(1)
+        return real(*a)
+    monkeypatch.setattr(hc, "move_one", stop)
+    with pytest.raises(OSError):
+        hc.move_from_scratch(settings, True, quota_fn=lambda: (None, None))
+    assert (new / "door" / hc.INDEX_DIRTY).exists()
+    monkeypatch.setattr(hc, "move_one", real)
+    assert hc.move_from_scratch(settings, True, quota_fn=lambda: (None, None))["left"] == 0
+    assert not (new / "door" / hc.INDEX_DIRTY).exists()
+    assert len((new / "door" / "index.jsonl").read_text().splitlines()) == 2
+
+
+def test_tc1698_a_marker_that_will_not_go_fails_the_move(tmp_path, monkeypatch):
+    settings, old, new = move_setup(tmp_path, monkeypatch)
+    old_clip(old)
+    real = hc._remove
+    monkeypatch.setattr(hc, "_remove", lambda p: False if p.endswith(hc.INDEX_DIRTY) else real(p))
+    with pytest.raises(hc.MoveFailed, match="could not be removed"):
+        hc.move_from_scratch(settings, True, quota_fn=lambda: (None, None))
+
+
+def test_tc1698_a_refused_guard_at_the_repair_keeps_the_marker(tmp_path, monkeypatch):
+    settings, old, new = move_setup(tmp_path, monkeypatch)
+    old_clip(new)
+    (new / "door" / hc.INDEX_DIRTY).write_text("")
+    monkeypatch.setattr(hc, "guard", lambda s: (False, "the drive dropped"))
+    with pytest.raises(hc.GuardStop):
+        hc.repair_dirty_indexes(settings)
+    assert (new / "door" / hc.INDEX_DIRTY).exists()
+
+
+# ── TC-1699 the switch: one unit that cannot leave cutting stopped ───────────
+
+
+def switch_setup(tmp_path, monkeypatch, clips=2):
+    settings, old, new = move_setup(tmp_path, monkeypatch)
+    state = tmp_path / "state"
+    state.mkdir()
+    env = tmp_path / "env"
+    env.write_bytes(b"SECRET=$$keep\nCLIPS_ENABLED=true\nCLIPS_ROOT=%s\n"
+                    b'HOMEHUB_DISK_MOUNTS="/ /boot /srv/scratch"\nZ=last\n' % str(old).encode())
+    monkeypatch.setattr(hc, "clips_quota", lambda s: (None, None))
+    for i in range(clips):
+        old_clip(old, stem="door_2026-11-06_09-0%d-00-0600_approach_11s" % i)
+    scratch_settings = hc.ClipsSettings({"CLIPS_ROOT": str(old)})
+    return scratch_settings, old, new, state, env
+
+
+def run_verb(env, state, *extra):
+    return hc.main(["--env-file", str(env), "--state-dir", str(state), "switch-to-media"] + list(extra))
+
+
+def result(state):
+    return json.loads((state / hc.SWITCH_RESULT).read_text())
+
+
+def test_tc1699_it_moves_verifies_and_writes_the_env_last_in_place_and_backed_up(tmp_path, monkeypatch, capsys):
+    _s, old, new, state, env = switch_setup(tmp_path, monkeypatch)
+    original = env.read_bytes()
+    inode = os.stat(str(env)).st_ino
+    old_clip(new, stem="door_2026-11-06_10-00-00-0600_approach_12s", body=b"cut there already")
+    assert run_verb(env, state) == 0
+    r = result(state)
+    assert r["state"] == "done" and r["ok"] is True and r["left"] == 0
+    assert (r["source_before"], r["drive_before"], r["drive_after"]) == (2, 1, 3)      # counted live, not assumed
+    assert os.stat(str(env)).st_ino == inode
+    text = env.read_bytes()
+    assert hc.mc.read_env_file(str(env))["CLIPS_ROOT"] == str(new)
+    assert b'HOMEHUB_DISK_MOUNTS="/ /boot /srv/scratch /srv/media"\n' in text
+    assert text.startswith(b"SECRET=$$keep\nCLIPS_ENABLED=true\n") and text.endswith(b"Z=last\n")
+    backup = state / hc.ENV_BACKUP
+    assert backup.read_bytes() == original
+    assert run_verb(env, state) == 0 and backup.read_bytes() == original    # a rerun keeps the first backup
+
+
+def test_tc1699_nothing_stops_a_timer(tmp_path, monkeypatch):
+    source = (STACK / "clips" / "homehub_clips.py").read_text(encoding="utf-8")
+    body = source[source.index("def switch_to_media("):source.index("# ── the quota stop marker")]
+    assert "systemctl" not in body and "subprocess" not in body
+    run = source[source.index("def run_switch("):source.index("def run_ensure(")]
+    assert "systemctl" not in run
+
+
+@pytest.mark.parametrize("fail,why", [
+    ("guard", "the drive dropped"),
+    ("copy", "I/O error"),
+    ("rebuild", "could not be rebuilt"),
+    ("clash", "did not move"),
+    ("index", "does not match"),
+    ("vanish", "not on the drive"),
+])
+def test_tc1699_any_failure_leaves_the_env_on_scratch_and_says_so(tmp_path, monkeypatch, capsys, fail, why):
+    _s, old, new, state, env = switch_setup(tmp_path, monkeypatch)
+    before = env.read_bytes()
+    real_keys = hc.clip_keys
+    if fail == "guard":
+        monkeypatch.setattr(hc, "guard", lambda s: (False, "the drive dropped"))
+    elif fail == "copy":
+        monkeypatch.setattr(hc, "copy_verified", lambda a, b: (_ for _ in ()).throw(OSError(5, "I/O error")))
+    elif fail == "rebuild":
+        monkeypatch.setattr(hc, "rebuild_index", lambda d: False)
+    elif fail == "clash":
+        old_clip(new, stem="door_2026-11-06_09-00-00-0600_approach_11s", body=b"a different clip")
+    elif fail == "index":
+        real_iter = hc.mc.iter_jsonl
+        monkeypatch.setattr(hc.mc, "iter_jsonl", lambda p: list(real_iter(p))[:1])
+    elif fail == "vanish":
+        calls = []
+        monkeypatch.setattr(hc, "clip_keys", lambda r: calls.append(r) or (set() if len(calls) > 2 else real_keys(r)))
+    assert run_verb(env, state) != 0
+    r = result(state)
+    assert r["state"] == "failed" and r["ok"] is False and why in r["why"]
+    assert env.read_bytes() == before and not (state / hc.ENV_BACKUP).exists()
+    assert "CLIPS_ROOT unchanged, cutting carries on" in capsys.readouterr().out
+
+
+def test_tc1699_a_failed_switch_then_a_rerun_finishes(tmp_path, monkeypatch):
+    _s, old, new, state, env = switch_setup(tmp_path, monkeypatch)
+    real = hc.rebuild_index
+    monkeypatch.setattr(hc, "rebuild_index", lambda d: False)
+    assert run_verb(env, state) == 1
+    assert hc.list_clips(str(old)) == []          # every clip across, the switch still refused to flip
+    monkeypatch.setattr(hc, "rebuild_index", real)
+    assert run_verb(env, state) == 0
+    r = result(state)
+    assert (r["source_before"], r["drive_before"], r["drive_after"], r["indexes_repaired"]) == (0, 2, 2, 1)
+    assert hc.mc.read_env_file(str(env))["CLIPS_ROOT"] != str(old)
+
+
+def test_tc1699_the_lock_is_waited_for_then_given_up_and_nothing_changes(tmp_path, monkeypatch):
+    _s, old, new, state, env = switch_setup(tmp_path, monkeypatch)
+    before = env.read_bytes()
+    waits = []
+
+    @hc.contextlib.contextmanager
+    def busy(state_dir, wait_sec=0):
+        waits.append(wait_sec)
+        yield False
+    monkeypatch.setattr(hc, "pipeline_lock", busy)
+    assert run_verb(env, state) == 1
+    assert waits == [hc.SWITCH_LOCK_WAIT_SEC] and "kept the lock" in result(state)["why"]
+    assert env.read_bytes() == before and len(hc.list_clips(str(old))) == 2
+
+
+def test_tc1699_a_run_marks_itself_so_a_kill_cannot_read_as_success(tmp_path, monkeypatch):
+    _s, old, new, state, env = switch_setup(tmp_path, monkeypatch)
+    (state / hc.SWITCH_RESULT).write_text('{"state": "done", "ok": true}')
+    seen = []
+    monkeypatch.setattr(hc, "switch_to_media", lambda *a, **k: seen.append(result(state)["state"]) or {"left": 0})
+    assert run_verb(env, state) == 0 and seen == ["running"]
+
+
+def test_tc1699_the_plan_changes_nothing_and_needs_no_lock(tmp_path, monkeypatch, capsys):
+    _s, old, new, state, env = switch_setup(tmp_path, monkeypatch)
+    before = env.read_bytes()
+    monkeypatch.setattr(hc, "media_guard", lambda root, paths=None, check_cap=True: (True, "ok"))
+    monkeypatch.setattr(hc, "pipeline_lock", None)
+    assert run_verb(env, state, "--plan") == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["clips"] == 2 and out["guard"] == "ok" and out["on_drive"] == 0 and out["moved"] == 0
+    assert env.read_bytes() == before and len(hc.list_clips(str(old))) == 2
+    monkeypatch.setattr(hc, "media_guard", lambda root, paths=None, check_cap=True: (False, "no drive"))
+    assert run_verb(env, state, "--plan") == hc.EXIT_GUARD
+
+
+def test_tc1699_a_pass_rereads_the_env_once_it_has_the_lock(tmp_path, monkeypatch):
+    env, state = tmp_path / "env", tmp_path / "state"
+    env.write_text("CLIPS_ENABLED=true\nCLIPS_ROOT=/srv/scratch/clips\n")
+    roots = []
+
+    @hc.contextlib.contextmanager
+    def lock(state_dir, wait_sec=0):
+        env.write_text("CLIPS_ENABLED=true\nCLIPS_ROOT=/srv/media/Clips\n")    # a switch finished while this pass waited
+        yield True
+    monkeypatch.setattr(hc, "pipeline_lock", lock)
+    monkeypatch.setattr(hc, "cut_camera", lambda s, *a, **k: roots.append(s.root) or
+                        {"cut": 0, "lost": 0, "failed": 0, "waiting": 0, "rejected_records": 0})
+    assert hc.main(["--env-file", str(env), "--state-dir", str(state), "cut"]) == 0
+    assert roots == ["/srv/media/Clips"]
+
+
+def test_tc1699_set_env_lines_touches_only_its_keys_and_appends_a_missing_one(tmp_path):
+    env = tmp_path / "env"
+    env.write_bytes(b"A=1\nCLIPS_ROOT=x\nB=$$2 # note\nCLIPS_ROOT=y\n")
+    hc.set_env_lines(str(env), {"CLIPS_ROOT": "/srv/media/Clips", "NEW": "z"})
+    assert env.read_bytes() == b"A=1\nCLIPS_ROOT=/srv/media/Clips\nB=$$2 # note\nCLIPS_ROOT=/srv/media/Clips\nNEW=z\n"
+    env.write_bytes(b"A=1")
+    hc.set_env_lines(str(env), {"N": "1"})
+    assert env.read_bytes() == b"A=1\nN=1\n"
+    env.write_bytes(b"CLIPS_ROOT=/a/very/long/value/indeed\n")
+    hc.set_env_lines(str(env), {"CLIPS_ROOT": "/s"})
+    assert env.read_bytes() == b"CLIPS_ROOT=/s\n"          # truncated, nothing left behind
+
+
+def test_tc1699_the_run_line_and_the_readme_say_the_same_thing():
+    readme = (STACK / "clips" / "README.md").read_text(encoding="utf-8")
+    run = hc.SWITCH_RUN
+    assert run in readme and "--wait" not in run and "--pipe" not in run      # detached: a lost session cannot reach it
+    assert "CapabilityBoundingSet=~CAP_SYS_RESOURCE" in run and "RuntimeMaxSec=" in run and "--collect" in run
+    section = readme[readme.index("**10. Clips on the media drive**"):readme.index("**Rollback**")]
+    assert "sudo sed -i" not in section and "systemctl stop" not in section
+    assert not re.search(r'"(clips|moved)": 12\b', section)
 
 
 def drop_setup(tmp_path, monkeypatch):

@@ -52,7 +52,7 @@ camera ──1 conn── go2rtc relay ──┬── recorder ── /srv/scra
 | retention | `homehub_clips.py retention`, `homehub-clips-retention.timer` | `CLIPS_ENABLED` | hourly |
 | status | `homehub_clips.py status`, `episodes --camera door` | — | by hand |
 | the drive's folder | `homehub_clips.py ensure [--plan]` | `CLIPS_ROOT` | firstboot step 6k, and by hand |
-| the move off scratch | `homehub_clips.py move-from-scratch [--apply]` | — | once, by hand |
+| the switch to the drive | `homehub_clips.py switch-to-media [--plan]` | — | once, by hand, under `systemd-run` |
 
 firstboot step 6k installs every unit, enables one detector instance per name in
 `CAMERAS` (inert while its knob is off), installs `python3-opencv` when a
@@ -210,7 +210,8 @@ camera's `index.jsonl` from the sidecars.
 
 **Switching `CLIPS_ROOT` strands the old area.** Retention, status and the
 encode look only at the current root, so the clips already in the old one no
-longer age out or count. `move-from-scratch` takes them across, once. Nothing
+longer age out or count. `switch-to-media` takes them across and then moves the
+knob, as one unit. Nothing
 needs rewriting, because no record names the root: the sidecar's `clip`, the
 `clip` in `index.jsonl` and the ledger's `clip` are all relative to the camera
 folder, and the ledger stays in `/var/lib/homehub-clips`, so an episode already
@@ -218,9 +219,24 @@ cut stays cut and is not cut again. Per clip it copies the sidecar and then the
 clip through a `.part`, syncs, compares, renames, and only then removes the
 source, with the guard asked before each. A name already there with the same
 bytes is the rest of a killed run; with other bytes it is left alone and reported.
-The index is rebuilt from the sidecars at the end, which also merges anything
-already cut on the drive. Run it again after any failure. Moving is the only thing
-it does: it removes no clip to make room, and refuses if they do not all fit.
+Each destination index is marked dirty on disk before the first clip moves, and
+rebuilt from the sidecars at the end, which also merges anything already cut on the
+drive; the marker goes only after a good rebuild, a failed rebuild is a failed switch,
+and a rerun repairs a marked index even with no clip left to move. It removes no clip
+to make room, and refuses if they do not all fit.
+
+**The switch cannot strand the pipeline, by construction.** It stops no timer: it
+holds the pipeline lock, so a cut or retention pass just skips ("another clips run
+holds the lock"), and the kernel drops the lock however the process ends. And
+`CLIPS_ROOT` stays on scratch until the last step: the move works on a copy of the
+settings, the counts taken inside the lock are checked (every clip that was on either
+side is on the drive, none left, every index whole), and only then is `.env` written,
+in place, keeping its inode, after a one-time root-only backup at
+`/var/lib/homehub-clips/env.pre-switch-to-media`. A pass re-reads `.env` once it has
+the lock, so none can cut to the old root afterwards. Any failure, a kill or a power
+cut therefore leaves cutting on scratch as before, with what already moved safe on the
+drive and invisible to scratch's retention until it is run again. It is bounded at
+one hour (`RuntimeMaxSec`), so a hung drive cannot hold the lock for long.
 
 **Where, on the media drive**: `CLIPS_ROOT=/srv/media/Clips`. "Clips on the media
 drive" below.
@@ -320,7 +336,7 @@ not built; the "not mounted" alert covers the first, and repeats every
   synthetic frames; the panel's filter and the engine's code against the sibling
   OfficeWallNaglight checkout; no private zone in this repository.
 * `../scratch/tests/scratch-fs.root-test.sh` check 7: `clips` stops at its quota.
-* `tests/clips-media.root-test.sh` (TC-1695, 17 checks): real ext4, real project
+* `tests/clips-media.root-test.sh` (TC-1695, 18 checks): real ext4, real project
   quota, a real virtio-scsi disk formatted as plan section 3.2 says, deleted under the
   mount and brought back. Only in the throwaway guest, because it uses the hub's real
   paths: `bash stack/scratch/tests/run-root-suite-in-qemu.sh <vmlinuz> <quota modules>
@@ -548,26 +564,28 @@ is the merged MiniPC-Deployer revision and `<hub>` the hub's address.
    reload, and stop. `Backup` and the backup itself are not touched: this is a reload.
    Then `rm /tmp/smb.conf.fragment /tmp/drive-identity.conf`.
 
-5. The switch. Events keep queueing while the timers are stopped, and are cut afterwards.
+5. The switch: one command, then checks. Nothing is stopped: while it runs the cut and
+   retention timers skip, and events queue as they always do. A lost session does not
+   matter, it runs detached. If it fails, cutting carries on to scratch exactly as before.
 
    ```sh
-   sudo systemctl stop homehub-clips-cut.timer homehub-clips-retention.timer homehub-clips-encode.timer
-   systemctl is-active homehub-clips-cut.service homehub-clips-retention.service   # inactive, inactive (or failed); wait if activating
-   sudo sed -i 's|^CLIPS_ROOT=.*|CLIPS_ROOT=/srv/media/Clips|' /opt/homehub/stack/.env
-   sudo sed -i 's|^HOMEHUB_DISK_MOUNTS=.*|HOMEHUB_DISK_MOUNTS="/ /var/lib/docker /boot /srv/scratch /srv/media"|' /opt/homehub/stack/.env
+   sudo python3 /opt/homehub/stack/clips/homehub_clips.py switch-to-media --plan
+   #   "guard": "ok", "root_now": "/srv/scratch/clips", "clips": N (the old area now), "on_drive": 0
+   sudo systemd-run --unit=homehub-clips-switch --collect -p RuntimeMaxSec=1h -p CapabilityBoundingSet=~CAP_SYS_RESOURCE -p NoNewPrivileges=yes /usr/bin/python3 /opt/homehub/stack/clips/homehub_clips.py switch-to-media
+   #   returns at once; `systemctl is-active homehub-clips-switch` is active while it runs
+   sudo cat /var/lib/homehub-clips/switch-to-media.json
+   #   "state": "done", "ok": true, "left": 0, "drive_after" = "drive_before" + "source_before",
+   #   "root_after": "/srv/media/Clips". Those counts were taken inside the lock: they are the check.
    grep -E '^(CLIPS_ROOT|HOMEHUB_DISK_MOUNTS)=' /opt/homehub/stack/.env
-   sudo systemd-run --wait --pipe --quiet -p CapabilityBoundingSet=~CAP_SYS_RESOURCE -p NoNewPrivileges=yes -p Nice=19 -p IOSchedulingClass=idle -p CPUQuota=25% /usr/bin/python3 /opt/homehub/stack/clips/homehub_clips.py move-from-scratch           # {"clips": 12, ... "moved": 0}
-   sudo systemd-run --wait --pipe --quiet -p CapabilityBoundingSet=~CAP_SYS_RESOURCE -p NoNewPrivileges=yes -p Nice=19 -p IOSchedulingClass=idle -p CPUQuota=25% /usr/bin/python3 /opt/homehub/stack/clips/homehub_clips.py move-from-scratch --apply   # "moved": 12, "left": 0
-   sudo python3 /opt/homehub/stack/clips/homehub_clips.py status   # "root": "/srv/media/Clips", "clips": 12, "quota": {"limit_mib": 112197, ...}
-   wc -l /srv/media/Clips/door/index.jsonl                         # 12
+   sudo python3 /opt/homehub/stack/clips/homehub_clips.py status   # "root": "/srv/media/Clips", "clips" = "drive_after" or a little more, "quota": {"limit_mib": 112197, ...}
    sudo find /srv/scratch/clips -type f                            # nothing
-   sudo systemctl start homehub-clips-cut.timer homehub-clips-retention.timer
+   journalctl -u homehub-clips-switch -n 20
    ```
 
-   Not `sudo python3` for the move: a root shell holds CAP_SYS_RESOURCE and the guard
-   refuses it (and says this command). The encode timer stays stopped while
-   `CLIPS_ENCODE_ENABLED=false`, which it is. `"left"` above 0 means a name clash: the log
-   says which, the source is intact.
+   `"state": "failed"`: read `why`, fix that, and run the same command again; it repairs and
+   finishes. `"state": "running"` with the unit gone means it was killed, and the same applies.
+   `.env` is unchanged in both cases. Not `sudo python3` for the switch itself: a root shell
+   holds CAP_SYS_RESOURCE and the guard refuses it (and says this command).
 
 6. Look at it. `sudo systemctl start homehub-disk-check.service; journalctl -t homehub-disk-check -n 6`
    shows `disk: skipped /srv/media`. From the dev PC, `\\homehub.<domain>\Clips` as `admin`
@@ -575,10 +593,11 @@ is the merged MiniPC-Deployer revision and `<hub>` the hub's address.
    `stat -c '%U %G %a %n' /srv/media/Clips/door/<day>/*.mp4` says `root homehub-clips 644`,
    and `homehub_clips.py status` shows `last_clip` moving.
 
-**Back:** stop the timers, set `CLIPS_ROOT=/srv/scratch/clips`, start them. New clips go
-to scratch; the ones on the drive stay readable through the share, and nothing ages them
-out until the switch comes back. `HOMEHUB_DISK_MOUNTS` can stay. The share, the account
-and the folder cost nothing left in place.
+**Back:** `CLIPS_ROOT=/srv/scratch/clips`, edited in place, never with `sed -i`, which replaces
+the inode: `sudo sh -c "umask 077; sed 's|^CLIPS_ROOT=.*|CLIPS_ROOT=/srv/scratch/clips|' /opt/homehub/stack/.env >/root/env.new && cat /root/env.new >/opt/homehub/stack/.env && rm /root/env.new"`.
+No timer needs stopping; the next pass reads it. New clips go to scratch; the ones on the drive
+stay readable through the share, and nothing ages them out until the switch comes back.
+`HOMEHUB_DISK_MOUNTS` can stay. The share, the account and the folder cost nothing left in place.
 
 **Rollback**: the knobs to false; `sudo systemctl disable --now homehub-camera-motion@door homehub-clips-cut.timer homehub-clips-retention.timer homehub-clips-encode.timer`.
 The clips area and its clips stay until removed by hand.

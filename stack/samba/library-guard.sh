@@ -20,8 +20,9 @@
 #   --report         checks the library mount AND a representative Samba read,
 #                    then reports only the combined file-share/backup health
 #                    override. It never reports drive identity or a backup run.
-#   --reattach       only the reattach below, for a drive other than the library
-#                    (`--reattach --library /srv/media`). Reports nothing: the
+#   --reattach       only the reattach below, for the media drive and NOTHING ELSE
+#                    (`--reattach --library /srv/media`; any other path, the default
+#                    included, exits 2 having touched nothing). Reports nothing: the
 #                    combined item is the library's alone. Through the mount
 #                    unit, so an ext4 drive gets its fsck. SR-149.
 #
@@ -62,6 +63,14 @@ while [ $# -gt 0 ]; do
         *) shift ;;
     esac
 done
+
+# A lazy unmount on a timer is not something the library or the backup drive may
+# ever receive through a mistyped argument: their reattach is --report's, with its
+# own rules. Compared as a literal, so neither a default nor an environment reaches it.
+if [ "$MODE" = "--reattach" ] && [ "$LIBRARY_ROOT" != /srv/media ]; then
+    echo "[library-guard] REFUSED --reattach for '$LIBRARY_ROOT': it serves /srv/media only" >&2
+    exit 2
+fi
 
 fail_reason=""
 

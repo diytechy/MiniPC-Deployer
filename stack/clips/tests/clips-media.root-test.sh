@@ -83,6 +83,16 @@ elif verb == "clips":                     # N clips of M MiB, the oldest first, 
 elif verb == "list":
     clips = hc.list_clips(args[0] if args else s.root)
     print(len(clips), sum(c[3] for c in clips) // hc.MIB)
+elif verb == "die-mid-move":              # the process ends between two clips, as a kill would
+    real, seen = hc.move_one, []
+
+    def one(*a):
+        if seen:
+            os._exit(9)
+        seen.append(1)
+        return real(*a)
+    hc.move_one = one
+    hc.main(["--env-file", sys.argv[2], "--state-dir", args[0], "switch-to-media"])
 elif verb == "room":
     need = int(args[0]) * hc.MIB
     print(hc.make_room(s, "", int(time.time() * 1000), need, lambda: hc.clips_quota(s)) // hc.MIB)
@@ -206,23 +216,38 @@ if [ "$rc" != 0 ] && grep -qiE 'quota exceeded' "$W/12.log" && [ "$used" -ge 75 
 else bad "12 wall: dd=$rc used=$used limit=$limit guard=$g_full retention=$rc_ret"; fi
 rm -f /srv/media/Clips/fill.bin; rm -rf /srv/media/Clips/door
 
-# 13 the move off scratch
+# 13 the switch, killed between two clips: .env untouched, the lock free, the marker on disk
 nocap "$PY" "$W/h.py" "$CLIPS" "$W/env" clips 3 1 /srv/scratch/clips
 printf '{"clip":"old"}\n' >/srv/scratch/clips/door/index.jsonl
 sums="$(cd /srv/scratch/clips/door && sha256sum */*.mp4 | sort)"
-nocap "$PY" "$CLIPS/homehub_clips.py" --env-file "$W/env" --state-dir "$W/state" move-from-scratch >"$W/13a.log" 2>&1
-left="$(h list /srv/scratch/clips)"
-nocap "$PY" "$CLIPS/homehub_clips.py" --env-file "$W/env" --state-dir "$W/state" move-from-scratch --apply >"$W/13.log" 2>&1; rc=$?
+sed -i 's|^CLIPS_ROOT=.*|CLIPS_ROOT=/srv/scratch/clips|' "$W/env"
+env_before="$(cat "$W/env")"; inode="$(stat -c %i "$W/env")"
+hc2() { nocap "$PY" "$CLIPS/homehub_clips.py" --env-file "$W/env" --state-dir "$W/state" "$@"; }
+hc2 switch-to-media --plan >"$W/13p.log" 2>&1; rc_plan=$?
+nocap "$PY" "$W/h.py" "$CLIPS" "$W/env" die-mid-move "$W/state" >"$W/13k.log" 2>&1; rc_kill=$?
+read -r still _ < <(h list /srv/scratch/clips)
+hc2 retention >"$W/13r.log" 2>&1; rc_ret=$?      # the lock is free: the pipeline runs on, on scratch
+if [ "$rc_plan" = 0 ] && grep -q '"clips": 3' "$W/13p.log" && [ "$rc_kill" = 9 ] && [ "$still" = 2 ] \
+   && [ "$(cat "$W/env")" = "$env_before" ] && [ -e /srv/media/Clips/door/.index-dirty ] && [ "$rc_ret" = 0 ] \
+   && ! grep -q 'holds the lock' "$W/13r.log"; then
+    ok "13 killed mid-move: 1 of 3 across, .env untouched, the marker on disk, retention runs at once"
+else bad "13 killed: plan=$rc_plan kill=$rc_kill still=$still retention=$rc_ret $(tail -1 "$W/13k.log")"; fi
+
+# 14 run again: it finishes, verifies, and only then writes the .env, in place
+hc2 switch-to-media >"$W/14s.log" 2>&1; rc=$?
 moved_sums="$(cd /srv/media/Clips/door && sha256sum */*.mp4 | sort)"
 f="$(ls /srv/media/Clips/door/*/*.mp4 | head -n1)"
-if [ "$rc" = 0 ] && [ "${left%% *}" = 3 ] && [ "$sums" = "$moved_sums" ] && [ ! -e /srv/scratch/clips/door ] \
+if [ "$rc" = 0 ] && [ "$sums" = "$moved_sums" ] && [ ! -e /srv/scratch/clips/door ] && [ ! -e /srv/media/Clips/door/.index-dirty ] \
    && [ "$(wc -l </srv/media/Clips/door/index.jsonl)" = 3 ] && [ "$(stat -c '%g %a' "$f")" = "3100 640" ] \
-   && [ "$(stat -c '%g %a' "$(dirname "$f")")" = "3100 2750" ] && [ "$(h quota | cut -d' ' -f1)" = 3 ]; then
-    ok "13 move: 3 clips across byte for byte, 3100 640, counted, index rebuilt, the old folder gone"
-else bad "13 move: rc=$rc left=$left $(tail -1 "$W/13.log") $(stat -c '%g %a' "$f")"; fi
+   && [ "$(stat -c '%g %a' "$(dirname "$f")")" = "3100 2750" ] && [ "$(h quota | cut -d' ' -f1)" = 3 ] \
+   && grep -q '^CLIPS_ROOT=/srv/media/Clips$' "$W/env" && grep -q '^HOMEHUB_DISK_MOUNTS="/srv/media"$' "$W/env" \
+   && [ "$(stat -c %i "$W/env")" = "$inode" ] && [ "$(cat "$W/state/env.pre-switch-to-media")" = "$env_before" ] \
+   && [ "$(stat -c %a "$W/state/env.pre-switch-to-media")" = 600 ] && grep -q '"state": "done"' "$W/state/switch-to-media.json"; then
+    ok "14 rerun: 3 clips byte for byte, 3100 640, counted, index whole, marker gone; .env written last, same inode, backed up 600"
+else bad "14 rerun: rc=$rc $(tail -1 "$W/14s.log") $(stat -c '%g %a' "$f")"; fi
 sync
 
-# 14 the drive drops under the mount (del_gendisk, as a USB disconnect)
+# 15 the drive drops under the mount (del_gendisk, as a USB disconnect)
 SYSDEV="$(cat "/sys/block/$DISK/$(basename "$PART")/dev")"
 echo 1 >"/sys/block/$DISK/device/delete"
 sleep 1
@@ -234,10 +259,10 @@ disk_state="$("$PY" -c "import json; print(json.load(open('$W/mon/disk-status.js
 hc ensure >"$W/14e.log" 2>&1; rc_ens=$?
 if [ "$line" = 1 ] && [[ "$reason" == *"the drive dropped"* ]] && [ "$rc_share" = 1 ] && grep -q STALE "$W/14.log" \
    && [ "$disk_state" = absent ] && [ "$rc_ens" = 4 ]; then
-    ok "14 dropped: mountinfo keeps its line ($SYSDEV); the guard, the share and ensure refuse; the disk check says absent"
-else bad "14 dropped: line=$line reason='$reason' share=$rc_share disk=$disk_state ensure=$rc_ens $(tail -1 "$W/14.log")"; fi
+    ok "15 dropped: mountinfo keeps its line ($SYSDEV); the guard, the share and ensure refuse; the disk check says absent"
+else bad "15 dropped: line=$line reason='$reason' share=$rc_share disk=$disk_state ensure=$rc_ens $(tail -1 "$W/14.log")"; fi
 
-# 15 it returns under a new name; --reattach puts it back through the mount unit
+# 16 it returns under a new name; --reattach puts it back through the mount unit
 for host in /sys/class/scsi_host/*; do echo '- - -' >"$host/scan"; done
 NEW=""
 for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -265,10 +290,10 @@ back_sums="$(cd /srv/media/Clips/door 2>/dev/null && sha256sum */*.mp4 | sort)"
 # else here, and on the hub systemd would call the unit active and start nothing.
 lines="$(grep -c ' /srv/media ' /proc/self/mountinfo)"
 if [ "$rc" = 0 ] && [ "$lines" = 1 ] && grep -q 'start srv-media.mount' "$W/systemctl.log" && [ "$g_back" = ok ] && [ "$back_sums" = "$moved_sums" ] && [ "$rc_share" = 0 ]; then
-    ok "15 returned as $NEW: reattached through the unit, the guard and the share pass, the clips are intact"
-else bad "15 reattach: rc=$rc lines=$lines guard='$g_back' share=$rc_share $(tail -3 "$W/15.log")"; fi
+    ok "16 returned as $NEW: reattached through the unit, the guard and the share pass, the clips are intact"
+else bad "16 reattach: rc=$rc lines=$lines guard='$g_back' share=$rc_share $(tail -3 "$W/15.log")"; fi
 
-# 16 I/O errors on a live mount. errors=remount-ro: the kernel says "Remounting
+# 17 I/O errors on a live mount. errors=remount-ro: the kernel says "Remounting
 # filesystem read-only" and shuts ext4 down WITHOUT setting the flag, so mountinfo
 # still says rw. Only a write can tell. The share's guard reads mountinfo, so it
 # still passes: reads then fail on their own. That limit is asserted, not hidden.
@@ -280,15 +305,15 @@ sb="$(grep ' /srv/media ' /proc/self/mountinfo | sed 's/.* - //')"
 reason="$(nocap "$PY" "$W/h.py" "$CLIPS" "$W/env" guard)"
 /bin/bash "$SAMBA/library-guard.sh" --check Clips --library /srv/media >"$W/16.log" 2>&1; rc_share=$?
 if [[ "$sb" == *" rw,"* ]] && [[ "$reason" == *"not writable ("* ]] && [ "$rc_share" = 0 ]; then
-    ok "16 I/O error: mountinfo still says rw ($sb); the write probe refuses: $reason"
-else bad "16 I/O error: sb='$sb' reason='$reason' share=$rc_share"; fi
+    ok "17 I/O error: mountinfo still says rw ($sb); the write probe refuses: $reason"
+else bad "17 I/O error: sb='$sb' reason='$reason' share=$rc_share"; fi
 
-# 17 and a stopped filesystem needs a remount by hand: the device is fine, so nothing re-attaches it
+# 18 and a stopped filesystem needs a remount by hand: the device is fine, so nothing re-attaches it
 umount /srv/media; mount -T "$W/fstab" /srv/media
 g_back="$(nocap "$PY" "$W/h.py" "$CLIPS" "$W/env" guard)"
 back_sums="$(cd /srv/media/Clips/door 2>/dev/null && sha256sum */*.mp4 | sort)"
-if [ "$g_back" = ok ] && [ "$back_sums" = "$moved_sums" ]; then ok "17 umount and mount: the guard passes, the clips are intact"
-else bad "17 remount: guard='$g_back'"; fi
+if [ "$g_back" = ok ] && [ "$back_sums" = "$moved_sums" ]; then ok "18 umount and mount: the guard passes, the clips are intact"
+else bad "18 remount: guard='$g_back'"; fi
 
 echo "clips-media: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

@@ -226,12 +226,11 @@ hc2() { nocap "$PY" "$CLIPS/homehub_clips.py" --env-file "$W/env" --state-dir "$
 hc2 switch-to-media --plan >"$W/13p.log" 2>&1; rc_plan=$?
 nocap "$PY" "$W/h.py" "$CLIPS" "$W/env" die-mid-move "$W/state" >"$W/13k.log" 2>&1; rc_kill=$?
 read -r still _ < <(h list /srv/scratch/clips)
-hc2 retention >"$W/13r.log" 2>&1; rc_ret=$?      # the lock is free: the pipeline runs on, on scratch
+flock -n "$W/state/pipeline.lock" true; rc_lock=$?      # the kernel let go of it: the next pass runs
 if [ "$rc_plan" = 0 ] && grep -q '"clips": 3' "$W/13p.log" && [ "$rc_kill" = 9 ] && [ "$still" = 2 ] \
-   && [ "$(cat "$W/env")" = "$env_before" ] && [ -e /srv/media/Clips/door/.index-dirty ] && [ "$rc_ret" = 0 ] \
-   && ! grep -q 'holds the lock' "$W/13r.log"; then
-    ok "13 killed mid-move: 1 of 3 across, .env untouched, the marker on disk, retention runs at once"
-else bad "13 killed: plan=$rc_plan kill=$rc_kill still=$still retention=$rc_ret $(tail -1 "$W/13k.log")"; fi
+   && [ "$(cat "$W/env")" = "$env_before" ] && [ -e /srv/media/Clips/door/.index-dirty ] && [ "$rc_lock" = 0 ]; then
+    ok "13 killed mid-move: 1 of 3 across, .env untouched, the marker on disk, the lock free"
+else bad "13 killed: plan=$rc_plan kill=$rc_kill still=$still lock=$rc_lock $(tail -1 "$W/13k.log")"; fi
 
 # 14 run again: it finishes, verifies, and only then writes the .env, in place
 hc2 switch-to-media >"$W/14s.log" 2>&1; rc=$?

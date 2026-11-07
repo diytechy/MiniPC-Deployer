@@ -574,6 +574,8 @@ EPOCH_FLOOR = 1735689600
 # exactly this; the literal is the fallback for a hand-run cycle, so a hand-run
 # is bound the same way rather than left unbound. See `open_for_write`.
 DEFAULT_STATE_ROOT = "/var/lib/homehub-weight"
+# Its name among the unit's several StateDirectory= entries (`resolve_state_root`).
+STATE_ROOT_NAME = "homehub-weight"
 
 
 class SourceFailure(Exception):
@@ -3148,14 +3150,32 @@ def resolve_state_root(env):
     other side.
 
     SINCE 2026-10-26 THE UNIT HAS TWO StateDirectory= LINES (the second is the
-    raw watch record, `resolve_raw_root`), and systemd then exports the list
-    joined by ':' in declaration order. The FIRST entry is this one; the raw
-    directory is never the state root, so the state file's guard is unchanged.
+    raw watch record, `resolve_raw_root`), and systemd exports both joined by
+    ':'. THE ENTRY IS CHOSEN BY ITS NAME, NEVER ITS POSITION. This used to take
+    the first entry on the belief that systemd keeps declaration order; the
+    hub's systemd 255 exports `homehub-health-raw` first, so from the 11-04
+    deploy the raw directory became the state root and the guard refused every
+    save of the real state file (found 2026-11-07: 221 refusals, the nightly
+    record frozen at 11-04). One entry is taken as it is (a unit with a single
+    StateDirectory=, a hand run); several without `homehub-weight` among them is
+    a unit this code does not understand, and that is refused, not guessed.
+
+    Raises:  ValueError for several entries none of which is STATE_ROOT_NAME.
 
     Implements: SR-022, LLR-006
     """
     entries = state_directories(env)
-    return entries[0] if entries else DEFAULT_STATE_ROOT
+    for entry in entries:
+        if os.path.basename(entry.rstrip("/\\")) == STATE_ROOT_NAME:
+            return entry
+    if len(entries) == 1:
+        return entries[0]
+    if not entries:
+        return DEFAULT_STATE_ROOT
+    raise ValueError("STATE_DIRECTORY lists %d directories and none is %s - "
+                     "the unit's StateDirectory= lines are not what this feeder "
+                     "expects, so it will not guess where to write"
+                     % (len(entries), STATE_ROOT_NAME))
 
 
 def state_directories(env):

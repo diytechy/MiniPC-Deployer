@@ -2026,6 +2026,35 @@ def test_the_state_root_comes_from_the_units_state_directory_sr022():
                   if l and not l.startswith(("#", "[", " "))]
     assert "StateDirectory=homehub-weight" in directives
     assert feeder.DEFAULT_STATE_ROOT == "/var/lib/homehub-weight"
+    assert os.path.basename(feeder.DEFAULT_STATE_ROOT) == feeder.STATE_ROOT_NAME
+
+
+@pytest.mark.parametrize("order", ["declared", "reversed"])
+def test_the_state_root_is_chosen_by_name_not_position_sr022(tmp_path, order):
+    """The hub's systemd 255 exports the raw directory FIRST (2026-11-07): the
+    state root must be homehub-weight either way, and the real state file must
+    then pass the guard while the raw directory is never the root."""
+    state_dir, raw = tmp_path / "homehub-weight", tmp_path / "homehub-health-raw"
+    state_dir.mkdir()
+    raw.mkdir()
+    entries = [str(state_dir), str(raw)]
+    if order == "reversed":
+        entries.reverse()
+    env = {"STATE_DIRECTORY": os.pathsep.join(entries)}
+    assert feeder.resolve_state_root(env) == str(state_dir)
+    assert feeder.resolve_raw_root(env) == str(raw)
+    state_path = state_dir / "weight-state.json"
+    feeder.save_state({"probe": 1}, str(state_path), feeder.resolve_state_root(env))
+    assert json.loads(state_path.read_text(encoding="utf-8"))["probe"] == 1
+
+
+def test_several_state_directories_without_ours_are_refused_sr022(tmp_path):
+    env = {"STATE_DIRECTORY": os.pathsep.join([str(tmp_path / "homehub-health-raw"),
+                                               str(tmp_path / "something-else")])}
+    with pytest.raises(ValueError, match="none is homehub-weight"):
+        feeder.resolve_state_root(env)
+    # One entry, whatever its name, is still taken as it is (a hand run, a test).
+    assert feeder.resolve_state_root({"STATE_DIRECTORY": str(tmp_path)}) == str(tmp_path)
 
 
 def test_a_whole_cycle_writes_exactly_one_file_and_no_token(tmp_path):

@@ -175,7 +175,8 @@ path itself is not here — it is a set of units and ALSA configuration under
 | `wall-line-in.service` | line input passthrough to the amplifier |
 | `wall-kiosk-loop.service` | routes kiosk audio through snd-aloop so it can be measured |
 | `wall-amp-trigger.service`, `panel-amp-trigger.py` | detects playing audio and commands the LCUS-2 relay (the headphone-tone actuator is retired, 2026-09-13) |
-| `wall-volume-keys.service`, `panel-volume-keys.py` | the side rocker |
+| `wall-volume-keys.service`, `panel-volume-keys.py` | the side rocker, and the USB adapter's Mute / Volume - / Volume + buttons (SR-150: the rocker's orientation swap is the rocker's alone, a held adapter button repeats at the rocker's rate, Mute toggles through the applier's `mute-toggle`) |
+| `92-wall-volume-keys.rules` | restarts `wall-volume-keys` when the adapter's button device arrives, so a replug does not leave the buttons dead |
 | `wall-audio-mode` | switches output modes |
 | `90-wall-audio-adapter.rules` | gives the USB adapter a port-independent systemd alias and starts the three units on it |
 | `91-wall-usb-hub-reset.rules`, `wall-usb-hub-reset@.service`, `wall-usb-hub-reset.py` | bounded re-enumeration of the amplifier-side hub when it comes back with no downstream ports |

@@ -2228,9 +2228,12 @@ def event_from_arguments(arguments):
     if arguments.command == "set":
         return {"kind": "set_output", "output": arguments.value}
     if arguments.command == "mute-toggle":
-        # The USB adapter's hardware Mute button, via the volume socket. It is
-        # deliberately NOT in ALLOWED_REQUEST_KINDS: the glass has its own Mute
-        # position, and the renderer has no business un-muting a microphone.
+        # The USB adapter's hardware Mute button, via the volume socket. Not in
+        # ALLOWED_REQUEST_KINDS: it is the button's verb, and the glass has its
+        # own Mute position and microphone button, so the renderer needs
+        # nothing from it. That is tidiness, not a privilege boundary: the
+        # volume socket is group `input`, which the kiosk user is in, and the
+        # glass's microphone button can already un-mute the microphone.
         return {"kind": "toggle_mute"}
     if arguments.command == "input-mute":
         return {"kind": "set_input_mute", "muted": arguments.value == "on"}

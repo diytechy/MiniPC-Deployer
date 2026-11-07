@@ -413,7 +413,7 @@ class PulsePlanner:
         self.holding = None
 
     def hold(self, louder, now):
-        """Take a KIND_HELD key going down: (opened, signed percent).
+        """Take a KIND_HELD key going down: (opened, signed percents).
 
         The press itself is the first step -- a held key sends nothing more
         until it is let go, so this is the only edge a tap has. `opened` is
@@ -421,18 +421,37 @@ class PulsePlanner:
         are timed by `due`; the gesture stays open for as long as the key is
         down, however long that is, because no quiet gap can mean "let go" for
         a device that is silent while it is held.
+
+        A key that was ALREADY held (a second button pressed over the first)
+        is paid what it earned up to this press before it is replaced, for the
+        same reason `let_go` pays first.
         """
+        owed = self.due(now)
         opened = self.press(now)
         self.holding = (louder, now + HELD_REPEAT_DELAY_S)
-        return opened, self.release(louder, now)
+        return opened, owed + [self.release(louder, now)]
 
-    def let_go(self, now):
-        """Take a KIND_HELD key coming up. Earns nothing; the gap runs from here."""
-        if self.holding is None:
-            return
+    def let_go(self, louder, now):
+        """Take a KIND_HELD key coming up: the steps it earned before `now`.
+
+        Only the key that is HELD can be let go. With + down, then - pressed
+        over it, the hold is now -'s; +'s release must not stop it (review,
+        2026-11-07), so a release in the other direction is ignored here.
+
+        The release adds no step of its own, and the gap runs from here. But it
+        PAYS FIRST (Codex Sol, 2026-11-07): `now` is the kernel's timestamp of
+        the release, and a loop that woke late can drain the release before
+        `due` ran -- a 650 ms hold whose repeats at 500 and 606 ms were never
+        charged would move 5% instead of 15%, so the hold's speed would depend
+        on how busy the loop was.
+        """
+        if self.holding is None or self.holding[0] != louder:
+            return []
+        owed = self.due(now)
         self.holding = None
         if self.open:
             self.contact = now
+        return owed
 
     def due(self, now):
         """The signed steps a held key has earned by `now`, oldest first.
@@ -1401,12 +1420,14 @@ def main():
                     # release. Kernel autorepeats (a USB keyboard) are ignored:
                     # the timing here is the only repeat that counts.
                     if value == KEY_PRESS:
-                        opened, percent = planner.hold(code == KEY_VOLUMEUP, when)
+                        opened, steps = planner.hold(code == KEY_VOLUMEUP, when)
                         if opened:
                             gesture, actor = _begin(preview, actor, gesture)
-                        _charge(gesture, actor, percent)
+                        for percent in steps:
+                            _charge(gesture, actor, percent)
                     elif value == KEY_RELEASE:
-                        planner.let_go(when)
+                        for percent in planner.let_go(code == KEY_VOLUMEUP, when):
+                            _charge(gesture, actor, percent)
                 elif code in (KEY_VOLUMEUP, KEY_VOLUMEDOWN):
                     louder = (code == KEY_VOLUMEUP)
                     if SWAP_FOR_PANEL_ORIENTATION:

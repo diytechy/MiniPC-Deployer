@@ -88,10 +88,20 @@ def test_toggle_returns_to_the_position_with_the_mic_as_it_was_tc1706(
             "the journal must not say the mic stayed muted when it did not"
 
 
-def test_leaving_mute_from_the_glass_keeps_item_j_and_clears_the_record_tc1707(policy):
-    """Only the BUTTON's exit restores the microphone."""
+def test_a_glass_mute_undone_by_the_button_keeps_the_mic_muted_tc1707(policy):
+    """Review 2026-11-07: the Owner's words are "before the FIRST PRESS", and a
+    Mute entered from the glass had no press. The position comes back; the
+    microphone does not."""
     state = on(policy, "speaker", False)
     state, _ = policy.apply_event(state, {"kind": "set_output", "output": "mute"})
+    assert state["mute_return"] == {"output": "speaker", "input_muted": True}
+    back, _ = toggle(policy, state)
+    assert (back["output"], back["input_muted"]) == ("speaker", True)
+
+
+def test_leaving_mute_from_the_glass_keeps_item_j_and_clears_the_record_tc1707(policy):
+    """Only the BUTTON's exit restores the microphone."""
+    state, _ = toggle(policy, on(policy, "speaker", False))
     assert state["mute_return"] == {"output": "speaker", "input_muted": False}
     state, lines = policy.apply_event(state, {"kind": "set_output", "output": "speaker"})
     assert state["input_muted"] is True
@@ -151,6 +161,17 @@ def test_a_record_is_never_a_repair_and_never_outlives_mute_tc1708(policy):
     assert policy.normalize(raw)["mute_return"] is None
 
 
+def test_a_repaired_file_drops_a_live_mic_record_tc1708(policy):
+    """Review 2026-11-07: a document that needed ANY repair never opens a mic."""
+    state, _ = toggle(policy, on(policy, "speaker", False))
+    raw = json.loads(json.dumps(state))
+    raw["volume"]["speaker"] = "x"
+    repaired = policy.normalize(raw)
+    assert repaired["mute_return"] is None
+    back, _ = toggle(policy, repaired)
+    assert (back["output"], back["input_muted"]) == ("speaker", True)
+
+
 def test_toggle_takes_no_arguments_and_the_glass_cannot_send_it_tc1708(policy):
     with pytest.raises(policy.StateError):
         policy.apply_event(policy.default_state(),
@@ -158,7 +179,7 @@ def test_toggle_takes_no_arguments_and_the_glass_cannot_send_it_tc1708(policy):
     applier_text = APPLIER.read_text(encoding="utf-8")
     allowed = applier_text.split("ALLOWED_REQUEST_KINDS = frozenset(", 1)[1].split(")", 1)[0]
     assert "toggle_mute" not in allowed, \
-        "the renderer's request file must not be able to un-mute a microphone"
+        "the button's verb stays off the renderer's request file"
 
 
 # ── the applier CLI and the root socket ─────────────────────────────────────
@@ -205,11 +226,11 @@ def test_the_socket_has_exactly_one_new_spelling_tc1709():
 
 def test_a_tap_on_a_held_key_is_one_step_tc1710(keys):
     plan = keys.PulsePlanner()
-    opened, percent = plan.hold(True, 0.0)
-    assert opened is True and percent == keys.PULSE_PERCENT
+    opened, steps = plan.hold(True, 0.0)
+    assert opened is True and steps == [keys.PULSE_PERCENT]
     # Measured taps are 288-320 ms: nothing more is due before the release.
     assert plan.due(0.32) == []
-    plan.let_go(0.32)
+    assert plan.let_go(True, 0.32) == [], "the release adds no step of its own"
     assert plan.settle(0.32 + keys.HOLD_GAP_S - 0.001) is False
     assert plan.settle(0.32 + keys.HOLD_GAP_S + 0.001) is True
     assert plan.due(5.0) == []
@@ -217,14 +238,13 @@ def test_a_tap_on_a_held_key_is_one_step_tc1710(keys):
 
 def test_a_held_key_repeats_at_the_rockers_rate_after_half_a_second_tc1710(keys):
     plan = keys.PulsePlanner()
-    _opened, first = plan.hold(False, 10.0)
-    steps = [first]
+    _opened, steps = plan.hold(False, 10.0)
     now = 10.0
     while now < 11.8:          # the captured 1.8 s hold, sampled like the loop
         now += keys.LOOP_WAKE_S
         steps += plan.due(now)
         assert plan.settle(now) is False, "a key that is down is never a quiet gap"
-    plan.let_go(11.8)
+    steps += plan.let_go(False, 11.8)
     assert all(step == -keys.PULSE_PERCENT for step in steps)
     expected = 1 + 1 + int((1.8 - keys.HELD_REPEAT_DELAY_S) / keys.HELD_REPEAT_PERIOD_S)
     assert len(steps) == expected
@@ -238,6 +258,31 @@ def test_a_late_wake_pays_exactly_what_is_owed_tc1710(keys):
     owed = plan.due(keys.HELD_REPEAT_DELAY_S + 3 * keys.HELD_REPEAT_PERIOD_S + 0.001)
     assert owed == [keys.PULSE_PERCENT] * 4
     assert plan.due(keys.HELD_REPEAT_DELAY_S + 3 * keys.HELD_REPEAT_PERIOD_S + 0.002) == []
+
+
+def test_a_release_drained_late_still_pays_what_the_hold_earned_tc1710(keys):
+    """Codex Sol 2026-11-07: hold 650 ms, the loop last looked at 490 ms and
+    next drains the release. The repeats due at 500 and 606 ms are owed."""
+    plan = keys.PulsePlanner()
+    _opened, steps = plan.hold(True, 0.0)
+    assert plan.due(0.49) == []
+    steps += plan.let_go(True, 0.65)
+    assert steps == [keys.PULSE_PERCENT] * 3
+    assert plan.due(5.0) == []
+
+
+def test_a_second_button_over_the_first_pays_the_first_tc1710(keys):
+    plan = keys.PulsePlanner()
+    plan.hold(True, 0.0)
+    opened, steps = plan.hold(False, 0.65)
+    assert opened is False
+    assert steps == [keys.PULSE_PERCENT, keys.PULSE_PERCENT, -keys.PULSE_PERCENT]
+    # +'s release does not stop -, which is still down.
+    assert plan.let_go(True, 0.7) == []
+    assert plan.due(0.65 + keys.HELD_REPEAT_DELAY_S) == [-keys.PULSE_PERCENT]
+    assert plan.settle(2.0) is False
+    plan.let_go(False, 2.0)
+    assert plan.settle(2.0 + keys.HOLD_GAP_S + 0.001) is True
 
 
 def test_a_vanished_device_stops_the_hold_tc1710(keys):

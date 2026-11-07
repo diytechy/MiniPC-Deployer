@@ -21,7 +21,9 @@ IT NEVER WAKES A DISK. A configured path must be a mount point in
 it is statfs'd. A path on a USB drive is reported "skipped" and never touched;
 the backup drive's free space belongs to the backup run's own record. A
 configured path that is NOT mounted alerts too: a recorder writing into an
-unmounted mount point fills the root instead.
+unmounted mount point fills the root instead. So does a mount whose device is
+gone: a USB drive that dropped can leave its mountinfo line behind, and that is
+as absent as a missing line, though only sysfs can tell (the media drive, SR-149).
 
 Each mount alerts once per crossing (high) and once on recovery (default); the
 alert helper rate-limits per key and journals every attempt. One journal line
@@ -90,12 +92,13 @@ def label_for(path: str) -> str:
     )
 
 
-def evaluate(specs, mounts: List[Dict[str, str]], nvme_check, statfs) -> List[dict]:
+def evaluate(specs, mounts: List[Dict[str, str]], nvme_check, statfs, device_alive=lambda majmin: True) -> List[dict]:
     """One result per configured mount: state in {low, ok, absent, skipped, error}.
 
     Contract:
       Inputs:  specs: [(path, floor)] from parse_mount_spec; mounts: parse_mountinfo
-               output; nvme_check(majmin) -> bool; statfs(path) -> (total, avail).
+               output; nvme_check(majmin) -> bool; statfs(path) -> (total, avail);
+               device_alive(majmin) -> bool, from sysfs alone.
       Outputs: [{"mount","label","state","totalBytes"?,"freeBytes"?,"floorBytes"?,"why"?}]
       statfs is called ONLY for a mount point on the NVMe (SN-048: never wake a disk).
     Implements: LLR-1154
@@ -107,10 +110,13 @@ def evaluate(specs, mounts: List[Dict[str, str]], nvme_check, statfs) -> List[di
         if entry is None:
             result.update(state="absent", why="not a mount point")
         elif not nvme_check(entry["majmin"]):
-            result.update(
-                state="skipped",
-                why="not on the NVMe (%s); never statfs'd" % entry["source"],
-            )
+            if device_alive(entry["majmin"]):
+                result.update(
+                    state="skipped",
+                    why="not on the NVMe (%s); never statfs'd" % entry["source"],
+                )
+            else:
+                result.update(state="absent", why="its device %s is gone" % entry["majmin"])
         else:
             try:
                 total, avail = statfs(path)
@@ -189,7 +195,9 @@ def main(argv=None) -> int:
         return st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize
 
     results = evaluate(
-        specs, mounts, lambda mm: mc.is_nvme_backed(mm, args.sys_root), statfs
+        specs, mounts, lambda mm: mc.is_nvme_backed(mm, args.sys_root), statfs,
+        # a pseudo filesystem (0:NN) has no block device to lose
+        lambda mm: mm.startswith("0:") or os.path.exists(os.path.join(args.sys_root, "dev", "block", mm)),
     )
     state_path = os.path.join(args.state_dir, "disk-state.json")
     state = mc.load_json(state_path, {})
@@ -216,8 +224,8 @@ def main(argv=None) -> int:
             pending.append(mc.plan_episode(
                 episodes, "disk-absent-" + r["label"], r["state"] == "absent",
                 ("high", "HomeHub: %s is not mounted" % r["mount"],
-                 "%s is configured in HOMEHUB_DISK_MOUNTS but is not a mount point; anything "
-                 "writing there is filling its parent filesystem instead." % r["mount"]),
+                 "%s is configured in HOMEHUB_DISK_MOUNTS but is not mounted (%s); anything "
+                 "writing there is filling its parent filesystem instead." % (r["mount"], r.get("why"))),
                 ("HomeHub: %s is mounted again" % r["mount"], "%s is a mount point again." % r["mount"]),
             ))  # fmt: skip
     mc.drop_stale_episodes(

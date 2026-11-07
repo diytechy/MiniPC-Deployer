@@ -35,5 +35,6 @@ truth for what each id means.
 | 2026-11-04 | The built kids ISO is read back (branch `kids-iso-payload-check`) | LLR-1439; TC-1658 (used: all; no new SR, SR-138 covers it) |
 | 2026-11-05 | The relay settle and the desktop's S/PDIF level (branch `panel-owner-items-2026-11-05`) | SR-143..145; LLR-1440..1447; TC-1659..1667 (used: all) |
 | 2026-11-06 | Hub-to-panel door events: the hub detector's feed and the image's source/port credentials (branch `hub-door-feed`; the panel half is OfficeWallNaglight's, HomeHub open-items A78) | SR-146..147; LLR-1448..1459; TC-1668..1685; IF-079 (used: SR-146..147, LLR-1448..1457, TC-1668..1685, IF-079; LLR-1458..1459 unused) |
+| 2026-11-06 | Door clip storage on the media drive: ensure, guard, quota, Clips share support, the move off scratch, a dropped drive (branch `clips-media-drive`; HomeHub media plan) | SR-148..149; LLR-1460..1475; TC-1686..1705 (used: SR-148..149, LLR-1460..1475, TC-1686..1700; IF-077 amended, SR-131 and LLR-1370 amended) |
 
 The plan is HomeHub `docs/archive/2026-10-23/IMPLEMENTATION_PLAN_2026-10-22.md`.

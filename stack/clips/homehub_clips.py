@@ -48,19 +48,23 @@ RETENTION (SR-131): CLIPS_RETENTION_DAYS (365), capped at CLIPS_CAP_MIB
 (95367 MiB = 100 GB) over all cameras, and while the clips quota project is
 past CLIPS_QUOTA_HIGH_PCT of its limit: oldest clips first. Hourly.
 
-WHERE (the Owner, 2026-10-26: the media drive is not bought yet, C111):
-CLIPS_ROOT=/srv/scratch/clips, the scratch volume's `clips` quota project
-(homehub_scratch.py, 5 GiB on the 22 GiB volume) behind the scratch guard. /srv/media/Clips is the
-other accepted value, for when the drive exists; it has a generic guard
-(a separate ext4 mount with project quotas, writable) until the media build
-adds the drive's identity check. A write that hits the quota stops the cutter
+WHERE: CLIPS_ROOT=/srv/media/Clips, the media drive (SR-148; the Owner,
+2026-11-06), or /srv/scratch/clips, the scratch volume's `clips` quota project
+(homehub_scratch.py, 5 GiB on the 22 GiB volume) behind the scratch guard. On
+the drive the guard asks for the mount, ext4 with project quotas, writable, the
+disk that drive-identity.conf names, and the root in quota project MEDIA_PROJECT.
+That project's hard limit is derived from CLIPS_CAP_MIB (media_quota_mib), so the
+cap, not the quota, normally acts. A write that hits the quota stops the cutter
 (exit 75, an alert, no retry loop) until retention has made room.
 
 Verbs: cut (timer, 60 s), encode (timer, 15 min), retention (timer, hourly),
-status (JSON), episodes --camera C (what cut would do, read-only).
+status (JSON), episodes --camera C (what cut would do, read-only), ensure
+(the drive's folder, account and quota; root, idempotent, firstboot and by hand),
+switch-to-media (the clips of the old area and CLIPS_ROOT, once, as one unit).
 
 Python 3.8-compatible (the dev PC's test runner imports this module).
-Implements: SR-129, SR-130, SR-131, IF-077, LLR-1363..LLR-1378.
+Implements: SR-129, SR-130, SR-131, SR-148, SR-149, IF-077, LLR-1363..LLR-1378,
+LLR-1460..LLR-1466, LLR-1472, LLR-1473, LLR-1475.
 """
 
 from __future__ import annotations
@@ -68,6 +72,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import contextlib
+import copy
 import errno
 import hashlib
 import json
@@ -99,6 +104,15 @@ MIB = 1024 * 1024
 SCRATCH_ROOT = scratch.MOUNTPOINT + "/clips"   # hub paths are POSIX wherever this is imported
 MEDIA_MOUNT = "/srv/media"
 MEDIA_ROOT = MEDIA_MOUNT + "/Clips"
+MEDIA_PROJECT = 7105       # the Clips tree on the media drive: one project, as CLIPS_CAP_MIB is one cap over all cameras
+# The share's `force user` (a Samba identity, never a login). Fixed, like the
+# household group's 3000: the group is on the drive as a number, and a reimage
+# that handed the name a different one would leave every older clip unreadable.
+CLIPS_ACCOUNT = "homehub-clips"
+CLIPS_ACCOUNT_ID = 3100
+# Generated from HomeHub's storage map: mountpoint<TAB>by-id<TAB>label, the same
+# file library-guard.sh reads. It lives on the hub, so no serial is in this repo.
+IDENTITY_FILE = "/etc/homehub-samba/drive-identity.conf"
 SETTLE_MS = 15000          # after the window closes: the detector's last renewal is written ~lease after it
 COVER_WAIT_MS = 180000     # how long to wait for the recording to reach the window's end
 LOOKBACK_MS = 30 * 3600 * 1000
@@ -120,6 +134,15 @@ MAX_WAITS = 10             # passes an episode may wait on a listed segment that
 MANUAL_RUN = ("sudo systemd-run --wait --pipe --quiet -p CapabilityBoundingSet=~CAP_SYS_RESOURCE "
               "-p NoNewPrivileges=yes -p Nice=19 -p IOSchedulingClass=idle -p CPUQuota=25% "
               "/usr/bin/python3 /opt/homehub/stack/clips/homehub_clips.py")
+# How the switch runs: detached, so a lost session cannot stop it, with its output in
+# the journal, bounded so it can never hold the pipeline lock past a sane copy of the
+# 5 GiB the old area can hold, and without CAP_SYS_RESOURCE, as the guard requires.
+SWITCH_RUN = ("sudo systemd-run --unit=homehub-clips-switch --collect -p RuntimeMaxSec=1h "
+              "-p CapabilityBoundingSet=~CAP_SYS_RESOURCE -p NoNewPrivileges=yes "
+              "/usr/bin/python3 /opt/homehub/stack/clips/homehub_clips.py switch-to-media")
+SWITCH_LOCK_WAIT_SEC = 900  # a running encode batch ends within ENCODE_RUN_SEC plus its last clip
+SWITCH_RESULT = "switch-to-media.json"
+ENV_BACKUP = "env.pre-switch-to-media"
 CUT_TIMEOUT_SEC = 300
 ENCODE_LOOKBACK_DAYS = 7   # the encode batch looks at this many days of clips
 ENCODE_RUN_SEC = 600       # and stops starting new encodes after this long
@@ -614,34 +637,120 @@ def clip_stem(camera: str, event_ms: int, cause: str, seconds: float,
 # ── the guard (before every file) ────────────────────────────────────────────
 
 
-def media_guard(root: str, paths: Optional[scratch.Paths] = None) -> Tuple[bool, str]:
-    """For CLIPS_ROOT=/srv/media/Clips: a separate ext4 mount with project
-    quotas, writable, the root a real directory on it, and this process without
-    CAP_SYS_RESOURCE. The drive's identity (label, serial) is the media-drive
-    build's to add (HomeHub open-items C111). Implements: LLR-1370."""
-    paths = paths or scratch.Paths()
+class MediaPaths(scratch.Paths):
+    """The host paths the media drive's checks read; tests point them elsewhere."""
+
+    def __init__(self, root: str = "/"):
+        super().__init__(root)
+        self.identity = IDENTITY_FILE
+        self.by_id = "/dev/disk/by-id"
+        self.sys_block = "/sys/dev/block"
+
+
+def expected_media_drive(identity_file: str) -> Optional[str]:
+    """The by-id name drive-identity.conf gives /srv/media, or None. Never logged:
+    it carries the disk's serial, and a guard's reason goes to an alert."""
+    try:
+        with open(identity_file, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                fields = line.rstrip("\r\n").split("\t")
+                if len(fields) >= 2 and fields[0] == MEDIA_MOUNT and re.fullmatch(r"[A-Za-z0-9._:-]+", fields[1]):
+                    return fields[1]
+    except OSError:
+        pass
+    return None
+
+
+def parent_majmin(majmin: str, paths: MediaPaths) -> Optional[str]:
+    """MAJ:MIN of the whole disk a partition belongs to, from sysfs: no read
+    reaches the drive. library-guard.sh's question, asked the same way: a
+    partition's parent directory IS its disk, so a name cannot pass for it."""
+    try:
+        with open(os.path.join(paths.sys_block, majmin, "..", "dev"), encoding="ascii") as handle:
+            return handle.read().strip()
+    except OSError:
+        return None
+
+
+def media_device_state(majmin: str, expected: str, paths: MediaPaths) -> str:
+    """"ok", or why the mounted device is not the media drive (no serial in it)."""
+    if not os.path.exists(os.path.join(paths.sys_block, majmin)):
+        return "the device mounted at %s (%s) no longer exists: the drive dropped" % (MEDIA_MOUNT, majmin)
+    disk = scratch.majmin_of_rdev(os.path.join(paths.by_id, expected))
+    if disk is None:
+        return "the disk drive-identity.conf names for %s is not attached" % MEDIA_MOUNT
+    if majmin == disk or parent_majmin(majmin, paths) == disk:
+        return "ok"
+    return "%s is mounted from device %s, which is not the disk drive-identity.conf names" % (MEDIA_MOUNT, majmin)
+
+
+def media_mount_state(paths: MediaPaths) -> Tuple[bool, str, Optional[Dict[str, str]]]:
+    """Is /srv/media the real drive, writable? (ok, reason, its mountinfo entry).
+    The one answer the guard and `ensure` share. Implements: LLR-1370, LLR-1460."""
     try:
         with open(paths.mountinfo, encoding="utf-8", errors="replace") as handle:
             entry = scratch.mount_of(scratch.parse_mountinfo(handle.read()), MEDIA_MOUNT)
     except OSError:
         entry = None
     if entry is None:
-        return False, "%s is not a mount point (the media drive is not mounted)" % MEDIA_MOUNT
+        return False, "%s is not a mount point (the media drive is not mounted)" % MEDIA_MOUNT, None
     if entry["fstype"] != "ext4" or "prjquota" not in entry["superopts"].split(","):
-        return False, "%s is not ext4 with prjquota" % MEDIA_MOUNT
+        return False, "%s is not ext4 with prjquota" % MEDIA_MOUNT, entry
     if "ro" in entry["superopts"].split(",") or "ro" in entry.get("options", "").split(","):
-        return False, "%s is mounted read-only" % MEDIA_MOUNT
-    if scratch.holds_cap_sys_resource(paths.status):
+        return False, "%s is mounted read-only" % MEDIA_MOUNT, entry
+    expected = expected_media_drive(paths.identity)
+    if expected is None:
+        return False, "%s has no %s row: nothing says which disk it must be" % (paths.identity, MEDIA_MOUNT), entry
+    state = media_device_state(entry["majmin"], expected, paths)
+    return (True, "ok", entry) if state == "ok" else (False, state, entry)
+
+
+def media_write_error(root: str) -> Optional[str]:
+    """None when an empty file can be made and removed in `root`, else the errno
+    name. THE ONLY WAY TO SEE AN EXT4 THAT HAS STOPPED: after an I/O error this
+    kernel logs "Remounting filesystem read-only" and shuts the filesystem down
+    without setting the read-only flag, so mountinfo and statvfs still say rw
+    (measured on 6.8, TC-1695). Empty, unlike the scratch guard's probe, and a
+    full quota answered None: it needs no block, and a guard that refused a full
+    quota would stop retention from ever clearing it."""
+    probe = os.path.join(root, ".clips-guard-%d" % os.getpid())
+    try:
+        os.close(os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        os.unlink(probe)
+    except OSError as exc:
+        if exc.errno in (getattr(errno, "EDQUOT", -1), errno.ENOSPC):
+            return None
+        return errno.errorcode.get(exc.errno, str(exc.errno))
+    return None
+
+
+def media_guard(root: str, paths: Optional[MediaPaths] = None, check_cap: bool = True) -> Tuple[bool, str]:
+    """For CLIPS_ROOT=/srv/media/Clips: the real drive (media_mount_state), this
+    process without CAP_SYS_RESOURCE, the root a real directory on the drive in
+    its own quota project, and the filesystem still taking writes.
+    Implements: LLR-1370, LLR-1461."""
+    paths = paths or MediaPaths()
+    ok, reason, entry = media_mount_state(paths)
+    if not ok:
+        return False, reason
+    if check_cap and scratch.holds_cap_sys_resource(paths.status):
         return False, "this process holds CAP_SYS_RESOURCE, which ignores quota hard limits"
     try:
         st = os.lstat(root)
     except OSError:
-        return False, "%s does not exist" % root
+        return False, "%s does not exist (run homehub_clips.py ensure)" % root
     if not stat.S_ISDIR(st.st_mode):
         return False, "%s is not a directory" % root
     maj, mnr = (int(x) for x in entry["majmin"].split(":"))
     if st.st_dev != os.makedev(maj, mnr):
         return False, "%s is not on the media drive" % root
+    project, inherit = scratch.get_project(root)
+    if (project, inherit) != (MEDIA_PROJECT, True):
+        return False, ("%s is in quota project %s (inherit %s), not %d: it would write outside its limit "
+                       "(run homehub_clips.py ensure)" % (root, project, inherit, MEDIA_PROJECT))
+    failed = media_write_error(root)
+    if failed:
+        return False, "%s is mounted but not writable (%s): the filesystem has stopped" % (MEDIA_MOUNT, failed)
     return True, "ok"
 
 
@@ -827,6 +936,18 @@ class GuardStop(Exception):
     """The guard refused: the clips area is not where it must be."""
 
 
+class MoveFailed(Exception):
+    """The move, its verification or the .env write did not complete."""
+
+
+class EnvWriteFailed(MoveFailed):
+    """Writing .env failed. `restored` says whether its bytes were put back and read back."""
+
+    def __init__(self, message: str, restored: bool):
+        super().__init__(message)
+        self.restored = restored
+
+
 # ── the cut ──────────────────────────────────────────────────────────────────
 
 
@@ -911,6 +1032,9 @@ def cut_episode(settings: ClipsSettings, cam: CameraSettings, ep: Episode, plan:
         why = "the cut lasts %.2f s for %d frames" % (float(probed["duration"]), plan.frames)
     if why:
         _remove(part_path)
+        ok, reason = guard(settings)
+        if not ok:  # the area went during the cut: not this episode's fault, and no attempt of its three
+            raise GuardStop(reason)
         mc.log("clips [%s]: cut FAILED for %s - %s" % (cam.camera, ep.id, why), warning=True)
         return {"status": "failed", "why": why}
     final = os.path.join(day_dir, stem + ".mp4")
@@ -1101,9 +1225,12 @@ def cut_camera(settings: ClipsSettings, cam: CameraSettings, state_dir: str, now
         for key in [k for k in ledger.get("waits", {}) if k not in live]:  # type: ignore[union-attr]
             del ledger["waits"][key]  # type: ignore[index]
         mc.save_json_atomic(ledger_path(state_dir, cam.camera), ledger)
-    if lost_new and alert:
-        alert("clips-lost-%s" % cam.camera, "HomeHub: %d %s motion clip(s) could not be cut" % (len(lost_new), cam.camera),
-              "The recording no longer (or never) covered: %s. Segments are kept ~27 h." % ", ".join(lost_new[:10]))
+        # In the finally: a pass that records a loss and then meets a refused
+        # guard (a drive gone longer than the recording lasts) still tells.
+        if lost_new and alert:
+            alert("clips-lost-%s" % cam.camera,
+                  "HomeHub: %d %s motion clip(s) could not be cut" % (len(lost_new), cam.camera),
+                  "The recording no longer (or never) covered: %s. Segments are kept ~27 h." % ", ".join(lost_new[:10]))
     return counts
 
 
@@ -1634,16 +1761,29 @@ def retention_plan(clips: Sequence[Tuple[int, str, str, int]], now_ms: int, keep
     return doomed
 
 
+def media_quota_mib(cap_mib: int, high_pct: int) -> int:
+    """The media project's hard limit, from the cap (pure). Retention's quota
+    rule starts at high_pct of the limit and trims to 5 points under, so a limit
+    with the cap exactly at that lower mark means: the cap acts first, in every
+    normal hour; the quota rule only ever trims back to the cap; and the room
+    between them (CLIPS_CAP_MIB 95367, 90 %: limit 112197, rule from 100977) is
+    what the cap does not count - blocks over bytes, folders, an hour of new
+    clips, the encode trial. Implements: LLR-1462."""
+    return -(-cap_mib * 100 // (high_pct - 5))
+
+
 def clips_quota(settings: ClipsSettings) -> Tuple[Optional[int], Optional[int]]:
-    """(used, limit) bytes of the clips quota project on scratch, or (None, None)."""
-    if settings.root != SCRATCH_ROOT:
-        return None, None
+    """(used, limit) bytes of CLIPS_ROOT's quota project, or (None, None)."""
+    if settings.root == SCRATCH_ROOT:
+        mount, project = scratch.MOUNTPOINT, scratch.PROJECT_ID["clips"]
+    else:
+        mount, project = MEDIA_MOUNT, MEDIA_PROJECT
     try:
         with open("/proc/self/mountinfo", encoding="utf-8", errors="replace") as handle:
-            entry = scratch.mount_of(scratch.parse_mountinfo(handle.read()), scratch.MOUNTPOINT)
+            entry = scratch.mount_of(scratch.parse_mountinfo(handle.read()), mount)
         if not entry:
             return None, None
-        return scratch.get_project_quota(entry["source"], scratch.PROJECT_ID["clips"])
+        return scratch.get_project_quota(entry["source"], project)
     except (OSError, KeyError):
         return None, None
 
@@ -1854,6 +1994,429 @@ def rewrite_index(path: str, gone: set) -> bool:
         return False
 
 
+# ── the media drive: provisioning, and the move off scratch ──────────────────
+
+
+def ensure_account(act: Callable[..., None]) -> None:
+    """The share's account, with its fixed ids. A name or an id that already
+    means something else is refused, not adopted: the drive's group is a number.
+    Implements: LLR-1463."""
+    import grp  # local: the dev PC's test runner (Windows) has neither
+    import pwd
+
+    name, ident = CLIPS_ACCOUNT, CLIPS_ACCOUNT_ID
+    try:
+        have = grp.getgrnam(name).gr_gid
+    except KeyError:
+        try:
+            other = grp.getgrgid(ident).gr_name
+        except KeyError:
+            act("create group %s (gid %d)" % (name, ident), ["groupadd", "-g", str(ident), name])
+        else:
+            raise scratch.Refused("gid %d is already group %s" % (ident, other))
+    else:
+        if have != ident:
+            raise scratch.Refused("group %s exists with gid %d, not %d" % (name, have, ident))
+    try:
+        user = pwd.getpwnam(name)
+    except KeyError:
+        try:
+            other = pwd.getpwuid(ident).pw_name
+        except KeyError:
+            # -M no home, -N no group of its own: Samba reads as this account; it logs in nowhere.
+            act("create user %s (uid %d, no home, nologin)" % (name, ident),
+                ["useradd", "-M", "-N", "-u", str(ident), "-g", str(ident), "-s", "/usr/sbin/nologin", name])
+        else:
+            raise scratch.Refused("uid %d is already user %s" % (ident, other))
+    else:
+        if (user.pw_uid, user.pw_gid) != (ident, ident):
+            raise scratch.Refused("user %s is uid %d gid %d, not %d" % (name, user.pw_uid, user.pw_gid, ident))
+
+
+def ensure_folder(entry: Dict[str, str], act: Callable[..., None], apply: bool) -> None:
+    """/srv/media/Clips: root:homehub-clips 2750 with no ACL of its own.
+
+    Owned by root, unlike the plan's homehub-clips:homehub-clips: the cutter's
+    ffmpeg is uid 0 in a container with every capability dropped, so it writes
+    only where uid 0 is the OWNER. The share reads through the GROUP instead:
+    setgid puts everything under here in homehub-clips whoever made it, and every
+    writer's mode leaves the group read (the units' umask 0027, the container's
+    0022), so no default ACL is needed, and the /srv/media one that mkdir would
+    inherit (group write, other read) is removed. Created through a descriptor
+    of the mount itself, so a drive that went since the check cannot put a folder
+    on the root filesystem. Implements: LLR-1464."""
+    maj, mnr = (int(x) for x in entry["majmin"].split(":"))
+    name = os.path.basename(MEDIA_ROOT)
+    fd = os.open(MEDIA_MOUNT, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        if os.fstat(fd).st_dev != os.makedev(maj, mnr):
+            raise scratch.Refused("%s is not on the mounted drive any more" % MEDIA_MOUNT)
+        try:
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)  # type: Optional[os.stat_result]
+        except FileNotFoundError:
+            st = None
+        if st is not None and not stat.S_ISDIR(st.st_mode):
+            raise scratch.Refused("%s exists and is not a directory" % MEDIA_ROOT)
+        if st is None:
+            act("create %s" % MEDIA_ROOT, fn=lambda: os.mkdir(name, 0o750, dir_fd=fd))
+            if not apply:
+                act("set it root:%s 2750, no ACL" % CLIPS_ACCOUNT)
+                return
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+    finally:
+        os.close(fd)
+    for attr in ("system.posix_acl_default", "system.posix_acl_access"):
+        try:
+            os.getxattr(MEDIA_ROOT, attr)
+        except OSError:
+            continue  # no such ACL
+        act("remove %s's %s" % (MEDIA_ROOT, attr), fn=lambda a=attr: os.removexattr(MEDIA_ROOT, a))
+    if (st.st_uid, st.st_gid) != (0, CLIPS_ACCOUNT_ID):
+        act("set %s's owner to root:%s" % (MEDIA_ROOT, CLIPS_ACCOUNT), fn=lambda: os.chown(MEDIA_ROOT, 0, CLIPS_ACCOUNT_ID))
+    if stat.S_IMODE(os.stat(MEDIA_ROOT).st_mode) != 0o2750:
+        act("set %s's mode to 2750" % MEDIA_ROOT, fn=lambda: os.chmod(MEDIA_ROOT, 0o2750))
+
+
+def ensure_quota(settings: ClipsSettings, entry: Dict[str, str], act: Callable[..., None]) -> Dict[str, object]:
+    """The quota project on the folder and its hard limit. A folder that already
+    holds files in another project is refused: the files keep the project they
+    were made in, so the limit would not count them. Implements: LLR-1465."""
+    limit = media_quota_mib(settings.cap_mib, settings.quota_high_pct)
+    usable = scratch.usable_bytes(MEDIA_MOUNT)
+    if limit * MIB > usable:
+        raise scratch.Refused("the quota for a %d MiB cap is %d MiB; the drive has %d" % (settings.cap_mib, limit, usable // MIB))
+    present = os.path.isdir(MEDIA_ROOT)
+    project, inherit = scratch.get_project(MEDIA_ROOT) if present else (None, False)
+    if (project, inherit) != (MEDIA_PROJECT, True):
+        if present and os.listdir(MEDIA_ROOT):
+            raise scratch.Refused("%s holds files in quota project %s, not %d; move them out first"
+                                  % (MEDIA_ROOT, project, MEDIA_PROJECT))
+        act("put %s in quota project %d (inherit)" % (MEDIA_ROOT, MEDIA_PROJECT),
+            fn=lambda: scratch.set_project(MEDIA_ROOT, MEDIA_PROJECT))
+    used, have = scratch.get_project_quota(entry["source"], MEDIA_PROJECT)
+    if have != limit * MIB:
+        act("set the hard quota to %d MiB (was %d MiB; %d MiB used)" % (limit, have // MIB, used // MIB),
+            fn=lambda: scratch.set_project_quota(entry["source"], MEDIA_PROJECT, limit))
+    return {"quota_mib": limit, "used_mib": used // MIB, "cap_mib": settings.cap_mib}
+
+
+def ensure_media(settings: ClipsSettings, apply: bool, paths: Optional[MediaPaths] = None) -> Dict[str, object]:
+    """Make /srv/media/Clips ready for CLIPS_ROOT. Every step asks its end state,
+    so a second run has no actions; with apply False nothing changes and the
+    actions are the plan. Raises scratch.Refused, having touched nothing, when
+    /srv/media is not the real drive. Root, with every capability (`ensure` is
+    the provisioner, not a writer). Implements: LLR-1460, SR-148."""
+    paths = paths or MediaPaths()
+    ok, reason, entry = media_mount_state(paths)
+    if not ok:
+        raise scratch.Refused(reason)
+    actions = []  # type: List[str]
+
+    def act(what: str, argv: Optional[Sequence[str]] = None, fn: Optional[Callable[[], object]] = None) -> None:
+        actions.append(what)
+        mc.log(("clips ensure: " if apply else "clips ensure (plan): would ") + what)
+        if apply and argv:
+            scratch.run(argv)
+        if apply and fn:
+            fn()
+    ensure_account(act)
+    ensure_folder(entry, act, apply)  # type: ignore[arg-type]
+    report = ensure_quota(settings, entry, act)  # type: ignore[arg-type]
+    report.update(root=MEDIA_ROOT, project=MEDIA_PROJECT, actions=actions)
+    if apply:
+        ok, why = media_guard(MEDIA_ROOT, paths, check_cap=False)  # as a writer sees it, bar the capability
+        if not ok:
+            raise scratch.Refused("the guard still refuses after ensure: %s" % why)
+    return report
+
+
+def copy_verified(src: str, dst: str) -> None:
+    """src to dst through a .part: written, synced, compared with src, renamed."""
+    part = dst + ".part"
+    with open(src, "rb") as reader, open(part, "wb") as writer:
+        for block in iter(lambda: reader.read(1 << 20), b""):
+            writer.write(block)
+        writer.flush()
+        os.fsync(writer.fileno())
+    st = os.stat(src)
+    os.utime(part, (st.st_atime, st.st_mtime))
+    if sha256_file(part) != sha256_file(src):
+        _remove(part)
+        raise OSError(errno.EIO, "the copy of %s does not match it" % src)
+    os.replace(part, dst)
+
+
+def sync_dir(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def move_one(src_day: str, dst_day: str, stem: str) -> bool:
+    """One clip across, the record before the clip (a clip never appears without
+    its record), and the source removed only once both are on the drive. A name
+    already there with the same bytes is the rest of a killed run; with other
+    bytes it is a different clip: left alone, False."""
+    names = [n for n in (stem + ".json", stem + ".mp4") if os.path.lexists(os.path.join(src_day, n))]
+    for name in names:
+        src, dst = os.path.join(src_day, name), os.path.join(dst_day, name)
+        if os.path.lexists(dst) and sha256_file(dst) != sha256_file(src):
+            mc.log("clips: %s is already on the drive with other bytes - left where it is" % name, warning=True)
+            return False
+    os.makedirs(dst_day, mode=0o750, exist_ok=True)
+    for name in names:
+        src, dst = os.path.join(src_day, name), os.path.join(dst_day, name)
+        if not os.path.lexists(dst):
+            copy_verified(src, dst)
+    sync_dir(dst_day)
+    for name in names:
+        _remove(os.path.join(src_day, name))
+    return True
+
+
+def persist_index_dirty(cam_dir: str) -> None:
+    """mark_index_dirty for the move: on disk before any clip is, and a failure
+    is a failure, not a shrug. Raises OSError."""
+    os.makedirs(cam_dir, mode=0o750, exist_ok=True)
+    path = os.path.join(cam_dir, INDEX_DIRTY)
+    with open(path, "w") as handle:
+        handle.flush()
+        os.fsync(handle.fileno())
+    sync_dir(cam_dir)
+
+
+def repair_dirty_indexes(settings: ClipsSettings) -> int:
+    """Rebuild every marked index under the root, whoever marked it. The marker
+    goes only after the rebuild succeeded; a failed one is a failed migration.
+    Returns how many were repaired. Implements: LLR-1473."""
+    repaired = 0
+    for camera in camera_dirs(settings.root):
+        cam_dir = os.path.join(settings.root, camera)
+        if not os.path.exists(os.path.join(cam_dir, INDEX_DIRTY)):
+            continue
+        ok, reason = guard(settings)
+        if not ok:
+            raise GuardStop(reason)
+        if not rebuild_index(cam_dir):
+            raise MoveFailed("%s/index.jsonl could not be rebuilt; its marker stays" % camera)
+        if not _remove(os.path.join(cam_dir, INDEX_DIRTY)):
+            raise MoveFailed("%s/%s could not be removed" % (camera, INDEX_DIRTY))
+        repaired += 1
+    return repaired
+
+
+def move_from_scratch(settings: ClipsSettings, apply: bool, source: Optional[str] = None,
+                      quota_fn: Optional[Callable[[], Tuple[Optional[int], Optional[int]]]] = None) -> Dict[str, object]:
+    """The clips left in the old area, once, with `settings.root` the drive.
+
+    Every reference a clip has is relative to its camera folder - the sidecar's
+    `clip`, index.jsonl's `clip`, the ledger's `clip` - and the ledger stays in
+    the state directory, so no record names the root and none is rewritten; an
+    episode already cut stays cut. Each destination index is marked dirty on disk
+    BEFORE a clip moves and rebuilt from the sidecars afterwards, so whatever stops
+    this run, the marker says so: the next run repairs it even with no clip left
+    to move, and retention would too. The guard is asked before every clip. Run
+    again after any failure: what moved is gone from the source, and the rest
+    moves. Raises GuardStop, QuotaStop, MoveFailed. Implements: LLR-1466,
+    LLR-1473, SR-148."""
+    source = source or SCRATCH_ROOT
+    if settings.root != MEDIA_ROOT:
+        raise Invalid("the clips can only move to %s" % MEDIA_ROOT)
+    clips = list_clips(source)
+    need = sum(c[3] for c in clips)
+    report = {"from": source, "to": settings.root, "clips": len(clips), "mib": round(need / MIB, 1),
+              "moved": 0, "left": len(clips), "applied": apply, "indexes_repaired": 0}  # type: Dict[str, object]
+    if not apply:
+        return report
+    ok, reason = guard(settings)
+    if not ok:
+        raise GuardStop(reason)
+    used, limit = (quota_fn or (lambda: clips_quota(settings)))()
+    if limit and used is not None and used + need > limit * settings.quota_high_pct // 100:
+        raise QuotaStop("%.1f MiB does not fit under the clips quota; nothing was moved" % (need / MIB))
+    cameras = {os.path.basename(os.path.dirname(c[1])) for c in clips} | set(camera_dirs(settings.root))
+    for camera in sorted(cameras):
+        persist_index_dirty(os.path.join(settings.root, camera))
+    moved = 0
+    for _start, day_dir, stem, _size in clips:
+        ok, reason = guard(settings)
+        if not ok:
+            raise GuardStop(reason)
+        camera, day = os.path.basename(os.path.dirname(day_dir)), os.path.basename(day_dir)
+        if move_one(day_dir, os.path.join(settings.root, camera, day), stem):
+            moved += 1
+    report["moved"] = moved
+    report["indexes_repaired"] = repair_dirty_indexes(settings)
+    for camera in camera_dirs(source):
+        cam_dir = os.path.join(source, camera)
+        for day in _days(cam_dir):
+            try:
+                os.rmdir(os.path.join(cam_dir, day))  # only when empty
+            except OSError:
+                pass
+        if not _days(cam_dir):
+            for name in ("index.jsonl", INDEX_DIRTY):
+                _remove(os.path.join(cam_dir, name))
+            try:
+                os.rmdir(cam_dir)
+            except OSError:
+                pass
+    report.update(left=len(list_clips(source)))
+    return report
+
+
+def clip_keys(root: str) -> set:
+    """(camera, day, stem) of every clip under a root."""
+    return {(os.path.basename(os.path.dirname(day_dir)), os.path.basename(day_dir), stem)
+            for _start, day_dir, stem, _size in list_clips(root)}
+
+
+def index_problems(root: str, cameras: Sequence[str]) -> List[str]:
+    """Where an index does not list exactly the clips with a sidecar (empty when true)."""
+    out = []
+    for camera in cameras:
+        cam_dir = os.path.join(root, camera)
+        if os.path.exists(os.path.join(cam_dir, INDEX_DIRTY)):
+            out.append("%s: still marked dirty" % camera)
+            continue
+        want = {"%s/%s.mp4" % (d, s) for c, d, s in clip_keys(root) if c == camera
+                and os.path.exists(os.path.join(cam_dir, d, s + ".json"))}
+        have = {r.get("clip") for r in mc.iter_jsonl(os.path.join(cam_dir, "index.jsonl")) if isinstance(r, dict)}
+        if want != have:
+            out.append("%s: %d clips, %d index lines" % (camera, len(want), len(have)))
+    return out
+
+
+def read_bytes(path: str) -> bytes:
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def put_bytes(fd: int, data: bytes) -> None:
+    """The whole of `data` as the file behind fd, unbuffered, so what failed is known."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    view = memoryview(data)
+    while len(view):
+        view = view[os.write(fd, view):]
+    os.ftruncate(fd, len(data))
+    os.fsync(fd)
+
+
+def restore_env(fd: int, env_file: str, before: bytes) -> Optional[str]:
+    """Put the pre-write bytes back through the same descriptor and read them
+    back. None when that all worked, else why it did not."""
+    try:
+        put_bytes(fd, before)
+        if read_bytes(env_file) != before:
+            return "reading it back gave other bytes"
+    except Exception as exc:  # noqa: BLE001 - whatever stopped it, the caller must be told
+        return str(exc) or repr(exc)
+    return None
+
+
+def set_env_lines(env_file: str, changes: Dict[str, str], backup: Optional[str] = None) -> None:
+    """Change KEY=... lines of the stack .env IN PLACE: same inode, because the
+    file is bind-mounted into containers and a rename would leave them on the old
+    one. Every line of a key is set (the last wins for readers), a missing key is
+    appended, every other byte stays.
+
+    IN PLACE IS NOT ATOMIC, so the exact bytes it found are kept, and if the write,
+    the truncate, the sync or the read-back fails they are put back the same way
+    and read back in turn. Raises EnvWriteFailed saying which of the two happened;
+    if they could not be put back it names `backup`, the file that can. The file
+    may be anything after that, so nothing else may be said about it.
+    Implements: LLR-1472, LLR-1475."""
+    before = read_bytes(env_file)
+    lines = before.split(b"\n")
+    for key, value in changes.items():
+        prefix = key.encode("ascii") + b"="
+        line = prefix + value.encode("utf-8")
+        found = False
+        for i, have in enumerate(lines):
+            if have.startswith(prefix):
+                lines[i], found = line, True
+        if not found:
+            lines[-1:] = [line, b""] if lines[-1] == b"" else [lines[-1], line, b""]
+    after = b"\n".join(lines)
+    fd = os.open(env_file, os.O_RDWR | getattr(os, "O_BINARY", 0))
+    try:
+        try:
+            put_bytes(fd, after)
+            if read_bytes(env_file) != after:
+                raise OSError(errno.EIO, "reading it back gave other bytes")
+        except Exception as exc:  # noqa: BLE001 - any failure here leaves the file unknown
+            failed = restore_env(fd, env_file, before)
+            if failed is None:
+                raise EnvWriteFailed("writing %s failed (%s); its previous bytes were put back in place and read back"
+                                     % (env_file, exc), True)
+            raise EnvWriteFailed(
+                "writing %s failed (%s) and it was NOT restored (%s), so it may be damaged. %s"
+                % (env_file, exc, failed,
+                   "The root-only backup is %s: compare with `sudo cmp %s %s`, put it back in place with "
+                   "`sudo sh -c 'cat %s >%s'`, then run the switch again" % (backup, backup, env_file, backup, env_file)
+                   if backup else "There is no backup: check it by hand"), False)
+    finally:
+        # By now the bytes are synced and read back, or a truthful EnvWriteFailed is
+        # on its way. A failed close must not replace that with a report of its own.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def back_up_env(env_file: str, state_dir: str) -> str:
+    """The .env as it was before the first switch, kept once, root-only: it holds secrets."""
+    path = os.path.join(state_dir, ENV_BACKUP)
+    if not os.path.exists(path):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as out, open(env_file, "rb") as source:
+            out.write(source.read())
+            out.flush()
+            os.fsync(out.fileno())
+    return path
+
+
+def switch_to_media(settings: ClipsSettings, env_file: str, state_dir: str, source: Optional[str] = None,
+                    quota_fn: Optional[Callable[[], Tuple[Optional[int], Optional[int]]]] = None) -> Dict[str, object]:
+    """Clips and CLIPS_ROOT to the drive, as one unit. The caller holds the pipeline lock.
+
+    IT CANNOT LEAVE CUTTING STOPPED, BY CONSTRUCTION, NOT BY CLEANING UP. No timer is
+    stopped: the lock alone makes a cut or retention pass skip, and the kernel
+    drops the lock however this process ends - a lost session, a kill, a power cut.
+    And CLIPS_ROOT stays on scratch until the very end: the move works on a copy of
+    the settings, the counts taken inside the lock are verified, and only then
+    is the .env written. So a failure before that write leaves the pipeline as it
+    was, cutting to scratch, with what already moved safe on the drive, and a
+    failure of the write itself is put right by set_env_lines or said not to
+    be: EnvWriteFailed.restored. Run it again: it repairs and finishes. Raises
+    MoveFailed, GuardStop, QuotaStop, OSError. Implements: LLR-1472, SR-148."""
+    target = copy.copy(settings)
+    target.root = MEDIA_ROOT
+    old = source or SCRATCH_ROOT
+    before_source, before_drive = clip_keys(old), clip_keys(MEDIA_ROOT)
+    report = {"source_before": len(before_source), "drive_before": len(before_drive), "root_before": settings.root}
+    report.update(move_from_scratch(target, True, old, quota_fn))
+    after_drive = clip_keys(MEDIA_ROOT)
+    report["drive_after"] = len(after_drive)
+    if report["left"]:
+        raise MoveFailed("%d clip(s) did not move: %s" % (report["left"], json.dumps(report, sort_keys=True)))
+    missing = (before_source | before_drive) - after_drive
+    if missing:
+        raise MoveFailed("%d clip(s) are not on the drive after the move" % len(missing))
+    problems = index_problems(MEDIA_ROOT, camera_dirs(MEDIA_ROOT))
+    if problems:
+        raise MoveFailed("the index does not match the clips: %s" % "; ".join(problems))
+    knobs = mc.read_knobs(env_file)
+    mounts = mc.knob_words(knobs, "HOMEHUB_DISK_MOUNTS", "/ /var/lib/docker /boot")
+    backup = back_up_env(env_file, state_dir)
+    set_env_lines(env_file, {"CLIPS_ROOT": MEDIA_ROOT, "HOMEHUB_DISK_MOUNTS": '"%s"' % " ".join(
+        list(mounts) + ([] if MEDIA_MOUNT in mounts else [MEDIA_MOUNT]))}, backup)
+    report["root_after"] = MEDIA_ROOT
+    return report
+
+
 # ── the quota stop marker ────────────────────────────────────────────────────
 
 
@@ -1909,8 +2472,9 @@ def status(settings: ClipsSettings, state_dir: str, now_ms: int) -> Dict[str, ob
 
 
 @contextlib.contextmanager
-def pipeline_lock(state_dir: str) -> Iterator[bool]:
-    """One of cut, encode and retention at a time; a busy lock is a skipped run."""
+def pipeline_lock(state_dir: str, wait_sec: int = 0) -> Iterator[bool]:
+    """One of cut, encode and retention at a time; a busy lock is a skipped run,
+    or with wait_sec, one waited for that long."""
     try:
         import fcntl
     except ImportError:  # the dev PC's test runner
@@ -1919,11 +2483,16 @@ def pipeline_lock(state_dir: str) -> Iterator[bool]:
     os.makedirs(state_dir, mode=0o750, exist_ok=True)
     handle = open(os.path.join(state_dir, "pipeline.lock"), "w")
     try:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            yield False
-            return
+        deadline = time.monotonic() + wait_sec
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(1)
         yield True
     finally:
         handle.close()
@@ -1964,6 +2533,62 @@ def run_encode_trial(settings: ClipsSettings, args) -> int:
         return 0
 
 
+def run_switch(settings: ClipsSettings, args) -> int:
+    """The switch-to-media verb. --plan reads and says; otherwise switch_to_media
+    under the pipeline lock, with the units' umask, its outcome in SWITCH_RESULT."""
+    if args.plan:
+        target = copy.copy(settings)
+        target.root = MEDIA_ROOT
+        ok, reason = media_guard(MEDIA_ROOT, check_cap=False)
+        report = move_from_scratch(target, False)
+        report.update(guard=reason, root_now=settings.root, on_drive=len(clip_keys(MEDIA_ROOT)))
+        print(json.dumps(report, sort_keys=True))
+        return 0 if ok else EXIT_GUARD
+    os.umask(0o027)
+    result = os.path.join(args.state_dir, SWITCH_RESULT)
+    os.makedirs(args.state_dir, mode=0o750, exist_ok=True)
+    mc.save_json_atomic(result, {"state": "running", "ok": False})
+    report = {"state": "failed", "ok": False, "env": "not written"}  # type: Dict[str, object]
+    code = 1
+    with pipeline_lock(args.state_dir, SWITCH_LOCK_WAIT_SEC) as got:
+        if not got:
+            report["why"] = "another clips run kept the lock for %d s" % SWITCH_LOCK_WAIT_SEC
+        else:
+            try:
+                # Read again inside the lock: what a pass finishing just now left is what counts.
+                settings = ClipsSettings(mc.read_knobs(args.env_file))
+                report.update(switch_to_media(settings, args.env_file, args.state_dir), state="done", ok=True,
+                              env="written")
+                code = 0
+            except (Invalid, QuotaStop, GuardStop, MoveFailed, OSError) as exc:
+                report["why"] = str(exc)
+                code = EXIT_GUARD if isinstance(exc, GuardStop) else 1
+                if isinstance(exc, EnvWriteFailed):
+                    report["env"] = "restored" if exc.restored else "NOT restored"
+    mc.save_json_atomic(result, report)
+    if code:
+        said = {"not written": "before .env was written; CLIPS_ROOT is as it was, cutting carries on",
+                "restored": "writing .env, which was restored and read back; CLIPS_ROOT is as it was, cutting carries on",
+                "NOT restored": "and .env was NOT RESTORED"}[str(report["env"])]
+        mc.log("clips: switch-to-media FAILED %s - %s" % (said, report.get("why")), warning=True)
+        if "CAP_SYS_RESOURCE" in str(report.get("why")):
+            mc.log("clips: run it as `%s`" % SWITCH_RUN, warning=True)
+    else:
+        mc.log("clips: switched to %s" % MEDIA_ROOT)
+    print(json.dumps(report, sort_keys=True))
+    return code
+
+
+def run_ensure(settings: ClipsSettings, args) -> int:
+    try:
+        report = ensure_media(settings, not args.plan)
+    except scratch.Refused as exc:
+        mc.log("clips: ensure REFUSED - %s" % exc, warning=True)
+        return scratch.EXIT_REFUSE
+    print(json.dumps(report, sort_keys=True))
+    return 0
+
+
 def make_alert(env_file: str):
     def alert(key: str, title: str, body: str) -> None:
         mc.send_alert(key, "high", title, body, env_file, mc.DEFAULT_STATE_DIR, repeat_sec=86400,
@@ -1986,6 +2611,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     t.add_argument("--day", help="the local day folder, YYYY-MM-DD")
     t.add_argument("--max-clips", type=int, default=4)
     t.add_argument("--clean", action="store_true", help="remove the trial folder and stop")
+    n = sub.add_parser("ensure", help="the media drive's Clips folder, account and quota; idempotent, as root")
+    n.add_argument("--plan", action="store_true", help="say what it would do and change nothing")
+    m = sub.add_parser("switch-to-media", help="the old area's clips, then CLIPS_ROOT, to the drive, as one unit")
+    m.add_argument("--plan", action="store_true", help="say what it would do and change nothing")
     args = p.parse_args(argv)
     if not args.verb:
         p.print_help()
@@ -2018,6 +2647,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     if args.verb == "encode-trial":
         return run_encode_trial(settings, args)
+    if args.verb == "ensure":
+        return run_ensure(settings, args)
+    if args.verb == "switch-to-media":
+        return run_switch(settings, args)
     if not settings.enabled:
         mc.log("clips: CLIPS_ENABLED is not true - nothing to do")
         return 0
@@ -2025,6 +2658,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not got:
             mc.log("clips: another clips run holds the lock - skipping this %s" % args.verb)
             return 0
+        # Read again now the lock is held: a switch that held it may have moved CLIPS_ROOT
+        # since this process started, and one pass to the old root would strand a clip.
+        try:
+            settings = ClipsSettings(mc.read_knobs(args.env_file))
+        except Invalid as exc:
+            mc.log("clips: REFUSED - %s" % exc, warning=True)
+            return 2
         if args.verb == "retention":
             ok, reason = guard(settings)
             if not ok:  # nothing is deleted or rewritten on a volume that is not the clips area

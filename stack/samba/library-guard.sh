@@ -20,6 +20,11 @@
 #   --report         checks the library mount AND a representative Samba read,
 #                    then reports only the combined file-share/backup health
 #                    override. It never reports drive identity or a backup run.
+#   --reattach       only the reattach below, for the media drive and NOTHING ELSE
+#                    (`--reattach --library /srv/media`; any other path, the default
+#                    included, exits 2 having touched nothing). Reports nothing: the
+#                    combined item is the library's alone. Through the mount
+#                    unit, so an ext4 drive gets its fsck. SR-149.
 #
 # Exit codes: 0 = library healthy; 1 = not mounted / stale / read-only / wrong.
 # `--report` deliberately narrows that verdict: read-only and identity details
@@ -48,6 +53,7 @@ while [ $# -gt 0 ]; do
             if [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; then SHARE="$1"; shift; fi
             ;;
         --report)  MODE="--report"; shift ;;
+        --reattach) MODE="--reattach"; shift ;;
         --library) LIBRARY_ROOT="$2"; shift 2 ;;
         --label)   DRIVE_LABEL="$2";  shift 2 ;;
         --expect)  IDENTITY_FILE="$2"; shift 2 ;;
@@ -57,6 +63,14 @@ while [ $# -gt 0 ]; do
         *) shift ;;
     esac
 done
+
+# A lazy unmount on a timer is not something the library or the backup drive may
+# ever receive through a mistyped argument: their reattach is --report's, with its
+# own rules. Compared as a literal, so neither a default nor an environment reaches it.
+if [ "$MODE" = "--reattach" ] && [ "$LIBRARY_ROOT" != /srv/media ]; then
+    echo "[library-guard] REFUSED --reattach for '$LIBRARY_ROOT': it serves /srv/media only" >&2
+    exit 2
+fi
 
 fail_reason=""
 
@@ -109,7 +123,7 @@ check_mount() {
                 # ntfs3 falls back to read-only when the NTFS dirty bit is set
                 # (Windows Fast Startup, unclean eject). Reads look perfect
                 # while every write fails, so this is a failure too.
-                [ "$ALLOW_READ_ONLY" = 1 ] || fail_reason="$LIBRARY_ROOT is mounted READ-ONLY — writes will fail (NTFS dirty bit? clear it from Windows)"
+                [ "$ALLOW_READ_ONLY" = 1 ] || fail_reason="$LIBRARY_ROOT is mounted READ-ONLY — writes will fail (on NTFS, the dirty bit: clear it from Windows)"
                 ;;
         esac
     fi
@@ -241,7 +255,7 @@ log() { echo "[library-guard] $*"; }
 # gets one last start before retirement. BACKUP_TARGET availability must never
 # be translated into the library share-health dimension.
 REPORT_LIBRARY_ROOT="${FILE_SHARE_LIBRARY_ROOT:-/srv/library}"
-if [ "$LIBRARY_ROOT" != "$REPORT_LIBRARY_ROOT" ]; then
+if [ "$MODE" = "--report" ] && [ "$LIBRARY_ROOT" != "$REPORT_LIBRARY_ROOT" ]; then
     log "REFUSED legacy report path $LIBRARY_ROOT; combined share health is owned only by $REPORT_LIBRARY_ROOT"
     logger -t homehub-library-guard -p daemon.err \
         "refused legacy report path $LIBRARY_ROOT (expected $REPORT_LIBRARY_ROOT)" 2>/dev/null || true
@@ -276,6 +290,17 @@ fi
 # the tests exercise this without writing to /run.
 no_remount_file="${NO_REMOUNT_FILE:-/run/homehub-no-remount}"
 fstab_file="${FSTAB_FILE:-/etc/fstab}"
+# --reattach goes through the mount unit: `mount` alone skips the unit's fsck, and
+# a drive that fell off USB is the one that may need it. Bounded, because the
+# caller is the health unit: a long fsck carries on without it, and the next run
+# finds the drive mounted.
+reattach_mount() {
+    if [ "$MODE" = "--reattach" ]; then
+        timeout "${REATTACH_TIMEOUT:-120}" systemctl start "$(systemd-escape -p --suffix=mount "$LIBRARY_ROOT")"
+    else
+        mount "$LIBRARY_ROOT"
+    fi
+}
 # A failed Samba probe alone must NEVER authorize umount -l: Samba could be
 # broken while the disk is healthy. Only a present mount whose kernel device
 # vanished is stale, and only that state may be detached from live clients.
@@ -311,7 +336,7 @@ if { [ "$mount_state" = "absent" ] || [ "$mount_state" = "stale" ]; } && [ "${GU
                 log "REATTACH: FAILED - could not detach stale mount at $LIBRARY_ROOT"
             fi
         fi
-        if [ "$reattach_ready" = 1 ] && mount "$LIBRARY_ROOT" >/dev/null 2>&1 && mountpoint -q "$LIBRARY_ROOT" 2>/dev/null; then
+        if [ "$reattach_ready" = 1 ] && reattach_mount >/dev/null 2>&1 && mountpoint -q "$LIBRARY_ROOT" 2>/dev/null; then
             log "REATTACH: SUCCEEDED - $LIBRARY_ROOT is mounted again ($(findmnt -no SOURCE,FSTYPE "$LIBRARY_ROOT" 2>/dev/null))"
             logger -t homehub-library-guard -p daemon.warning \
                 "reattached $LIBRARY_ROOT after it dropped - the drive returned and nothing else would have remounted it" 2>/dev/null || true
@@ -327,6 +352,11 @@ if { [ "$mount_state" = "absent" ] || [ "$mount_state" = "stale" ]; } && [ "${GU
             log "REATTACH: FAILED - 'mount $LIBRARY_ROOT' did not take; the drive is absent, or the filesystem refused"
         fi
     fi
+fi
+
+if [ "$MODE" = "--reattach" ]; then
+    [ -z "$fail_reason" ]
+    exit
 fi
 
 # The Samba preexec guard above still rejects a read-only library because a

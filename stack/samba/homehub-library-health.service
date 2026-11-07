@@ -20,6 +20,11 @@ ExecStartPre=/usr/local/sbin/homehub-retire-legacy-backup-health
 # call is lock-aware and leaves a genuinely live backup alone.
 # `-` so it can never fail the share-health report that is this unit's job.
 ExecStartPre=-/opt/homehub/stack/backup/library-backup.sh --reconcile-run-state
+# THE MEDIA DRIVE IS PUT BACK FROM HERE TOO (SR-149): it hangs off a USB hub, and a
+# drive that returns mid-session is mounted by nothing else. Motion clips queue
+# while it is away and are cut when it returns, so this is what keeps the wait
+# short. `-` for the same reason as above, and a no-op without an fstab row.
+ExecStartPre=-/usr/local/sbin/homehub-library-guard --reattach --library /srv/media --label media
 ExecStart=/usr/local/sbin/homehub-library-guard --report --label library
 # A failing report must not put the unit in a permanent failed state that
 # masks later recoveries — the REPORT is the signal, not the exit code.

@@ -81,6 +81,9 @@ reboot or a gap of more than two minutes restarts every count.
 `HOMEHUB_DISK_MOUNTS="/ /var/lib/docker /boot"`; an entry may carry its own
 floor, `PATH=N%` or `PATH=NG`. Without one: the smaller of 10 % and 5 GB (the
 panel's rule, SR-083). Add `/srv/scratch` here when the scratch volume exists.
+A USB mount may be listed too, for one purpose: `/srv/media` is `skipped` while it is
+there, and `absent`, with the high "not mounted" alert, when it is not a mount point or
+its device has gone (SR-149: a dropped drive can leave its line in mountinfo).
 
 ### Watches (SR-088)
 

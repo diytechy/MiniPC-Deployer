@@ -58,6 +58,8 @@ LoadCredential=motion-approach-polygon:/run/wall-door-credentials/motion-approac
 LoadCredential=motion-road-polygon:/run/wall-door-credentials/motion-road-polygon
 LoadCredential=motion-ignore-polygons:/run/wall-door-credentials/motion-ignore-polygons
 LoadCredential=motion-diagnostics:/run/wall-door-credentials/motion-diagnostics
+LoadCredential=motion-source:/run/wall-door-credentials/motion-source
+LoadCredential=motion-hub-port:/run/wall-door-credentials/motion-hub-port
 # NO ExecStartPre chgrp here. It looked like it granted the kiosk access and it
 # did nothing at all -- see RuntimeDirectoryMode above. A privileged pre-command
 # cannot win against systemd's own directory setup, which runs after it.

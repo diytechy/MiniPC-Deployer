@@ -2210,7 +2210,7 @@ fi
 # application may declare the FULL sampler eligible and may separately request
 # public visible Door frames.
 _door_cred_dir=/run/wall-door-credentials
-_door_credential_names="host password port path username width height input-fov horizontal-fov vertical-fov yaw pitch stale-seconds start-seconds motion-enabled motion-calibrated motion-sample-fps motion-min-area-ratio motion-persistence-seconds motion-dwell-seconds motion-stationary-ratio motion-approach-polygon motion-road-polygon motion-ignore-polygons motion-diagnostics"
+_door_credential_names="host password port path username width height input-fov horizontal-fov vertical-fov yaw pitch stale-seconds start-seconds motion-enabled motion-calibrated motion-sample-fps motion-min-area-ratio motion-persistence-seconds motion-dwell-seconds motion-stationary-ratio motion-approach-polygon motion-road-polygon motion-ignore-polygons motion-diagnostics motion-source motion-hub-port"
 
 # Stop before removing the volatile inputs. A rerun with an incomplete payload
 # must not leave the previous process or socket alive on stale credentials.
@@ -2386,6 +2386,8 @@ if [ -f /etc/systemd/system/wall-door-stream.service ] && \
     : "${DOORBELL_MOTION_ROAD_POLYGON:=}"
     : "${DOORBELL_MOTION_IGNORE_POLYGONS:=}"
     : "${DOORBELL_MOTION_DIAGNOSTICS:=false}"
+    : "${DOORBELL_MOTION_SOURCE:=panel}"
+    : "${DOORBELL_MOTION_HUB_PORT:=8556}"
     _door_credentials_ready=0
     install -d -m 0700 -o root -g root "$_door_cred_dir"
     purge_door_runtime
@@ -2408,6 +2410,35 @@ if [ -f /etc/systemd/system/wall-door-stream.service ] && \
     door_motion_polygon_valid "$DOORBELL_MOTION_APPROACH_POLYGON" || { fail_step "Door motion approach polygon must be 3 to 16 normalized x,y points enclosing a real area"; _door_motion_valid=0; }
     door_motion_polygon_valid "$DOORBELL_MOTION_ROAD_POLYGON" 1 || { fail_step "Door motion road polygon must be empty (road-stop observation off) or 3 to 16 normalized x,y points enclosing a real area"; _door_motion_valid=0; }
     door_motion_polygons_valid "$DOORBELL_MOTION_IGNORE_POLYGONS" || { fail_step "Door motion ignore polygons must be empty or at most 8 valid polygons separated by |"; _door_motion_valid=0; }
+
+    # Where the panel takes its door events from (IF-079): its own detector
+    # (panel, today's behaviour) or the hub's feed (hub). An unknown source is
+    # the panel's own detector, never a guess at hub; an unusable port is the
+    # default. Neither poisons the motion keys above, which are a different fact.
+    _door_source_valid=1
+    case "$DOORBELL_MOTION_SOURCE" in
+        panel|hub) ;;
+        *)
+            fail_step "Door motion source must be exactly panel or hub; using panel"
+            DOORBELL_MOTION_SOURCE=panel
+            _door_source_valid=0
+            ;;
+    esac
+    case "$DOORBELL_MOTION_HUB_PORT" in
+        ''|*[!0-9]*) _door_hub_port_ok=0 ;;
+        *)
+            if [ "${#DOORBELL_MOTION_HUB_PORT}" -le 5 ] && [ "$DOORBELL_MOTION_HUB_PORT" -ge 1024 ] && [ "$DOORBELL_MOTION_HUB_PORT" -le 65535 ]; then
+                _door_hub_port_ok=1
+            else
+                _door_hub_port_ok=0
+            fi
+            ;;
+    esac
+    if [ "$_door_hub_port_ok" -eq 0 ]; then
+        fail_step "Door motion hub port must be a whole number from 1024 to 65535; using 8556"
+        DOORBELL_MOTION_HUB_PORT=8556
+        _door_source_valid=0
+    fi
 
     _door_motion_effective=false
     if [ "$_door_motion_valid" -eq 1 ] && [ "$DOORBELL_MOTION_ENABLED" = "true" ]; then
@@ -2463,6 +2494,8 @@ if [ -f /etc/systemd/system/wall-door-stream.service ] && \
         printf '%s' "$DOORBELL_MOTION_ROAD_POLYGON" > "$_door_cred_dir/motion-road-polygon"
         printf '%s' "$DOORBELL_MOTION_IGNORE_POLYGONS" > "$_door_cred_dir/motion-ignore-polygons"
         printf '%s' "$DOORBELL_MOTION_DIAGNOSTICS" > "$_door_cred_dir/motion-diagnostics"
+        printf '%s' "$DOORBELL_MOTION_SOURCE" > "$_door_cred_dir/motion-source"
+        printf '%s' "$DOORBELL_MOTION_HUB_PORT" > "$_door_cred_dir/motion-hub-port"
         chmod 0600 "$_door_cred_dir"/*
         _door_credentials_ready=1
     fi

@@ -7,9 +7,13 @@ Interfaces: **IF-076** (the motion-event record) and **IF-077** (the clips tree)
 The Owner ruled on 2026-10-26 (HomeHub open-items A78; HomeHub
 `docs/MEDIA_DRIVE_AND_CAMERA_CLIPS_PLAN_2026-10-26.md` section 0):
 
-* **the detector runs on the hub** and is the event source for clips. The panel
-  keeps its own detector for now; taking its door events from the hub is a later
-  step, not built here;
+* **the detector runs on the hub** and is the event source for clips, **and the
+  panel takes its door events from it** instead of decoding the stream itself,
+  so one detector owns door motion. The hub half is the panel feed
+  (`../camera-motion/event_feed.py`, IF-079; SR-146), built and OFF
+  (`CAMERA_DOOR_MOTION_FEED_PORT=0`); until a panel is switched to
+  `DOORBELL_MOTION_SOURCE=hub` it keeps its own detector and nothing changes
+  for it (deploy step 9);
 * a clip is **3 s before the first event to the panel's own display window**:
   5 s after presence ends, or a 30 s hold for a stopped vehicle (WSN-107);
 * clips are **cut copy-only** from the rolling recording, then **re-encoded** on
@@ -52,6 +56,17 @@ firstboot step 6k installs every unit, enables one detector instance per name in
 camera's knob is true and it is missing (the image carries it in
 `packages.list` from now on), and converges the clip timers to their knobs.
 
+## Listeners
+
+The hub's own listeners that belong to the door and the clips (nothing else here
+listens; placeholders, the real addresses are the stack's `.env`):
+
+| Listener | Bind | Port knob | Admits | Carries |
+|---|---|---|---|---|
+| go2rtc relay, RTSP (`../door/`) | `LAN_IP` | `DOOR_RELAY_RTSP_PORT` (8554) | the relay's own credential | the camera's video |
+| go2rtc relay, API (`../door/`) | loopback | `DOOR_RELAY_API_PORT` (1984) | the same credential | stream state |
+| detector panel feed (IF-079) | `LAN_IP` | `CAMERA_<CAM>_MOTION_FEED_PORT` (**0 = none**; 8556 planned) | `PANEL_IP` only, two clients | door motion lines, no picture |
+
 ## The detector
 
 * **One engine.** `motion_engine.py` is the panel's replay-validated engine at
@@ -71,6 +86,22 @@ camera's knob is true and it is missing (the image carries it in
   whole-image placeholder is refused by the engine's own `eligible`.
   `tests/test_camera_motion.py` TC-1567 fails if any private polygon appears in
   any tracked file here.
+* **The panel feed** (IF-079). With `CAMERA_DOOR_MOTION_FEED_PORT` set the
+  detector also listens for the panel and tells it each engine signal at once,
+  unthrottled and separately from the store's throttled records:
+  `{"v":1,"type":"hello"...}` on connect, `{"v":1,"type":"motion","camera":"door","cause":..,"id":..,"utc_ms":..}`
+  for every signal, `{"v":1,"type":"beat","utc_ms":..,"frame_age_ms":..}` every
+  5 s; each line at most 256 bytes, no backlog, never an image, a zone or a
+  credential. Only `PANEL_IP` may connect (any other peer is closed at accept),
+  two clients at most, 8 KiB queued per client and a client that falls behind is
+  dropped. A feed fault cannot affect detection or the records: a bind failure
+  or a port in use is a warning and the detector runs on; an unexpected
+  exception turns the feed off for that run. The status file
+  (`/var/lib/homehub-clips/motion/<cam>.json`) gains
+  `feed {port, clients, sent, dropped}` (`port` is the port actually listening,
+  0 for none; `sent` counts lines queued to clients; `dropped` counts clients
+  let go for falling behind). `hub-feed up` on the panel means the feed is
+  connected, not that the engine has finished its warm-up after a restart.
 * **Signals to records.** New events (`approach`, `road-stop`) are written at
   once; renewals (`visitor`, `bridge`, `road-hold`) at most every 3 s, and the
   last renewal of a presence always - so the records end where the panel's
@@ -336,6 +367,31 @@ h264 native 300 kb/s at 5 fps 1.12 MB, 0.961.
 **8. Make it survive a reimage.** In HomeHub `config.homehub.psd1`, set the knobs
 that were switched on (`CAMERA_DOOR_MOTION_ENABLED`, `CAMERA_DOOR_MOTION_DECODE`
 if changed, `CLIPS_ENABLED`, `CLIPS_ENCODE_ENABLED`), and commit.
+
+**9. The panel feed, hub first and then the panel** (the Owner, 2026-10-26; the
+panel's side is OfficeWallNaglight's `doorstream`, `DOORBELL_MOTION_SOURCE`).
+`deploy_stack.py` does NOT write `.env`, on the hub or on the panel: every key
+below is a hand edit of the live file (the hub's `/opt/homehub/stack/.env`, and
+the panel's `wall.env`, which the deployed HomeHub config files
+`config.homehub.psd1` and `config.wall.psd1` render at a reimage). Panel first
+would leave Door motion silent until the hub lands, so:
+
+1. Hub: deliver the revision (step 1), then in `.env` set
+   `CAMERA_DOOR_MOTION_FEED_PORT=8556` (any port 1024..65535) and restart:
+   `sudo systemctl restart homehub-camera-motion@door`. Check the journal says
+   "event feed listening", `ss -ltn` shows the port on `LAN_IP` only, and
+   `motion/door.json` has `"feed": {"port": 8556, ...}`. A detector restart is a
+   gap in Door motion (`RestartSec` 15 s, the decoder, the engine's warm-up).
+2. Panel: ship the paired release (the new firstboot and app), then in `wall.env`
+   `DOORBELL_MOTION_SOURCE=hub` and `DOORBELL_MOTION_HUB_PORT=8556` (the same
+   number), and re-render the credentials (reboot, or the supported firstboot
+   path). The kiosk journal shows `[door] hub-feed state=up`; on the hub
+   `feed.clients` is 1 and `sent` rises with the beat.
+3. Back: `DOORBELL_MOTION_SOURCE=panel` in `wall.env`, then
+   `printf panel | sudo tee /run/wall-door-credentials/motion-source` and restart
+   `wall-door-stream` (or reboot). The panel decodes for itself again; the hub's
+   feed may stay on. Turning the hub's feed off first would leave a `hub` panel
+   with no door events: do the panel first when going back.
 
 **Rollback**: the knobs to false; `sudo systemctl disable --now homehub-camera-motion@door homehub-clips-cut.timer homehub-clips-retention.timer homehub-clips-encode.timer`.
 The clips area and its clips stay until removed by hand.

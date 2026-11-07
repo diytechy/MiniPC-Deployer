@@ -108,7 +108,7 @@ def to_text(entry: dict, value) -> str:
     if entry["kind"] == "polygons":
         return "|".join(";".join(",".join(repr(n) for n in point) for point in polygon)
                         for polygon in value)
-    return str(value) if entry["kind"] in ("int", "string") else repr(value)
+    return str(value) if entry["kind"] in ("int", "string", "enum") else repr(value)
 
 
 FIRSTBOOT_TEXT = FIRSTBOOT.read_text(encoding="utf-8")
@@ -263,13 +263,16 @@ def test_tc1228_printf_credential_list_equals_credential_files():
 
 def run_cases(env: str, values: list[str]) -> list[tuple[int, list[str]]]:
     """Run firstboot's real validation block once per value, with all other keys
-    at their fixture defaults. Returns (valid flag, failure messages) per value."""
+    at their fixture defaults. Returns (valid flag, failure messages) per value.
+    The flag is 1 only when neither the motion keys (`_door_motion_valid`) nor the
+    source and hub-port keys (`_door_source_valid`, a separate fact on purpose: a
+    bad source must not reset the motion keys) tripped."""
     baseline = "".join("%s=%s\n" % (e["env"], shlex.quote(to_text(e, e["default"])))
                        for e in KEYS if not e["required"])
     script = ["fail_step() { echo \"FAIL $*\"; }", lift_functions(), baseline,
               "check_block() {", lift_validation_block(), "}"]
     for index, value in enumerate(values):
-        script.append("( %s=%s; echo \"CASE %d\"; check_block; echo \"VALID=$_door_motion_valid\" )"
+        script.append("( %s=%s; echo \"CASE %d\"; check_block; echo \"VALID=$(( _door_motion_valid && _door_source_valid ))\" )"
                       % (env, shlex.quote(value), index))
     cases, current = [], None
     for line in bash("\n".join(script) + "\n").splitlines():
@@ -329,3 +332,88 @@ def test_tc1229_shell_fallback_defaults_equal_the_fixture_defaults():
     for env in names:
         entry = BY_ENV[env]
         assert from_text(entry["kind"], got[env]) == entry["default"], env
+
+
+# --- the motion source and the hub port, executed (WSN-115, LLR-1455) --------
+
+def run_source_case(**over: str) -> dict:
+    """Firstboot's real validation block with the given keys set (all others at
+    their fixture defaults, motion enabled and calibrated over a real zone).
+    Returns every key's final value and the failure messages."""
+    base = {e["env"]: to_text(e, e["default"]) for e in KEYS if not e["required"]}
+    base.update({"DOORBELL_MOTION_ENABLED": "true", "DOORBELL_MOTION_CALIBRATED": "true",
+                 "DOORBELL_MOTION_APPROACH_POLYGON": "0.2,0.2;0.8,0.2;0.8,0.8;0.2,0.8"})
+    base.update(over)
+    script = ["fail_step() { echo \"FAIL $*\"; }", lift_functions(),
+              "".join("%s=%s\n" % (k, shlex.quote(v)) for k, v in base.items()),
+              lift_validation_block()]
+    script.append("".join('printf "OUT %%s=%%s\\n" %s "${%s}"\n' % (k, k) for k in base))
+    script.append('printf "OUT EFFECTIVE=%s\\n" "$_door_motion_effective"\n')
+    got = {"fail": [], "out": {}}
+    for line in bash("\n".join(script) + "\n").splitlines():
+        if line.startswith("FAIL "):
+            got["fail"].append(line[5:])
+        elif line.startswith("OUT "):
+            key, value = line[4:].split("=", 1)
+            got["out"][key] = value
+    return got
+
+
+@needs_bash
+@pytest.mark.parametrize("source", ["panel", "hub"])
+def test_tc1682_a_valid_source_is_kept_and_costs_nothing(source):
+    got = run_source_case(DOORBELL_MOTION_SOURCE=source)
+    assert got["fail"] == [] and got["out"]["DOORBELL_MOTION_SOURCE"] == source
+    assert got["out"]["EFFECTIVE"] == "true"
+
+
+@needs_bash
+@pytest.mark.parametrize("source", ["", "Hub", "PANEL", "both", "hub ", "panel\nhub"])
+def test_tc1682_any_other_source_becomes_panel_with_one_failure_and_motion_untouched(source):
+    got = run_source_case(DOORBELL_MOTION_SOURCE=source)
+    assert got["out"]["DOORBELL_MOTION_SOURCE"] == "panel"      # never a guess at hub
+    assert len(got["fail"]) == 1 and "source" in got["fail"][0]
+    # The motion keys are a different fact: still calibrated, still effective.
+    assert got["out"]["DOORBELL_MOTION_CALIBRATED"] == "true" and got["out"]["EFFECTIVE"] == "true"
+    assert got["out"]["DOORBELL_MOTION_APPROACH_POLYGON"] == "0.2,0.2;0.8,0.2;0.8,0.8;0.2,0.8"
+
+
+@needs_bash
+@pytest.mark.parametrize("port", ["1024", "8556", "65535"])
+def test_tc1682_a_good_hub_port_is_kept(port):
+    got = run_source_case(DOORBELL_MOTION_HUB_PORT=port)
+    assert got["fail"] == [] and got["out"]["DOORBELL_MOTION_HUB_PORT"] == port
+
+
+@needs_bash
+@pytest.mark.parametrize("port", ["", "0", "1023", "65536", "99999", "123456", "abc", "-1", "8556.0", "85 56",
+                                  "0x2000"])
+def test_tc1682_a_bad_hub_port_becomes_8556_with_one_failure_and_motion_untouched(port):
+    got = run_source_case(DOORBELL_MOTION_HUB_PORT=port, DOORBELL_MOTION_SOURCE="hub")
+    assert got["out"]["DOORBELL_MOTION_HUB_PORT"] == "8556"
+    assert len(got["fail"]) == 1 and "port" in got["fail"][0]
+    assert got["out"]["DOORBELL_MOTION_SOURCE"] == "hub"        # the other key is judged on its own
+    assert got["out"]["EFFECTIVE"] == "true"
+
+
+@needs_bash
+def test_tc1682_a_bad_motion_key_does_not_change_the_source():
+    got = run_source_case(DOORBELL_MOTION_SAMPLE_FPS="999", DOORBELL_MOTION_SOURCE="hub",
+                          DOORBELL_MOTION_HUB_PORT="9000")
+    assert got["out"]["DOORBELL_MOTION_SOURCE"] == "hub" and got["out"]["DOORBELL_MOTION_HUB_PORT"] == "9000"
+    assert got["out"]["EFFECTIVE"] == "false"
+
+
+def test_tc1681_the_shipped_example_keeps_the_panels_own_detector():
+    values = env_example_values()
+    assert values["DOORBELL_MOTION_SOURCE"] == "panel" and values["DOORBELL_MOTION_HUB_PORT"] == "8556"
+    assert BY_ENV["DOORBELL_MOTION_SOURCE"]["default"] == "panel"
+
+
+def test_tc1685_the_fixture_has_the_two_hub_rows_in_credential_order():
+    names = [e["credential"] for e in KEYS]
+    assert names[-2:] == ["motion-source", "motion-hub-port"]
+    source, port = BY_ENV["DOORBELL_MOTION_SOURCE"], BY_ENV["DOORBELL_MOTION_HUB_PORT"]
+    assert (source["kind"], source["default"], source["accept"]) == ("enum", "panel", ["panel", "hub"])
+    assert (port["kind"], port["default"], port["min"], port["max"]) == ("int", 8556, 1024, 65535)
+    assert source["shellValidated"] and port["shellValidated"]

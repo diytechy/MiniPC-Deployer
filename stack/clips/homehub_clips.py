@@ -64,7 +64,7 @@ switch-to-media (the clips of the old area and CLIPS_ROOT, once, as one unit).
 
 Python 3.8-compatible (the dev PC's test runner imports this module).
 Implements: SR-129, SR-130, SR-131, SR-148, SR-149, IF-077, LLR-1363..LLR-1378,
-LLR-1460..LLR-1466, LLR-1472, LLR-1473.
+LLR-1460..LLR-1466, LLR-1472, LLR-1473, LLR-1475.
 """
 
 from __future__ import annotations
@@ -937,7 +937,15 @@ class GuardStop(Exception):
 
 
 class MoveFailed(Exception):
-    """The move or its verification did not complete; CLIPS_ROOT was not changed."""
+    """The move, its verification or the .env write did not complete."""
+
+
+class EnvWriteFailed(MoveFailed):
+    """Writing .env failed. `restored` says whether its bytes were put back and read back."""
+
+    def __init__(self, message: str, restored: bool):
+        super().__init__(message)
+        self.restored = restored
 
 
 # ── the cut ──────────────────────────────────────────────────────────────────
@@ -2281,27 +2289,76 @@ def index_problems(root: str, cameras: Sequence[str]) -> List[str]:
     return out
 
 
-def set_env_lines(env_file: str, changes: Dict[str, str]) -> None:
+def read_bytes(path: str) -> bytes:
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def put_bytes(fd: int, data: bytes) -> None:
+    """The whole of `data` as the file behind fd, unbuffered, so what failed is known."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    view = memoryview(data)
+    while len(view):
+        view = view[os.write(fd, view):]
+    os.ftruncate(fd, len(data))
+    os.fsync(fd)
+
+
+def restore_env(fd: int, env_file: str, before: bytes) -> Optional[str]:
+    """Put the pre-write bytes back through the same descriptor and read them
+    back. None when that all worked, else why it did not."""
+    try:
+        put_bytes(fd, before)
+        if read_bytes(env_file) != before:
+            return "reading it back gave other bytes"
+    except Exception as exc:  # noqa: BLE001 - whatever stopped it, the caller must be told
+        return str(exc) or repr(exc)
+    return None
+
+
+def set_env_lines(env_file: str, changes: Dict[str, str], backup: Optional[str] = None) -> None:
     """Change KEY=... lines of the stack .env IN PLACE: same inode, because the
     file is bind-mounted into containers and a rename would leave them on the old
     one. Every line of a key is set (the last wins for readers), a missing key is
-    appended, every other byte stays. Implements: LLR-1472."""
-    with open(env_file, "r+b") as handle:
-        lines = handle.read().split(b"\n")
-        for key, value in changes.items():
-            prefix = key.encode("ascii") + b"="
-            line = prefix + value.encode("utf-8")
-            found = False
-            for i, have in enumerate(lines):
-                if have.startswith(prefix):
-                    lines[i], found = line, True
-            if not found:
-                lines[-1:] = [line, b""] if lines[-1] == b"" else [lines[-1], line, b""]
-        handle.seek(0)
-        handle.write(b"\n".join(lines))
-        handle.truncate()
-        handle.flush()
-        os.fsync(handle.fileno())
+    appended, every other byte stays.
+
+    IN PLACE IS NOT ATOMIC, so the exact bytes it found are kept, and if the write,
+    the truncate, the sync or the read-back fails they are put back the same way
+    and read back in turn. Raises EnvWriteFailed saying which of the two happened;
+    if they could not be put back it names `backup`, the file that can. The file
+    may be anything after that, so nothing else may be said about it.
+    Implements: LLR-1472, LLR-1475."""
+    before = read_bytes(env_file)
+    lines = before.split(b"\n")
+    for key, value in changes.items():
+        prefix = key.encode("ascii") + b"="
+        line = prefix + value.encode("utf-8")
+        found = False
+        for i, have in enumerate(lines):
+            if have.startswith(prefix):
+                lines[i], found = line, True
+        if not found:
+            lines[-1:] = [line, b""] if lines[-1] == b"" else [lines[-1], line, b""]
+    after = b"\n".join(lines)
+    fd = os.open(env_file, os.O_RDWR | getattr(os, "O_BINARY", 0))
+    try:
+        try:
+            put_bytes(fd, after)
+            if read_bytes(env_file) != after:
+                raise OSError(errno.EIO, "reading it back gave other bytes")
+        except Exception as exc:  # noqa: BLE001 - any failure here leaves the file unknown
+            failed = restore_env(fd, env_file, before)
+            if failed is None:
+                raise EnvWriteFailed("writing %s failed (%s); its previous bytes were put back in place and read back"
+                                     % (env_file, exc), True)
+            raise EnvWriteFailed(
+                "writing %s failed (%s) and it was NOT restored (%s), so it may be damaged. %s"
+                % (env_file, exc, failed,
+                   "The root-only backup is %s: compare with `sudo cmp %s %s`, put it back in place with "
+                   "`sudo sh -c 'cat %s >%s'`, then run the switch again" % (backup, backup, env_file, backup, env_file)
+                   if backup else "There is no backup: check it by hand"), False)
+    finally:
+        os.close(fd)
 
 
 def back_up_env(env_file: str, state_dir: str) -> str:
@@ -2325,10 +2382,11 @@ def switch_to_media(settings: ClipsSettings, env_file: str, state_dir: str, sour
     drops the lock however this process ends - a lost session, a kill, a power cut.
     And CLIPS_ROOT stays on scratch until the very end: the move works on a copy of
     the settings, the counts taken inside the lock are verified, and only then
-    is the .env written. So any failure leaves the pipeline exactly as it was,
-    cutting to scratch, with what already moved safe on the drive. Run it again:
-    it repairs and finishes. Raises MoveFailed, GuardStop, QuotaStop, OSError.
-    Implements: LLR-1472, SR-148."""
+    is the .env written. So a failure before that write leaves the pipeline as it
+    was, cutting to scratch, with what already moved safe on the drive, and a
+    failure of the write itself is put right by set_env_lines or said not to
+    be: EnvWriteFailed.restored. Run it again: it repairs and finishes. Raises
+    MoveFailed, GuardStop, QuotaStop, OSError. Implements: LLR-1472, SR-148."""
     target = copy.copy(settings)
     target.root = MEDIA_ROOT
     old = source or SCRATCH_ROOT
@@ -2347,11 +2405,9 @@ def switch_to_media(settings: ClipsSettings, env_file: str, state_dir: str, sour
         raise MoveFailed("the index does not match the clips: %s" % "; ".join(problems))
     knobs = mc.read_knobs(env_file)
     mounts = mc.knob_words(knobs, "HOMEHUB_DISK_MOUNTS", "/ /var/lib/docker /boot")
-    back_up_env(env_file, state_dir)
+    backup = back_up_env(env_file, state_dir)
     set_env_lines(env_file, {"CLIPS_ROOT": MEDIA_ROOT, "HOMEHUB_DISK_MOUNTS": '"%s"' % " ".join(
-        list(mounts) + ([] if MEDIA_MOUNT in mounts else [MEDIA_MOUNT]))})
-    if mc.read_env_file(env_file).get("CLIPS_ROOT") != MEDIA_ROOT:
-        raise MoveFailed("CLIPS_ROOT did not take in %s" % env_file)
+        list(mounts) + ([] if MEDIA_MOUNT in mounts else [MEDIA_MOUNT]))}, backup)
     report["root_after"] = MEDIA_ROOT
     return report
 
@@ -2487,7 +2543,7 @@ def run_switch(settings: ClipsSettings, args) -> int:
     result = os.path.join(args.state_dir, SWITCH_RESULT)
     os.makedirs(args.state_dir, mode=0o750, exist_ok=True)
     mc.save_json_atomic(result, {"state": "running", "ok": False})
-    report = {"state": "failed", "ok": False}  # type: Dict[str, object]
+    report = {"state": "failed", "ok": False, "env": "not written"}  # type: Dict[str, object]
     code = 1
     with pipeline_lock(args.state_dir, SWITCH_LOCK_WAIT_SEC) as got:
         if not got:
@@ -2496,14 +2552,20 @@ def run_switch(settings: ClipsSettings, args) -> int:
             try:
                 # Read again inside the lock: what a pass finishing just now left is what counts.
                 settings = ClipsSettings(mc.read_knobs(args.env_file))
-                report.update(switch_to_media(settings, args.env_file, args.state_dir), state="done", ok=True)
+                report.update(switch_to_media(settings, args.env_file, args.state_dir), state="done", ok=True,
+                              env="written")
                 code = 0
             except (Invalid, QuotaStop, GuardStop, MoveFailed, OSError) as exc:
                 report["why"] = str(exc)
                 code = EXIT_GUARD if isinstance(exc, GuardStop) else 1
+                if isinstance(exc, EnvWriteFailed):
+                    report["env"] = "restored" if exc.restored else "NOT restored"
     mc.save_json_atomic(result, report)
     if code:
-        mc.log("clips: switch-to-media FAILED, CLIPS_ROOT unchanged, cutting carries on - %s" % report.get("why"), warning=True)
+        said = {"not written": "before .env was written; CLIPS_ROOT is as it was, cutting carries on",
+                "restored": "writing .env, which was restored and read back; CLIPS_ROOT is as it was, cutting carries on",
+                "NOT restored": "and .env was NOT RESTORED"}[str(report["env"])]
+        mc.log("clips: switch-to-media FAILED %s - %s" % (said, report.get("why")), warning=True)
         if "CAP_SYS_RESOURCE" in str(report.get("why")):
             mc.log("clips: run it as `%s`" % SWITCH_RUN, warning=True)
     else:

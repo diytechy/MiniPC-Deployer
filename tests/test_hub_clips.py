@@ -12,7 +12,7 @@ What does not: real ffmpeg and VA-API. The integration test at the bottom
 (TC-1569, release tier) cuts real recorded segments through the pinned image
 when HOMEHUB_CLIPS_SEGMENTS names a directory of them and docker answers;
 VA-API is measured on the hub (stack/clips/README.md, deploy steps).
-Implements: TC-1541, TC-1542, TC-1551..TC-1566, TC-1568, TC-1569, TC-1686..TC-1693, TC-1698, TC-1699.
+Implements: TC-1541, TC-1542, TC-1551..TC-1566, TC-1568, TC-1569, TC-1686..TC-1693, TC-1698..TC-1700.
 """
 
 from __future__ import annotations
@@ -2134,7 +2134,8 @@ def test_tc1699_any_failure_leaves_the_env_on_scratch_and_says_so(tmp_path, monk
     r = result(state)
     assert r["state"] == "failed" and r["ok"] is False and why in r["why"]
     assert env.read_bytes() == before and not (state / hc.ENV_BACKUP).exists()
-    assert "CLIPS_ROOT unchanged, cutting carries on" in capsys.readouterr().out
+    assert r["env"] == "not written"
+    assert "FAILED before .env was written; CLIPS_ROOT is as it was, cutting carries on" in capsys.readouterr().out
 
 
 def test_tc1699_a_failed_switch_then_a_rerun_finishes(tmp_path, monkeypatch):
@@ -2223,6 +2224,140 @@ def test_tc1699_the_run_line_and_the_readme_say_the_same_thing():
     section = readme[readme.index("**10. Clips on the media drive**"):readme.index("**Rollback**")]
     assert "sudo sed -i" not in section and "systemctl stop" not in section
     assert not re.search(r'"(clips|moved)": 12\b', section)
+
+
+def test_tc1699_step_10_runs_as_the_hub_user_and_waits_for_the_unit():
+    readme = (STACK / "clips" / "README.md").read_text(encoding="utf-8")
+    section = readme[readme.index("**10. Clips on the media drive**"):readme.index("**Back:**")]
+    # .env, drive-identity.conf and the folder are root's; `hub` may not read the journal or the state
+    commands = [x.strip() for x in section.splitlines() if x.strip() and not x.strip().startswith("#")]
+    root_only = ("/opt/homehub/stack/.env", "drive-identity.conf", "homehub_clips.py", "journalctl", "/var/lib/homehub-clips",
+                 "/srv/media/Clips/door", "testparm")
+    for line in commands:
+        if any(word in line for word in root_only) and not re.match(r"[`*\d]|.*hub@<hub>", line) and " " in line:
+            if re.match(r"(grep|cat|journalctl|python3|testparm|stat|wc)\b", line):
+                raise AssertionError("needs sudo as the hub user: " + line)
+    for word in ("journalctl -t homehub-disk-check", "stat -c '%U %G %a %n' /srv/media/Clips/door"):
+        at = section.index(word)
+        assert "sudo" in section[at - 12:at], word
+    assert "*.mp4\"`" in section                                     # the glob is expanded as root, not as hub
+    launch = section.index(hc.SWITCH_RUN)
+    wait = section.index("while systemctl is-active -q homehub-clips-switch; do sleep 5; done")
+    read = section.index("sudo cat /var/lib/homehub-clips/switch-to-media.json")
+    assert launch < wait < read
+    assert ".env` is unchanged" not in readme and "exactly as before" not in section
+
+
+# ── TC-1700 a failed .env write is put right, or said not to be ─────────────
+
+
+class EnvFault:
+    """Fails os.<name> on its nth call inside set_env_lines, after `partial` bytes of a
+    write. Only there: the move syncs files of its own before it gets that far."""
+
+    def __init__(self, monkeypatch, name, at=(1,), partial=0):
+        self.real, self.calls, self.at, self.partial = getattr(hc.os, name), 0, at, partial
+        self.name, self.armed = name, False
+        monkeypatch.setattr(hc.os, name, self)
+        write_env = hc.set_env_lines
+
+        def armed(*args):
+            self.armed = True
+            try:
+                return write_env(*args)
+            finally:
+                self.armed = False
+        monkeypatch.setattr(hc, "set_env_lines", armed)
+
+    def __call__(self, *args):
+        if not self.armed:
+            return self.real(*args)
+        self.calls += 1
+        if self.calls in self.at:
+            if self.name == "write" and self.partial:
+                self.real(args[0], bytes(args[1][:self.partial]))
+            raise OSError(5, "injected %s failure" % self.name)
+        return self.real(*args)
+
+
+@pytest.mark.parametrize("name,partial", [("write", 0), ("write", 9), ("ftruncate", 0), ("fsync", 0)])
+def test_tc1700_a_failed_write_is_restored_byte_for_byte_and_says_so(tmp_path, monkeypatch, capsys, name, partial):
+    _s, old, new, state, env = switch_setup(tmp_path, monkeypatch)
+    before, inode = env.read_bytes(), os.stat(str(env)).st_ino
+    EnvFault(monkeypatch, name, partial=partial)
+    assert run_verb(env, state) == 1
+    monkeypatch.undo()
+    assert env.read_bytes() == before and os.stat(str(env)).st_ino == inode
+    r = result(state)
+    assert r["state"] == "failed" and r["env"] == "restored"
+    assert "injected %s failure" % name in r["why"] and "put back in place and read back" in r["why"]
+    assert "NOT" not in r["why"] and "root_after" not in r
+    assert "FAILED writing .env, which was restored and read back; CLIPS_ROOT is as it was" in capsys.readouterr().out
+
+
+def test_tc1700_bytes_that_read_back_wrong_are_restored_too(tmp_path, monkeypatch):
+    _s, old, new, state, env = switch_setup(tmp_path, monkeypatch)
+    before = env.read_bytes()
+    real, calls = hc.read_bytes, []
+
+    def wrong_once(path):
+        calls.append(path)
+        return b"garbage" if len(calls) == 2 else real(path)    # 1 is the bytes kept; 2 the read-back
+    monkeypatch.setattr(hc, "read_bytes", wrong_once)
+    assert run_verb(env, state) == 1
+    assert env.read_bytes() == before and result(state)["env"] == "restored"
+
+
+@pytest.mark.parametrize("name,at,partial", [("write", (1, 2), 9), ("fsync", (1, 2), 0)])
+def test_tc1700_a_restore_that_fails_says_not_restored_and_names_the_backup(tmp_path, monkeypatch, capsys, name, at, partial):
+    _s, old, new, state, env = switch_setup(tmp_path, monkeypatch)
+    before, inode = env.read_bytes(), os.stat(str(env)).st_ino
+    EnvFault(monkeypatch, name, at=at, partial=partial)
+    assert run_verb(env, state) == 1
+    monkeypatch.undo()
+    r = result(state)
+    backup = str(state / hc.ENV_BACKUP)
+    assert r["state"] == "failed" and r["ok"] is False and r["env"] == "NOT restored"
+    assert "NOT restored" in r["why"] and "may be damaged" in r["why"]
+    assert "The root-only backup is %s" % backup in r["why"] and "sudo cmp" in r["why"] and "cat %s >" % backup in r["why"]
+    out = capsys.readouterr().out
+    assert "FAILED and .env was NOT RESTORED" in out and "cutting carries on" not in out and "as it was" not in out
+    assert (state / hc.ENV_BACKUP).read_bytes() == before     # what it tells you to use is good
+    assert os.stat(str(env)).st_ino == inode
+
+
+def test_tc1700_a_restore_that_reads_back_wrong_is_not_called_restored(tmp_path, monkeypatch):
+    _s, old, new, state, env = switch_setup(tmp_path, monkeypatch)
+    real, calls = hc.read_bytes, []
+
+    def wrong(path):
+        calls.append(path)
+        return b"garbage" if len(calls) >= 2 else real(path)
+    monkeypatch.setattr(hc, "read_bytes", wrong)
+    assert run_verb(env, state) == 1
+    assert result(state)["env"] == "NOT restored" and "reading it back" in result(state)["why"]
+
+
+def test_tc1700_without_a_backup_it_does_not_invent_one(tmp_path, monkeypatch):
+    env = tmp_path / "env"
+    env.write_bytes(b"A=1\n")
+    EnvFault(monkeypatch, "write", at=(1, 2))
+    with pytest.raises(hc.EnvWriteFailed, match="There is no backup") as info:
+        hc.set_env_lines(str(env), {"A": "2"})
+    assert info.value.restored is False
+
+
+def test_tc1700_a_clean_write_says_written(tmp_path, monkeypatch):
+    _s, old, new, state, env = switch_setup(tmp_path, monkeypatch)
+    assert run_verb(env, state) == 0 and result(state)["env"] == "written"
+
+
+def test_tc1700_no_text_promises_more_than_that():
+    source = (STACK / "clips" / "homehub_clips.py").read_text(encoding="utf-8")
+    assert "CLIPS_ROOT unchanged" not in source and "any failure leaves" not in source.lower().replace("\n    ", " ")
+    readme = (STACK / "clips" / "README.md").read_text(encoding="utf-8")
+    assert "cut therefore leaves cutting on scratch" not in readme.replace("Any failure, a kill or a power\n", "")
+    assert "Any failure, a kill" not in readme
 
 
 def drop_setup(tmp_path, monkeypatch):

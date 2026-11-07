@@ -233,10 +233,16 @@ settings, the counts taken inside the lock are checked (every clip that was on e
 side is on the drive, none left, every index whole), and only then is `.env` written,
 in place, keeping its inode, after a one-time root-only backup at
 `/var/lib/homehub-clips/env.pre-switch-to-media`. A pass re-reads `.env` once it has
-the lock, so none can cut to the old root afterwards. Any failure, a kill or a power
-cut therefore leaves cutting on scratch as before, with what already moved safe on the
-drive and invisible to scratch's retention until it is run again. It is bounded at
-one hour (`RuntimeMaxSec`), so a hung drive cannot hold the lock for long.
+the lock, so none can cut to the old root afterwards. A failure, a kill or a power
+cut before that write therefore leaves cutting on scratch as before, with what already
+moved safe on the drive and invisible to scratch's retention until it is run again.
+It is bounded at one hour (`RuntimeMaxSec`), so a hung drive cannot hold the lock for long.
+
+**The write itself can fail.** In place is not atomic, so the switch keeps the exact bytes
+it found, and if the write, the truncate, the sync or the read-back fails it puts them back
+the same way and reads them back too. It then says which happened, in `"env"` and in `why`:
+`restored`, or `NOT restored`, with the backup's path and what to do. A kill in that same
+moment can do neither; step 5 says how to tell.
 
 **Where, on the media drive**: `CLIPS_ROOT=/srv/media/Clips`. "Clips on the media
 drive" below.
@@ -530,7 +536,7 @@ is the merged MiniPC-Deployer revision and `<hub>` the hub's address.
 2. The identity. It is generated, not typed.
 
    ```sh
-   grep -c '^/srv/media' /etc/homehub-samba/drive-identity.conf   # 1. If 0, and only then:
+   sudo grep -c '^/srv/media' /etc/homehub-samba/drive-identity.conf   # 1. If 0, and only then:
    sudo sh -c 'cat /tmp/drive-identity.conf >/etc/homehub-samba/drive-identity.conf'
    ```
 
@@ -556,7 +562,7 @@ is the merged MiniPC-Deployer revision and `<hub>` the hub's address.
    sudo cp -a /etc/samba/smb.conf /etc/samba/smb.conf.pre-clips
    sudo sh -c 'cat /tmp/smb.conf.fragment >/etc/homehub-samba/smb.conf.fragment'   # keeps its owner and mode
    sudo sh -c "sed -n '/^\[Clips\]/,\$p' /etc/homehub-samba/smb.conf.fragment >>/etc/samba/smb.conf"
-   testparm -s --section-name=Clips 2>/dev/null   # path, force user, read only, valid users, root preexec
+   sudo testparm -s --section-name=Clips 2>/dev/null   # path, force user, read only, valid users, root preexec
    sudo smbcontrol smbd reload-config
    ```
 
@@ -566,32 +572,46 @@ is the merged MiniPC-Deployer revision and `<hub>` the hub's address.
 
 5. The switch: one command, then checks. Nothing is stopped: while it runs the cut and
    retention timers skip, and events queue as they always do. A lost session does not
-   matter, it runs detached. If it fails, cutting carries on to scratch exactly as before.
+   matter, it runs detached: only the wait below is yours, and it can be started again.
 
    ```sh
    sudo python3 /opt/homehub/stack/clips/homehub_clips.py switch-to-media --plan
    #   "guard": "ok", "root_now": "/srv/scratch/clips", "clips": N (the old area now), "on_drive": 0
    sudo systemd-run --unit=homehub-clips-switch --collect -p RuntimeMaxSec=1h -p CapabilityBoundingSet=~CAP_SYS_RESOURCE -p NoNewPrivileges=yes /usr/bin/python3 /opt/homehub/stack/clips/homehub_clips.py switch-to-media
-   #   returns at once; `systemctl is-active homehub-clips-switch` is active while it runs
+   while systemctl is-active -q homehub-clips-switch; do sleep 5; done   # returns when it has finished
    sudo cat /var/lib/homehub-clips/switch-to-media.json
-   #   "state": "done", "ok": true, "left": 0, "drive_after" = "drive_before" + "source_before",
+   #   "state": "done", "ok": true, "env": "written", "left": 0, "drive_after" = "drive_before" + "source_before",
    #   "root_after": "/srv/media/Clips". Those counts were taken inside the lock: they are the check.
-   grep -E '^(CLIPS_ROOT|HOMEHUB_DISK_MOUNTS)=' /opt/homehub/stack/.env
+   sudo grep -E '^(CLIPS_ROOT|HOMEHUB_DISK_MOUNTS)=' /opt/homehub/stack/.env
    sudo python3 /opt/homehub/stack/clips/homehub_clips.py status   # "root": "/srv/media/Clips", "clips" = "drive_after" or a little more, "quota": {"limit_mib": 112197, ...}
    sudo find /srv/scratch/clips -type f                            # nothing
-   journalctl -u homehub-clips-switch -n 20
+   sudo journalctl -u homehub-clips-switch -n 20
    ```
 
-   `"state": "failed"`: read `why`, fix that, and run the same command again; it repairs and
-   finishes. `"state": "running"` with the unit gone means it was killed, and the same applies.
-   `.env` is unchanged in both cases. Not `sudo python3` for the switch itself: a root shell
-   holds CAP_SYS_RESOURCE and the guard refuses it (and says this command).
+   `"state": "failed"`, by `"env"`:
 
-6. Look at it. `sudo systemctl start homehub-disk-check.service; journalctl -t homehub-disk-check -n 6`
+   * `"not written"`: `.env` was not touched. Read `why`, fix that, run the same command again;
+     it repairs and finishes.
+   * `"restored"`: the write failed and `.env` is back as it was. The same, once the write's
+     cause (`why`) is fixed.
+   * `"NOT restored"`: `.env` may be damaged, and `why` gives the backup's path and the two
+     commands. Do that before anything else: every reader of `.env` is affected, not only clips.
+
+   `"state": "running"` with the unit gone means it was killed. If
+   `/var/lib/homehub-clips/env.pre-switch-to-media` does not exist, the write was never reached
+   and `.env` is untouched: run it again. If it exists, the kill may have landed in the write:
+   `sudo wc -c` both files and read the two `grep`ped lines above, restore from the backup as
+   for `"NOT restored"` if anything is wrong, then run it again.
+
+   Not `sudo python3` for the switch itself: a root shell holds CAP_SYS_RESOURCE and the guard
+   refuses it (and says this command).
+
+6. Look at it. `sudo systemctl start homehub-disk-check.service; sudo journalctl -t homehub-disk-check -n 6`
    shows `disk: skipped /srv/media`. From the dev PC, `\\homehub.<domain>\Clips` as `admin`
    lists `door` and a clip plays, and a copy into it is refused. After the next visitor,
-   `stat -c '%U %G %a %n' /srv/media/Clips/door/<day>/*.mp4` says `root homehub-clips 644`,
-   and `homehub_clips.py status` shows `last_clip` moving.
+   `sudo sh -c "stat -c '%U %G %a %n' /srv/media/Clips/door/<day>/*.mp4"` says `root homehub-clips 644`
+   (in `sudo sh -c` because `hub` cannot enter the folder, so its own shell cannot expand the
+   `*`), and `sudo python3 /opt/homehub/stack/clips/homehub_clips.py status` shows `last_clip` moving.
 
 **Back:** `CLIPS_ROOT=/srv/scratch/clips`, edited in place, never with `sed -i`, which replaces
 the inode: `sudo sh -c "umask 077; sed 's|^CLIPS_ROOT=.*|CLIPS_ROOT=/srv/scratch/clips|' /opt/homehub/stack/.env >/root/env.new && cat /root/env.new >/opt/homehub/stack/.env && rm /root/env.new"`.

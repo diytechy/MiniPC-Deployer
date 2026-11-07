@@ -1937,7 +1937,18 @@ case "${WALL_VOLUME_KEYS_ENABLED:-true}" in
         systemctl disable --now wall-volume-keys.service wall-volume-request.socket >/dev/null 2>&1 || true
         log "audio: WALL_VOLUME_KEYS_ENABLED is false — the side rocker is inert" ;;
     *)
-        enable_unit "wall-volume-keys.service enabled — the side rocker drives whichever output the current mode uses" wall-volume-keys.service ;;
+        if enable_unit "wall-volume-keys.service enabled — the side rocker drives whichever output the current mode uses" wall-volume-keys.service; then
+            # RE-ASSERT THE NEW CODE (2026-11-07, SR-150). `enable` leaves a
+            # running daemon alone, and this one is long-lived: a paired release
+            # runs this script against a panel whose daemon started at boot, so
+            # without this the root half (the applier, the socket) would be new
+            # while the key reader kept the old code until the next reboot --
+            # behaviour a fresh image never has. `try-restart` does nothing
+            # when it is not running yet, so an install is unaffected. A failure
+            # costs the buttons, not the audio, so it warns.
+            systemctl try-restart wall-volume-keys.service >/dev/null 2>&1 ||
+                warn "audio: wall-volume-keys did not restart — the volume buttons may run the previous code until a reboot. Check: systemctl status wall-volume-keys"
+        fi ;;
 esac
 
 # apply_audio_mode MODE SUCCESS_LINE... — apply one output chain and JUDGE it.

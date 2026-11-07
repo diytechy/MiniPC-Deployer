@@ -18,6 +18,7 @@ DOOR_CREDENTIAL_FILES = {
     "motion-min-area-ratio", "motion-persistence-seconds",
     "motion-dwell-seconds", "motion-stationary-ratio", "motion-approach-polygon",
     "motion-road-polygon", "motion-ignore-polygons", "motion-diagnostics",
+    "motion-source", "motion-hub-port",
 }
 
 
@@ -111,6 +112,8 @@ def test_door_configuration_contract_is_complete_without_committed_credentials()
         "DOORBELL_MOTION_ROAD_POLYGON=",
         "DOORBELL_MOTION_IGNORE_POLYGONS=",
         "DOORBELL_MOTION_DIAGNOSTICS=false",
+        "DOORBELL_MOTION_SOURCE=panel",
+        "DOORBELL_MOTION_HUB_PORT=8556",
     }
     assert expected_public <= set(env.splitlines())
     assert "rtsp://" not in env
@@ -415,3 +418,22 @@ def test_the_socket_itself_still_carries_the_access_control():
     assert "--allowed-group panel" in unit
     assert "UMask=0007" in unit, "the socket must stay group-only, never world"
     assert "Group=wall-door-stream" in unit, "the service keeps its own identity"
+
+
+def test_the_motion_source_and_hub_port_reach_the_broker_as_credentials():
+    """IF-079 / SR-147: firstboot writes each to its own file from its own key,
+    and the unit loads each from /run/wall-door-credentials (the broker reads
+    credentials, never wall.env)."""
+    firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
+    unit = (WALL / "wall-door-stream.service").read_text(encoding="utf-8")
+    for key, name in (("DOORBELL_MOTION_SOURCE", "motion-source"), ("DOORBELL_MOTION_HUB_PORT", "motion-hub-port")):
+        assert "printf '%%s' \"$%s\" > \"$_door_cred_dir/%s\"" % (key, name) in firstboot
+        assert "LoadCredential=%s:/run/wall-door-credentials/%s\n" % (name, name) in unit
+        assert ': "${%s:=' % key in firstboot
+    assert ': "${DOORBELL_MOTION_SOURCE:=panel}"' in firstboot
+    assert ': "${DOORBELL_MOTION_HUB_PORT:=8556}"' in firstboot
+
+
+def test_the_shipped_image_keeps_the_panel_on_its_own_detector():
+    env = (WALL / "wall.env.example").read_text(encoding="utf-8").splitlines()
+    assert "DOORBELL_MOTION_SOURCE=panel" in env and "DOORBELL_MOTION_SOURCE=hub" not in env

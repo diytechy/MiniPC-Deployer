@@ -562,6 +562,48 @@
     "yes",
     ""
    ]
+  },
+  {
+   "env": "DOORBELL_MOTION_SOURCE",
+   "credential": "motion-source",
+   "kind": "enum",
+   "required": false,
+   "default": "panel",
+   "min": null,
+   "max": null,
+   "shellValidated": true,
+   "accept": [
+    "panel",
+    "hub"
+   ],
+   "reject": [
+    "",
+    "Panel",
+    "HUB",
+    "both"
+   ]
+  },
+  {
+   "env": "DOORBELL_MOTION_HUB_PORT",
+   "credential": "motion-hub-port",
+   "kind": "int",
+   "required": false,
+   "default": 8556,
+   "min": 1024,
+   "max": 65535,
+   "shellValidated": true,
+   "accept": [
+    "1024",
+    "65535"
+   ],
+   "reject": [
+    "1023",
+    "65536",
+    "",
+    "abc",
+    "nan",
+    "inf"
+   ]
   }
  ]
 }

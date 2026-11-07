@@ -24,6 +24,14 @@ and the API reports the camera URL); WebRTC, SRTP and RTMP disabled. Host
 networking, so those binds are the host's. **No Caddy route, no DNS name.**
 Video only (`#media=video`, `default_query: video`).
 
+**One more listener, not the relay's, and off by default**: the hub detector's
+panel feed (IF-079, `../camera-motion/event_feed.py`) on `LAN_IP:<CAMERA_DOOR_MOTION_FEED_PORT>`
+(0 = none; 8556 in the deployed plan). It is a few JSON lines about door motion
+and carries no picture, zone or credential; only `PANEL_IP` may connect. The
+panel takes its door events from it when its `DOORBELL_MOTION_SOURCE` is `hub`
+(the Owner, 2026-10-26: one detector owns door motion). Deploy order is in
+`../clips/README.md`, "Deploy steps", step 9: **hub first, then the panel**.
+
 **The relay's output never carries the credential.** go2rtc's producer warns
 with the whole camera URL - credential and camera address included - every time
 the camera drops, and `info` is kept because those warnings are the record of a

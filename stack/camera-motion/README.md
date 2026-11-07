@@ -7,6 +7,7 @@ that camera's relay stream and writing IF-076 records. It ships off.
 | File | What |
 |---|---|
 | `camera_motion.py` | `condition`, `check`, `run`, `replay`, `cost` |
+| `event_feed.py` | the panel feed (IF-079): a bounded, non-blocking TCP listener the run loop serves; `CAMERA_<C>_MOTION_FEED_PORT`, 0 = off |
 | `motion_engine.py` | OfficeWallNaglight `doorstream/motion.py`, comments removed (this repository is public), code unchanged - never edit it here |
 | `motion-engine.pin` | the commit it was taken at and the scrubbed file's sha256; the run refuses any other bytes, and TC-1543 compares its code with that commit's |
 | `homehub-camera-motion@.service` | the instance unit |

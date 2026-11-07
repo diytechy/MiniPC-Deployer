@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
 """camera_motion.py - the hub's motion detector for a relayed camera (SR-128).
 
-THE EVENT SOURCE FOR CLIPS. The panel's door detector runs only while the panel
-is lit and someone is in the office, so on its own it would give no clips at
-night or with the office empty. The Owner ruled on 2026-10-26 (HomeHub
-open-items A78) that the detector runs on the hub and is the event source for
-clips. This module is that detector: one instance per camera
+THE EVENT SOURCE FOR CLIPS, AND FOR THE PANEL. The panel's own door detector runs
+only while the panel is lit and someone is in the office, so on its own it would
+give no clips at night or with the office empty. The Owner ruled on 2026-10-26
+(HomeHub open-items A78) that the detector runs on the hub, is the event source
+for clips, and that the panel takes its door events from the hub instead of
+decoding the stream itself, so one detector owns door motion. This module is
+that detector: one instance per camera
 (homehub-camera-motion@<camera>.service), each writing IF-076 records
 (stack/clips/clip_events.py) that the clip cutter reads. A later camera with
 its own motion events (ONVIF) is another source writing the same records; the
 cutter does not change.
+
+THE PANEL FEED (event_feed.py, IF-079). With CAMERA_<C>_MOTION_FEED_PORT set (0,
+the default, is off) the detector also tells the panel what the engine sees: a
+small TCP listener on the hub's LAN address, inside the loop below, that
+publishes every signal at once and unthrottled, separately from the store's
+throttled records. The panel subscribes when its DOORBELL_MOTION_SOURCE is hub;
+until a panel is switched, its own detector is the one that runs. A feed fault
+never affects detection or the records (event_feed.py says how).
 
 ONE ENGINE, NOT TWO. motion_engine.py is OfficeWallNaglight doorstream/motion.py
 at a pinned commit (motion-engine.pin) with its comments removed - this
@@ -56,7 +66,7 @@ Verbs:
                            (25 % of one core, the Owner's budget).
 
 Python 3.8-compatible (the dev PC's test runner imports this module).
-Implements: SR-128, LLR-1357..LLR-1362.
+Implements: SR-128, LLR-1357..LLR-1362; SR-146, LLR-1452..LLR-1454.
 """
 
 from __future__ import annotations
@@ -82,6 +92,7 @@ sys.path.insert(0, HERE)
 import monitor_common as mc  # noqa: E402
 import door_relay  # noqa: E402
 import clip_events as ev  # noqa: E402
+import event_feed as feed  # noqa: E402
 
 ENGINE_FILE = os.path.join(HERE, "motion_engine.py")
 PIN_FILE = os.path.join(HERE, "motion-engine.pin")
@@ -132,12 +143,15 @@ class MotionSettings:
       Config:  CAMERAS (space-separated names); per camera C:
                CAMERA_<C>_MOTION_ENABLED (false), _MOTION_RELAY_STREAM (C: the
                go2rtc stream it reads), _MOTION_DECODE (software|vaapi),
-               _MOTION_STALL_SEC (30), _FPS (10, the stream's nominal rate, for
-               replay), the engine's knobs _MOTION_<ENGINE_KEYS>; and
+               _MOTION_STALL_SEC (30), _MOTION_FEED_PORT (0 = no panel feed,
+               else 1024..65535; anything else is 0 with a warning), _FPS (10,
+               the stream's nominal rate, for replay), the engine's knobs
+               _MOTION_<ENGINE_KEYS>; PANEL_IP (the only peer the feed
+               admits); and
                CAMERA_VAAPI_DEVICE (/dev/dri/renderD128),
                CAMERA_MOTION_BUDGET_PCT (25).  [stack/.env]
-      Raises:  Invalid naming the key, never a value.
-    Implements: LLR-1358.
+      Raises:  Invalid naming the key, never a value (the feed knob never raises).
+    Implements: LLR-1358, LLR-1454.
     """
 
     def __init__(self, env: Dict[str, str], camera: str):
@@ -156,6 +170,12 @@ class MotionSettings:
         self.stall_sec = mc.knob_int(env, knob(camera, "MOTION_STALL_SEC"), 30, 5, 600)
         self.stream_fps = mc.knob_int(env, knob(camera, "FPS"), 10, 1, 60)
         self.budget_pct = mc.knob_int(env, "CAMERA_MOTION_BUDGET_PCT", 25, 1, 400)
+        # The panel feed: a bad value turns the feed off and never refuses the
+        # detector, which is the clips' event source (a feed fault touches nothing else).
+        self.feed_port = mc.knob_int(env, knob(camera, "MOTION_FEED_PORT"), 0, feed.PORT_LOW, feed.PORT_HIGH)
+        raw_port = env.get(knob(camera, "MOTION_FEED_PORT"), "").strip()
+        self.feed_port_invalid = bool(raw_port) and raw_port != "0" and self.feed_port == 0
+        self.panel_ip = env.get("PANEL_IP", "").strip()
         values = {}
         for suffix in ENGINE_KEYS:
             key = knob(camera, "MOTION_" + suffix)
@@ -272,7 +292,7 @@ class RawFramer:
         return frames
 
 
-# ── which signals reach the store ────────────────────────────────────────────
+# ── which signals reach the panel and the store ──────────────────────────────
 
 
 class SignalSpooler:
@@ -317,6 +337,18 @@ class SignalSpooler:
             cause, utc_ms = self.pending
             self.pending = None
             self.emit(cause, "renewal", utc_ms)
+
+
+def dispatch_signal(panel_feed: Optional["feed.EventFeed"], spool: SignalSpooler, cause: str,
+                    mono: float, utc_ms: int) -> None:
+    """One engine signal to its two readers: the panel feed first, every signal at
+    once and unthrottled, then the spooler that decides what the store keeps. The
+    feed cannot raise (it catches and disables itself), so the spooler always runs
+    and its output is the same with the feed healthy, faulted or absent.
+    Implements: LLR-1452."""
+    if panel_feed is not None:
+        panel_feed.publish(cause, utc_ms)
+    spool.signal(cause, mono, utc_ms)
 
 
 class EventWriter:
@@ -377,6 +409,13 @@ def prepare(env_file: str, camera: str, preflight: bool = False):
     return settings, engine, config
 
 
+def status_record(status: Dict[str, object], counts: Dict[str, int], panel_feed: "feed.EventFeed",
+                  **extra: object) -> Dict[str, object]:
+    """The status JSON: the run's counters, what was written to the store, and the
+    panel feed's block {port, clients, sent, dropped}. Implements: LLR-1453."""
+    return dict(status, written=dict(counts), feed=panel_feed.status(), **extra)
+
+
 def write_status(state_dir: str, camera: str, status: Dict[str, object]) -> None:
     mc.save_json_atomic(os.path.join(state_dir, "motion", "%s.json" % camera), status)
 
@@ -400,6 +439,11 @@ def run_service(env_file: str, camera: str, state_dir: str = ev.STATE_DIR) -> in
     motion = engine.MotionEngine(config)
     writer = EventWriter(state_dir, camera)
     spool = SignalSpooler(writer.emit)
+    panel_feed = feed.EventFeed(camera, relay.lan_ip, settings.feed_port, settings.panel_ip, log=mc.log)
+    if settings.feed_port_invalid:
+        mc.log("camera motion [%s]: %s is not 0 or a port in %d..%d - no panel feed"
+               % (camera, knob(camera, "MOTION_FEED_PORT"), feed.PORT_LOW, feed.PORT_HIGH), warning=True)
+    panel_feed.open()
     subprocess.run(["docker", "rm", "-f", container_name(camera)], stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL, timeout=60)
     argv, payload = decoder_command(relay, settings, config.sample_fps)
@@ -423,13 +467,22 @@ def run_service(env_file: str, camera: str, state_dir: str = ev.STATE_DIR) -> in
     code = 1
     try:
         while not stopping:
-            ready, _w, _x = select.select([fd], [], [], 1.0)
+            try:
+                ready, writable, _x = select.select([fd] + panel_feed.read_fds(), panel_feed.write_fds(), [], 1.0)
+            except (OSError, ValueError):
+                # Only the feed's sockets can be at fault here: end the feed, and
+                # ask again about the decoder alone (a bad decoder fd still raises).
+                panel_feed.close()
+                panel_feed.disabled = True
+                ready, writable, _x = select.select([fd], [], [], 1.0)
             mono = time.monotonic()
             spool.tick(mono)
+            panel_feed.service(set(ready), set(writable))
+            panel_feed.tick(mono, int((mono - last_data) * 1000))
             if mono - last_status >= STATUS_EVERY_SEC:
-                write_status(state_dir, camera, dict(status, written=dict(writer.counts)))
+                write_status(state_dir, camera, status_record(status, writer.counts, panel_feed))
                 last_status = mono
-            if not ready:
+            if fd not in ready:
                 if mono - last_data > settings.stall_sec:
                     mc.log("camera motion [%s]: no frame for %ds - ending this run" % (camera, settings.stall_sec),
                            warning=True)
@@ -447,12 +500,14 @@ def run_service(env_file: str, camera: str, state_dir: str = ev.STATE_DIR) -> in
                 status["frames"] = int(status["frames"]) + 1
                 status["last_frame_utc_ms"] = utc_ms
                 if fired and motion.cause:
-                    spool.signal(motion.cause, now, utc_ms)
+                    dispatch_signal(panel_feed, spool, motion.cause, now, utc_ms)
         else:
             code = 0
     finally:
         spool.flush()
-        write_status(state_dir, camera, dict(status, written=dict(writer.counts), stopped_utc_ms=int(time.time() * 1000)))
+        write_status(state_dir, camera, status_record(status, writer.counts, panel_feed,
+                                                      stopped_utc_ms=int(time.time() * 1000)))
+        panel_feed.close()
         subprocess.run(["docker", "rm", "-f", container_name(camera)], stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=60)
         try:

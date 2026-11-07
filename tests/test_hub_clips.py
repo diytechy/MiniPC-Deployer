@@ -2308,6 +2308,20 @@ def test_tc1700_bytes_that_read_back_wrong_are_restored_too(tmp_path, monkeypatc
     assert env.read_bytes() == before and result(state)["env"] == "restored"
 
 
+def test_tc1700_a_failed_close_cannot_change_what_the_write_reported(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_bytes(b"CLIPS_ROOT=/srv/scratch/clips\nOTHER=1\n")
+    real = os.close
+
+    def close_then_fail(fd):
+        real(fd)
+        raise OSError(errno.EIO, "injected close failure")
+    monkeypatch.setattr(hc.os, "close", close_then_fail)
+    hc.set_env_lines(str(env), {"CLIPS_ROOT": "/srv/media/Clips"})      # raising here would report "not written"
+    monkeypatch.undo()
+    assert env.read_bytes() == b"CLIPS_ROOT=/srv/media/Clips\nOTHER=1\n"
+
+
 @pytest.mark.parametrize("name,at,partial", [("write", (1, 2), 9), ("fsync", (1, 2), 0)])
 def test_tc1700_a_restore_that_fails_says_not_restored_and_names_the_backup(tmp_path, monkeypatch, capsys, name, at, partial):
     _s, old, new, state, env = switch_setup(tmp_path, monkeypatch)

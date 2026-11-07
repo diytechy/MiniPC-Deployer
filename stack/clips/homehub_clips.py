@@ -2358,7 +2358,12 @@ def set_env_lines(env_file: str, changes: Dict[str, str], backup: Optional[str] 
                    "`sudo sh -c 'cat %s >%s'`, then run the switch again" % (backup, backup, env_file, backup, env_file)
                    if backup else "There is no backup: check it by hand"), False)
     finally:
-        os.close(fd)
+        # By now the bytes are synced and read back, or a truthful EnvWriteFailed is
+        # on its way. A failed close must not replace that with a report of its own.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def back_up_env(env_file: str, state_dir: str) -> str:

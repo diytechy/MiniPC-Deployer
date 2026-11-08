@@ -886,12 +886,17 @@ set_log_count() {
 # runs: an upper bound for this one, never a lower one - which is the direction
 # a memory limit must be sized from. A diagnostic, so it can never fail the run.
 FILEBACKUP_SLICE_CGROUP="${FILEBACKUP_SLICE_CGROUP:-}"
-log_slice_peak() {
-    local cg="$FILEBACKUP_SLICE_CGROUP" peak=""
+slice_cgroup() {
+    local cg="$FILEBACKUP_SLICE_CGROUP"
     if [ -z "$cg" ]; then
         cg="$(systemctl show -p ControlGroup --value homehub-filebackup.slice 2>/dev/null || true)"
         [ -z "$cg" ] || cg="/sys/fs/cgroup$cg"
     fi
+    printf '%s' "$cg"
+}
+log_slice_peak() {
+    local cg peak=""
+    cg="$(slice_cgroup)"
     [ -z "$cg" ] || peak="$(cat "$cg/memory.peak" 2>/dev/null || true)"
     case "$peak" in
         ''|*[!0-9]*)
@@ -899,6 +904,98 @@ log_slice_peak() {
         *)
             log "filebackup slice memory.peak: $peak bytes ($(( peak / 1048576 )) MiB) $1 - the peak since boot across runs, an upper bound for this one" ;;
     esac
+}
+
+# mem_sampler_start LABEL / mem_sampler_stop LABEL - THIS run's memory, and when.
+# memory.peak above cannot answer either question: it has no timestamp, kernel
+# 6.8 cannot reset it, and it counts page cache and kernel memory (the first
+# full run, 2026-11-08, logged 3184 MiB while the slice held 801 MiB of cache
+# and slab with no container running at all). So a sampler reads the slice's
+# memory.stat every FILEBACKUP_MEM_SAMPLE_SECS (default 10) into
+# $FB_LOGS/memory/<utc>-<label>.tsv and the stop logs one line: the peak of
+# `anon` (the engine and 7-Zip, the number a limit is sized from) with its time,
+# the peak charged total with its time, the cache and kernel peaks, and how many
+# times the slice's MemoryHigh throttled the run (memory.events `high`, as a
+# delta across the run). One sample is taken synchronously at start and one at
+# stop, so even a run shorter than the interval reports something. The newest
+# FILEBACKUP_MEM_SAMPLE_KEEP files (default 30) are kept.
+# A diagnostic, so it can never fail the run: every read is `|| true`, the loop
+# runs with the ERR trap cleared, and it exits by itself when the wrapper does.
+FILEBACKUP_MEM_SAMPLE_SECS="${FILEBACKUP_MEM_SAMPLE_SECS:-10}"
+FILEBACKUP_MEM_SAMPLE_KEEP="${FILEBACKUP_MEM_SAMPLE_KEEP:-30}"
+MEM_SAMPLER_PID=""; MEM_SAMPLE_FILE=""; MEM_SAMPLE_CG=""; MEM_HIGH_BEFORE=0
+mem_sample() {
+    local cur
+    cur="$(cat "$MEM_SAMPLE_CG/memory.current" 2>/dev/null || true)"
+    awk -v t="$(date -u +%Y-%m-%dT%H:%M:%SZ)" -v c="${cur:-0}" \
+        '$1=="anon"{a=$2} $1=="file"{f=$2} $1=="kernel"{k=$2} END{printf "%s\t%s\t%d\t%d\t%d\n", t, c, a, f, k}' \
+        "$MEM_SAMPLE_CG/memory.stat" >>"$MEM_SAMPLE_FILE" 2>/dev/null || true
+}
+mem_events_high() {
+    local n
+    n="$(awk '$1=="high"{print $2}' "$1/memory.events" 2>/dev/null || true)"
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    printf '%s' "$n"
+}
+mem_sampler_start() {
+    MEM_SAMPLER_PID=""; MEM_SAMPLE_FILE=""
+    MEM_SAMPLE_CG="$(slice_cgroup)"
+    if [ -z "$MEM_SAMPLE_CG" ] || [ ! -r "$MEM_SAMPLE_CG/memory.stat" ]; then
+        log "memory sampler: off for $1 (${MEM_SAMPLE_CG:-homehub-filebackup.slice is not active} has no readable memory.stat)"
+        return 0
+    fi
+    mkdir -p "$FB_LOGS/memory" 2>/dev/null || true
+    MEM_SAMPLE_FILE="$FB_LOGS/memory/$(date -u +%Y%m%dT%H%M%SZ)-$1.tsv"
+    if ! printf 'utc\tcharged\tanon\tfile\tkernel\n' >"$MEM_SAMPLE_FILE" 2>/dev/null; then
+        log "memory sampler: off for $1 (cannot write $MEM_SAMPLE_FILE)"
+        MEM_SAMPLE_FILE=""
+        return 0
+    fi
+    # shellcheck disable=SC2012  # names are our own <utc>-<label>.tsv, no odd characters
+    ls -1t "$FB_LOGS/memory"/*.tsv 2>/dev/null | tail -n +"$(( FILEBACKUP_MEM_SAMPLE_KEEP + 1 ))" \
+        | while read -r old; do rm -f -- "$old"; done || true
+    MEM_HIGH_BEFORE="$(mem_events_high "$MEM_SAMPLE_CG")"
+    mem_sample
+    (
+        trap - ERR
+        sp=""
+        trap '[ -z "$sp" ] || kill "$sp" 2>/dev/null; exit 0' TERM
+        while kill -0 "$$" 2>/dev/null; do
+            sleep "$FILEBACKUP_MEM_SAMPLE_SECS" & sp=$!
+            wait "$sp" 2>/dev/null || true
+            mem_sample
+        done
+    ) &
+    MEM_SAMPLER_PID=$!
+}
+mem_sampler_stop() {
+    [ -n "$MEM_SAMPLE_FILE" ] || return 0
+    if [ -n "$MEM_SAMPLER_PID" ]; then
+        kill "$MEM_SAMPLER_PID" 2>/dev/null || true
+        wait "$MEM_SAMPLER_PID" 2>/dev/null || true
+    fi
+    MEM_SAMPLER_PID=""
+    mem_sample
+    local summary high_after high_limit
+    summary="$(awk -F'\t' 'NR>1 && $1!="" {
+            n++
+            if (n==1 || $3+0>a) { a=$3+0; at=$1 }
+            if (n==1 || $2+0>c) { c=$2+0; ct=$1 }
+            if ($4+0>f) f=$4+0
+            if ($5+0>k) k=$5+0
+        } END {
+            if (!n) exit
+            printf "anon (engine + 7-Zip) peak %d MiB at %s; charged peak %d MiB at %s; cache peak %d MiB; kernel peak %d MiB; %d samples", a/1048576, at, c/1048576, ct, f/1048576, k/1048576, n
+        }' "$MEM_SAMPLE_FILE" 2>/dev/null || true)"
+    high_after="$(mem_events_high "$MEM_SAMPLE_CG")"
+    high_limit="$(cat "$MEM_SAMPLE_CG/memory.high" 2>/dev/null || true)"
+    case "$high_limit" in
+        ''|max) high_limit="${high_limit:-unknown}" ;;
+        *[!0-9]*) ;;
+        *) high_limit="$(( high_limit / 1048576 )) MiB" ;;
+    esac
+    log "memory this run ($1): ${summary:-no samples}; MemoryHigh $high_limit, throttled $(( high_after - MEM_HIGH_BEFORE )) time(s); samples in $MEM_SAMPLE_FILE"
+    MEM_SAMPLE_FILE=""
 }
 SNAPSHOT_BEFORE="$(count_snapshots)"
 run_state backing-up
@@ -912,7 +1009,9 @@ run_state backing-up
 log "7-Zip level for compressed files: 5 = Normal, fixed in the native engine (the Owner's ruling); FILEBACKUP_7Z_LEVEL no longer does anything"
 log "running: docker compose --profile filebackup run --rm -T $FB_SERVICE backup"
 BACKUP_RC=0
+mem_sampler_start backup
 fb_run backup || BACKUP_RC=$?
+mem_sampler_stop backup
 log_slice_peak "after backup (exit $BACKUP_RC)"
 SNAPSHOT_AFTER="$(count_snapshots)"
 SNAPSHOT_MADE=no
@@ -1070,7 +1169,9 @@ if [ "$VERIFY_RUN" != none ]; then
     # Naming the phase is what stops that looking like a hung backup.
     run_state verifying
     VERIFY_RC=0
+    mem_sampler_start "$VERIFY_RUN-verify"
     fb_run "${VERIFY_ARGS[@]}" || VERIFY_RC=$?
+    mem_sampler_stop "$VERIFY_RUN-verify"
     log_slice_peak "after $VERIFY_RUN verify (exit $VERIFY_RC)"
     # The VERIFY table (FileBackup SR-049/SR-040), a different table from the
     # backup one above: 0 clean · 1 findings · 2 precondition · 4 the store

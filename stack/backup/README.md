@@ -750,7 +750,15 @@ the old store aside: it sits on `/mnt/backup-old` (`library` and
     `4g`** unless `anon` from steps 10 and 12 says otherwise. Do not double a
     peak: on this hub that is more memory than it has, and it would turn the cap
     into no cap. A 3 GiB cap carried the heaviest backup but was not proven for
-    verify.
+    verify. **Since 2026-11-08 the wrapper measures this itself:** every backup
+    and verify logs `memory this run (…): anon (engine + 7-Zip) peak N MiB at
+    <utc>; …; MemoryHigh …, throttled N time(s)`, with 10 s samples in
+    `/var/log/homehub-filebackup/memory/` (the newest 30 runs are kept). The
+    first full run (1.1 TiB, 17 h 43 m, 2026-11-07/08) predates the sampler; the
+    host's 5-minute `MemAvailable` fell only 0.3-0.7 GB over it while
+    `memory.peak` read 3184 MiB. The slice now carries `MemoryHigh=2G` (the
+    Owner): a soft line, so a run whose `anon` needs more is slowed, not killed,
+    and the `throttled` count says so.
 14. **Turn the timer on, the Owner only.** `FILEBACKUP_TIMER_ENABLED='true'` in
     `config.homehub.psd1`, `=true` in the hub's `.env`, `systemctl enable --now
     homehub-library-backup.timer`, release the hold. Both are needed: an image

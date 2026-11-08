@@ -199,9 +199,21 @@ The P4 expiry test is what answers this: after the test reset, run
 
 The library backup runs under `homehub-filebackup.slice`; after every run the
 wrapper logs `filebackup slice memory.peak: … bytes` — the peak since boot
-across runs, an **upper** bound for any one run, which is what
-`FILEBACKUP_MEM_LIMIT` must be sized from (rollout P2). The supervisor scans
-that slice too, so the backup is still in its victim set.
+across runs, an **upper** bound for any one run. It has no timestamp, kernel 6.8
+cannot reset it, and it counts page cache and slab, so on its own it cannot say
+what the engine needed. Since 2026-11-08 the wrapper also samples the slice's
+`memory.stat` every 10 s during the backup and the verify, and logs
+
+```
+memory this run (backup): anon (engine + 7-Zip) peak N MiB at <utc>; charged peak N MiB at <utc>; cache peak …; kernel peak …; N samples; MemoryHigh 2048 MiB, throttled N time(s); samples in /var/log/homehub-filebackup/memory/<utc>-backup.tsv
+```
+
+Size `FILEBACKUP_MEM_LIMIT` from the **anon** peak, not from `memory.peak`.
+The slice carries `MemoryHigh=2G` (the Owner, 2026-11-08): a soft line that
+reclaims cache and throttles, never kills. A non-zero `throttled` count means
+the run was slowed by it; if `anon` itself is near 2 GiB, raise the line rather
+than live with a crawling backup. The supervisor scans that slice too, so the
+backup is still in its victim set.
 
 A run interrupted by a recovery leaves FileBackup's staging folder (`Temp`)
 behind. Until FileBackup can recover that by itself (Owner D8 — it gates the

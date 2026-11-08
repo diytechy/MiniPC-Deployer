@@ -6,6 +6,19 @@
 # systemd nests a dashed slice under its prefix, so the cgroup is
 #   /sys/fs/cgroup/homehub.slice/homehub-filebackup.slice
 # Enabled (and so kept active) by firstboot step 6g.
+#
+# MemoryHigh=2G (the Owner, 2026-11-08: "sit below 2 GB"). A SOFT line: above it
+# the kernel reclaims the slice's page cache and slab hard and throttles its
+# allocations; nothing is killed. The first full run (2026-11-08) charged the
+# slice 3184 MiB, mostly cache from reading 1.1 TiB, while the host lost only
+# 0.3-0.7 GB of MemAvailable over the run. If the engine's own `anon` ever
+# needs more than 2G, the run slows rather than dies, and library-backup.sh logs
+# "throttled N time(s)" from memory.events after each run. The hard ceiling is
+# still the container's FILEBACKUP_MEM_LIMIT (4g), which counts the same cache.
+# Lift it live without a restart: systemctl set-property --runtime
+# homehub-filebackup.slice MemoryHigh=infinity (gone at reboot; this file is
+# what a boot reads). After editing this file: daemon-reload, then read
+# /sys/fs/cgroup/homehub.slice/homehub-filebackup.slice/memory.high back.
 [Unit]
 Description=HomeHub library backup containers
 Documentation=file:///opt/homehub/stack/recovery/README.md
@@ -13,6 +26,7 @@ Before=slices.target
 
 [Slice]
 MemoryAccounting=yes
+MemoryHigh=2G
 
 [Install]
 WantedBy=multi-user.target

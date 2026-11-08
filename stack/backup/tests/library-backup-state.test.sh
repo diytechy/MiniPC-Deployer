@@ -101,6 +101,14 @@ if [ "${1:-}" = image ]; then
 fi
 last=""; for arg in "$@"; do last="$arg"; done
 printf '%s\n' "docker:$last" >>"$EVENTS"
+# MOCK_MEM_DIR models the slice DURING a backup: MemoryHigh throttled it (so the
+# wrapper's before/after delta has something to count) and its memory then FELL,
+# so the peak is the first sample and only a true maximum reports it.
+if [ -n "${MOCK_MEM_DIR:-}" ] && [ "$last" = backup ]; then
+    printf 'low 0\nhigh %s\nmax 0\noom 0\noom_kill 0\n' "${MOCK_MEM_HIGH_AFTER:-0}" >"$MOCK_MEM_DIR/memory.events"
+    printf 'anon 104857600\nfile 1073741824\nkernel 134217728\n' >"$MOCK_MEM_DIR/memory.stat"
+    printf '1312817152\n' >"$MOCK_MEM_DIR/memory.current"
+fi
 case "$last" in
     backup) exit "${MOCK_BACKUP_RC:-0}" ;;
     verify|--deep) exit "${MOCK_VERIFY_RC:-0}" ;;
@@ -515,6 +523,44 @@ if [ "$RUN_RC" = 0 ] && grep -qF 'filebackup slice memory.peak: unavailable' "$T
     pass "TC-1064 an unreadable slice is reported and does not fail the run"
 else
     fail "TC-1064 an unreadable slice changed the run (rc=$RUN_RC)"
+fi
+
+# ── the per-run memory sampler (TC-1064, 2026-11-08) ──────────────────────────
+# memory.peak has no time and counts cache; the sampler logs THIS run's anon
+# peak with its time, the charged peak, and the MemoryHigh throttle delta.
+# The mock run is instant, so the two synchronous samples are all there is.
+printf 'anon 734003200\nfile 2147483648\nkernel 268435456\nshmem 0\n' >"$TMP/slice/memory.stat"
+printf '3149922304\n' >"$TMP/slice/memory.current"
+printf '2147483648\n' >"$TMP/slice/memory.high"
+printf 'low 0\nhigh 4\nmax 0\noom 0\noom_kill 0\n' >"$TMP/slice/memory.events"
+FILEBACKUP_SLICE_CGROUP="$TMP/slice" MOCK_MEM_DIR="$TMP/slice" MOCK_MEM_HIGH_AFTER=11 \
+    run_wrapper memsample "$TMP/good.env" shallow 0 0 200
+if [ "$RUN_RC" = 0 ] \
+   && grep -qE 'memory this run \(backup\): anon \(engine \+ 7-Zip\) peak 700 MiB at [0-9TZ:-]+; charged peak 3004 MiB at [0-9TZ:-]+; cache peak 2048 MiB; kernel peak 256 MiB; [0-9]+ samples; MemoryHigh 2048 MiB, throttled 7 time\(s\)' "$TMP/memsample.out" \
+   && grep -qF 'memory this run (shallow-verify):' "$TMP/memsample.out" \
+   && [ "$(find "$TMP/logs/memory" -name '*-backup.tsv' | wc -l)" -ge 1 ] \
+   && [ "$(head -n 1 "$(find "$TMP/logs/memory" -name '*-backup.tsv' | head -n 1)")" = "$(printf 'utc\tcharged\tanon\tfile\tkernel')" ]; then
+    pass "TC-1064 the sampler logs this run's anon and charged peaks with times, and MemoryHigh's throttle delta"
+else
+    fail "TC-1064 sampler line wrong (rc=$RUN_RC): $(grep 'memory this run\|memory sampler' "$TMP/memsample.out" | tr '\n' '|')"
+fi
+# Retention: only the newest FILEBACKUP_MEM_SAMPLE_KEEP sample files survive.
+mkdir -p "$TMP/logs/memory"
+for i in 1 2 3 4 5; do : >"$TMP/logs/memory/20200101T00000${i}Z-old.tsv"; touch -d "2020-01-0$i" "$TMP/logs/memory/20200101T00000${i}Z-old.tsv"; done
+FILEBACKUP_SLICE_CGROUP="$TMP/slice" FILEBACKUP_MEM_SAMPLE_KEEP=2 run_wrapper memkeep "$TMP/good.env" none 0 0 200
+if [ "$RUN_RC" = 0 ] && [ "$(find "$TMP/logs/memory" -name '*.tsv' | wc -l)" -le 3 ] \
+   && [ ! -e "$TMP/logs/memory/20200101T000001Z-old.tsv" ]; then
+    pass "TC-1064 the sampler keeps only the newest FILEBACKUP_MEM_SAMPLE_KEEP files"
+else
+    fail "TC-1064 sampler retention: $(find "$TMP/logs/memory" -name '*.tsv' | wc -l) files left"
+fi
+# A slice with no memory.stat: the sampler says it is off, and the run is unchanged.
+FILEBACKUP_SLICE_CGROUP="$TMP/no-such-slice" run_wrapper memoff "$TMP/good.env" none 0 0 200
+if [ "$RUN_RC" = 0 ] && grep -qF 'memory sampler: off for backup' "$TMP/memoff.out" \
+   && ! grep -qF 'memory this run' "$TMP/memoff.out"; then
+    pass "TC-1064 an unreadable slice turns the sampler off and does not fail the run"
+else
+    fail "TC-1064 sampler-off case (rc=$RUN_RC): $(grep 'memory' "$TMP/memoff.out" | tr '\n' '|')"
 fi
 
 # ── hub recovery §8: an old engine's staging is a NAMED note, not a refusal ───

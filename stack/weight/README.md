@@ -437,13 +437,19 @@ color_weight: 1.5
 items:
   - id: weigh-in
     title: Step on the scale
-    type: habit
+    type: automated
+    check: weight
     recur: weekly
     horizon: long
     target: 170
     unit: lb
 ---
 ```
+
+(`type: automated` with `check: weight` is the current declaration - see "The
+automated check-off" below. Before the Owner changed it this row was
+`type: habit`; the feeder reads only `id`, `target` and `unit`, so it works with
+either.)
 
 **Which item is configuration, not code.** `WEIGHT_ITEM_CATEGORY` (default
 `Health`) and `WEIGHT_ITEM_ID` (default `weigh-in`) name the item's **location**.
@@ -749,65 +755,58 @@ one**, so `ok` travels alone. It locates the item by
    needs no timezone database and no guess about where the household lives.
 
 Two more things it never does: it never posts `ok: false` (nothing here can
-know somebody did *not* weigh in, and `ok: false` calls `engine.Uncheck`, which
-would silently erase a tick the Owner made by hand), and it never posts a
+know somebody did *not* weigh in, and the tracker treats `ok: false` as a failed
+attempt - `RecordFailure` clears any colour override and leaves `LastSuccess`
+where it was - so it would add nothing true), and it never posts a
 `note`. The gauge already carries the number; a note would be the obvious way a
 body weight leaks into the tracker's **log lines**, which the traceability
 mirror pushes to a private repo hourly — and it would be dead weight anyway,
 because `handleAPIFeed` decodes `Note` and then never reads it.
 
-### Which day the tick lands on — and what this repo cannot fix
+### What a tick does in the tracker, and when the item comes due again
 
-**The legacy `ok` lane cannot back-date.** This was read off
-`internal/web/handlers.go`, not assumed:
+*(Rewritten 2026-11-09. The earlier text described pre-G3 internals -
+`engine.Uncheck`, `logfile.Report`, `todayString` - that no longer exist. Source
+for everything below: NagLight `internal/web/handlers.go`, `handleAPIFeed`
+(about lines 1713-1741) and `internal/feeder/state.go`, read on branch `dev`,
+2026-11-09.)*
 
-* `body.At` is parsed (`time.RFC3339`, into a `logfile.Report`) **only** inside
-  `if body.Color != "" || body.RGB != ""`. The boolean path never touches it and
-  falls through to `date := s.Now()`.
-* `s.Now()` defaults to `todayString` = `time.Now().Format("2006-01-02")` — the
-  **tracker container's local date**.
-* `stack/docker-compose.yml`'s `tracker:` service **now sets `TZ: ${TIMEZONE}`**
-  — the same one value the other services that care already share, and
-  `TIMEZONE=America/Chicago` in the hub's `.env`. So that date is the
-  **household's today**.
+* **A feeder post never writes the event record.** It writes the tracker's
+  feeder state (`state/feeder.json`), because an append-only record cannot say
+  "`ok: false` supersedes an earlier `ok: true`".
+* **`{"check":"weight","ok":true}` is `RecordSuccess`:** `LastSuccess` becomes
+  the tracker's *current time* (not the sample's time - the lane cannot
+  back-date, so this feeder sends no `at`; one would be silently dropped) and any
+  colour override is cleared.
+* **`ok: false` is `RecordFailure`:** the override is cleared and `LastSuccess`
+  is left unchanged, so the item keeps aging from its last real success. This
+  feeder never sends it.
+* **A `color` or `rgb` report also counts as a success** (`RecordReport`): it
+  stamps `LastSuccess` and sets a day-scoped override. This feeder sends neither.
 
-**This changed on 2026-09-10, and it used to say the opposite.** Until then the
-`tracker:` service set no `TZ:` at all, so `time.Now()` in the container was
-**UTC** and the tick landed on the **UTC** day. For the shape the capture
-proved — a weigh-in at **20:24 local on 2026-09-08**, which is **01:24 UTC on
-2026-09-09** — the tick used to land on **2026-09-09's** log. With the
-household's zone applied it lands on **2026-09-08's**, which is the day the
-person actually stood on the scale. (The older passages above call these Monday
-and Tuesday; 2026-09-08 is in fact a Tuesday. The day *shift* is what those
-passages are about and it is right — only the weekday names are wrong, and they
-predate this change.)
+**The tracker's date is the household's.** `stack/docker-compose.yml`'s
+`tracker:` service sets `TZ: ${TIMEZONE}` (`TIMEZONE=America/Chicago` in the
+hub's `.env`), so "now" for a tick is household-local. This was changed on
+2026-09-10; until then the container ran on UTC and evening ticks landed on the
+next day. A test asserts the `tracker:` block carries a `TZ` spelled
+`${TIMEZONE}` rather than a hard-coded zone, so the tracker cannot drift onto a
+different clock from the services that share that value. Whoever changes it is
+sent back to this section.
 
-**What is still true:** the lane carries **no back-dating**, so this feeder
-still sends no `at` — one would be silently dropped, which is worse than not
-sending it, because it would look as though back-dating had worked. The tick is
-therefore stamped with the *tracker's* today, not the reading's day. Those two
-now agree for a reading taken in the household's own zone; a reading whose
-`utcOffset` is some other zone's can still be a day out, and **gate 4** is what
-keeps that bounded (a three-day-old reading recovered after an outage is not
-ticked onto today at all).
+**When the weigh-in comes due again (NagLight Phase 2, 2026-11-09 - built on
+NagLight branch `tracker-entry-semantics`/N1, NOT deployed when this was
+written, and NOT verified against `handlers.go`, which does not contain it):**
 
-**The consequence is much wider than weight.** `s.Now()` is the day boundary for
-**every** item in the tracker — habits, todos, rollovers, streaks, catch-ups,
-the lot. Before this change they rolled over at **midnight UTC**, which is
-**19:00 local** in `America/Chicago`; afterwards they roll at **local
-midnight**. Anything the Owner ticked between 19:00 and midnight had been
-landing on the *next* day's log; from now on it lands on the day they ticked it.
-Historical logs are **not** rewritten — the boundary moves forward only, so the
-evening of the switchover is the seam. NagLight's own Dockerfile installs
-`tzdata` for exactly this ("correct local *today* for the nightly
-materialize"), so the missing `TZ:` was a pre-existing gap rather than a
-decision. Owner-approved 2026-09-10; written up in `docs/status.md`.
-
-A test still guards this line, inverted: it now asserts the `tracker:` block
-**does** carry a `TZ` and that it is spelled `${TIMEZONE}` rather than a
-hard-coded zone, so the tracker cannot drift onto a different day boundary from
-the services that share that value. Whoever changes it is sent back to this
-section.
+* An automated item ages from its **last success**: calendar grace for the day
+  of the success, then no reset at 02:00.
+* A weekly weigh-in with no fixed date is **rolling**: it is absent from the
+  list until seven days after the last success (same local time), Sunday weeks
+  until it has first succeeded, and a missed week stays overdue until the scale
+  reports again.
+* The old 00:00-02:00 hazard (a tick landing just before the 02:00 reset and
+  being counted against the wrong day) is gone, because nothing resets at 02:00.
+* **A silent scale keeps getting redder until it reports again.** There is no
+  02:00 reset to clear it.
 
 ### The two posts fail independently, and the gauge goes first
 
@@ -1176,17 +1175,42 @@ target.** NagLight emits `count` for *quantified* items only, and quantified
 means "has a non-zero target" — so the same `target` that gives this gauge its
 goal line is what makes the measurement readable at all.
 
-**Three arrays are searched, not one.** `engine.derive` sends a quantified row
-to `items` while the occurrence's fold is short of its target and to `undoable`
-once it is met. A reader that knew only `items` would lose the measurement on
-exactly the days somebody was doing well. `catchups` is searched too.
+**Three arrays are searched, not one.** With `input: measure` (below) any entry
+completes the period: the row sits in `undoable` for the rest of that tracking
+day, is then **absent** from `/api/today` until the next occurrence opens, and
+an undo puts it back in `items`. A measure row is never in `catchups`; that
+array is searched for the older `input: hybrid` declaration and older trackers,
+which sent a row to `items` while the fold was short of its target and to
+`undoable` once it was met.
 
 **What it costs, stated plainly:** `count` is the fold of the **current
-occurrence**, so it reads 0 at each new period until something is entered. That
-is why both halves are **cached in the state file** and re-posted at their
-**original** stamp — the gauge stands at the last real measurement and goes
-stale on NagLight's own 7-day static horizon, rather than flickering out every
-time a new week begins.
+occurrence**, so at each new period there is nothing to read until something is
+entered. With a `measure` item `count` is **absent, not 0** (an older tracker
+served `count: 0` with no `lastEventAt`, and the feeder still reads that as
+"nothing entered"). That is why both halves are **cached in the state file** and
+re-posted at their **original** stamp — the gauge stands at the last real
+measurement and goes stale on NagLight's own 7-day static horizon, rather than
+flickering out every time a new week begins.
+
+**`periodStart` tells a retraction from a new period.** A `measure` row always
+carries `periodStart` (RFC3339, the instant the current occurrence began). When
+the row comes back with no `count`: a cached waist stamped **at or after**
+`periodStart` was entered in this occurrence and has since been undone, so the
+feeder **drops the cache** and posts no ratio (one journal line, no value); a
+cached waist stamped **before** `periodStart` belongs to an earlier period and is
+kept and re-posted at its original stamp. A tracker that serves no `periodStart`
+keeps the old behaviour; a malformed one is a named failure (the field, never
+the value) and the cache is kept.
+
+**Correcting a waist.** Press Undo on the panel the same day. The feeder notices
+on its next cycle (15 minutes at most) and stops re-posting. **A ratio it already
+posted stays on the wall until it goes stale** (up to 7 days): the ratio gauge has
+no "unavailable" body, so there is nothing to post in its place. That is a known,
+accepted residual. A second one: a same-day correction (enter A, re-enter B)
+followed by undoing B in the last 15 minutes before 02:00 can leave the feeder
+publishing B until the next measurement, because the row disappears before its
+next poll. After the day ends there is no Undo; enter the right value next
+period.
 
 ### The target: one number, in the unit it is measured in
 
@@ -1197,9 +1221,11 @@ survive contact with either half of the system:
 
 * the item declares `unit: in`, so a `0.5` under it reads as a **half-inch
   waist** to every other reader of that sheet, including the person who typed it;
-* NagLight treats a quantified item as **satisfied** once progress reaches its
-  target, and a waist of 33.5 against a target of 0.5 is satisfied the instant it
-  is entered, every time, forever.
+* With `input: measure` the tracker completes the period on **any** entry, so
+  the target is only the goal line. Under the earlier `input: hybrid` a waist
+  below its target could never complete the row (progress had to reach the
+  target), which is why the declaration changed on 2026-11-09. Putting `0.5` in
+  the column would still read as a half-inch waist.
 
 `unit: in` is **checked, never assumed**, and a wrong one falls back to the
 default rather than converting — `goal_from_item`'s rule: `target: 85` with
@@ -1258,8 +1284,8 @@ the cell empty:
 | `color_weight` | *(blank)* | a category-level column, already set on the category's other rows |
 | `id` | `waist-in` | what `WEIGHT_WAIST_ITEM_ID` defaults to |
 | `title` | `Measure the waist` | free text |
-| `type` | `meta` | `hybrid` input is valid **only** on a `meta` item |
-| `recur` | `weekly` | required for every type but `project`. Weekly keeps one entry readable for the whole week; `daily` would make `count` read 0 every day until it was re-entered (the cache covers the gap either way) |
+| `type` | `meta` | `measure` input is valid **only** on a `meta` item with a target |
+| `recur` | `weekly` | required for every type but `project`. Undated weekly is rolling: due again seven days after the last entry, at the same time of day; Sunday weeks until it is first entered; a missed week stays overdue until entered. (`daily` would leave `count` absent every day until re-entered; the cache covers the gap either way) |
 | `horizon` | `long` | matches the weigh-in beside it |
 | `target` | `34` | **the waist you are aiming at, in inches — not the ratio.** It is also what makes the item *quantified*, which is what makes `count` appear on `/api/today` at all |
 | `unit` | `in` | checked and never converted; anything else falls back to the 0.5 default |
@@ -1269,8 +1295,8 @@ the cell empty:
 | `completed_at` | *(blank)* | written back by the tracker |
 | `progress` | *(blank)* | written back by the tracker |
 | `depends_on` | *(blank)* | a `depends_on` this feeder cannot satisfy would hide the row from `/api/today` |
-| `input` | `hybrid` | free entry. The Owner's ruling (Q6). A `picker` cannot do it: 30–45 in at 0.5 in is 31 steps and the picker caps at 21 |
-| `picker_min` | *(blank)* | a hybrid item **may not** carry picker metadata — NagLight refuses the row |
+| `input` | `measure` | a number pad on the panel; any entry completes the week; the target is the goal line. **Requires the NagLight image that knows `measure`**; an older one skips the row. (A `picker` cannot do it: 30–45 in at 0.5 in is 31 steps and the picker caps at 21) |
+| `picker_min` | *(blank)* | a measure item **may not** carry picker metadata — NagLight refuses the row |
 | `picker_max` | *(blank)* | |
 | `picker_step` | *(blank)* | |
 | `check` | *(blank)* | this item is entered by a person, not ticked by a feeder |
@@ -1278,6 +1304,14 @@ the cell empty:
 | `delinquency_hours` | *(blank)* | |
 | `carry_over` | *(blank)* | it affects debt and catch-up offers only, never `count` |
 | `notes` | *(blank)* | |
+
+**This row said `input: hybrid` until 2026-11-09** (the Owner's ruling, Q6: free
+entry). Under `hybrid` the item completed only when the entry reached the target,
+so a waist below its goal could never complete the week. The Owner ruled
+"Yes, input: measure": entering any value completes the period and is stored as
+"this period's value is X". Change the Sheet row only once the NagLight image
+that knows `measure` is deployed, and check there is no `waist-in` entry history
+from the `hybrid` days that `measure` would read differently.
 
 Then, on the hub, in `/opt/homehub/stack/.env`:
 

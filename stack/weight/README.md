@@ -1203,7 +1203,9 @@ flickering out every time a new week begins.
 measurement still in the record and are omitted when there is none. When the
 body carries it and lists the waist item, the feeder uses it and ignores the
 row: `value` + `at` are the waist (stamp = `at`; the unit is still checked,
-against the row's if the row is on the board, otherwise the definitions'; the
+the entry's own `unit` is preferred; an older N2 build omits it, and then the
+row's if the row is on the board, otherwise the definitions'; none confirmed is
+refused; the
 plausibility band and the no-value-in-a-message rules are unchanged), and no
 `value`/`at` means **no waist** (never measured, or undone), so the cache is
 dropped and no ratio is posted. An undo makes the previous measurement

@@ -4976,15 +4976,87 @@ def test_a_timestamp_failure_names_its_own_field_ni_a2():
         assert "nope" not in message
 
 
-def test_a_withdrawal_leaves_the_exit_status_zero_ni_a2(tmp_path):
-    """The run-level check: `main` returns 1 iff there are failure lines."""
+def test_a_withdrawal_leaves_the_exit_status_zero_ni_a2(
+        tmp_path, monkeypatch, capsys):
+    """The real entry point: `main()` returns 0 after a successful withdrawal.
+
+    The cycle is the real `run_cycle` (real ratio_cycle, real state file) with
+    injected readers and poster; only the environment `main` hands it is
+    swapped for the fixture's. A regression in main()'s return, or a failure
+    line added beside the withdrawal, turns this red.
+    """
     env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
-    run_with_ratio(env, [])
+    run_with_ratio(env, [])                      # caches a waist
+    assert cached_waist_state(env) is not None
     payload = with_measurements(a_today(item_id="x"),
                                 a_measurement(value=None, at=None))
-    _posted, failures, _ = run_with_ratio(
-        env, [], waist_reader=a_measurements_reader(payload))
-    assert (1 if failures else 0) == 0
+    real_run_cycle = feeder.run_cycle
+
+    def cycle(_main_env):
+        posts = []
+
+        def poster(body, url, e, t):
+            posts.append(body)
+            return True, "HTTP 200"
+
+        def ratio(env_, state, now_, poster_, feed_url, timeout, failures):
+            return feeder.ratio_cycle(
+                env_, state, now_, poster_, feed_url, timeout, failures,
+                height_readers={"google-health": a_height_reader()},
+                waist_reader=a_measurements_reader(payload))
+
+        return real_run_cycle(
+            env, now=SAME_DAY_NOW, readers={"google-health": captured_reader()},
+            poster=poster, goal_loader=a_goal, check_loader=lambda *a: None,
+            ratio=ratio)
+
+    monkeypatch.setattr(feeder, "run_cycle", cycle)
+    monkeypatch.setattr(os, "environ", {
+        "WEIGHT_ENABLED": "true", "WEIGHT_USER": "1080",
+        "WEIGHT_FEED_URL": "http://127.0.0.1:8787/api/feed"})
+    capsys.readouterr()
+    assert feeder.main([]) == 0
+    captured = capsys.readouterr()
+    assert "withdrawn" in captured.out
+    assert captured.err == ""
+    assert cached_waist_state(env) is None
+
+
+def test_a_measurements_entry_stamped_in_the_future_is_refused_ni_a2():
+    """`at` goes through check_observed_at like every other stamp."""
+    future = feeder.iso8601_utc(SAME_DAY_NOW + 6 * 3600)
+    payload = with_measurements(a_today(item_id="x"), a_measurement(at=future))
+    with pytest.raises(feeder.SourceFailure) as raised:
+        feeder.waist_from_today(payload, "waist-in", SAME_DAY_NOW,
+                                declared_unit="in")
+    assert not isinstance(raised.value, feeder.NoWeightYet)
+
+
+def test_a_non_json_today_body_leaves_no_decode_error_in_the_chain_ni_a2():
+    """A JSONDecodeError's `.doc` is the whole body, waist included."""
+    secret = "98765"
+
+    def respond(handler):
+        body = ("not json " + secret).encode()
+        handler.send_response(200)
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    with loopback_server(respond) as (base, _seen):
+        env = {"_identity": "sub-123", "_feed_url": base + "/api/feed",
+               "_now": NOW}
+        with pytest.raises(feeder.SourceFailure) as raised:
+            feeder.read_waist_measurement(env, url=base + "/api/today")
+    exc, seen = raised.value, []
+    while exc is not None and id(exc) not in seen:
+        seen.append(id(exc))
+        assert secret not in str(exc)
+        assert not isinstance(exc, ValueError)
+        exc = exc.__cause__ or exc.__context__
+    text = "".join(traceback.format_exception(
+        type(raised.value), raised.value, raised.value.__traceback__))
+    assert secret not in text
 
 
 def test_measurements_entry_unit_is_preferred_ni_a2():
@@ -4999,8 +5071,9 @@ def test_measurements_entry_unit_is_preferred_ni_a2():
     ok = with_measurements(off_board, entry("in"))
     # Accepted even though the definitions say nothing / something else.
     for declared in (None, "cm"):
-        assert feeder.waist_from_today(
-            ok, "waist-in", SAME_DAY_NOW, declared_unit=declared)[0]             == FIXTURE_WAIST_IN
+        got = feeder.waist_from_today(
+            ok, "waist-in", SAME_DAY_NOW, declared_unit=declared)
+        assert got[0] == FIXTURE_WAIST_IN
     # Refused even though the row and the definitions both say inches.
     bad = with_measurements(a_today(unit="in"), entry("cm"))
     with pytest.raises(feeder.SourceFailure) as raised:

@@ -2393,8 +2393,9 @@ def waist_height_ratio(waist_in, height_in, where="ratio"):
 # twice is a name that can drift. Three arrays are searched rather than one, and
 # that is not defensiveness - it is NagLight's own model.
 #
-# WITH `input: measure` (2026-11-09; the row shape below is tracker N2, built on
-# NagLight branch tracker-entry-semantics and NOT deployed) the row is
+# WITH `input: measure` (2026-11-09; the row shape and `periodStart` below are
+# SPECIFIED for tracker N2, NagLight branch tracker-entry-semantics, NOT YET
+# BUILT, and tested here only with synthetic bodies) the row is
 # `type: meta`, and ANY entry
 # completes the period: after an entry the row sits in `undoable` for the rest
 # of that tracking day, then it is ABSENT from /api/today until the next
@@ -2414,12 +2415,12 @@ TODAY_COUNT_KEY = "count"
 TODAY_UNIT_KEY = "unit"
 TODAY_LAST_EVENT_AT_KEY = "lastEventAt"
 TODAY_PERIOD_START_KEY = "periodStart"
-# THE AUTHORITATIVE READ (tracker N2, built on NagLight branch
-# tracker-entry-semantics, NOT deployed): a top-level `measurements` array with
-# one object per `input: measure` item, on the board or not -
-# {"id", "value", "at", "unit", "periodStart"}, `value`/`at` omitted when the
-# record holds no measurement. When it is present and lists the waist item it wins
-# over the checklist row.
+# THE AUTHORITATIVE READ (SPECIFIED for tracker N2, NagLight branch
+# tracker-entry-semantics, NOT YET BUILT; tested only with synthetic bodies): a
+# top-level `measurements` array with one object per `input: measure` item, on
+# the board or not - {"id", "value", "at", "unit", "periodStart"},
+# `value`/`at` omitted when the record holds no measurement. When it is present
+# and lists the waist item it wins over the checklist row.
 TODAY_MEASUREMENTS_KEY = "measurements"
 TODAY_MEASUREMENT_VALUE_KEY = "value"
 TODAY_MEASUREMENT_AT_KEY = "at"
@@ -2564,7 +2565,8 @@ def waist_from_today(payload, item_id, now, where="naglight /api/today",
             # the row's, else the definitions', is used. None confirmed = refuse.
             unit = entry.get(TODAY_UNIT_KEY)
             if unit is None:
-                unit = row.get(TODAY_UNIT_KEY) if row is not None                     else declared_unit
+                unit = (row.get(TODAY_UNIT_KEY) if row is not None
+                        else declared_unit)
             if not isinstance(unit, str) or unit.strip().casefold() != WAIST_UNIT:
                 raise SourceFailure(
                     "%s: the `%s` item's unit is not confirmed as %s (the "
@@ -5102,7 +5104,8 @@ def read_waist_measurement(env, url=None):
     is entered: with an `input: measure` item `count` is absent (an older
     tracker served 0 with no `lastEventAt`). `periodStart` lets the caller tell
     that from a measurement withdrawn by an undo, and a tracker that serves the
-    `measurements` array (tracker N2, not deployed) answers the question
+    `measurements` array (specified for tracker N2, not yet built) answers the
+    question
     outright. That is why the value is cached in the state file and re-posted
     at its ORIGINAL stamp - the gauge stands at the last real measurement and
     goes stale on NagLight's own horizon, rather than flickering out every time
@@ -5141,9 +5144,15 @@ def read_waist_measurement(env, url=None):
     except Exception as exc:
         raise SourceFailure("naglight: /api/today failed: %s"
                             % type(exc).__name__)
+    # The raise is OUTSIDE the `except`: a JSONDecodeError keeps the whole
+    # body in `.doc`, and raising inside the handler would leave it in
+    # `__context__` (the waist is in that body).
     try:
         payload = json.loads(raw.decode("utf-8", "replace"))
+        is_json = True
     except ValueError:
+        is_json = False
+    if not is_json:
         raise SourceFailure("naglight: /api/today returned something that is "
                             "not JSON")
     return waist_from_today(

@@ -1183,9 +1183,9 @@ day, is then **absent** from `/api/today` until the next occurrence opens, and
 an undo puts it back in `items`. A measure row is never in `catchups`; that
 array is searched for the older `input: hybrid` declaration and older trackers,
 which sent a row to `items` while the fold was short of its target and to
-`undoable` once it was met. *(The measure-row shape is tracker N2, built on
-NagLight branch `tracker-entry-semantics`, **not deployed**; the tests use fake
-bodies.)*
+`undoable` once it was met. *(The measure-row shape and `periodStart` are
+**specified for tracker N2** (NagLight branch `tracker-entry-semantics`), **NOT
+YET BUILT**; the tests use only synthetic bodies.)*
 
 **What it costs, stated plainly:** `count` is the fold of the **current
 occurrence**, so at each new period there is nothing to read until something is
@@ -1196,8 +1196,9 @@ re-posted at their **original** stamp — the gauge stands at the last real
 measurement and goes stale on NagLight's own 7-day static horizon, rather than
 flickering out every time a new week begins.
 
-**The authoritative read: `measurements`** *(tracker N2, branch
-`tracker-entry-semantics`, not deployed)*. A tracker that serves a top-level
+**The authoritative read: `measurements`** *(specified for tracker N2, NagLight
+branch `tracker-entry-semantics`, **NOT YET BUILT**; tested only with synthetic
+bodies)*. A tracker that serves a top-level
 `measurements` array lists one `{id, value, at, periodStart}` per `measure` item
 **whether or not its row is on the board**; `value`/`at` are the latest
 measurement still in the record and are omitted when there is none. When the

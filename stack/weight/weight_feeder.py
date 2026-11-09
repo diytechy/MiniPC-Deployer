@@ -2417,8 +2417,8 @@ TODAY_PERIOD_START_KEY = "periodStart"
 # THE AUTHORITATIVE READ (tracker N2, built on NagLight branch
 # tracker-entry-semantics, NOT deployed): a top-level `measurements` array with
 # one object per `input: measure` item, on the board or not -
-# {"id", "value", "at", "periodStart"}, `value`/`at` omitted when the record
-# holds no measurement. When it is present and lists the waist item it wins
+# {"id", "value", "at", "unit", "periodStart"}, `value`/`at` omitted when the
+# record holds no measurement. When it is present and lists the waist item it wins
 # over the checklist row.
 TODAY_MEASUREMENTS_KEY = "measurements"
 TODAY_MEASUREMENT_VALUE_KEY = "value"
@@ -2559,7 +2559,12 @@ def waist_from_today(payload, item_id, now, where="naglight /api/today",
                     "`%s`, so it is not usable."
                     % (where, item_id, TODAY_MEASUREMENT_VALUE_KEY,
                        TODAY_MEASUREMENT_AT_KEY))
-            unit = row.get(TODAY_UNIT_KEY) if row is not None else declared_unit
+            # THE ENTRY'S OWN `unit` (the item's declared unit as the tracker
+            # loaded it) is preferred; an older N2 build omits it, and then
+            # the row's, else the definitions', is used. None confirmed = refuse.
+            unit = entry.get(TODAY_UNIT_KEY)
+            if unit is None:
+                unit = row.get(TODAY_UNIT_KEY) if row is not None                     else declared_unit
             if not isinstance(unit, str) or unit.strip().casefold() != WAIST_UNIT:
                 raise SourceFailure(
                     "%s: the `%s` item's unit is not confirmed as %s (the "

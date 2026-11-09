@@ -4985,3 +4985,33 @@ def test_a_withdrawal_leaves_the_exit_status_zero_ni_a2(tmp_path):
     _posted, failures, _ = run_with_ratio(
         env, [], waist_reader=a_measurements_reader(payload))
     assert (1 if failures else 0) == 0
+
+
+def test_measurements_entry_unit_is_preferred_ni_a2():
+    """The entry's `unit` wins; the row/definitions are only the fallback."""
+    off_board = a_today(item_id="x")
+
+    def entry(unit):
+        e = a_measurement()
+        e["unit"] = unit
+        return e
+
+    ok = with_measurements(off_board, entry("in"))
+    # Accepted even though the definitions say nothing / something else.
+    for declared in (None, "cm"):
+        assert feeder.waist_from_today(
+            ok, "waist-in", SAME_DAY_NOW, declared_unit=declared)[0]             == FIXTURE_WAIST_IN
+    # Refused even though the row and the definitions both say inches.
+    bad = with_measurements(a_today(unit="in"), entry("cm"))
+    with pytest.raises(feeder.SourceFailure) as raised:
+        feeder.waist_from_today(bad, "waist-in", SAME_DAY_NOW, declared_unit="in")
+    assert "cm" not in str(raised.value)
+    # No entry unit: the definitions fall back; none anywhere is refused.
+    plain = with_measurements(a_today(item_id="x"), a_measurement())
+    assert feeder.waist_from_today(plain, "waist-in", SAME_DAY_NOW,
+                                   declared_unit="in")[0] == FIXTURE_WAIST_IN
+    with pytest.raises(feeder.SourceFailure):
+        feeder.waist_from_today(plain, "waist-in", SAME_DAY_NOW,
+                                declared_unit="cm")
+    with pytest.raises(feeder.SourceFailure):
+        feeder.waist_from_today(plain, "waist-in", SAME_DAY_NOW)

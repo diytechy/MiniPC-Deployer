@@ -2309,9 +2309,13 @@ def check_plausible_waist_in(value, where):
     try:
         inches = check_pounds(value, where)
     except SourceFailure:
+        why = "it is a %s" % type(value).__name__
+        if not isinstance(value, bool) and isinstance(value, (int, float)) \
+                and value <= 0:
+            why = "it is zero or negative"
         raise SourceFailure(
-            "%s: the waist is not a usable number (it is a %s). The value is "
-            "not logged." % (where, type(value).__name__))
+            "%s: the waist is not a usable number (%s). The value is "
+            "not logged." % (where, why))
     low, high = PLAUSIBLE_WAIST_IN
     if inches < low or inches > high:
         raise SourceFailure(
@@ -2439,6 +2443,19 @@ def waist_from_today(payload, item_id, now, where="naglight /api/today"):
             "for a quantified item), or nothing has been entered for the "
             "current occurrence. Nothing is broken and no ratio is posted."
             % (where, item_id, TODAY_COUNT_KEY, TARGET_KEY))
+    # A ZERO WITH NO STAMP IS "NOTHING ENTERED YET", NOT A BAD MEASUREMENT.
+    # NagLight serves `count: 0` and omits `lastEventAt` for a quantified
+    # occurrence nobody has touched — so every new week of a weekly waist item
+    # starts this way. Refusing it failed the whole feeder run every cycle until
+    # someone measured (observed on the hub 2026-11-08). A zero that DOES carry a
+    # stamp was entered, and still goes to the band below and is refused.
+    count = row.get(TODAY_COUNT_KEY)
+    if not isinstance(count, bool) and isinstance(count, (int, float)) \
+            and count == 0 and not row.get(TODAY_LAST_EVENT_AT_KEY):
+        raise NoWeightYet(
+            "%s: the `%s` row has no entry for the current occurrence yet "
+            "(count 0, no `%s`). Nothing is broken and no ratio is posted."
+            % (where, item_id, TODAY_LAST_EVENT_AT_KEY))
     declared_unit = row.get(TODAY_UNIT_KEY)
     if not isinstance(declared_unit, str) \
             or declared_unit.strip().casefold() != WAIST_UNIT:

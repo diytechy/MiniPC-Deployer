@@ -4056,6 +4056,27 @@ def test_no_waist_row_is_NOT_a_failure_ni_a2():
         feeder.waist_from_today(a_today(count=None), "waist-in", NOW)
 
 
+@pytest.mark.parametrize("count", [0, 0.0])
+def test_an_untouched_occurrence_is_nothing_entered_not_a_failure(count):
+    """NAGLIGHT SERVES `count: 0` AND NO `lastEventAt` FOR AN UNTOUCHED WEEK.
+
+    Seen on the hub 2026-11-08: the waist-in row of a fresh weekly occurrence
+    carried `count: 0` (an int) and no stamp, and the feeder failed every
+    15-minute cycle until someone measured. That is NoWeightYet. A zero that
+    carries a stamp was entered, and stays refused (the implausible-count test).
+    """
+    with pytest.raises(feeder.NoWeightYet):
+        feeder.waist_from_today(a_today(count=count, stamp=None), "waist-in", NOW)
+
+
+def test_a_stamped_zero_still_says_zero_not_its_type():
+    """The old message read 'it is a int', which hid that the value was 0."""
+    with pytest.raises(feeder.SourceFailure) as raised:
+        feeder.waist_from_today(a_today(count=0), "waist-in", NOW)
+    assert not isinstance(raised.value, feeder.NoWeightYet)
+    assert "zero or negative" in str(raised.value)
+
+
 def test_a_body_that_is_not_the_today_shape_is_refused_ni_a2():
     """A shape we do not recognise is refused, never read as 'nothing entered'."""
     with pytest.raises(feeder.SourceFailure):

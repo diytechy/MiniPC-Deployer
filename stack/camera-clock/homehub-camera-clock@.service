@@ -1,0 +1,49 @@
+# homehub-camera-clock@<camera> - set a cloud-less camera's clock from the hub
+# (SR-161; stack/camera-clock/README.md). One pass: log in on the camera's SDK
+# port, read its clock, set it to the hub's local time when it is off by more
+# than CAMERA_<C>_CLOCK_MAX_DRIFT_SEC. Run by homehub-camera-clock@<camera>.timer.
+#
+# The knob is CAMERA_<CAMERA>_CLOCK_ENABLED (ExecCondition: a clean skip when
+# off). 78 = refused (the SDK is not the pinned bytes, a knob is malformed): an
+# alert, never retried by the unit.
+#
+# THE SDK IS A VENDOR BINARY, so it gets the least this job needs: root only to
+# read the root-only stack .env, but no capabilities at all, a read-only system
+# with one writable state directory, no devices, and IP traffic to private
+# (RFC 1918) and loopback addresses only - it cannot reach the internet.
+[Unit]
+Description=Camera clock (%i): set the camera's clock from the hub
+Documentation=file:///opt/homehub/stack/camera-clock/README.md
+After=network-online.target homehub-firstboot.service
+Wants=network-online.target
+AssertPathExists=/opt/homehub/stack/camera-clock/camera_clock.py
+
+[Service]
+Type=oneshot
+WorkingDirectory=/var/lib/homehub-camera-clock
+ExecCondition=/usr/bin/python3 /opt/homehub/stack/camera-clock/camera_clock.py --camera %i condition
+ExecStart=/usr/bin/python3 /opt/homehub/stack/camera-clock/camera_clock.py --camera %i sync
+SyslogIdentifier=homehub-camera-clock
+StateDirectory=homehub-camera-clock
+StateDirectoryMode=0750
+UMask=0027
+TimeoutStartSec=60
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadOnlyPaths=/opt/homehub/stack/.env
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictAddressFamilies=AF_INET AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+IPAddressDeny=any
+IPAddressAllow=localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+MemoryMax=128M
+TasksMax=32

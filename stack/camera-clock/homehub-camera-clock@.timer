@@ -1,0 +1,15 @@
+# homehub-camera-clock@<camera>.timer - every 10 minutes, and 2 minutes after
+# the hub boots (SR-161). The camera loses its clock at every power cut; the
+# next pass after it comes back sets it, so a wrong date shows for 10 minutes
+# at most. A pass that finds the clock right changes nothing and logs nothing.
+[Unit]
+Description=Camera clock (%i): every 10 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+RandomizedDelaySec=20s
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

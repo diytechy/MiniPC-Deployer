@@ -841,21 +841,25 @@ GOOGLE_DURATION_RE = re.compile(r"^(-?)(\d+)(?:\.(\d{1,9}))?s$")
 FRACTIONAL_SECONDS_RE = re.compile(r"\.(\d+)")
 
 
-def parse_rfc3339_utc(text, where):
+def parse_rfc3339_utc(text, where, field=None):
     """Return the epoch second an RFC3339 timestamp names, or raise SourceFailure.
 
     Contract:
       Inputs:  text: the timestamp exactly as the vendor sent it; where: str for
-               the message.
+               the message; field: the name of the field the text came from, so
+               a message names ITS OWN field (default `physicalTime`, the one
+               Google's samples carry).
       Outputs: int epoch seconds.
       Raises:  SourceFailure for a non-string, a blank, an unparseable string,
                and - deliberately - for a stamp carrying NO ZONE at all.
 
-    A ZONELESS STAMP IS REFUSED RATHER THAN ASSUMED TO BE UTC. `physicalTime` is
-    documented and observed as UTC with a `Z`, so a stamp without one is not the
-    field this parser thinks it is reading; assuming UTC would silently shift the
-    reading by up to a day, which is how a stale weigh-in starts rendering fresh
-    (or a fresh one starts rendering as being in the future and gets refused).
+    A ZONELESS STAMP IS REFUSED RATHER THAN ASSUMED TO BE UTC. Every field read
+    through here is documented or observed to carry an offset (`physicalTime` a
+    `Z`, NagLight's stamps an explicit offset), so a stamp without one is not
+    the field this parser thinks it is reading; assuming UTC would silently
+    shift the reading by up to a day, which is how a stale weigh-in starts
+    rendering fresh (or a fresh one starts rendering as being in the future and
+    gets refused).
 
     THE OFFENDING TEXT IS NEVER PUT IN THE MESSAGE, only its type. Every string
     that reaches here came off a vendor's wire, `run_cycle` prints a
@@ -865,10 +869,11 @@ def parse_rfc3339_utc(text, where):
 
     Implements: LLR-006
     """
+    field = field or PHYSICAL_TIME_KEY
     if not isinstance(text, str) or not text.strip():
         raise SourceFailure(
             "%s: %s is missing or is not a string (it is a %s)"
-            % (where, PHYSICAL_TIME_KEY, type(text).__name__))
+            % (where, field, type(text).__name__))
     cleaned = text.strip()
     if cleaned.endswith(("Z", "z")):
         cleaned = cleaned[:-1] + "+00:00"
@@ -881,13 +886,12 @@ def parse_rfc3339_utc(text, where):
     except (ValueError, TypeError):
         raise SourceFailure(
             "%s: %s is not an RFC3339 timestamp (the value is not logged: it "
-            "is a vendor's bytes)" % (where, PHYSICAL_TIME_KEY))
+            "is a vendor's bytes)" % (where, field)) from None
     if parsed.tzinfo is None:
         raise SourceFailure(
-            "%s: %s carries no timezone. It is documented and was observed as "
-            "UTC with a `Z`; a zoneless stamp is not that field, and assuming "
-            "UTC would move the weigh-in by hours."
-            % (where, PHYSICAL_TIME_KEY))
+            "%s: %s carries no timezone. A zoneless stamp is refused rather "
+            "than assumed to be UTC, which would move the time by hours."
+            % (where, field))
     return int(parsed.timestamp())
 
 
@@ -1398,15 +1402,23 @@ def check_vendor_millimetres(raw, where):
             "%s: %s is not the plain decimal string this field was observed to "
             "carry (it is a %s). The value is not logged."
             % (where, HEIGHT_MILLIMETRES_KEY, type(raw).__name__))
+    # Both raises sit OUTSIDE their `except` (see check_plausible_waist_in):
+    # the wrapped exceptions quote the value and must not be left in
+    # `__context__`.
     try:
         inches = millimetres_to_inches(float(raw), where)
+        usable = True
     except SourceFailure:
+        usable = False
+    if not usable:
         raise SourceFailure(
             "%s: %s is not a usable number (it is a %s). The value is not "
             "logged." % (where, HEIGHT_MILLIMETRES_KEY, type(raw).__name__))
     try:
         return check_plausible_height_in(inches, where)
     except SourceFailure:
+        in_band = False
+    if not in_band:
         raise SourceFailure(
             "%s: %s converts to a height outside the plausible band %g..%g in, "
             "so it is a units error or corruption rather than a body height. "
@@ -2306,9 +2318,16 @@ def check_plausible_waist_in(value, where):
 
     Implements: LLR-006
     """
+    # THE RAISE IS OUTSIDE THE `except`, on purpose. check_pounds' message
+    # quotes the value, and raising inside the handler would keep that
+    # exception in `__context__` (`from None` only hides it from a printed
+    # traceback), where anything that walks the chain would find it.
     try:
         inches = check_pounds(value, where)
+        usable = True
     except SourceFailure:
+        usable = False
+    if not usable:
         why = "it is a %s" % type(value).__name__
         if not isinstance(value, bool) and isinstance(value, (int, float)) \
                 and value <= 0:
@@ -2372,32 +2391,109 @@ def waist_height_ratio(waist_in, height_in, where="ratio"):
 # ── Reading the entered waist back out of NagLight (NI_A2) ──────────────────
 # The GET /api/today keys this parser reads, as constants because a name typed
 # twice is a name that can drift. Three arrays are searched rather than one, and
-# that is not defensiveness - it is NagLight's own model:
-# `engine.derive` sends a quantified row to `items` while the occurrence's fold
-# is short of its target and to `undoable` once it is met, so WHICH array a
-# waist entry lands in depends on whether the person is under their goal. A
-# reader that knew only `items` would lose the measurement on exactly the days
-# somebody was doing well. `catchups` is searched too, for a value entered
-# against an earlier occurrence.
+# that is not defensiveness - it is NagLight's own model.
+#
+# WITH `input: measure` (2026-11-09; the row shape and `periodStart` below are
+# SPECIFIED for tracker N2, NagLight branch tracker-entry-semantics, NOT YET
+# BUILT, and tested here only with synthetic bodies) the row is
+# `type: meta`, and ANY entry
+# completes the period: after an entry the row sits in `undoable` for the rest
+# of that tracking day, then it is ABSENT from /api/today until the next
+# occurrence opens, and an undo puts it back in `items`. `count` is ABSENT, not
+# 0, until the current occurrence holds an entry, and `periodStart` (RFC3339,
+# always present on a measure row) is the instant the occurrence began - which
+# is what lets this reader tell a retracted measurement (the cached stamp is at
+# or after `periodStart`) from a new period that simply has nothing yet.
+# `catchups` never carries a measure row; it is still searched because the
+# older `input: hybrid` declaration (and an older tracker) could put a value
+# entered against an earlier occurrence there. Under that older declaration
+# `engine.derive` sent a quantified row to `items` while the fold was short of
+# its target and to `undoable` once it was met.
 TODAY_ITEM_ARRAYS = ("items", "undoable", "catchups")
 TODAY_ID_KEY = "id"
 TODAY_COUNT_KEY = "count"
 TODAY_UNIT_KEY = "unit"
 TODAY_LAST_EVENT_AT_KEY = "lastEventAt"
+TODAY_PERIOD_START_KEY = "periodStart"
+# THE AUTHORITATIVE READ (SPECIFIED for tracker N2, NagLight branch
+# tracker-entry-semantics, NOT YET BUILT; tested only with synthetic bodies): a
+# top-level `measurements` array with one object per `input: measure` item, on
+# the board or not - {"id", "value", "at", "unit", "periodStart"},
+# `value`/`at` omitted when the record holds no measurement. When it is present
+# and lists the waist item it wins over the checklist row.
+TODAY_MEASUREMENTS_KEY = "measurements"
+TODAY_MEASUREMENT_VALUE_KEY = "value"
+TODAY_MEASUREMENT_AT_KEY = "at"
 
 
-def waist_from_today(payload, item_id, now, where="naglight /api/today"):
+class NoWaistInRecord(NoWeightYet):
+    """The tracker's `measurements` array says the record holds NO waist.
+
+    Authoritative, unlike NoWaistThisPeriod: the waist was never measured, or
+    every measurement was undone. `ratio_cycle` drops any cached waist on it.
+
+    Implements: SR-022, LLR-006
+    """
+
+
+class NoWaistThisPeriod(NoWeightYet):
+    """The waist row is served with no `count`: nothing is entered THIS period.
+
+    A NoWeightYet in every respect (it is not a failure, and it posts nothing by
+    itself); the subclass exists to carry `period_start`, the epoch second the
+    tracker says the current occurrence began, or None when the tracker served
+    no `periodStart` (an older NagLight). `ratio_cycle` compares it with the
+    cached measurement's stamp to tell a RETRACTED measurement (undone after it
+    was read) from a new period that has not been measured yet.
+
+    Implements: SR-022, LLR-006
+    """
+
+    def __init__(self, message, period_start=None):
+        super().__init__(message)
+        self.period_start = period_start
+
+
+def waist_from_today(payload, item_id, now, where="naglight /api/today",
+                     declared_unit=None):
     """The latest entered waist, as (inches, observed_at), from /api/today.
 
     Contract:
       Inputs:  payload: the decoded GET /api/today body; item_id: the waist
-               item's id; now: this cycle's clock; where: str for the messages.
+               item's id; now: this cycle's clock; where: str for the messages;
+               declared_unit: the unit the DEFINITIONS declare for the item,
+               used to check a `measurements` value when the row is not on the
+               board (the row's own unit wins when it is).
       Outputs: (float inches, int epoch seconds).
       Raises:  NoWeightYet when the response is well-formed and simply carries
                no entered waist - nothing is broken and no ratio is posted;
-               SourceFailure when the body is not the shape this parser knows,
-               when the item declares a unit that is not `in`, or when the
-               count or the stamp cannot be used.
+               its subclass NoWaistThisPeriod when the row is present with no
+               `count` (carrying `period_start`, or None from an older
+               tracker), and NoWaistInRecord when `measurements` lists the
+               item with no value; SourceFailure when the body is not the shape this
+               parser knows, when the item declares a unit that is not `in`,
+               when `periodStart` is malformed, or when the count or the stamp
+               cannot be used.
+
+    WHEN THE BODY CARRIES `measurements` AND LISTS THE ITEM, THAT ENTRY IS THE
+    ANSWER and the row is not consulted for the value: `value` + `at` are the
+    latest measurement still in the record (the stamp is `at`), and neither
+    present means no waist (an undo, or never measured). It exists because the
+    row is on the board only while owed or for the rest of the tracking day it
+    was satisfied, so a poll missed before 02:00 - or an undo of a same-day
+    correction between two polls - would otherwise be invisible. The unit is
+    still checked (the row's, else `declared_unit`), the band and the privacy
+    rules are unchanged. An older tracker serves no `measurements`; the row
+    logic below then applies, including NoWaistThisPeriod.
+
+    WITH `input: measure`, `count` IS ABSENT - NOT 0 - UNTIL THE CURRENT PERIOD
+    HOLDS AN ENTRY, and the row carries `periodStart`, the instant the
+    occurrence began. A row with a count is read exactly as below and its
+    `periodStart` is ignored. A row without one raises NoWaistThisPeriod so the
+    caller can compare `period_start` with the cached stamp: a cached
+    measurement stamped at or after it was entered in this occurrence and has
+    since been undone. The zero-with-no-stamp case further down is the OLDER
+    tracker's shape for the same moment and is kept for it.
 
     `count` IS THE VALUE, AND IT IS THERE ONLY BECAUSE THE ITEM CARRIES A
     TARGET. NagLight emits `count` for QUANTIFIED items only, and quantified
@@ -2436,7 +2532,69 @@ def waist_from_today(payload, item_id, now, where="naglight /api/today"):
                 break
         if row is not None:
             break
-    if row is None or row.get(TODAY_COUNT_KEY) is None:
+    if TODAY_MEASUREMENTS_KEY in payload:
+        listed = payload[TODAY_MEASUREMENTS_KEY]
+        if not isinstance(listed, list):
+            raise SourceFailure(
+                "%s: `%s` is not an array (it is a %s)"
+                % (where, TODAY_MEASUREMENTS_KEY, type(listed).__name__))
+        mine = [entry for entry in listed
+                if isinstance(entry, dict) and entry.get(TODAY_ID_KEY) == item_id]
+        if len(mine) > 1:
+            raise SourceFailure(
+                "%s: `%s` lists the `%s` item more than once, so which is "
+                "authoritative is not guessable."
+                % (where, TODAY_MEASUREMENTS_KEY, item_id))
+        if mine:
+            entry = mine[0]
+            value = entry.get(TODAY_MEASUREMENT_VALUE_KEY)
+            at = entry.get(TODAY_MEASUREMENT_AT_KEY)
+            if value is None and at is None:
+                raise NoWaistInRecord(
+                    "%s: the tracker's record holds no measurement for `%s`. "
+                    "Nothing is broken and no ratio is posted."
+                    % (where, item_id))
+            if value is None or at is None:
+                raise SourceFailure(
+                    "%s: the `%s` measurement carries only one of `%s` and "
+                    "`%s`, so it is not usable."
+                    % (where, item_id, TODAY_MEASUREMENT_VALUE_KEY,
+                       TODAY_MEASUREMENT_AT_KEY))
+            # THE ENTRY'S OWN `unit` (the item's declared unit as the tracker
+            # loaded it) is preferred; an older N2 build omits it, and then
+            # the row's, else the definitions', is used. None confirmed = refuse.
+            unit = entry.get(TODAY_UNIT_KEY)
+            if unit is None:
+                unit = (row.get(TODAY_UNIT_KEY) if row is not None
+                        else declared_unit)
+            if not isinstance(unit, str) or unit.strip().casefold() != WAIST_UNIT:
+                raise SourceFailure(
+                    "%s: the `%s` item's unit is not confirmed as %s (the "
+                    "row's, else the definitions'), and this feeder reads %s "
+                    "only. It does NOT convert."
+                    % (where, item_id, WAIST_UNIT, WAIST_UNIT))
+            inches = check_plausible_waist_in(
+                value, "%s %s measurement" % (where, item_id))
+            return inches, check_observed_at(
+                parse_rfc3339_utc(at, "%s %s %s" % (where, item_id,
+                                                    TODAY_MEASUREMENT_AT_KEY),
+                                  TODAY_MEASUREMENT_AT_KEY), now, where)
+    if row is not None and row.get(TODAY_COUNT_KEY) is None:
+        raw_start = row.get(TODAY_PERIOD_START_KEY)
+        period_start = None
+        if raw_start is not None:
+            # THE MESSAGE NAMES THE FIELD AND NEVER THE VALUE.
+            if not isinstance(raw_start, str) or not raw_start.strip():
+                raise SourceFailure(
+                    "%s: the `%s` row's `%s` is not an RFC3339 string."
+                    % (where, item_id, TODAY_PERIOD_START_KEY))
+            period_start = parse_rfc3339_utc(
+                raw_start, where, TODAY_PERIOD_START_KEY)
+        raise NoWaistThisPeriod(
+            "%s: the `%s` row carries no `%s`: nothing is entered for the "
+            "current occurrence. Nothing is broken and no ratio is posted."
+            % (where, item_id, TODAY_COUNT_KEY), period_start)
+    if row is None:
         raise NoWeightYet(
             "%s: no `%s` row carrying a `%s`. Either the Owner has not added "
             "the item, or it declares no `%s:` (NagLight serves a count only "
@@ -2474,8 +2632,7 @@ def waist_from_today(payload, item_id, now, where="naglight /api/today"):
             "the clock: that would keep a months-old measurement permanently "
             "fresh." % (where, item_id, TODAY_LAST_EVENT_AT_KEY))
     return inches, check_observed_at(
-        parse_rfc3339_utc(stamp, "%s %s" % (where, TODAY_LAST_EVENT_AT_KEY)),
-        now, where)
+        parse_rfc3339_utc(stamp, where, TODAY_LAST_EVENT_AT_KEY), now, where)
 
 
 def ratio_gauge_body(ratio, target, observed_at):
@@ -4067,10 +4224,13 @@ def waist_target_ratio_from_definitions(defs_dir, height_in, category=None,
         item's unit". A `0.5` sitting under `unit: in` would be a half-inch
         waist to every other reader of that sheet, including the person who
         typed it.
-      * NagLight treats a quantified item as SATISFIED once its progress
-        reaches its target, and a waist of 33.5 against a target of 0.5 is
-        satisfied the instant it is entered - every time, forever. A target in
-        inches keeps the row behaving like the measurement it is.
+      * With `input: measure` (the declaration since 2026-11-09, replacing
+        `input: hybrid`) the tracker completes the period on ANY entry, so the
+        target is only the goal line this function turns into a ratio; it
+        decides nothing about the row. Under `hybrid` a waist below its target
+        could never complete the row (progress had to reach the target), which
+        is why the declaration changed. A target in inches is still right: it
+        keeps the one number in the unit it is measured in.
 
     So the Owner declares the waist they are aiming at, in inches, and the
     ratio target is that goal expressed in the gauge's own terms. One number,
@@ -4888,6 +5048,25 @@ def today_url_from_feed(feed_url):
     return urlunsplit((parts.scheme, parts.netloc, head + "/today", "", ""))
 
 
+def waist_unit_from_definitions(defs_dir, category, item_id):
+    """The unit the definitions declare for the waist item, or None.
+
+    Never raises: None means "cannot say", which the caller treats as
+    unconfirmed (and refuses a `measurements` value on), never as inches.
+
+    Implements: SR-022, LLR-006
+    """
+    try:
+        found, _legacy = scan_definitions(defs_dir, category or DEFAULT_WAIST_CATEGORY,
+                                          item_id or DEFAULT_WAIST_ITEM_ID)
+        if found is None or UNIT_KEY not in found[0]:
+            return None
+        item, where = found
+        return clean_scalar(one_value(item[UNIT_KEY], where, UNIT_KEY))
+    except (GoalMissing, ValueError, OSError):
+        return None
+
+
 def read_waist_measurement(env, url=None):
     """Source: NagLight's own GET /api/today -> (waist inches, observed_at).
 
@@ -4921,15 +5100,20 @@ def read_waist_measurement(env, url=None):
         folded answer, so there is no second implementation to keep in step.
 
     WHAT IT COSTS, STATED PLAINLY: `count` is the fold of the CURRENT
-    occurrence, so it reads 0 at each new period until something is entered.
-    That is why the value is cached in the state file and re-posted at its
-    ORIGINAL stamp - the gauge stands at the last real measurement and goes
-    stale on NagLight's own horizon, rather than flickering out every time a
-    new week begins.
+    occurrence, so at each new period there is nothing to read until something
+    is entered: with an `input: measure` item `count` is absent (an older
+    tracker served 0 with no `lastEventAt`). `periodStart` lets the caller tell
+    that from a measurement withdrawn by an undo, and a tracker that serves the
+    `measurements` array (specified for tracker N2, not yet built) answers the
+    question
+    outright. That is why the value is cached in the state file and re-posted
+    at its ORIGINAL stamp - the gauge stands at the last real measurement and
+    goes stale on NagLight's own horizon, rather than flickering out every time
+    a new week begins.
 
     Implements: SR-022, LLR-006
     """
-    _category, item_id = resolve_waist_location(env)
+    category, item_id = resolve_waist_location(env)
     target = url or today_url_from_feed(env["_feed_url"])
     try:
         timeout = int(env.get("WEIGHT_TIMEOUT_SECONDS") or 30)
@@ -4960,12 +5144,21 @@ def read_waist_measurement(env, url=None):
     except Exception as exc:
         raise SourceFailure("naglight: /api/today failed: %s"
                             % type(exc).__name__)
+    # The raise is OUTSIDE the `except`: a JSONDecodeError keeps the whole
+    # body in `.doc`, and raising inside the handler would leave it in
+    # `__context__` (the waist is in that body).
     try:
         payload = json.loads(raw.decode("utf-8", "replace"))
+        is_json = True
     except ValueError:
+        is_json = False
+    if not is_json:
         raise SourceFailure("naglight: /api/today returned something that is "
                             "not JSON")
-    return waist_from_today(payload, item_id, cycle_now(env))
+    return waist_from_today(
+        payload, item_id, cycle_now(env),
+        declared_unit=waist_unit_from_definitions(
+            env.get("WEIGHT_DEFINITIONS_DIR") or "", category, item_id))
 
 
 def ratio_cycle(env, state, now, poster, feed_url, timeout, failures,
@@ -5029,8 +5222,34 @@ def ratio_cycle(env, state, now, poster, feed_url, timeout, failures,
         waist = {"value": inches, "observed_at": stamp}
         state[WAIST_STATE_KEY] = waist
         fresh_waist = True
-    except NoWeightYet:
-        pass
+    except NoWeightYet as exc:
+        # A MEASUREMENT UNDONE AFTER WE CACHED IT IS WITHDRAWN, NOT STALE.
+        #   * A tracker that serves `measurements` says so outright
+        #     (NoWaistInRecord): the record holds no waist, so the cache goes.
+        #   * An older tracker serves the row back in `items` with no `count`
+        #     and a `periodStart`; a cached stamp at or after that instant was
+        #     entered in this very occurrence, so it was retracted.
+        # A stamp BEFORE `periodStart` belongs to an earlier period and keeps
+        # going stale honestly; no `periodStart` (older tracker, or no row)
+        # keeps the cache, as before.
+        # RESIDUALS, ACCEPTED (OPEN O6): no unavailable ratio body is posted -
+        # the gauge has none - so a ratio ALREADY posted stays served by the
+        # tracker until its staleness horizon. And with an OLDER tracker (no
+        # `measurements`) any entry not polled before its row leaves the board
+        # at 02:00 is never seen: the feeder being down, or an undo of a
+        # same-day correction between two polls. A tracker that serves
+        # `measurements` has neither gap.
+        period_start = getattr(exc, "period_start", None)
+        withdrawn = isinstance(exc, NoWaistInRecord) or (
+            period_start is not None and waist is not None
+            and waist["observed_at"] >= period_start)
+        if withdrawn and waist is not None:
+            del state[WAIST_STATE_KEY]
+            waist = None
+            # NOT a failure line: `failures` turns the unit's exit code to 1,
+            # and a withdrawal is the system working. Journal-only, no value.
+            print("weight: waist: the cached measurement was withdrawn on the "
+                  "tracker; not reposted")
     except SourceFailure as exc:
         failures.append("waist: %s" % exc)
     except Exception as exc:

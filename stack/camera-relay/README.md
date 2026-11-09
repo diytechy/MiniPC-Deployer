@@ -48,8 +48,11 @@ and the code goes in **through a pipe, never argv**.
 # 1. payload: stack/camera-relay, stack/door (unchanged), the compose file -> /opt/homehub/stack
 sudo install -m 0644 /opt/homehub/stack/camera-relay/homehub-camera-relay@.service /etc/systemd/system/
 sudo systemctl daemon-reload
-# 2. the CAMERA_LIVINGROOM_RELAY_* keys from .env.example into /opt/homehub/stack/.env,
-#    with UPSTREAM_HOST set and UPSTREAM_PASSWORD carried by stdin (values never printed)
+# 2. the CAMERA_LIVINGROOM_RELAY_* keys from .env.example into /opt/homehub/stack/.env, UPSTREAM_HOST set;
+#    then the code, piped from the dev PC's deploy store (never argv, never printed):
+#      <store value> | ssh hub@<hub> 'sudo -n python3 /opt/homehub/stack/camera-relay/camera_relay.py \
+#          --camera livingroom import-password'
+#    "wrote CAMERA_LIVINGROOM_RELAY_UPSTREAM_PASSWORD into /opt/homehub/stack/.env (value not shown)"
 # 3. render and start
 sudo python3 /opt/homehub/stack/camera-relay/camera_relay.py --camera livingroom render
 sudo systemctl enable --now homehub-camera-relay@livingroom

@@ -239,3 +239,27 @@ def test_tc1735_the_template_ships_it_off_audio_on_and_off_the_door_ports():
         .isdisjoint({env_example("DOOR_RELAY_RTSP_PORT"), env_example("DOOR_RELAY_API_PORT")})
     # Never enrolled in motion clips (a recording) by the template.
     assert "livingroom" not in (env_example("CAMERAS") or "").split()
+
+
+# ── TC-1735 the code reaches the live .env by stdin only ─────────────────────
+
+
+def test_tc1735_import_password_writes_the_key_from_stdin_and_prints_no_value(tmp_path, capsys, monkeypatch):
+    path = write_env(tmp_path, CAMERA_LIVINGROOM_RELAY_UPSTREAM_PASSWORD="", OTHER="kept")
+    monkeypatch.setattr(cr.sys, "stdin", type("S", (), {"buffer": __import__("io").BytesIO(b"AB$CD EF\n")})())
+    assert cr.main(["--env-file", path, "--camera", "livingroom", "import-password"]) == 0
+    text = open(path, encoding="utf-8").read()
+    assert 'CAMERA_LIVINGROOM_RELAY_UPSTREAM_PASSWORD="AB$$CD EF"' in text and "OTHER=kept" in text
+    assert text.count("CAMERA_LIVINGROOM_RELAY_UPSTREAM_PASSWORD=") == 1
+    assert cr.CameraRelaySettings(path, "livingroom").password == "AB$CD EF"
+    out = capsys.readouterr()
+    assert "AB$CD" not in out.out + out.err and "CAMERA_LIVINGROOM_RELAY_UPSTREAM_PASSWORD" in out.out
+
+
+@pytest.mark.parametrize("blob", [b"", b"\n", b"A\nB", b"x" * 2000])
+def test_tc1735_import_password_refuses_empty_multiline_and_oversize(tmp_path, blob):
+    path = write_env(tmp_path)
+    before = open(path, encoding="utf-8").read()
+    with pytest.raises(cr.Invalid):
+        cr.import_password(path, "livingroom", blob)
+    assert open(path, encoding="utf-8").read() == before

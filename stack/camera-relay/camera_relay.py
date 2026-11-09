@@ -24,6 +24,9 @@ MINI-SERV's voice assistant and never kept on the hub (the plan, section 3.2).
 Verbs (all take --camera C):
     condition         exit 0 only when CAMERA_<C>_RELAY_ENABLED is exactly true
                       (the unit's ExecCondition: a clean skip otherwise).
+    import-password   read the camera's code from STDIN (one line) and write it
+                      into the stack .env as CAMERA_<C>_RELAY_UPSTREAM_PASSWORD;
+                      prints the key name only.
     render            write the relay's config to
                       /run/homehub-camera-relay-<C>/go2rtc.yaml, 0600 root.
     redact-run -- CMD the unit's ExecStart wrapper (door_relay.redact_run).
@@ -49,6 +52,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 from typing import Dict, List, Optional, Sequence
 
@@ -211,6 +215,50 @@ def audio_probe(s: CameraRelaySettings, seconds: int, ask: bool, name: str) -> D
     return out
 
 
+def import_password(env_file: str, camera: str, blob: bytes) -> str:
+    """Write CAMERA_<C>_RELAY_UPSTREAM_PASSWORD from STDIN into the stack .env.
+
+    The live hub's .env is never rewritten by a delivery, so the camera's code
+    reaches it this way: piped from the deploy store, one line, never in argv,
+    never printed. One trailing newline is dropped; the value is encoded the
+    materialiser's way (door_relay.env_encode) and written atomically with the
+    file's own mode and owner. Returns the key name. Implements: LLR-1493.
+    """
+    if len(blob) > 1024:
+        raise Invalid("the password on stdin is longer than 1 KiB")
+    text = blob.decode("utf-8")
+    if text.endswith("\n"):
+        text = text[:-1]
+    if text.endswith("\r"):
+        text = text[:-1]
+    if not text or re.search(r"[\r\n\0]", text):
+        raise Invalid("the password on stdin is empty or holds a control character")
+    key = knob(camera, "UPSTREAM_PASSWORD")
+    with open(env_file, encoding="utf-8") as handle:
+        current = handle.read()
+    st = os.stat(env_file)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(env_file)), prefix=".env.tmp-")
+    try:
+        if hasattr(os, "fchmod"):  # the hub; the dev PC's Windows test runner has neither
+            os.fchmod(fd, st.st_mode & 0o7777)
+            try:
+                os.fchown(fd, st.st_uid, st.st_gid)
+            except PermissionError:
+                pass
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(door_relay.set_env_keys(current, {key: door_relay.env_encode(text)}))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, env_file)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return key
+
+
 def audio_verdict(withheld: Dict[str, object], asked: Dict[str, object], passes_audio: bool) -> List[str]:
     """Reasons the audio check fails; empty when it passes. Implements: LLR-1492."""
     reasons = []
@@ -239,6 +287,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--camera", required=True)
     sub = p.add_subparsers(dest="verb")
     sub.add_parser("condition")
+    sub.add_parser("import-password")
     r = sub.add_parser("render")
     r.add_argument("--out", default=None)
     rr = sub.add_parser("redact-run")
@@ -265,6 +314,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         on = mc.knob_bool(mc.read_knobs(args.env_file), knob(camera, "ENABLED"), False)
         mc.log("%s: %s is %s" % (tag, knob(camera, "ENABLED"), "true - starting" if on else "not true - clean skip"))
         return 0 if on else 1
+    if args.verb == "import-password":
+        try:
+            key = import_password(args.env_file, camera, sys.stdin.buffer.read(4096))
+        except (Invalid, UnicodeDecodeError, OSError) as exc:
+            mc.log("%s: REFUSED - %s" % (tag, type(exc).__name__ if not isinstance(exc, Invalid) else exc),
+                   warning=True)
+            return 2
+        mc.log("%s: wrote %s into %s (value not shown)" % (tag, key, args.env_file))
+        return 0
     try:
         s = CameraRelaySettings(args.env_file, camera)
     except Invalid as exc:

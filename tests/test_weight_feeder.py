@@ -4604,3 +4604,153 @@ def test_a_cycle_that_changes_nothing_does_not_rewrite_the_state_file_ni_a2(
         check_loader=lambda *a: None,
         ratio=lambda e, s, n, p, f, t, fails: None)
     assert path.read_bytes() == before
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# `input: measure` — a retracted waist is dropped; a new period keeps the cache
+# ═══════════════════════════════════════════════════════════════════════════
+# The seven tracker states of the waist item, one test each. The tracker serves
+# the row with no `count` and a `periodStart` when nothing is entered for the
+# current occurrence; the feeder compares the cached stamp with it.
+
+PERIOD_AFTER_CACHE = "2026-09-16T01:24:33+00:00"     # a week after the entry
+PERIOD_AT_CACHE = FIXTURE_ENTERED_AT
+PERIOD_BEFORE_CACHE = "2026-09-09T00:00:00+00:00"    # when that week began
+
+
+def a_measure_reader(payload):
+    """A waist reader that runs the REAL parser over a fake /api/today body."""
+    return lambda env: feeder.waist_from_today(payload, "waist-in", SAME_DAY_NOW)
+
+
+def cached_waist_state(env):
+    return json.loads(Path(env["WEIGHT_STATE_FILE"]).read_text()).get("waist-in")
+
+
+def ratio_posts(posts):
+    return [body for body in posts if body["id"] == "weight-waist"]
+
+
+def test_never_measured_posts_no_ratio_and_caches_nothing_ni_a2(tmp_path):
+    """State 1: a measure row with no count, nothing cached."""
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    payload = a_today(count=None, stamp=None,
+                      extra={"input": "measure",
+                             "periodStart": PERIOD_BEFORE_CACHE})
+    posts = []
+    run_with_ratio(env, posts, waist_reader=a_measure_reader(payload))
+    assert ratio_posts(posts) == []
+    assert cached_waist_state(env) is None
+
+
+def test_a_measurement_in_undoable_is_read_cached_and_posted_fresh_ni_a2(
+        tmp_path):
+    """State 2: an entry sits in `undoable` with count and lastEventAt."""
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    payload = a_today(array="undoable",
+                      extra={"input": "measure",
+                             "periodStart": PERIOD_BEFORE_CACHE})
+    posts = []
+    posted, _failures, _ = run_with_ratio(
+        env, posts, waist_reader=a_measure_reader(payload))
+    assert ("weight-waist", True, True) in posted
+    assert cached_waist_state(env)["value"] == FIXTURE_WAIST_IN
+    assert cached_waist_state(env)["observed_at"] == CAPTURED_AT
+
+
+def test_an_absent_row_reposts_the_cache_at_its_original_stamp_ni_a2(tmp_path):
+    """State 3: the following days - the row is gone from /api/today."""
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    run_with_ratio(env, [])
+    payload = a_today(item_id="something-else")
+    posts = []
+    run_with_ratio(env, posts, waist_reader=a_measure_reader(payload))
+    body = ratio_posts(posts)
+    assert len(body) == 1
+    assert body[0]["observed_at"] == feeder.iso8601_utc(CAPTURED_AT)
+    assert cached_waist_state(env)["observed_at"] == CAPTURED_AT
+
+
+def test_a_new_period_keeps_the_cache_and_reposts_it_ni_a2(tmp_path):
+    """State 4: periodStart AFTER the cached stamp - an earlier period's value."""
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    run_with_ratio(env, [])
+    payload = a_today(count=None, stamp=None,
+                      extra={"input": "measure",
+                             "periodStart": PERIOD_AFTER_CACHE})
+    posts = []
+    run_with_ratio(env, posts, waist_reader=a_measure_reader(payload))
+    body = ratio_posts(posts)
+    assert len(body) == 1
+    assert body[0]["observed_at"] == feeder.iso8601_utc(CAPTURED_AT)
+    assert cached_waist_state(env)["value"] == FIXTURE_WAIST_IN
+
+
+@pytest.mark.parametrize("period_start", [PERIOD_AT_CACHE, PERIOD_BEFORE_CACHE],
+                         ids=["equal", "before"])
+def test_an_undone_measurement_is_dropped_and_not_reposted_ni_a2(
+        tmp_path, period_start, capsys):
+    """State 5: row back in `items`, no count, periodStart <= cached stamp."""
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    run_with_ratio(env, [])
+    assert cached_waist_state(env) is not None
+    payload = a_today(count=None, stamp=None,
+                      extra={"input": "measure", "periodStart": period_start})
+    capsys.readouterr()
+    posts = []
+    posted, failures, _ = run_with_ratio(
+        env, posts, waist_reader=a_measure_reader(payload))
+    assert ratio_posts(posts) == []
+    assert all(entry[0] != "weight-waist" for entry in posted)
+    assert cached_waist_state(env) is None, "the state file no longer holds it"
+    out = capsys.readouterr().out
+    assert "withdrawn" in out
+    assert str(FIXTURE_WAIST_IN) not in out and "35" not in out
+    assert not any("35" in line for line in failures)
+    # ...and it stays gone on the next quiet cycle.
+    again = []
+    run_with_ratio(env, again, waist_reader=a_measure_reader(payload))
+    assert ratio_posts(again) == []
+
+
+def test_an_older_tracker_without_period_start_keeps_the_cache_ni_a2(tmp_path):
+    """State 6: no `periodStart` - today's behaviour, the cache is re-posted."""
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    run_with_ratio(env, [])
+    payload = a_today(count=None, stamp=None, extra={"input": "measure"})
+    posts = []
+    run_with_ratio(env, posts, waist_reader=a_measure_reader(payload))
+    assert len(ratio_posts(posts)) == 1
+    assert cached_waist_state(env)["value"] == FIXTURE_WAIST_IN
+    with pytest.raises(feeder.NoWaistThisPeriod) as raised:
+        feeder.waist_from_today(payload, "waist-in", SAME_DAY_NOW)
+    assert raised.value.period_start is None
+
+
+@pytest.mark.parametrize("bad", ["not a time", 12345, ""])
+def test_a_malformed_period_start_is_a_failure_and_keeps_the_cache_ni_a2(
+        tmp_path, bad):
+    """State 7: fail safe - name the field, never the value, keep the cache."""
+    payload = a_today(count=None, stamp=None,
+                      extra={"input": "measure", "periodStart": bad})
+    with pytest.raises(feeder.SourceFailure) as raised:
+        feeder.waist_from_today(payload, "waist-in", SAME_DAY_NOW)
+    assert not isinstance(raised.value, feeder.NoWeightYet)
+    assert "periodStart" in str(raised.value)
+    assert "not a time" not in str(raised.value) and "12345" not in str(raised.value)
+
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    run_with_ratio(env, [])
+    posts = []
+    _posted, failures, _ = run_with_ratio(
+        env, posts, waist_reader=a_measure_reader(payload))
+    assert any("periodStart" in line for line in failures)
+    assert len(ratio_posts(posts)) == 1
+    assert cached_waist_state(env)["value"] == FIXTURE_WAIST_IN
+
+
+def test_a_row_with_a_count_ignores_period_start_ni_a2():
+    """A measurement is read exactly as before; periodStart is not consulted."""
+    payload = a_today(extra={"input": "measure", "periodStart": "garbage"})
+    assert feeder.waist_from_today(payload, "waist-in", SAME_DAY_NOW)[0] \
+        == FIXTURE_WAIST_IN

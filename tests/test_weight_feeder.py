@@ -33,6 +33,7 @@ import re
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import pytest
@@ -4706,7 +4707,7 @@ def test_an_undone_measurement_is_dropped_and_not_reposted_ni_a2(
     out = capsys.readouterr().out
     assert "withdrawn" in out
     assert str(FIXTURE_WAIST_IN) not in out and "35" not in out
-    assert not any("35" in line for line in failures)
+    assert failures == [], "a withdrawal is not a failure: exit status stays 0"
     # ...and it stays gone on the next quiet cycle.
     again = []
     run_with_ratio(env, again, waist_reader=a_measure_reader(payload))
@@ -4754,3 +4755,233 @@ def test_a_row_with_a_count_ignores_period_start_ni_a2():
     payload = a_today(extra={"input": "measure", "periodStart": "garbage"})
     assert feeder.waist_from_today(payload, "waist-in", SAME_DAY_NOW)[0] \
         == FIXTURE_WAIST_IN
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# The authoritative `measurements` array (tracker N2, not deployed)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def with_measurements(payload, *entries):
+    payload["measurements"] = list(entries)
+    return payload
+
+
+def a_measurement(value=FIXTURE_WAIST_IN, at=FIXTURE_ENTERED_AT,
+                  period_start=PERIOD_BEFORE_CACHE, item_id="waist-in"):
+    entry = {"id": item_id, "periodStart": period_start}
+    if value is not None:
+        entry["value"] = value
+    if at is not None:
+        entry["at"] = at
+    return entry
+
+
+def a_measurements_reader(payload, declared_unit="in"):
+    return lambda env: feeder.waist_from_today(
+        payload, "waist-in", SAME_DAY_NOW, declared_unit=declared_unit)
+
+
+def test_measurements_value_is_read_with_row_off_the_board_ni_a2(tmp_path):
+    """The row has left the board (the day after); `measurements` still has it."""
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    payload = with_measurements(a_today(item_id="something-else"),
+                                a_measurement())
+    posts = []
+    posted, failures, _ = run_with_ratio(
+        env, posts, waist_reader=a_measurements_reader(payload))
+    assert failures == []
+    assert ("weight-waist", True, True) in posted
+    assert cached_waist_state(env)["value"] == FIXTURE_WAIST_IN
+    assert cached_waist_state(env)["observed_at"] == CAPTURED_AT
+
+
+def test_an_entry_made_while_the_feeder_was_down_is_still_read_ni_a2(tmp_path):
+    """Entered 20:00, feeder down until after 02:00: the row is long gone.
+
+    The old row logic never saw this entry; the next poll must still read it,
+    stamped at its entry time, with nothing cached beforehand.
+    """
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    payload = with_measurements(
+        a_today(item_id="something-else"),
+        a_measurement(value=33.5, at="2026-09-09T01:00:00+00:00",
+                      period_start="2026-09-09T00:00:00+00:00"))
+    assert not any(r.get("id") == "waist-in" for key in feeder.TODAY_ITEM_ARRAYS
+                   for r in payload[key] if isinstance(r, dict))
+    inches, stamp = feeder.waist_from_today(
+        payload, "waist-in", SAME_DAY_NOW, declared_unit="in")
+    assert inches == 33.5 and stamp == feeder.parse_rfc3339_utc(
+        "2026-09-09T01:00:00+00:00", "t")
+    posts = []
+    run_with_ratio(env, posts, waist_reader=a_measurements_reader(payload))
+    assert len(ratio_posts(posts)) == 1
+
+
+def test_an_undo_of_a_same_day_correction_serves_the_previous_value_ni_a2(
+        tmp_path):
+    """A then B were entered; B is undone between polls: A is authoritative.
+
+    The feeder cached B. The next read says the latest measurement in the
+    record is A, at A's stamp, and the cache moves to A - no row involved.
+    """
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    run_with_ratio(env, [])                            # caches 35.0 at CAPTURED_AT
+    earlier = "2026-09-08T18:00:00+00:00"
+    payload = with_measurements(
+        a_today(count=None, stamp=None,
+                extra={"input": "measure", "periodStart": PERIOD_BEFORE_CACHE}),
+        a_measurement(value=34.5, at=earlier))
+    posts = []
+    run_with_ratio(env, posts, waist_reader=a_measurements_reader(payload))
+    cached = cached_waist_state(env)
+    assert cached["value"] == 34.5
+    assert cached["observed_at"] == feeder.parse_rfc3339_utc(earlier, "t")
+
+
+def test_measurements_with_no_value_drops_the_cache_ni_a2(tmp_path, capsys):
+    """Undo of the only measurement (or never measured): withdrawn, drop it."""
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    run_with_ratio(env, [])
+    payload = with_measurements(a_today(item_id="something-else"),
+                                a_measurement(value=None, at=None))
+    capsys.readouterr()
+    posts = []
+    posted, failures, _ = run_with_ratio(
+        env, posts, waist_reader=a_measurements_reader(payload))
+    assert failures == []
+    assert ratio_posts(posts) == []
+    assert cached_waist_state(env) is None
+    out = capsys.readouterr().out
+    assert "withdrawn" in out and "35" not in out
+
+
+def test_measurements_with_no_value_and_no_cache_posts_nothing_ni_a2(tmp_path):
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    payload = with_measurements(a_today(item_id="x"),
+                                a_measurement(value=None, at=None))
+    posts = []
+    _posted, failures, _ = run_with_ratio(
+        env, posts, waist_reader=a_measurements_reader(payload))
+    assert failures == [] and ratio_posts(posts) == []
+    assert cached_waist_state(env) is None
+
+
+def test_measurements_beats_a_contradicting_row_ni_a2():
+    """The record is authoritative; the row's count is not consulted."""
+    payload = with_measurements(a_today(count=40.0), a_measurement(value=34.0))
+    assert feeder.waist_from_today(payload, "waist-in", SAME_DAY_NOW)[0] == 34.0
+
+
+def test_measurements_not_listing_the_waist_falls_back_to_the_row_ni_a2():
+    payload = with_measurements(a_today(),
+                                a_measurement(item_id="somebody-else"))
+    assert feeder.waist_from_today(payload, "waist-in", SAME_DAY_NOW)[0] \
+        == FIXTURE_WAIST_IN
+
+
+def test_measurements_unit_is_checked_ni_a2():
+    """Row on the board: its unit. Row absent: the definitions' (else refuse)."""
+    on_board = with_measurements(a_today(unit="cm"), a_measurement())
+    with pytest.raises(feeder.SourceFailure):
+        feeder.waist_from_today(on_board, "waist-in", SAME_DAY_NOW)
+    off_board = with_measurements(a_today(item_id="x"), a_measurement())
+    for unit in (None, "cm"):
+        with pytest.raises(feeder.SourceFailure):
+            feeder.waist_from_today(off_board, "waist-in", SAME_DAY_NOW,
+                                    declared_unit=unit)
+    assert feeder.waist_from_today(off_board, "waist-in", SAME_DAY_NOW,
+                                   declared_unit="IN ")[0] == FIXTURE_WAIST_IN
+
+
+@pytest.mark.parametrize("entry", [
+    a_measurement(value=335.25), a_measurement(value=0), a_measurement(value="x"),
+    a_measurement(value=True), a_measurement(at=None), a_measurement(value=None),
+    a_measurement(at="garbage")])
+def test_a_bad_measurements_entry_is_a_value_free_failure_ni_a2(entry):
+    payload = with_measurements(a_today(item_id="x"), entry)
+    with pytest.raises(feeder.SourceFailure) as raised:
+        feeder.waist_from_today(payload, "waist-in", SAME_DAY_NOW,
+                                declared_unit="in")
+    assert not isinstance(raised.value, feeder.NoWeightYet)
+    text = "".join(traceback.format_exception(
+        type(raised.value), raised.value, raised.value.__traceback__))
+    for leaked in ("335.25", "garbage"):
+        assert leaked not in str(raised.value)
+        assert leaked not in text
+
+
+def test_a_measurements_array_that_is_not_a_list_is_refused_ni_a2():
+    payload = a_today()
+    payload["measurements"] = {"id": "waist-in"}
+    with pytest.raises(feeder.SourceFailure):
+        feeder.waist_from_today(payload, "waist-in", SAME_DAY_NOW)
+    payload["measurements"] = [a_measurement(), a_measurement()]
+    with pytest.raises(feeder.SourceFailure):
+        feeder.waist_from_today(payload, "waist-in", SAME_DAY_NOW,
+                                declared_unit="in")
+
+
+def test_the_waist_unit_comes_from_the_definitions_ni_a2(tmp_path):
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    category, item = feeder.resolve_waist_location(env)
+    assert feeder.waist_unit_from_definitions(
+        env["WEIGHT_DEFINITIONS_DIR"], category, item) == "in"
+    assert feeder.waist_unit_from_definitions(
+        str(tmp_path / "nowhere"), category, item) is None
+
+
+# ── B/D: no value in a chained exception or a traceback; field names right ──
+
+# The sentinel is built at run time so the test's own source lines (which a
+# formatted traceback quotes) never contain it.
+SECRET_WAIST = float("98765.4")
+SECRET_MM = str(99000)
+
+
+@pytest.mark.parametrize("call", [
+    lambda: feeder.check_plausible_waist_in(SECRET_WAIST, "w"),
+    lambda: feeder.check_plausible_waist_in(-SECRET_WAIST, "w"),
+    lambda: feeder.check_plausible_waist_in(str(SECRET_WAIST), "w"),
+    lambda: feeder.check_vendor_millimetres(SECRET_MM, "h"),
+    lambda: feeder.check_vendor_millimetres("0", "h"),
+    lambda: feeder.waist_from_today(a_today(count=SECRET_WAIST), "waist-in", NOW),
+])
+def test_no_health_value_survives_in_the_exception_chain_or_traceback(call):
+    """`str(exc)` is not the only way out: `__context__` and the formatted
+    traceback carried check_pounds' original message, value and all."""
+    with pytest.raises(feeder.SourceFailure) as raised:
+        call()
+    exc, seen = raised.value, []
+    while exc is not None and id(exc) not in seen:
+        seen.append(id(exc))
+        for needle in ("98765", SECRET_MM):
+            assert needle not in str(exc)
+        exc = exc.__cause__ or exc.__context__
+    text = "".join(traceback.format_exception(
+        type(raised.value), raised.value, raised.value.__traceback__))
+    assert "98765" not in text and SECRET_MM not in text
+
+
+def test_a_timestamp_failure_names_its_own_field_ni_a2():
+    cases = (("periodStart", a_today(count=None, stamp=None,
+                                     extra={"periodStart": "nope"})),
+             ("lastEventAt", a_today(stamp="nope")),
+             ("periodStart", a_today(count=None, stamp=None,
+                                     extra={"periodStart": "2026-09-09T00:00:00"})))
+    for key, payload in cases:
+        with pytest.raises(feeder.SourceFailure) as raised:
+            feeder.waist_from_today(payload, "waist-in", SAME_DAY_NOW)
+        message = str(raised.value)
+        assert key in message and "physicalTime" not in message
+        assert "nope" not in message
+
+
+def test_a_withdrawal_leaves_the_exit_status_zero_ni_a2(tmp_path):
+    """The run-level check: `main` returns 1 iff there are failure lines."""
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    run_with_ratio(env, [])
+    payload = with_measurements(a_today(item_id="x"),
+                                a_measurement(value=None, at=None))
+    _posted, failures, _ = run_with_ratio(
+        env, [], waist_reader=a_measurements_reader(payload))
+    assert (1 if failures else 0) == 0

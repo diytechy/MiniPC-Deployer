@@ -448,8 +448,10 @@ items:
 
 (`type: automated` with `check: weight` is the current declaration - see "The
 automated check-off" below. Before the Owner changed it this row was
-`type: habit`; the feeder reads only `id`, `target` and `unit`, so it works with
-either.)
+`type: habit`. The goal read uses only `id`, `target` and `unit`, so it works
+with either, but the check-off does not: `check_id_from_definitions` reads
+`type` and `check`, so with `type: habit` the goal still works and the check-off
+**silently stops**.)
 
 **Which item is configuration, not code.** `WEIGHT_ITEM_CATEGORY` (default
 `Health`) and `WEIGHT_ITEM_ID` (default `weigh-in`) name the item's **location**.
@@ -768,7 +770,7 @@ because `handleAPIFeed` decodes `Note` and then never reads it.
 *(Rewritten 2026-11-09. The earlier text described pre-G3 internals -
 `engine.Uncheck`, `logfile.Report`, `todayString` - that no longer exist. Source
 for everything below: NagLight `internal/web/handlers.go`, `handleAPIFeed`
-(about lines 1713-1741) and `internal/feeder/state.go`, read on branch `dev`,
+(about lines 1713-1741) and `internal/feeder/feeder.go`, read on branch `dev`,
 2026-11-09.)*
 
 * **A feeder post never writes the event record.** It writes the tracker's
@@ -1181,7 +1183,9 @@ day, is then **absent** from `/api/today` until the next occurrence opens, and
 an undo puts it back in `items`. A measure row is never in `catchups`; that
 array is searched for the older `input: hybrid` declaration and older trackers,
 which sent a row to `items` while the fold was short of its target and to
-`undoable` once it was met.
+`undoable` once it was met. *(The measure-row shape is tracker N2, built on
+NagLight branch `tracker-entry-semantics`, **not deployed**; the tests use fake
+bodies.)*
 
 **What it costs, stated plainly:** `count` is the fold of the **current
 occurrence**, so at each new period there is nothing to read until something is
@@ -1192,25 +1196,42 @@ re-posted at their **original** stamp — the gauge stands at the last real
 measurement and goes stale on NagLight's own 7-day static horizon, rather than
 flickering out every time a new week begins.
 
-**`periodStart` tells a retraction from a new period.** A `measure` row always
-carries `periodStart` (RFC3339, the instant the current occurrence began). When
-the row comes back with no `count`: a cached waist stamped **at or after**
-`periodStart` was entered in this occurrence and has since been undone, so the
-feeder **drops the cache** and posts no ratio (one journal line, no value); a
-cached waist stamped **before** `periodStart` belongs to an earlier period and is
-kept and re-posted at its original stamp. A tracker that serves no `periodStart`
-keeps the old behaviour; a malformed one is a named failure (the field, never
-the value) and the cache is kept.
+**The authoritative read: `measurements`** *(tracker N2, branch
+`tracker-entry-semantics`, not deployed)*. A tracker that serves a top-level
+`measurements` array lists one `{id, value, at, periodStart}` per `measure` item
+**whether or not its row is on the board**; `value`/`at` are the latest
+measurement still in the record and are omitted when there is none. When the
+body carries it and lists the waist item, the feeder uses it and ignores the
+row: `value` + `at` are the waist (stamp = `at`; the unit is still checked,
+against the row's if the row is on the board, otherwise the definitions'; the
+plausibility band and the no-value-in-a-message rules are unchanged), and no
+`value`/`at` means **no waist** (never measured, or undone), so the cache is
+dropped and no ratio is posted. An undo makes the previous measurement
+authoritative at once, and an entry made while the feeder was down is still read
+after the row has left the board.
 
-**Correcting a waist.** Press Undo on the panel the same day. The feeder notices
-on its next cycle (15 minutes at most) and stops re-posting. **A ratio it already
-posted stays on the wall until it goes stale** (up to 7 days): the ratio gauge has
-no "unavailable" body, so there is nothing to post in its place. That is a known,
-accepted residual. A second one: a same-day correction (enter A, re-enter B)
-followed by undoing B in the last 15 minutes before 02:00 can leave the feeder
-publishing B until the next measurement, because the row disappears before its
-next poll. After the day ends there is no Undo; enter the right value next
-period.
+**Older tracker: `periodStart` on the row tells a retraction from a new
+period.** With no `measurements` array, a `measure` row always carries
+`periodStart` (RFC3339, the instant the current occurrence began). When the row
+comes back with no `count`: a cached waist stamped **at or after** `periodStart`
+was entered in this occurrence and has since been undone, so the feeder **drops
+the cache** and posts no ratio (one journal line, no value, exit status
+unaffected); a cached waist stamped **before** `periodStart` belongs to an
+earlier period and is kept and re-posted at its original stamp. A tracker that
+serves no `periodStart` keeps the old behaviour; a malformed one is a named
+failure (the field, never the value) and the cache is kept.
+
+**Correcting a waist.** Press Undo on the panel the same day. While the feeder is
+running it notices on its next cycle (15 minutes) and stops re-posting; if the
+feeder is down, it notices on its first cycle after it is back. **A ratio it
+already posted stays on the wall until it goes stale** (up to 7 days): the ratio
+gauge has no "unavailable" body, so there is nothing to post in its place. That
+is a known, accepted residual. With a tracker that serves `measurements`, a
+missed poll or an undo between polls loses nothing. **With an older tracker**
+(row logic only) the row is on the board only until 02:00 of the tracking day, so
+any entry not polled before it leaves is never seen - the feeder down, an entry
+at 01:50, or an undo of a same-day correction landing between two polls. After
+the day ends there is no Undo; enter the right value next period.
 
 ### The target: one number, in the unit it is measured in
 

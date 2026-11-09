@@ -81,6 +81,7 @@ EXIT_REFUSED = 78
 STATUS_EVERY_SEC = 60.0
 BODY_MODES = ("cascade", "always", "off")
 COCO_PERSON = 0
+EDGE = 0.999                          # anchors are clamped to [0, EDGE]
 WHOLE_FRAME = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
 
 
@@ -229,15 +230,26 @@ class PresenceSettings:
         self.body_mode = text("BODY_MODE", "cascade")
         if self.body_mode not in BODY_MODES:
             raise Invalid("%s must be one of %s" % (k("BODY_MODE"), ", ".join(BODY_MODES)))
+        for suffix in ("CONFIRM_COUNT", "CONFIRM_WINDOW"):
+            raw = env.get(k(suffix), "").strip()
+            if raw and not re.fullmatch(r"[0-9]{1,2}", raw):
+                raise Invalid("%s must be a whole number" % k(suffix))
         self.confirm_count = int(number("CONFIRM_COUNT", 2, 1, 10))
         self.confirm_window = int(number("CONFIRM_WINDOW", 3, 1, 10))
         if self.confirm_count > self.confirm_window:
             raise Invalid("%s may not exceed %s" % (k("CONFIRM_COUNT"), k("CONFIRM_WINDOW")))
         self.hold_sec = number("HOLD_SEC", 8, 2, 120)
         self.engage_sec = number("ENGAGE_SEC", 20, 1, 3600)
-        self.motion_holds = mc.knob_bool(env, k("MOTION_HOLDS"), True)
+        holds = env.get(k("MOTION_HOLDS"), "").strip()
+        if holds not in ("", "true", "false"):
+            raise Invalid("%s must be true or false" % k("MOTION_HOLDS"))
+        self.motion_holds = holds != "false"
         self.motion_min_ratio = number("MOTION_MIN_RATIO", 0.004, 0.0001, 0.5)
-        self.stall_sec = number("STALL_SEC", 30, 5, 600)
+        # Motion may extend presence at most this long past the last real
+        # detection: light from a TV left on, a pet or a fan must not hold an
+        # empty room present all night (review 2026-11-09).
+        self.motion_max_sec = number("MOTION_MAX_SEC", 60, 0, 3600)
+        self.stall_sec = number("STALL_SEC", 20, 5, 600)
         self.budget_pct = int(number("BUDGET_PCT", 30, 1, 400))
         self.model_dir = text("MODEL_DIR", DEFAULT_MODEL_DIR)
         self.event_prefix = text("EVENT_PREFIX", "living_room")
@@ -245,8 +257,12 @@ class PresenceSettings:
             raise Invalid("%s must match [a-z][a-z0-9_]{0,31}" % k("EVENT_PREFIX"))
         raw_port = env.get(k("FEED_PORT"), "").strip()
         self.feed_port = mc.knob_int(env, k("FEED_PORT"), 0, feed.PORT_LOW, feed.PORT_HIGH)
-        self.feed_port_invalid = bool(raw_port) and raw_port != "0" and self.feed_port == 0
-        peers = env.get(k("FEED_PEERS"), "").split() or [env.get("MAIN_BOX_IP", "").strip()]
+        if raw_port not in ("", "0") and self.feed_port == 0:
+            raise Invalid("%s must be 0 or a port in %d..%d" % (k("FEED_PORT"), feed.PORT_LOW, feed.PORT_HIGH))
+        listed = env.get(k("FEED_PEERS"), "").split()
+        if any(not feed.IPV4_RE.fullmatch(p) for p in listed):
+            raise Invalid("%s holds something that is not an IPv4 address" % k("FEED_PEERS"))
+        peers = listed or [env.get("MAIN_BOX_IP", "").strip()]
         self.feed_peers = [p for p in peers if feed.IPV4_RE.fullmatch(p)]
         if self.feed_port and not self.feed_peers:
             raise Invalid("%s (or MAIN_BOX_IP) must name at least one IPv4 address" % k("FEED_PEERS"))
@@ -339,7 +355,10 @@ def to_frame(boxes, kind: str, scale: float, crop_px: Tuple[int, int, int, int],
     for score, cx, cy, _w, h in boxes:
         ax = x0 + cx / scale
         ay = y0 + ((cy + h / 2.0) if kind == "body" else cy) / scale
-        out.append((kind, score, (min(1.0, max(0.0, ax / frame_w)), min(1.0, max(0.0, ay / frame_h)))))
+        # Clamped just inside the frame: the even-odd test never contains a
+        # point ON the bottom or right edge, and a body cut off by the frame's
+        # bottom has its box there (review 2026-11-09).
+        out.append((kind, score, (min(EDGE, max(0.0, ax / frame_w)), min(EDGE, max(0.0, ay / frame_h)))))
     return out
 
 
@@ -407,6 +426,8 @@ class PresenceState:
         self.present = False
         self.since = None          # type: Optional[float]   (wall clock)
         self.last_positive = None  # type: Optional[float]   (monotonic)
+        self.last_detection = None  # type: Optional[float]  (monotonic; detections only, never motion)
+        self.frames = 0
         self.scores = collections.deque()   # (mono, score) within the hold
         self.engaged = False
         self.engage_start = None   # type: Optional[float]   (monotonic)
@@ -435,9 +456,11 @@ class PresenceState:
         events = []
         for _kind, score, _anchor in counted:
             self.scores.append((mono, score))
+        self.frames += 1
         if positive:
-            self.last_positive = mono
-        elif self.present and self.s.motion_holds and motion >= self.s.motion_min_ratio:
+            self.last_positive = self.last_detection = mono
+        elif (self.present and self.s.motion_holds and motion >= self.s.motion_min_ratio
+              and self.last_detection is not None and mono - self.last_detection < self.s.motion_max_sec):
             self.last_positive = mono
         if not self.present and sum(self.window) >= self.s.confirm_count:
             self.present, self.since = True, utc
@@ -463,6 +486,13 @@ class PresenceState:
             elif not in_engage and self.last_engage is not None and mono - self.last_engage >= self.s.hold_sec:
                 self.engage_start = None
         return events
+
+    @property
+    def known(self) -> bool:
+        """Enough frames evaluated for the state to mean something. Until then a
+        fresh run (a restart after a stall, say) announces nothing rather than a
+        false absence (review 2026-11-09)."""
+        return self.frames >= self.s.confirm_window
 
     def snapshot(self, mono: float) -> List[Dict[str, object]]:
         out = [self.presence_record(mono)]
@@ -598,6 +628,9 @@ def run_service(env_file: str, camera: str, state_dir: str = STATE_DIR) -> int:
     if s.placeholder:
         return refuse(camera, "%s is the whole-frame placeholder and nothing is excluded: draw the zones first"
                       % knob(camera, "ROOM_POLYGON"))
+    relay_knob = camera_relay.knob(s.relay_camera, "ENABLED")
+    if not mc.knob_bool(mc.read_knobs(env_file), relay_knob, False):
+        return refuse(camera, "%s is not true: there is no relay to read" % relay_knob)
     try:
         import numpy as np
         import cv2
@@ -615,10 +648,7 @@ def run_service(env_file: str, camera: str, state_dir: str = STATE_DIR) -> int:
     motion = Motion(s.zones)
     state = PresenceState(s)
     out = PresenceFeed(camera, relay.lan_ip, s.feed_port, s.feed_peers, log=mc.log)
-    if s.feed_port_invalid:
-        mc.log("camera presence [%s]: %s is not 0 or a port in %d..%d - no feed"
-               % (camera, knob(camera, "FEED_PORT"), feed.PORT_LOW, feed.PORT_HIGH), warning=True)
-    out.current = state.snapshot(time.monotonic())
+    out.current = []   # nothing is announced until the state is known
     out.open()
     subprocess.run(["docker", "rm", "-f", container_name(camera)], stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL, timeout=60)
@@ -644,10 +674,11 @@ def run_service(env_file: str, camera: str, state_dir: str = STATE_DIR) -> int:
     fd = proc.stdout.fileno()
     last_data = last_status = time.monotonic()
     infer_ms = collections.deque(maxlen=60)
+    announced = False
     code = 1
 
     def status_record():
-        rec = dict(status, state=state.snapshot(time.monotonic()), feed=out.status(), ran=dict(evaluator.ran),
+        rec = dict(status, known=state.known, state=state.snapshot(time.monotonic()), feed=out.status(), ran=dict(evaluator.ran),
                    infer_ms_p50=sorted(infer_ms)[len(infer_ms) // 2] if infer_ms else None)
         return rec
     try:
@@ -676,6 +707,12 @@ def run_service(env_file: str, camera: str, state_dir: str = STATE_DIR) -> int:
                 break
             last_data = mono
             buffer.extend(chunk)
+            if len(buffer) >= 2 * frame_bytes:
+                # Behind live (a slow pass, a throttled quota): judge the newest
+                # whole frame, never a backlog - the hold is timed by the clock.
+                skip = (len(buffer) // frame_bytes - 1) * frame_bytes
+                del buffer[:skip]
+                status["skipped"] = int(status.get("skipped", 0)) + skip // frame_bytes
             while len(buffer) >= frame_bytes:
                 frame = np.frombuffer(bytes(buffer[:frame_bytes]), dtype=np.uint8).reshape(FRAME_H, FRAME_W, 3)
                 del buffer[:frame_bytes]
@@ -688,16 +725,27 @@ def run_service(env_file: str, camera: str, state_dir: str = STATE_DIR) -> int:
                 infer_ms.append(int((now - started) * 1000))
                 status["frames"] = int(status["frames"]) + 1
                 status["last_frame_utc_ms"] = int(time.time() * 1000)
+                changed = False
                 for record in state.update(now, time.time(), detections, moved):
+                    changed = True
                     status["changes"] = int(status["changes"]) + 1
-                    out.publish_state(record)
+                    if announced:
+                        out.publish_state(record)
                     # The journal is the record of the live proof: state, the
                     # best score, never a box, a zone or a picture.
                     mc.log("camera presence [%s]: %s %s (since %s, confidence %s)"
                            % (camera, record["event"], json.dumps({k: record[k] for k in ("present", "engaged")
                                                                   if k in record}),
                               record.get("since"), record.get("confidence", "-")))
-                out.current = state.snapshot(now)
+                if state.known:
+                    out.current = state.snapshot(now)
+                    if not announced:
+                        announced = True
+                        for record in out.current:
+                            out.publish_state(record)
+                if changed:
+                    write_status(state_dir, camera, status_record())
+                    last_status = now
         else:
             code = 0
     finally:
@@ -736,6 +784,8 @@ def still(env_file: str, camera: str, out_path: str) -> int:
             raw.stderr.decode("utf-8", "replace").strip(), relay)[-300:]), warning=True)
         return 1
     fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    if hasattr(os, "fchmod"):  # an existing file keeps its mode through O_CREAT: set it
+        os.fchmod(fd, 0o600)
     with os.fdopen(fd, "wb") as handle:
         handle.write(raw.stdout)
     mc.log("camera presence [%s]: one still written to %s (%d bytes, 0600); delete it once the zones are drawn"

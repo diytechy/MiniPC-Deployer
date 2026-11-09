@@ -85,8 +85,24 @@ else
     rm -rf "$root/venv.previous"
 fi
 
-install -d -m 0755 "$root/models"
+# The models are staged beside the live set, verified THERE (a full disk or a
+# short copy is caught before anything live changes), then swapped in whole;
+# the previous set comes back if the swap fails.
+stage=$(mktemp -d "$root/.models.XXXXXX")
+trap 'rm -rf "$stage"' EXIT
 for name in "${names[@]}"; do
-    install -m 0644 "$models/$name" "$root/models/$name"
+    install -m 0644 "$models/$name" "$stage/$name"
+    want=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["models"][sys.argv[2]]["sha256"])' \
+        "$here/models.manifest.json" "$name")
+    [ "$(sha256sum "$stage/$name" | cut -d' ' -f1)" = "$want" ] || fail "staged model $name is not the pinned bytes"
 done
+chmod 0755 "$stage"
+rm -rf "$root/models.previous"
+[ ! -e "$root/models" ] || mv -T "$root/models" "$root/models.previous"
+if ! mv -T "$stage" "$root/models"; then
+    [ ! -e "$root/models.previous" ] || mv -T "$root/models.previous" "$root/models"
+    fail "could not swap the models in; the previous set is back"
+fi
+trap - EXIT
+rm -rf "$root/models.previous"
 note "installed: $root/venv, ${#names[@]} model(s) in $root/models"

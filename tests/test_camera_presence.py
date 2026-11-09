@@ -437,3 +437,69 @@ def test_tc1747_run_refuses_the_placeholder_with_78_and_starts_nothing(tmp_path,
     monkeypatch.setattr(cp.subprocess, "run", lambda *a, **k: started.append(a))
     assert cp.run_service(str(path), "livingroom", state_dir=str(tmp_path / "state")) == cp.EXIT_REFUSED
     assert started == []
+
+
+# ── review 2026-11-09: the fixes, each pinned ────────────────────────────────
+
+
+def test_tc1740_motion_alone_cannot_hold_an_empty_room_past_its_cap():
+    """A TV left on lights the walls every second; presence must still end."""
+    state = cp.PresenceState(settings())
+    run(state, 3, lambda t: ROOM_HIT)                  # last detection at t=2
+    events = run(state, 200, lambda t: [], motion=0.5, start=3)
+    assert len(events) == 1 and events[0][1]["present"] is False
+    assert events[0][0] <= 2 + 60 + 8 + 1
+
+
+def test_tc1739_a_body_cut_off_by_the_bottom_of_the_frame_still_counts():
+    s = settings(CAMERA_LIVINGROOM_PRESENCE_ROOM_POLYGON="0,0.2;1,0.2;1,1;0,1",
+                 CAMERA_LIVINGROOM_PRESENCE_EXCLUDE_POLYGONS=None)
+    (det,) = cp.to_frame([(0.5, 160.0, 150.0, 40.0, 200.0)], "body", 0.5, (0, 0, 640, 360), 640, 360)
+    assert det[2][1] < 1.0 and s.zones.counts(det[2])
+
+
+@pytest.mark.parametrize("over, key", [
+    ({"CAMERA_LIVINGROOM_PRESENCE_MOTION_HOLDS": "yes"}, "MOTION_HOLDS"),
+    ({"CAMERA_LIVINGROOM_PRESENCE_FEED_PORT": "80"}, "FEED_PORT"),
+    ({"CAMERA_LIVINGROOM_PRESENCE_FEED_PEERS": "192.0.2.50 mini-serv"}, "FEED_PEERS"),
+])
+def test_tc1737_malformed_knobs_refuse_rather_than_default(over, key):
+    with pytest.raises(cp.Invalid) as err:
+        settings(**over)
+    assert key in str(err.value)
+
+
+def test_tc1740_the_state_is_not_known_until_a_full_window_was_judged():
+    state = cp.PresenceState(settings())
+    run(state, 2, lambda t: ROOM_HIT)
+    assert not state.known
+    run(state, 1, lambda t: ROOM_HIT, start=2)
+    assert state.known and state.present
+
+
+def test_tc1747_run_refuses_when_its_relay_is_switched_off(tmp_path, monkeypatch):
+    path = tmp_path / "env"
+    path.write_text("LAN_IP=192.0.2.10\nCAMERA_LIVINGROOM_RELAY_RTSP_PORT=8564\nCAMERA_LIVINGROOM_RELAY_API_PORT=1994\n"
+                    "CAMERA_LIVINGROOM_RELAY_UPSTREAM_HOST=192.0.2.69\n"
+                    "CAMERA_LIVINGROOM_RELAY_UPSTREAM_PATH=/h264/ch1/sub/av_stream\n"
+                    "CAMERA_LIVINGROOM_RELAY_UPSTREAM_PASSWORD=ABCDEF\nCAMERA_LIVINGROOM_RELAY_EXPECT_SIZE=768x432\n"
+                    "CAMERA_LIVINGROOM_RELAY_ENABLED=false\n"
+                    'CAMERA_LIVINGROOM_PRESENCE_ROOM_POLYGON="%s"\nCAMERA_LIVINGROOM_PRESENCE_EXCLUDE_POLYGONS="%s"\n'
+                    % (ROOM, TREADMILL))
+    started = []
+    monkeypatch.setattr(dr, "start_consumer", lambda *a, **k: started.append(a))
+    monkeypatch.setattr(cp.subprocess, "run", lambda *a, **k: started.append(a))
+    assert cp.run_service(str(path), "livingroom", state_dir=str(tmp_path / "state")) == cp.EXIT_REFUSED
+    assert started == []
+
+
+def test_tc1745_a_missing_runtime_fails_the_unit_once_instead_of_looping():
+    u = (STACK / "camera-presence" / "homehub-camera-presence@.service").read_text(encoding="utf-8")
+    assert "AssertPathExists=/opt/homehub-presence/venv/bin/python" in u.splitlines()
+
+
+@pytest.mark.parametrize("value", ["2.9", "2.0", "x"])
+def test_tc1737_a_fractional_confirmation_count_refuses(value):
+    with pytest.raises(cp.Invalid) as err:
+        settings(CAMERA_LIVINGROOM_PRESENCE_CONFIRM_COUNT=value)
+    assert "CONFIRM_COUNT" in str(err.value)

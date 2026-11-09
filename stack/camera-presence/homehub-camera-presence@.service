@@ -18,6 +18,8 @@ Documentation=file:///opt/homehub/stack/camera-presence/README.md
 Wants=docker.service network-online.target homehub-camera-relay@%i.service
 After=docker.service network-online.target homehub-camera-relay@%i.service homehub-firstboot.service
 AssertPathExists=/opt/homehub/stack/camera-presence/camera_presence.py
+# A missing runtime fails the unit once (an assert is not restarted), never a 203/EXEC loop.
+AssertPathExists=/opt/homehub-presence/venv/bin/python
 
 [Service]
 Type=simple

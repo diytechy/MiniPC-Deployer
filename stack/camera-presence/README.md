@@ -19,7 +19,7 @@ status and journal never carry a picture, a box or a zone.
 | Body | `yolov8n` person, confidence 0.40, only when no face counted (`cascade`; or `always`, `off`) |
 | Counts | a detection whose anchor (face: centre; body: bottom centre) is in the room and in no exclude polygon |
 | On | 2 positive seconds of the last 3 |
-| Off | `HOLD_SEC` (8) with no positive. Any positive refreshes the hold; room motion refreshes it while present and never turns presence on |
+| Off | `HOLD_SEC` (8) with no positive. Any positive refreshes the hold; room motion refreshes it while present, for at most `MOTION_MAX_SEC` (60) past the last real detection, and never turns presence on |
 | Engage | anchors in the engage polygon (the couch) for `ENGAGE_SEC` (20) |
 
 **Draw the exclude polygon around where a person ON the treadmill appears**,
@@ -35,7 +35,7 @@ someone faces the camera, and 192 may be enough once the crop is known.
 
 The feed (IF-081): JSON lines on `LAN_IP:CAMERA_<C>_PRESENCE_FEED_PORT` (0 =
 off), only from `CAMERA_<C>_PRESENCE_FEED_PEERS` (default `MAIN_BOX_IP`):
-`hello`, then the current state, then each change, plus a beat every 5 s:
+`hello`, then the current state (only once three frames have been judged), then each change, plus a beat every 5 s. A beat whose `frame_age_ms` exceeds 10000 means the state is unknown:
 
 ```
 {"v":1,"type":"state","event":"living_room.presence","present":true,"zone":"room","since":"2026-11-09T20:14:03Z","confidence":0.62}

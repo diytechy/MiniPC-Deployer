@@ -270,6 +270,9 @@ def test_tc1756_the_template_ships_it_off_and_the_installer_checks_before_it_swa
     # One rename switches releases: a symlink, never two moves (review 2026-11-09).
     assert 'ln -sfn "$release" "$root/.sdk.new"' in sh and 'mv -T "$root/.sdk.new" "$root/sdk"' in sh
     assert sh.index('mv -T "$stage" "$release"') < sh.index('ln -sfn')
+    # A plain directory is refused before anything moves, never migrated (re-review 2026-11-09).
+    assert sh.index('is not a symlink; remove it by hand') < sh.index('mv -T "$stage" "$release"')
+    assert "legacy-" not in sh
 
 
 # ── review 2026-11-09: each fix pinned ───────────────────────────────────────

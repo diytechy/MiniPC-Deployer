@@ -58,12 +58,15 @@ sync -f "$stage/lib/libhcnetsdk.so"
 # THE SWITCH IS ONE RENAME (review 2026-11-09): each release is its own
 # directory, and $root/sdk is a symlink replaced by rename(2), so an interrupted
 # install leaves either the old release or the new one live, never neither.
+# A plain directory at $root/sdk (a layout no release of this script ever
+# deployed) is refused rather than migrated: moving it aside first would open
+# the very window this switch exists to close (review 2026-11-09).
+if [ -e "$root/sdk" ] && [ ! -L "$root/sdk" ]; then
+    fail "$root/sdk is not a symlink; remove it by hand (nothing was changed) and run this again"
+fi
 release="$root/releases/$(date -u +%Y%m%dT%H%M%SZ)"
 mv -T "$stage" "$release"
 trap - EXIT
-if [ -d "$root/sdk" ] && [ ! -L "$root/sdk" ]; then
-    mv -T "$root/sdk" "$root/releases/legacy-$(date -u +%Y%m%dT%H%M%SZ)"   # a pre-symlink install
-fi
 ln -sfn "$release" "$root/.sdk.new"
 mv -T "$root/.sdk.new" "$root/sdk"
 sync -f "$root"

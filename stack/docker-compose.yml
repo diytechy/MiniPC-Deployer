@@ -1698,6 +1698,46 @@ services:
       # Pinned by digest; a digest pin has nothing for diun to watch.
       - "diun.enable=false"
 
+  # ── camera-relay-livingroom — the living-room camera's own relay (SR-155) ────
+  #
+  # The door relay's pattern for a second camera, as a SEPARATE go2rtc process:
+  # go2rtc's RTSP listener has one consumer credential, and each relay serves
+  # its camera with that camera's own login (stack/camera-relay/README.md).
+  # Sub stream; audio passed through to a consumer that asks for it, never kept
+  # on the hub.
+  #
+  # LIFECYCLE: homehub-camera-relay@livingroom.service. The profile is NOT an
+  # enable switch; the unit is its only caller and its knob is
+  # CAMERA_LIVINGROOM_RELAY_ENABLED. NEVER add it to COMPOSE_PROFILES.
+  # Same image (DOOR_RELAY_IMAGE, pinned by digest), same hardening, no log
+  # driver (the producer's warnings carry the credentialed URL; the unit's
+  # redact-run is the only way out).
+  camera-relay-livingroom:
+    image: ${DOOR_RELAY_IMAGE}
+    container_name: homehub-camera-relay-livingroom
+    profiles: ["camera-relay-livingroom"]
+    network_mode: host
+    restart: "no"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.5
+    volumes:
+      - type: bind
+        source: /run/homehub-camera-relay-livingroom/go2rtc.yaml
+        target: /config/go2rtc.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    logging:
+      driver: none
+    labels:
+      - "diun.enable=false"
+
   # ── OtterTube: the curated kids' video downloader, catalogue and media (SN-051) ──
   #
   # Three services, ONE profile, and the profile is NOT an enable switch: it keeps

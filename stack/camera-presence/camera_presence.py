@@ -1,0 +1,839 @@
+#!/usr/bin/env python3
+"""camera_presence.py - room presence from a relayed camera (SR-157..SR-160).
+
+HomeHub LIVING_ROOM_PRESENCE_PLAN_2026-11-09 section 4. One instance per camera
+(homehub-camera-presence@<camera>.service) reads ONE frame a second from the
+camera's own relay (stack/camera-relay), decides whether someone is in the room
+OUTSIDE the excluded zones (the treadmill), and publishes state changes only:
+
+    living_room.presence  {present, zone, since, confidence}
+    living_room.engage    {engaged, zone, since}     (only with an engage zone)
+
+on a small LAN feed (IF-081) and in a status file. It never writes a frame to
+disk, keeps no identity, and nothing it publishes carries a picture, a box or a
+zone. The audio is never decoded (-an), and the relay withholds it from a
+consumer that does not ask anyway.
+
+THE METHOD (HomeHub METHOD_PRESENCE_BODY_CLASSIFIER_2026-09-15): never drop
+presence while someone is there; absence within about ten seconds; 1 fps.
+Per second: a head/face detector (faceyolo) on the room's crop, and a body
+detector (yolov8n, person) when face found nobody (`cascade`). A detection
+counts only when its anchor - a face box's centre, a body box's bottom centre -
+is inside the room polygon and outside every exclude polygon. Presence turns on
+after CONFIRM_COUNT positive seconds out of CONFIRM_WINDOW, and off after
+HOLD_SEC with none. Room motion (a grey difference, excluded zones masked) may
+refresh the hold while present but never turns presence on: a TV picture moves,
+so the TV belongs in an exclude polygon.
+
+MODELS are not in this public repository: models.manifest.json pins each file's
+sha256 and the run refuses other bytes. THE RUNTIME is onnxruntime in
+/opt/homehub-presence/venv (install-presence-runtime.sh); OpenCV 4.6, the hub's
+apt build, cannot load these graphs (measured on the hub 2026-11-09).
+
+Verbs (all take --camera C):
+    condition   exit 0 only when CAMERA_<C>_PRESENCE_ENABLED is exactly true
+                (the unit's ExecCondition).
+    check       what the detector would run with; never prints a polygon.
+    run         the service.
+    still       ONE frame from the relay as a JPEG at --out (0600), to draw the
+                zones on with the Owner. Nothing keeps it; delete it after.
+    cost        CPU of the running detector (unit + decoder) and PSI, against
+                CAMERA_<C>_PRESENCE_BUDGET_PCT.
+
+Python 3.8-compatible (the dev PC's test runner imports this module).
+Implements: SR-157..SR-160, LLR-1496..LLR-1511.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime
+import hashlib
+import json
+import os
+import re
+import select
+import signal
+import subprocess
+import sys
+import threading
+import time
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "monitoring"))
+sys.path.insert(0, os.path.join(HERE, "..", "door"))
+sys.path.insert(0, os.path.join(HERE, "..", "camera-relay"))
+sys.path.insert(0, os.path.join(HERE, "..", "camera-motion"))
+import monitor_common as mc  # noqa: E402
+import door_relay  # noqa: E402
+import camera_relay  # noqa: E402
+import event_feed as feed  # noqa: E402
+
+STATE_DIR = "/var/lib/homehub-presence"
+MANIFEST_FILE = os.path.join(HERE, "models.manifest.json")
+DEFAULT_MODEL_DIR = "/opt/homehub-presence/models"
+FRAME_W, FRAME_H = 640, 360           # the decoder's output, RGB24
+MOTION_W, MOTION_H = 160, 90
+MOTION_LEVEL = 18                     # grey levels: the door engine's threshold
+EXIT_REFUSED = 78
+STATUS_EVERY_SEC = 60.0
+BODY_MODES = ("cascade", "always", "off")
+COCO_PERSON = 0
+WHOLE_FRAME = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+
+
+class Invalid(ValueError):
+    """A configuration field is missing or malformed; the message names the KEY only."""
+
+
+def knob(camera: str, suffix: str) -> str:
+    return "CAMERA_%s_PRESENCE_%s" % (camera.upper(), suffix)
+
+
+# ── zones ────────────────────────────────────────────────────────────────────
+
+Point = Tuple[float, float]
+Polygon = List[Point]
+
+
+def parse_polygon(text: str, key: str) -> Polygon:
+    """`x,y;x,y;...` in 0..1, at least three points. Raises Invalid naming the key.
+
+    Implements: LLR-1496.
+    """
+    points = []
+    for part in [p for p in (text or "").strip().split(";") if p.strip()]:
+        m = re.fullmatch(r"\s*([0-9]*\.?[0-9]+)\s*,\s*([0-9]*\.?[0-9]+)\s*", part)
+        if not m:
+            raise Invalid("%s holds a point that is not x,y" % key)
+        x, y = float(m.group(1)), float(m.group(2))
+        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+            raise Invalid("%s holds a point outside 0..1" % key)
+        points.append((x, y))
+    if len(points) < 3:
+        raise Invalid("%s needs at least three points" % key)
+    return points
+
+
+def parse_polygons(text: str, key: str) -> List[Polygon]:
+    """`|`-separated polygons; empty is none."""
+    return [parse_polygon(part, key) for part in (text or "").split("|") if part.strip()]
+
+
+def inside(point: Point, polygon: Polygon) -> bool:
+    """Even-odd ray casting; a point on an edge may fall either way."""
+    x, y = point
+    hit = False
+    n = len(polygon)
+    for i in range(n):
+        x1, y1 = polygon[i]
+        x2, y2 = polygon[(i + 1) % n]
+        if (y1 > y) != (y2 > y):
+            if x < x1 + (y - y1) * (x2 - x1) / (y2 - y1):
+                hit = not hit
+    return hit
+
+
+def is_whole_frame(polygon: Polygon) -> bool:
+    xs = [p[0] for p in polygon]
+    ys = [p[1] for p in polygon]
+    return min(xs) <= 0.001 and min(ys) <= 0.001 and max(xs) >= 0.999 and max(ys) >= 0.999 and len(polygon) == 4
+
+
+class Zones:
+    """The room, its exclusions and the optional engage area (normalised).
+
+    Implements: LLR-1496.
+    """
+
+    def __init__(self, room: Polygon, exclude: List[Polygon], engage: Optional[Polygon]):
+        self.room, self.exclude, self.engage = room, exclude, engage
+
+    def counts(self, point: Point) -> bool:
+        return inside(point, self.room) and not any(inside(point, p) for p in self.exclude)
+
+    def engaged(self, point: Point) -> bool:
+        return self.engage is not None and self.counts(point) and inside(point, self.engage)
+
+    def crop(self, pad: float = 0.04) -> Tuple[float, float, float, float]:
+        """The room's bounding box, padded, clamped: (x0, y0, x1, y1) in 0..1."""
+        xs = [p[0] for p in self.room]
+        ys = [p[1] for p in self.room]
+        return (max(0.0, min(xs) - pad), max(0.0, min(ys) - pad), min(1.0, max(xs) + pad), min(1.0, max(ys) + pad))
+
+    def motion_mask(self, width: int, height: int):
+        """A boolean array (height, width): in the room and in no exclusion."""
+        import numpy as np
+        mask = np.zeros((height, width), dtype=bool)
+        for row in range(height):
+            y = (row + 0.5) / height
+            for col in range(width):
+                mask[row, col] = self.counts(((col + 0.5) / width, y))
+        return mask
+
+
+# ── settings ─────────────────────────────────────────────────────────────────
+
+
+class PresenceSettings:
+    """Camera C's presence knobs, read from the stack .env.
+
+    Contract:
+      Config:  CAMERA_<C>_PRESENCE_ENABLED (false); _RELAY (C: whose relay it
+               reads); _ROOM_POLYGON (required; the whole frame is refused),
+               _EXCLUDE_POLYGONS (|-separated), _ENGAGE_POLYGON (empty: no
+               engage events); _FACE_MODEL (faceyolo_320.onnx), _FACE_CONF
+               (0.15), _BODY_MODEL (yolov8n_256.onnx), _BODY_CONF (0.40),
+               _BODY_MODE (cascade|always|off); _CONFIRM_COUNT (2) of
+               _CONFIRM_WINDOW (3); _HOLD_SEC (8); _ENGAGE_SEC (20);
+               _MOTION_HOLDS (true), _MOTION_MIN_RATIO (0.004); _STALL_SEC (30);
+               _FEED_PORT (0 = off), _FEED_PEERS (space-separated IPv4;
+               default MAIN_BOX_IP); _BUDGET_PCT (30); _MODEL_DIR
+               (/opt/homehub-presence/models); _EVENT_PREFIX (living_room).
+               [stack/.env]
+      Raises:  Invalid naming the key, never a value.
+    Implements: LLR-1497.
+    """
+
+    def __init__(self, env: Dict[str, str], camera: str):
+        self.camera = camera_relay.camera_name(camera)
+        k = lambda s: knob(camera, s)  # noqa: E731
+
+        def text(suffix: str, default: str = "") -> str:
+            return env.get(k(suffix), "").strip() or default
+
+        def number(suffix: str, default: float, low: float, high: float) -> float:
+            raw = env.get(k(suffix), "").strip()
+            if not raw:
+                return default
+            if not re.fullmatch(r"[0-9]*\.?[0-9]+", raw) or not low <= float(raw) <= high:
+                raise Invalid("%s must be a number in %g..%g" % (k(suffix), low, high))
+            return float(raw)
+
+        self.enabled = mc.knob_bool(env, k("ENABLED"), False)
+        self.relay_camera = text("RELAY", camera)
+        room = parse_polygon(text("ROOM_POLYGON"), k("ROOM_POLYGON"))
+        self.zones = Zones(room, parse_polygons(text("EXCLUDE_POLYGONS"), k("EXCLUDE_POLYGONS")),
+                           parse_polygon(text("ENGAGE_POLYGON"), k("ENGAGE_POLYGON"))
+                           if text("ENGAGE_POLYGON") else None)
+        self.placeholder = is_whole_frame(room) and not self.zones.exclude
+        self.face_model = text("FACE_MODEL", "faceyolo_320.onnx")
+        self.body_model = text("BODY_MODEL", "yolov8n_256.onnx")
+        for suffix, value in (("FACE_MODEL", self.face_model), ("BODY_MODEL", self.body_model)):
+            if not re.fullmatch(r"[a-z0-9_]+\.onnx", value):
+                raise Invalid("%s must be a model file name such as faceyolo_320.onnx" % k(suffix))
+        self.face_conf = number("FACE_CONF", 0.15, 0.01, 0.99)
+        self.body_conf = number("BODY_CONF", 0.40, 0.01, 0.99)
+        self.body_mode = text("BODY_MODE", "cascade")
+        if self.body_mode not in BODY_MODES:
+            raise Invalid("%s must be one of %s" % (k("BODY_MODE"), ", ".join(BODY_MODES)))
+        self.confirm_count = int(number("CONFIRM_COUNT", 2, 1, 10))
+        self.confirm_window = int(number("CONFIRM_WINDOW", 3, 1, 10))
+        if self.confirm_count > self.confirm_window:
+            raise Invalid("%s may not exceed %s" % (k("CONFIRM_COUNT"), k("CONFIRM_WINDOW")))
+        self.hold_sec = number("HOLD_SEC", 8, 2, 120)
+        self.engage_sec = number("ENGAGE_SEC", 20, 1, 3600)
+        self.motion_holds = mc.knob_bool(env, k("MOTION_HOLDS"), True)
+        self.motion_min_ratio = number("MOTION_MIN_RATIO", 0.004, 0.0001, 0.5)
+        self.stall_sec = number("STALL_SEC", 30, 5, 600)
+        self.budget_pct = int(number("BUDGET_PCT", 30, 1, 400))
+        self.model_dir = text("MODEL_DIR", DEFAULT_MODEL_DIR)
+        self.event_prefix = text("EVENT_PREFIX", "living_room")
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", self.event_prefix):
+            raise Invalid("%s must match [a-z][a-z0-9_]{0,31}" % k("EVENT_PREFIX"))
+        raw_port = env.get(k("FEED_PORT"), "").strip()
+        self.feed_port = mc.knob_int(env, k("FEED_PORT"), 0, feed.PORT_LOW, feed.PORT_HIGH)
+        self.feed_port_invalid = bool(raw_port) and raw_port != "0" and self.feed_port == 0
+        peers = env.get(k("FEED_PEERS"), "").split() or [env.get("MAIN_BOX_IP", "").strip()]
+        self.feed_peers = [p for p in peers if feed.IPV4_RE.fullmatch(p)]
+        if self.feed_port and not self.feed_peers:
+            raise Invalid("%s (or MAIN_BOX_IP) must name at least one IPv4 address" % k("FEED_PEERS"))
+
+
+# ── models ───────────────────────────────────────────────────────────────────
+
+
+def read_manifest(path: str = MANIFEST_FILE) -> Dict[str, Dict[str, object]]:
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)["models"]
+
+
+def verify_model(model_dir: str, name: str, manifest: Dict[str, Dict[str, object]]) -> str:
+    """The model's path when its bytes are the pinned ones; Invalid otherwise.
+
+    Implements: LLR-1498.
+    """
+    entry = manifest.get(name)
+    if not entry:
+        raise Invalid("model %s is not in models.manifest.json" % name)
+    path = os.path.join(model_dir, name)
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+    except OSError:
+        raise Invalid("model %s is missing from %s" % (name, model_dir))
+    if digest.hexdigest() != entry["sha256"]:
+        raise Invalid("model %s is not the pinned bytes (models.manifest.json)" % name)
+    return path
+
+
+# ── detection ────────────────────────────────────────────────────────────────
+
+
+def letterbox(rgb, size: int, resize: Optional[Callable] = None):
+    """Aspect-preserving resize into a zero-padded square anchored top-left; RGB
+    0..1 NCHW float32. The panel's layout (OfficeWallNaglight
+    tools/sensor-corpus/replay_body.py). Returns (blob, scale).
+
+    Implements: LLR-1499.
+    """
+    import numpy as np
+    height, width = rgb.shape[:2]
+    if height > width:
+        new_h, new_w = size, max(1, int(size / height * width))
+    else:
+        new_w, new_h = size, max(1, int(size / width * height))
+    if resize is None:
+        import cv2
+        resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    else:
+        resized = resize(rgb, (new_w, new_h))
+    canvas = np.zeros((size, size, 3), dtype=np.float32)
+    canvas[:new_h, :new_w, :] = resized.astype(np.float32)
+    blob = (canvas / 255.0).transpose(2, 0, 1)[np.newaxis]
+    return np.ascontiguousarray(blob, dtype=np.float32), new_w / float(width)
+
+
+def decode_yolo(output, threshold: float, class_index: int = 0) -> List[Tuple[float, float, float, float, float]]:
+    """YOLOv8 output (1, 4+C, anchors) or (anchors, 4+C) -> [(score, cx, cy, w, h)]
+    in letterbox pixels, for one class, at or above threshold. No objectness
+    channel (that is YOLOv5's layout, which these models are not).
+
+    Implements: LLR-1499.
+    """
+    import numpy as np
+    array = np.asarray(output)
+    if array.ndim == 3:
+        array = array[0]
+    if array.shape[0] > array.shape[1]:
+        array = array.T
+    scores = array[4 + class_index]
+    keep = np.nonzero(scores >= threshold)[0]
+    return [(float(scores[i]), float(array[0, i]), float(array[1, i]), float(array[2, i]), float(array[3, i]))
+            for i in keep]
+
+
+Detection = Tuple[str, float, Point]   # (kind, score, anchor in 0..1 of the whole frame)
+
+
+def to_frame(boxes, kind: str, scale: float, crop_px: Tuple[int, int, int, int],
+             frame_w: int, frame_h: int) -> List[Detection]:
+    """Letterbox boxes -> anchors on the whole frame: a face's centre, a body's
+    bottom centre (where a person sits or stands). Implements: LLR-1500."""
+    x0, y0, _x1, _y1 = crop_px
+    out = []
+    for score, cx, cy, _w, h in boxes:
+        ax = x0 + cx / scale
+        ay = y0 + ((cy + h / 2.0) if kind == "body" else cy) / scale
+        out.append((kind, score, (min(1.0, max(0.0, ax / frame_w)), min(1.0, max(0.0, ay / frame_h)))))
+    return out
+
+
+class OnnxDetector:
+    """One single-threaded onnxruntime session (more threads is slower on these
+    boxes: measured on the panel 2026-09-15)."""
+
+    def __init__(self, path: str, conf: float, class_index: int):
+        import onnxruntime as ort
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 1
+        options.inter_op_num_threads = 1
+        self.session = ort.InferenceSession(path, options, providers=["CPUExecutionProvider"])
+        self.input = self.session.get_inputs()[0].name
+        self.size = int(self.session.get_inputs()[0].shape[2])
+        self.conf, self.class_index = conf, class_index
+
+    def detect(self, crop):
+        blob, scale = letterbox(crop, self.size)
+        return decode_yolo(self.session.run(None, {self.input: blob})[0], self.conf, self.class_index), scale
+
+
+class Motion:
+    """Room motion between consecutive samples: the changed fraction of the
+    room's pixels (excluded zones masked). Implements: LLR-1501."""
+
+    def __init__(self, zones: Zones):
+        self.mask = zones.motion_mask(MOTION_W, MOTION_H)
+        self.area = max(1, int(self.mask.sum()))
+        self.previous = None
+
+    def update(self, grey) -> float:
+        import numpy as np
+        if self.previous is None:
+            self.previous = grey
+            return 0.0
+        changed = np.abs(grey.astype(np.int16) - self.previous.astype(np.int16)) > MOTION_LEVEL
+        self.previous = grey
+        return float((changed & self.mask).sum()) / self.area
+
+
+# ── the state ────────────────────────────────────────────────────────────────
+
+
+def iso(utc: float) -> str:
+    return datetime.datetime.fromtimestamp(utc, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class PresenceState:
+    """Presence and engage from one second's evidence; returns the events.
+
+    present: on after CONFIRM_COUNT positive samples of the last CONFIRM_WINDOW;
+    off once HOLD_SEC passes with no positive sample (and, with motion_holds,
+    no room motion). A positive refreshes the hold even when the window would
+    not confirm, so a flicker never drops a present person. Motion never turns
+    presence on.
+    engage: detections anchored in the engage zone, unbroken by more than
+    HOLD_SEC, lasting ENGAGE_SEC; off once HOLD_SEC passes without one.
+    Implements: LLR-1502, LLR-1503.
+    """
+
+    def __init__(self, s: PresenceSettings):
+        self.s = s
+        self.window = collections.deque(maxlen=s.confirm_window)
+        self.present = False
+        self.since = None          # type: Optional[float]   (wall clock)
+        self.last_positive = None  # type: Optional[float]   (monotonic)
+        self.scores = collections.deque()   # (mono, score) within the hold
+        self.engaged = False
+        self.engage_start = None   # type: Optional[float]   (monotonic)
+        self.engage_start_utc = None  # type: Optional[float]
+        self.engage_since = None   # type: Optional[float]
+        self.last_engage = None    # type: Optional[float]
+
+    def confidence(self, mono: float) -> float:
+        while self.scores and mono - self.scores[0][0] > self.s.hold_sec:
+            self.scores.popleft()
+        return round(max([sc for _m, sc in self.scores] or [0.0]), 3)
+
+    def presence_record(self, mono: float) -> Dict[str, object]:
+        return {"v": 1, "type": "state", "event": self.s.event_prefix + ".presence", "present": self.present,
+                "zone": "room", "since": iso(self.since) if self.since is not None else None,
+                "confidence": self.confidence(mono) if self.present else 0.0}
+
+    def engage_record(self) -> Dict[str, object]:
+        return {"v": 1, "type": "state", "event": self.s.event_prefix + ".engage", "engaged": self.engaged,
+                "zone": "engage", "since": iso(self.engage_since) if self.engage_since is not None else None}
+
+    def update(self, mono: float, utc: float, detections: List[Detection], motion: float) -> List[Dict[str, object]]:
+        counted = [d for d in detections if self.s.zones.counts(d[2])]
+        positive = bool(counted)
+        self.window.append(positive)
+        events = []
+        for _kind, score, _anchor in counted:
+            self.scores.append((mono, score))
+        if positive:
+            self.last_positive = mono
+        elif self.present and self.s.motion_holds and motion >= self.s.motion_min_ratio:
+            self.last_positive = mono
+        if not self.present and sum(self.window) >= self.s.confirm_count:
+            self.present, self.since = True, utc
+            events.append(self.presence_record(mono))
+        elif self.present and (self.last_positive is None or mono - self.last_positive >= self.s.hold_sec):
+            self.present, self.since = False, utc
+            self.window.clear()
+            events.append(self.presence_record(mono))
+        if self.s.zones.engage is not None:
+            in_engage = any(self.s.zones.engaged(d[2]) for d in counted)
+            if in_engage:
+                if self.engage_start is None or (self.last_engage is not None
+                                                 and mono - self.last_engage >= self.s.hold_sec):
+                    self.engage_start, self.engage_start_utc = mono, utc
+                self.last_engage = mono
+            if not self.engaged and in_engage and mono - self.engage_start >= self.s.engage_sec:
+                self.engaged, self.engage_since = True, self.engage_start_utc
+                events.append(self.engage_record())
+            elif self.engaged and (not self.present or mono - self.last_engage >= self.s.hold_sec):
+                self.engaged, self.engage_since = False, utc
+                self.engage_start = None
+                events.append(self.engage_record())
+            elif not in_engage and self.last_engage is not None and mono - self.last_engage >= self.s.hold_sec:
+                self.engage_start = None
+        return events
+
+    def snapshot(self, mono: float) -> List[Dict[str, object]]:
+        out = [self.presence_record(mono)]
+        if self.s.zones.engage is not None:
+            out.append(self.engage_record())
+        return out
+
+
+class Evaluator:
+    """One frame -> detections, with the face-first cascade. Implements: LLR-1500."""
+
+    def __init__(self, s: PresenceSettings, face, body, frame_w: int = FRAME_W, frame_h: int = FRAME_H):
+        self.s, self.face, self.body = s, face, body
+        x0, y0, x1, y1 = s.zones.crop()
+        self.crop_px = (int(x0 * frame_w), int(y0 * frame_h), max(int(x0 * frame_w) + 1, int(round(x1 * frame_w))),
+                        max(int(y0 * frame_h) + 1, int(round(y1 * frame_h))))
+        self.frame_w, self.frame_h = frame_w, frame_h
+        self.ran = {"face": 0, "body": 0}
+
+    def evaluate(self, rgb) -> List[Detection]:
+        x0, y0, x1, y1 = self.crop_px
+        crop = rgb[y0:y1, x0:x1]
+        found = []
+        if self.face is not None:
+            boxes, scale = self.face.detect(crop)
+            self.ran["face"] += 1
+            found += to_frame(boxes, "face", scale, self.crop_px, self.frame_w, self.frame_h)
+        counted_face = any(self.s.zones.counts(d[2]) for d in found)
+        if self.body is not None and (self.s.body_mode == "always" or not counted_face):
+            boxes, scale = self.body.detect(crop)
+            self.ran["body"] += 1
+            found += to_frame(boxes, "body", scale, self.crop_px, self.frame_w, self.frame_h)
+        return found
+
+
+# ── the feed (IF-081): IF-079's listener, with a peer list and state on connect ──
+
+
+class PresenceFeed(feed.EventFeed):
+    """event_feed.EventFeed (bounded, non-blocking, never able to touch
+    detection) with several admitted peers, and the current state sent to a new
+    subscriber after its hello. Implements: LLR-1504."""
+
+    def __init__(self, camera: str, host: str, port: int, peers: Sequence[str], log=feed._noop_log):
+        relabel = lambda m, warning=False: log(m.replace("camera motion [", "camera presence [", 1)  # noqa: E731
+                                               .replace("PANEL_IP", "an admitted peer"), warning=warning)
+        super().__init__(camera, host, port, (list(peers) or [""])[0], log=relabel)
+        self.peers = set(peers)
+        self.current = []  # type: List[Dict[str, object]]
+
+    def publish_state(self, record: Dict[str, object]) -> None:
+        if not self.active:
+            return
+        try:
+            self._broadcast(feed.encode(record))
+        except Exception as exc:  # noqa: BLE001
+            self._fault("publish_state", exc)
+
+    def _accept(self) -> None:
+        for _ in range(feed.ACCEPTS_PER_PASS):
+            try:
+                conn, addr = self.listener.accept()  # type: ignore[union-attr]
+            except (BlockingIOError, InterruptedError, OSError):
+                return
+            if addr[0] not in self.peers or len(self.clients) >= feed.MAX_CLIENTS:
+                self._close_quietly(conn)
+                continue
+            try:
+                conn.setblocking(False)
+                conn.setsockopt(feed.socket.SOL_SOCKET, feed.socket.SO_KEEPALIVE, 1)
+                conn.setsockopt(feed.socket.SOL_SOCKET, feed.socket.SO_SNDBUF, feed.CLIENT_BUFFER)
+            except OSError:
+                pass
+            client = feed._Client(conn)
+            self.clients.append(client)
+            self._queue(client, feed.encode({"v": feed.PROTOCOL, "type": "hello", "camera": self.camera}))
+            for record in self.current:
+                if client in self.clients:
+                    self._queue(client, feed.encode(record))
+
+
+# ── the service ──────────────────────────────────────────────────────────────
+
+
+def container_name(camera: str) -> str:
+    return "homehub-camera-presence-%s" % camera
+
+
+def decoder_command(relay: camera_relay.CameraRelaySettings, camera: str):
+    """The one decoder: video only, one frame a second, 640x360 RGB24 on stdout.
+
+    Implements: LLR-1505.
+    """
+    return door_relay.relay_consumer(
+        relay, container_name(camera), "ffmpeg", ["-nostdin", "-v", "error", "-fflags", "nobuffer"],
+        ["-an", "-sn", "-dn", "-vf", "fps=1,scale=%d:%d:flags=area" % (FRAME_W, FRAME_H),
+         "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"],
+        docker_extra=["--cpus", "0.3", "--cpu-shares", "256"], timeout_us=10000000)
+
+
+def load(env_file: str, camera: str) -> Tuple[PresenceSettings, camera_relay.CameraRelaySettings]:
+    env = mc.read_knobs(env_file)
+    s = PresenceSettings(env, camera)
+    relay = camera_relay.CameraRelaySettings(env_file, s.relay_camera)
+    return s, relay
+
+
+def refuse(camera: str, reason: str) -> int:
+    mc.log("camera presence [%s]: REFUSED - %s" % (camera, reason), warning=True)
+    return EXIT_REFUSED
+
+
+def write_status(state_dir: str, camera: str, record: Dict[str, object]) -> None:
+    path = os.path.join(state_dir, camera, "status.json")
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o750, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, sort_keys=True)
+            handle.write("\n")
+        os.chmod(tmp, 0o640)
+        os.replace(tmp, path)
+    except OSError as exc:
+        mc.log("camera presence [%s]: status not written (%s)" % (camera, type(exc).__name__), warning=True)
+
+
+def run_service(env_file: str, camera: str, state_dir: str = STATE_DIR) -> int:
+    """homehub-camera-presence@<camera>.service's ExecStart. Implements: LLR-1506."""
+    try:
+        s, relay = load(env_file, camera)
+    except (Invalid, door_relay.Invalid) as exc:
+        return refuse(camera, str(exc))
+    if s.placeholder:
+        return refuse(camera, "%s is the whole-frame placeholder and nothing is excluded: draw the zones first"
+                      % knob(camera, "ROOM_POLYGON"))
+    try:
+        import numpy as np
+        import cv2
+        cv2.setNumThreads(1)
+        manifest = read_manifest()
+        face = OnnxDetector(verify_model(s.model_dir, s.face_model, manifest), s.face_conf, 0)
+        body = (OnnxDetector(verify_model(s.model_dir, s.body_model, manifest), s.body_conf, COCO_PERSON)
+                if s.body_mode != "off" else None)
+    except Invalid as exc:
+        return refuse(camera, str(exc))
+    except ImportError as exc:
+        return refuse(camera, "the presence runtime is not installed (%s): run "
+                              "stack/camera-presence/install-presence-runtime.sh" % exc.name)
+    evaluator = Evaluator(s, face, body)
+    motion = Motion(s.zones)
+    state = PresenceState(s)
+    out = PresenceFeed(camera, relay.lan_ip, s.feed_port, s.feed_peers, log=mc.log)
+    if s.feed_port_invalid:
+        mc.log("camera presence [%s]: %s is not 0 or a port in %d..%d - no feed"
+               % (camera, knob(camera, "FEED_PORT"), feed.PORT_LOW, feed.PORT_HIGH), warning=True)
+    out.current = state.snapshot(time.monotonic())
+    out.open()
+    subprocess.run(["docker", "rm", "-f", container_name(camera)], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=60)
+    argv, payload = decoder_command(relay, camera)
+    proc = door_relay.start_consumer(argv, payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stopping = []
+    signal.signal(signal.SIGTERM, lambda *_: stopping.append(1))
+    signal.signal(signal.SIGINT, lambda *_: stopping.append(1))
+
+    def relay_stderr():
+        for line in proc.stderr:
+            mc.log("camera presence [%s]: ffmpeg: %s"
+                   % (camera, door_relay.redact(line.decode("utf-8", "replace").rstrip(), relay)))
+    threading.Thread(target=relay_stderr, daemon=True).start()
+    mc.log("camera presence [%s]: reading /%s from its relay on port %d at 1 fps (video only); face %s, body %s "
+           "(%s); hold %gs; %d exclude zone(s); engage %s"
+           % (camera, relay.stream, relay.rtsp_port, s.face_model, s.body_model if body else "off", s.body_mode,
+              s.hold_sec, len(s.zones.exclude), "on" if s.zones.engage else "off"))
+    status = {"camera": camera, "pid": os.getpid(), "started_utc_ms": int(time.time() * 1000), "frames": 0,
+              "last_frame_utc_ms": None, "changes": 0}
+    frame_bytes = FRAME_W * FRAME_H * 3
+    buffer = bytearray()
+    fd = proc.stdout.fileno()
+    last_data = last_status = time.monotonic()
+    infer_ms = collections.deque(maxlen=60)
+    code = 1
+
+    def status_record():
+        rec = dict(status, state=state.snapshot(time.monotonic()), feed=out.status(), ran=dict(evaluator.ran),
+                   infer_ms_p50=sorted(infer_ms)[len(infer_ms) // 2] if infer_ms else None)
+        return rec
+    try:
+        while not stopping:
+            try:
+                ready, writable, _x = select.select([fd] + out.read_fds(), out.write_fds(), [], 1.0)
+            except (OSError, ValueError):
+                out.close()
+                out.disabled = True
+                ready, writable, _x = select.select([fd], [], [], 1.0)
+            mono = time.monotonic()
+            out.service(set(ready), set(writable))
+            out.tick(mono, int((mono - last_data) * 1000))
+            if mono - last_status >= STATUS_EVERY_SEC:
+                write_status(state_dir, camera, status_record())
+                last_status = mono
+            if fd not in ready:
+                if mono - last_data > s.stall_sec:
+                    mc.log("camera presence [%s]: no frame for %ds - ending this run" % (camera, s.stall_sec),
+                           warning=True)
+                    break
+                continue
+            chunk = os.read(fd, 1 << 18)
+            if not chunk:
+                mc.log("camera presence [%s]: the decoder ended" % camera, warning=True)
+                break
+            last_data = mono
+            buffer.extend(chunk)
+            while len(buffer) >= frame_bytes:
+                frame = np.frombuffer(bytes(buffer[:frame_bytes]), dtype=np.uint8).reshape(FRAME_H, FRAME_W, 3)
+                del buffer[:frame_bytes]
+                started = time.monotonic()
+                detections = evaluator.evaluate(frame)
+                grey = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY), (MOTION_W, MOTION_H),
+                                  interpolation=cv2.INTER_AREA)
+                moved = motion.update(grey)
+                now = time.monotonic()
+                infer_ms.append(int((now - started) * 1000))
+                status["frames"] = int(status["frames"]) + 1
+                status["last_frame_utc_ms"] = int(time.time() * 1000)
+                for record in state.update(now, time.time(), detections, moved):
+                    status["changes"] = int(status["changes"]) + 1
+                    out.publish_state(record)
+                    # The journal is the record of the live proof: state, the
+                    # best score, never a box, a zone or a picture.
+                    mc.log("camera presence [%s]: %s %s (since %s, confidence %s)"
+                           % (camera, record["event"], json.dumps({k: record[k] for k in ("present", "engaged")
+                                                                  if k in record}),
+                              record.get("since"), record.get("confidence", "-")))
+                out.current = state.snapshot(now)
+        else:
+            code = 0
+    finally:
+        write_status(state_dir, camera, dict(status_record(), stopped_utc_ms=int(time.time() * 1000)))
+        out.close()
+        subprocess.run(["docker", "rm", "-f", container_name(camera)], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=60)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    return code
+
+
+def still(env_file: str, camera: str, out_path: str) -> int:
+    """One JPEG from the relay, written 0600 to out_path; nothing else kept.
+
+    Implements: LLR-1507.
+    """
+    try:
+        s, relay = load(env_file, camera)
+    except (Invalid, door_relay.Invalid) as exc:
+        return refuse(camera, str(exc))
+    name = "homehub-camera-still-%s" % camera
+    argv, payload = door_relay.relay_consumer(
+        relay, name, "ffmpeg", ["-nostdin", "-v", "error"],
+        ["-an", "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg", "-q:v", "3", "pipe:1"], timeout_us=10000000)
+    try:
+        raw = subprocess.run(argv, input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    except subprocess.TimeoutExpired:
+        door_relay.remove_containers(name)
+        mc.log("camera presence [%s]: still timed out" % camera, warning=True)
+        return 1
+    if raw.returncode != 0 or not raw.stdout.startswith(b"\xff\xd8"):
+        mc.log("camera presence [%s]: still failed: %s" % (camera, door_relay.redact(
+            raw.stderr.decode("utf-8", "replace").strip(), relay)[-300:]), warning=True)
+        return 1
+    fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(raw.stdout)
+    mc.log("camera presence [%s]: one still written to %s (%d bytes, 0600); delete it once the zones are drawn"
+           % (camera, out_path, len(raw.stdout)))
+    return 0
+
+
+def check(env_file: str, camera: str) -> int:
+    """What the detector would run with. Never prints a polygon. Implements: LLR-1508."""
+    report = {"camera": camera}
+    try:
+        s, relay = load(env_file, camera)
+    except (Invalid, door_relay.Invalid) as exc:
+        door_relay.emit(dict(report, eligible=False, reason=str(exc)))
+        return 1
+    reasons = []
+    if s.placeholder:
+        reasons.append("the room zone is the whole-frame placeholder")
+    manifest = read_manifest()
+    for name in [s.face_model] + ([s.body_model] if s.body_mode != "off" else []):
+        try:
+            verify_model(s.model_dir, name, manifest)
+        except Invalid as exc:
+            reasons.append(str(exc))
+    try:
+        import onnxruntime  # noqa: F401
+        runtime = getattr(onnxruntime, "__version__", "?")
+    except ImportError:
+        runtime = None
+        reasons.append("onnxruntime is not importable by this interpreter")
+    door_relay.emit(dict(report, eligible=not reasons, reasons=reasons, enabled=s.enabled, relay_stream=relay.stream,
+                         relay_port=relay.rtsp_port, face=s.face_model, body=s.body_model, body_mode=s.body_mode,
+                         hold_sec=s.hold_sec, exclude_zones=len(s.zones.exclude),
+                         engage=s.zones.engage is not None, feed_port=s.feed_port,
+                         feed_peers=len(s.feed_peers), onnxruntime=runtime))
+    return 0 if not reasons else 1
+
+
+def unit_cgroup(camera: str) -> Optional[str]:
+    done = subprocess.run(["systemctl", "show", "--property", "ControlGroup", "--value",
+                           "homehub-camera-presence@%s.service" % camera], stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, universal_newlines=True, timeout=20)
+    rel = done.stdout.strip()
+    return "/sys/fs/cgroup" + rel if done.returncode == 0 and rel.startswith("/") else None
+
+
+def cost(env_file: str, camera: str, seconds: int) -> int:
+    """CPU of the unit, its decoder and its relay, and PSI; the verdict is the
+    motion detector's (decoder + detector against the budget; a missing part
+    fails). Implements: LLR-1509."""
+    import camera_motion
+    try:
+        s, _relay = load(env_file, camera)
+    except (Invalid, door_relay.Invalid) as exc:
+        return refuse(camera, str(exc))
+    groups = {"detector": unit_cgroup(camera) or "/nonexistent/detector",
+              "decoder": door_relay.container_cgroup(container_name(camera)) or "/nonexistent/decoder",
+              "relay": door_relay.container_cgroup(camera_relay.container(s.relay_camera)) or "/nonexistent/relay"}
+    result = door_relay.cost(groups, seconds)
+    result.update(camera_motion.cost_verdict(result, s.budget_pct))
+    door_relay.emit(result)
+    return 0 if result.get("pass") else 1
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p.add_argument("--env-file", default=mc.DEFAULT_ENV_FILE)
+    p.add_argument("--camera", required=True)
+    sub = p.add_subparsers(dest="verb")
+    sub.add_parser("condition")
+    sub.add_parser("check")
+    sub.add_parser("run")
+    st = sub.add_parser("still")
+    st.add_argument("--out", required=True)
+    co = sub.add_parser("cost")
+    co.add_argument("--seconds", type=int, default=1800)
+    args = p.parse_args(argv)
+    try:
+        camera = camera_relay.camera_name(args.camera)
+    except door_relay.Invalid as exc:
+        mc.log("camera presence: REFUSED - %s" % exc, warning=True)
+        return 2
+    if args.verb == "condition":
+        on = mc.knob_bool(mc.read_knobs(args.env_file), knob(camera, "ENABLED"), False)
+        mc.log("camera presence [%s]: %s is %s" % (camera, knob(camera, "ENABLED"),
+                                                   "true - starting" if on else "not true - clean skip"))
+        return 0 if on else 1
+    if args.verb == "check":
+        return check(args.env_file, camera)
+    if args.verb == "run":
+        return run_service(args.env_file, camera)
+    if args.verb == "still":
+        return still(args.env_file, camera, args.out)
+    if args.verb == "cost":
+        return cost(args.env_file, camera, args.seconds)
+    p.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

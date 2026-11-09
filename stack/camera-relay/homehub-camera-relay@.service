@@ -1,0 +1,37 @@
+# homehub-camera-relay@<camera> - one camera's own go2rtc relay (SR-155;
+# stack/camera-relay/README.md). The door relay's pattern, per camera: the
+# relay holds the camera's one connection and re-serves it on the hub's LAN
+# address with the CAMERA'S OWN login, so a second camera never shares the
+# doorbell's credential and restarting one relay never touches the other.
+#
+# The knob is CAMERA_<CAMERA>_RELAY_ENABLED in the stack .env, read by
+# ExecCondition: off, the instance is a clean skip. The compose service is
+# camera-relay-<camera> behind profile camera-relay-<camera>, which this unit is
+# the only caller of: NEVER put it in COMPOSE_PROFILES. Its output reaches the
+# journal only through `redact-run` (go2rtc prints the camera URL, credential
+# included, when the camera drops), and docker keeps no log at all.
+[Unit]
+Description=Camera relay (%i, go2rtc): the camera's one RTSP session, re-served on the LAN
+Documentation=file:///opt/homehub/stack/camera-relay/README.md
+Wants=docker.service network-online.target
+After=docker.service network-online.target homehub-firstboot.service
+AssertPathExists=/opt/homehub/stack/camera-relay/camera_relay.py
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/homehub/stack
+ExecCondition=/usr/bin/python3 /opt/homehub/stack/camera-relay/camera_relay.py --camera %i condition
+ExecStartPre=/usr/bin/python3 /opt/homehub/stack/camera-relay/camera_relay.py --env-file /opt/homehub/stack/.env --camera %i render
+ExecStartPre=-/usr/bin/docker rm -f homehub-camera-relay-%i
+ExecStart=/usr/bin/python3 /opt/homehub/stack/camera-relay/camera_relay.py --env-file /opt/homehub/stack/.env --camera %i redact-run -- /usr/bin/docker compose --profile camera-relay-%i up --no-deps --no-log-prefix --exit-code-from camera-relay-%i camera-relay-%i
+ExecStop=/usr/bin/docker compose --profile camera-relay-%i stop --timeout 10 camera-relay-%i
+ExecStopPost=-/usr/bin/docker rm -f homehub-camera-relay-%i
+RuntimeDirectory=homehub-camera-relay-%i
+RuntimeDirectoryMode=0700
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=180
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

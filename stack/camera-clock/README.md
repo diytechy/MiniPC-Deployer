@@ -56,15 +56,42 @@ and never appears in argv, the environment or a log.
 ```sh
 # 1. the zip (from the manifest's URL, with its Referer) onto the hub's /tmp, then:
 sudo bash /opt/homehub/stack/camera-clock/install-camera-clock-sdk.sh --zip /tmp/EN-HCNetSDKV6.1.11.40_build20260922_linux64.zip
-# 2. the CAMERA_LIVINGROOM_CLOCK_* keys into .env (the relay's credential is already there)
+# 2. the CAMERA_LIVINGROOM_CLOCK_* keys into .env (the relay's credential is already there).
+#    `check` verifies the pin and the settings WITHOUT loading the library:
 sudo python3 /opt/homehub/stack/camera-clock/camera_clock.py --camera livingroom check
-sudo python3 /opt/homehub/stack/camera-clock/camera_clock.py --camera livingroom read
-# 3. units, knob true, timer on
+# 3. units, knob true. THE ACCEPTANCE GATE is one pass run by the unit itself, inside its
+#    sandbox - never run `read`/`sync` from a root shell, which would give the vendor
+#    library unconfined root and the internet:
 sudo install -m 0644 /opt/homehub/stack/camera-clock/homehub-camera-clock@.service /opt/homehub/stack/camera-clock/homehub-camera-clock@.timer /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now homehub-camera-clock@livingroom.timer
+sudo systemctl daemon-reload
 sudo systemctl start homehub-camera-clock@livingroom.service; journalctl -t homehub-camera-clock -n 5
-cat /var/lib/homehub-camera-clock/livingroom.json
+sudo cat /var/lib/homehub-camera-clock/livingroom.json      # "ok": true, the camera's and the hub's times
+# 4. only then the timer
+sudo systemctl enable --now homehub-camera-clock@livingroom.timer
 ```
+
+**The safeguards (review 2026-11-09):**
+
+- **The hub's own clock.** The hub's clock is never copied to the camera
+  unless it is synchronised (`/run/systemd/timesync/synchronized`, or
+  `timedatectl`'s `NTPSynchronized=yes`) and reads 2024 or later. A pass
+  that finds it unsynchronised skips and says so.
+- **Failed logins.** A refused credential (wrong code, no such user, locked)
+  stops logins for an hour (`<camera>.backoff`). Otherwise retries every ten
+  minutes would extend a lockout that also blocks the relay, which uses the
+  same address and login.
+- **Status.** Any failure leaves `"ok": false` in the status file.
+- **The SDK's log.** The library always runs from an empty private
+  directory, so it never finds a log switch file. If closing its log is
+  refused, the pass fails.
+
+**Not proven:**
+
+- **Summer time.** The only runs were in standard time. If the camera applies
+  its own daylight-saving rule to a time set this way, every pass after the
+  March change will fail its read-back loudly.
+- **Reinstalling the hub.** No firstboot or image step installs the SDK,
+  the unit or the timer, so a reimage drops this fix (FOLLOWUPS).
 
 ## Tests
 

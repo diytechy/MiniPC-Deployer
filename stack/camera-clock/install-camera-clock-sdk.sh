@@ -27,8 +27,8 @@ done
 want=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["zip"]["sha256"])' "$here/sdk.manifest.json")
 [ "$(sha256sum "$zip" | cut -d' ' -f1)" = "$want" ] || fail "the zip is not the pinned release (sdk.manifest.json)"
 
-install -d -m 0755 "$root"
-stage=$(mktemp -d "$root/.sdk.XXXXXX")
+install -d -m 0755 "$root" "$root/releases"
+stage=$(mktemp -d "$root/releases/.stage.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
 python3 -I - "$zip" "$here/sdk.manifest.json" "$stage/lib" <<'PY'
 import hashlib, json, os, sys, zipfile
@@ -54,12 +54,24 @@ python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import camera_clock 
     "$here" "$stage" || fail "the staged SDK does not verify"
 chmod -R a+rX "$stage"
 chmod 0755 "$stage"
-rm -rf "$root/sdk.previous"
-[ ! -e "$root/sdk" ] || mv -T "$root/sdk" "$root/sdk.previous"
-if ! mv -T "$stage" "$root/sdk"; then
-    [ ! -e "$root/sdk.previous" ] || mv -T "$root/sdk.previous" "$root/sdk"
-    fail "could not swap the SDK in; the previous set is back"
-fi
+sync -f "$stage/lib/libhcnetsdk.so"
+# THE SWITCH IS ONE RENAME (review 2026-11-09): each release is its own
+# directory, and $root/sdk is a symlink replaced by rename(2), so an interrupted
+# install leaves either the old release or the new one live, never neither.
+release="$root/releases/$(date -u +%Y%m%dT%H%M%SZ)"
+mv -T "$stage" "$release"
 trap - EXIT
-rm -rf "$root/sdk.previous"
+if [ -d "$root/sdk" ] && [ ! -L "$root/sdk" ]; then
+    mv -T "$root/sdk" "$root/releases/legacy-$(date -u +%Y%m%dT%H%M%SZ)"   # a pre-symlink install
+fi
+ln -sfn "$release" "$root/.sdk.new"
+mv -T "$root/.sdk.new" "$root/sdk"
+sync -f "$root"
+# Keep the live release and the one before it; older ones go.
+live=$(readlink -f "$root/sdk")
+ls -1dt "$root"/releases/*/ 2>/dev/null | sed 's:/$::' | while read -r r; do
+    [ "$r" = "$live" ] && continue
+    if [ -z "${kept:-}" ]; then kept=1; continue; fi
+    rm -rf "$r"
+done
 echo "[camera-clock-sdk] installed: $root/sdk/lib ($(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["release"])' "$here/sdk.manifest.json"))"

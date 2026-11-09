@@ -57,18 +57,21 @@ def no_override(monkeypatch, tmp_path):
 
 
 class FakeSdk:
-    def __init__(self, camera_time, keeps=True, login_ok=True):
+    def __init__(self, camera_time, keeps=True, login_ok=True, login_code=1, get_raises=None):
         self.camera_time, self.keeps, self.login_ok = camera_time, keeps, login_ok
+        self.login_code, self.get_raises = login_code, get_raises
         self.calls, self.closed, self.login_args = [], False, None
 
     def login(self, host, port, username, password):
         self.calls.append("login")
         self.login_args = (host, port, username, password)
         if not self.login_ok:
-            raise cc.SdkError("login refused (SDK error 1)")
+            raise cc.SdkError("login refused (SDK error %d)" % self.login_code, code=self.login_code)
 
     def get_time(self):
         self.calls.append("get")
+        if self.get_raises:
+            raise self.get_raises
         return self.camera_time
 
     def set_time(self, when):
@@ -168,7 +171,8 @@ def test_tc1751_set_when_off_by_more_than_the_drift_or_freshly_powered_up(camera
 def test_tc1752_a_fresh_power_up_is_set_and_logged_without_the_credential(tmp_path):
     s = cc.ClockSettings(write_env(tmp_path), "livingroom")
     sdk, lines = FakeSdk(T(1970, 1, 1, 0, 20, 6)), []
-    rec = cc.sync(s, sdk, now=lambda: T(2026, 11, 9, 15, 33, 51), log=lambda m, warning=False: lines.append(m))
+    rec = cc.sync(s, sdk, now=lambda: T(2026, 11, 9, 15, 33, 51), log=lambda m, warning=False: lines.append(m),
+                  synchronized=lambda: True)
     assert sdk.calls == ["login", "get", "set", "get"] and sdk.login_args == ("192.0.2.69", 8000, "admin", PASSWORD)
     assert rec["set"] is True and rec["after"] == "2026-11-09T15:33:51"
     assert len(lines) == 1 and "1970-01-01 00:20:06" in lines[0]
@@ -178,7 +182,8 @@ def test_tc1752_a_fresh_power_up_is_set_and_logged_without_the_credential(tmp_pa
 def test_tc1752_a_clock_in_step_is_left_alone_and_logs_nothing(tmp_path):
     s = cc.ClockSettings(write_env(tmp_path), "livingroom")
     sdk, lines = FakeSdk(T(2026, 11, 9, 15, 33, 52)), []
-    rec = cc.sync(s, sdk, now=lambda: T(2026, 11, 9, 15, 33, 51), log=lambda m, warning=False: lines.append(m))
+    rec = cc.sync(s, sdk, now=lambda: T(2026, 11, 9, 15, 33, 51), log=lambda m, warning=False: lines.append(m),
+                  synchronized=lambda: True)
     assert sdk.calls == ["login", "get"] and rec["set"] is False and lines == []
 
 
@@ -186,7 +191,7 @@ def test_tc1752_a_camera_that_does_not_keep_the_time_fails(tmp_path):
     s = cc.ClockSettings(write_env(tmp_path), "livingroom")
     with pytest.raises(cc.SdkError, match="did not keep"):
         cc.sync(s, FakeSdk(T(1970, 1, 1), keeps=False), now=lambda: T(2026, 11, 9, 15, 0, 0),
-                log=lambda *a, **k: None)
+                log=lambda *a, **k: None, synchronized=lambda: True)
 
 
 # ── TC-1753 main: cleanup on every path, status, refusals ────────────────────
@@ -195,6 +200,7 @@ def test_tc1752_a_camera_that_does_not_keep_the_time_fails(tmp_path):
 def run_main(tmp_path, monkeypatch, sdk, verb="sync", **env_over):
     path = write_env(tmp_path, **env_over)
     monkeypatch.setattr(cc, "verify_sdk", lambda d, m: "/fake/lib")
+    monkeypatch.setattr(cc, "hub_clock_synchronized", lambda: True)
     monkeypatch.setattr(cc, "STATE_DIR", str(tmp_path / "state"))
     status = {}
     monkeypatch.setattr(cc, "write_status", lambda cam, rec, state_dir=None: status.update(rec))
@@ -261,4 +267,97 @@ def test_tc1756_the_template_ships_it_off_and_the_installer_checks_before_it_swa
     assert env_example("CAMERA_LIVINGROOM_CLOCK_PORT") == "8000"
     sh = unit("install-camera-clock-sdk.sh")
     assert sh.index('[ "$(sha256sum "$zip"') < sh.index("zipfile.ZipFile") < sh.index("verify_sdk") < sh.index('mv -T "$stage"')
-    assert "the previous set is back" in sh
+    # One rename switches releases: a symlink, never two moves (review 2026-11-09).
+    assert 'ln -sfn "$release" "$root/.sdk.new"' in sh and 'mv -T "$root/.sdk.new" "$root/sdk"' in sh
+    assert sh.index('mv -T "$stage" "$release"') < sh.index('ln -sfn')
+
+
+# ── review 2026-11-09: each fix pinned ───────────────────────────────────────
+
+
+def test_tc1752_an_unsynchronised_hub_never_writes_its_clock_to_the_camera(tmp_path):
+    s = cc.ClockSettings(write_env(tmp_path), "livingroom")
+    for synced, hub in ((False, T(2026, 11, 9, 15, 0, 0)), (True, T(2019, 6, 1, 0, 0, 0))):
+        sdk, lines = FakeSdk(T(1970, 1, 1)), []
+        rec = cc.sync(s, sdk, now=lambda: hub, log=lambda m, warning=False: lines.append(m),
+                      synchronized=lambda: synced)
+        assert "set" not in sdk.calls and rec["set"] is False and "not synchronised" in rec["skipped"]
+        assert len(lines) == 1
+
+
+def test_tc1752_hub_clock_synchronized_reads_the_flag_then_timedatectl(tmp_path):
+    flag = tmp_path / "synchronized"
+    flag.write_text("")
+    assert cc.hub_clock_synchronized(str(flag))
+    class Done:
+        def __init__(self, out, rc=0):
+            self.stdout, self.returncode = out, rc
+    absent = str(tmp_path / "absent")
+    assert cc.hub_clock_synchronized(absent, run=lambda *a, **k: Done("yes" + chr(10)))
+    assert not cc.hub_clock_synchronized(absent, run=lambda *a, **k: Done("no" + chr(10)))
+    def boom(*a, **k):
+        raise OSError("no timedatectl")
+    assert not cc.hub_clock_synchronized(absent, run=boom)
+
+
+def test_tc1753_an_unexpected_error_leaves_a_red_status_not_a_stale_green_one(tmp_path, monkeypatch):
+    sdk = FakeSdk(T(1970, 1, 1), get_raises=ValueError("month 0"))
+    rc, status = run_main(tmp_path, monkeypatch, sdk)
+    assert rc == 1 and sdk.closed and status["ok"] is False and "ValueError" in status["error"]
+
+
+def test_tc1753_a_refused_credential_backs_off_and_a_network_failure_does_not(tmp_path, monkeypatch):
+    sdk = FakeSdk(T(1970, 1, 1), login_ok=False, login_code=1)
+    rc, status = run_main(tmp_path, monkeypatch, sdk)
+    assert rc == 1 and (tmp_path / "state" / "livingroom.backoff").exists()
+    assert "wrong username or password" in status["error"]
+    again = FakeSdk(T(1970, 1, 1))
+    rc, status = run_main(tmp_path, monkeypatch, again)
+    assert rc == 0 and again.calls == [] and "backing off" in status["error"]
+    (tmp_path / "state" / "livingroom.backoff").unlink()
+    net = FakeSdk(T(1970, 1, 1), login_ok=False, login_code=7)
+    run_main(tmp_path, monkeypatch, net)
+    assert not (tmp_path / "state" / "livingroom.backoff").exists()
+
+
+def test_tc1753_the_sdk_runs_from_an_empty_private_directory(tmp_path, monkeypatch):
+    seen = []
+    class Spy(FakeSdk):
+        def login(self, *a):
+            seen.append(cc.os.getcwd())
+            super().login(*a)
+    before = cc.os.getcwd()
+    run_main(tmp_path, monkeypatch, Spy(T(1970, 1, 1)))
+    assert seen and seen[0] != before and "camera-clock-" in seen[0] and cc.os.getcwd() == before
+    assert not cc.os.path.exists(seen[0])
+
+
+class FakeLib:
+    def __init__(self, log_ok):
+        self.log_ok, self.cleaned = log_ok, False
+
+    def NET_DVR_SetSDKInitCfg(self, *a):
+        return 1
+
+    def NET_DVR_Init(self):
+        return 1
+
+    def NET_DVR_SetLogToFile(self, *a):
+        return 1 if self.log_ok else 0
+
+    def NET_DVR_GetLastError(self):
+        return 103
+
+    def NET_DVR_SetConnectTime(self, *a):
+        return 1
+
+    def NET_DVR_Cleanup(self):
+        self.cleaned = True
+
+
+def test_tc1750_a_log_that_cannot_be_closed_refuses_and_cleans_up():
+    lib = FakeLib(log_ok=False)
+    with pytest.raises(cc.SdkError, match="103"):
+        cc.HikSdk("/fake/lib", loader=lambda path: lib)
+    assert lib.cleaned
+    assert cc.HikSdk("/fake/lib", loader=lambda path: FakeLib(log_ok=True)).uid == -1

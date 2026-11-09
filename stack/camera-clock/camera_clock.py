@@ -43,7 +43,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
+import time
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -171,6 +174,18 @@ class _Time(ctypes.Structure):
 class SdkError(RuntimeError):
     """An SDK call failed; carries the call's name and the SDK's error number only."""
 
+    def __init__(self, message: str, code: int = 0):
+        super().__init__(message)
+        self.code = code
+
+
+# Login errors that mean "the credential is wrong or the account is locked":
+# retrying every 10 minutes from the hub would extend a lockout that also
+# blocks the relay (same address, same login), so the timer backs off.
+CREDENTIAL_ERRORS = {1: "wrong username or password", 47: "no such user", 153: "user locked",
+                     193: "user locked"}
+BACKOFF_SEC = 3600
+
 
 class HikSdk:
     """The four calls this needs: login, get time, set time, logout. One
@@ -186,9 +201,14 @@ class HikSdk:
         self.sdk.NET_DVR_SetSDKInitCfg(INIT_SSLEAY_PATH, ctypes.c_char_p(os.path.join(lib_dir, "libssl.so.3").encode()))
         if not self.sdk.NET_DVR_Init():
             raise SdkError("NET_DVR_Init failed (SDK error %d)" % self.sdk.NET_DVR_GetLastError())
-        # Level 0 closes the SDK's own file log (its HCNetSDK_Log_Switch.xml asks
-        # for INFO into ./SDKLOG/): nothing of the camera's is written anywhere.
-        self.sdk.NET_DVR_SetLogToFile(0, None, 1)
+        # Level 0 closes the SDK's own file log. The library reads
+        # ./HCNetSDK_Log_Switch.xml from the CURRENT directory (and then refuses
+        # this call, error 103), so main() always runs it from an empty private
+        # directory; a refusal here is a failure, not a shrug (review 2026-11-09).
+        if not self.sdk.NET_DVR_SetLogToFile(0, None, 1):
+            code = self.sdk.NET_DVR_GetLastError()
+            self.sdk.NET_DVR_Cleanup()
+            raise SdkError("the SDK's file log could not be closed (SDK error %d)" % code)
         self.sdk.NET_DVR_SetConnectTime(5000, 1)
         self.uid = -1
 
@@ -204,7 +224,8 @@ class HikSdk:
         self.uid = self.sdk.NET_DVR_Login_V40(ctypes.byref(info), ctypes.byref(device))
         ctypes.memset(ctypes.addressof(info), 0, ctypes.sizeof(info))
         if self.uid < 0:
-            raise SdkError("login refused (SDK error %d)" % self.sdk.NET_DVR_GetLastError())
+            code = self.sdk.NET_DVR_GetLastError()
+            raise SdkError("login refused (SDK error %d)" % code, code=code)
 
     def get_time(self) -> datetime.datetime:
         t = _Time()
@@ -243,11 +264,34 @@ def local_now() -> datetime.datetime:
     return datetime.datetime.now().replace(microsecond=0)
 
 
+TIMESYNC_FLAG = "/run/systemd/timesync/synchronized"
+
+
+def hub_clock_synchronized(flag: str = TIMESYNC_FLAG, run=None) -> bool:
+    """True only when the hub's own clock is known good: systemd-timesyncd's
+    flag file, else timedatectl's NTPSynchronized=yes. Unknown is False: after
+    a power cut the hub's RTC may be stale, and copying it to the camera would
+    read back "correct" against the same stale clock (review 2026-11-09).
+    Implements: LLR-1516."""
+    if os.path.exists(flag):
+        return True
+    import subprocess
+    run = run or subprocess.run
+    try:
+        done = run(["timedatectl", "show", "--property", "NTPSynchronized", "--value"], stdout=subprocess.PIPE,
+                   stderr=subprocess.DEVNULL, universal_newlines=True, timeout=10)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0 and done.stdout.strip() == "yes"
+
+
 def sync(s: ClockSettings, sdk, now: Callable[[], datetime.datetime] = local_now,
-         log: Callable[..., None] = mc.log) -> Dict[str, object]:
+         log: Callable[..., None] = mc.log,
+         synchronized: Optional[Callable[[], bool]] = None) -> Dict[str, object]:
     """One pass: log in, read, set when needed, read back. Returns the status
     record; raises SdkError. The caller closes the SDK. Never logs a
-    credential. Implements: LLR-1516."""
+    credential. Never sets from a hub clock that is not synchronised, or
+    before SANE_YEAR. Implements: LLR-1516."""
     tag = "camera clock [%s]" % s.camera
     sdk.login(s.host, s.port, s.username, s.password)
     before = sdk.get_time()
@@ -255,6 +299,11 @@ def sync(s: ClockSettings, sdk, now: Callable[[], datetime.datetime] = local_now
     set_it, drift = needs_set(before, hub, s.max_drift)
     record = {"camera": s.camera, "camera_time": before.isoformat(), "hub_time": hub.isoformat(),
               "drift_sec": round(drift, 1), "set": False}
+    if set_it and (hub.year < SANE_YEAR or not (synchronized or hub_clock_synchronized)()):
+        record["skipped"] = "the hub's own clock is not synchronised; nothing set"
+        log("%s: camera is %+.0fs from the hub, but the hub's clock is not synchronised - not set this pass"
+            % (tag, drift), warning=True)
+        return record
     if set_it:
         target = now()
         sdk.set_time(target)
@@ -312,7 +361,18 @@ def main(argv: Optional[Sequence[str]] = None, sdk_factory: Optional[Callable[[s
         door_relay.emit({"camera": camera, "eligible": True, "enabled": s.enabled, "port": s.port,
                          "max_drift_sec": s.max_drift, "sdk": read_manifest().get("release")})
         return 0
+    backoff = os.path.join(STATE_DIR, "%s.backoff" % camera)
+    if args.verb == "sync":
+        until = read_backoff(backoff)
+        if until and until > time.time():
+            write_status(camera, {"camera": camera, "ok": False, "at": local_now().isoformat(),
+                                  "error": "backing off after a refused login until %s"
+                                           % datetime.datetime.fromtimestamp(until).isoformat(timespec="seconds")})
+            return 0
     factory = sdk_factory or HikSdk
+    workdir = tempfile.mkdtemp(prefix="camera-clock-")   # empty: no log switch file to obey
+    previous_cwd = os.getcwd()
+    os.chdir(workdir)
     try:
         sdk = factory(lib)
         try:
@@ -324,13 +384,45 @@ def main(argv: Optional[Sequence[str]] = None, sdk_factory: Optional[Callable[[s
             record = sync(s, sdk)
         finally:
             sdk.close()
-    except SdkError as exc:
-        mc.log("%s: %s" % (tag, exc), warning=True)
-        write_status(camera, {"camera": camera, "ok": False, "error": str(exc),
-                              "at": local_now().isoformat()})
+    except Exception as exc:  # noqa: BLE001 - any failure must leave a red status, never a stale green one
+        detail = str(exc) if isinstance(exc, SdkError) else "%s (unexpected)" % type(exc).__name__
+        mc.log("%s: %s" % (tag, detail), warning=True)
+        if isinstance(exc, SdkError) and exc.code in CREDENTIAL_ERRORS:
+            write_backoff(backoff, time.time() + BACKOFF_SEC)
+            detail += "; %s - no login for %d min" % (CREDENTIAL_ERRORS[exc.code], BACKOFF_SEC // 60)
+            mc.log("%s: %s" % (tag, detail), warning=True)
+        write_status(camera, {"camera": camera, "ok": False, "error": detail, "at": local_now().isoformat()})
         return 1
-    write_status(camera, dict(record, ok=True, at=local_now().isoformat()))
+    finally:
+        os.chdir(previous_cwd)
+        shutil.rmtree(workdir, ignore_errors=True)
+    clear_backoff(backoff)
+    write_status(camera, dict(record, ok="skipped" not in record, at=local_now().isoformat()))
     return 0
+
+
+def read_backoff(path: str) -> Optional[float]:
+    try:
+        with open(path, encoding="ascii") as handle:
+            return float(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def write_backoff(path: str, until: float) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o750, exist_ok=True)
+        with open(path, "w", encoding="ascii") as handle:
+            handle.write("%d\n" % until)
+    except OSError:
+        pass
+
+
+def clear_backoff(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

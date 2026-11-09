@@ -14,7 +14,7 @@
 [Unit]
 Description=Camera clock (%i): set the camera's clock from the hub
 Documentation=file:///opt/homehub/stack/camera-clock/README.md
-After=network-online.target homehub-firstboot.service
+After=network-online.target time-sync.target homehub-firstboot.service
 Wants=network-online.target
 AssertPathExists=/opt/homehub/stack/camera-clock/camera_clock.py
 

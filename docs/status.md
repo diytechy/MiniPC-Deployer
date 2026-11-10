@@ -3219,3 +3219,26 @@ tests/test_panel_amp_trigger_sleep.py, tests/test_wall_amp_trigger.py and
 tests/test_panel_audio.py passed together (146 passed / 1 skipped). LF and
 diff checks pass; firstboot matches 5d848b5 byte-for-byte. Next action is Owner
 review and paired release. No merge or push.
+
+## 2026-11-09 - volume previews readable by the kiosk; MIN_OFF across restarts
+
+Branch `panel-preview-dir-and-min-off` (LLR-1481..1482, TC-1716..1717).
+Found on the panel: the Owner reported MUTED (OfficeWallNaglight WSN-120)
+never appearing. As `panel`, `ls /run/wall-volume-gesture/` is Permission
+denied: systemd 255 puts a DynamicUser RuntimeDirectory under root-0700
+/run/private behind a symlink, so no preview document has ever reached the
+renderer since the 2026-09-19 move to that directory. Two synthetic preview
+documents (output mute, then speaker at 60) written as root drew nothing on
+the glass. The level overlay only ever rose from the audio-state file, which
+a refused set on Mute does not change. Fix: wall-volume-keys runs as a static
+system user created by firstboot before the unit is installed, and firstboot
+checks readability as `panel`. The amp trigger now keeps its earliest
+verified OFF beside the S3 proof and starts changed_at from it.
+Measured: the five touched suites 333 passed. Five mutations each caught
+(changed_at 0.0; ledger always overwritten; ledger ignored at start; ledger
+not revoked before ON; DynamicUser restored). validate_config.py, bash -n,
+LF checks and trace.py --strict-integrity (integrity 0, 25 orphans
+unchanged) pass. Not proven: nothing on the panel yet. The static user,
+systemd's move of the old private directory, the kiosk's first real
+previews (the whole schema-2 lead, never seen on the glass before) and MUTED
+need the paired release and the Owner's presses.

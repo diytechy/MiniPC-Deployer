@@ -63,8 +63,11 @@ only the Contract cell's opening words; the CSV holds the contract.
 | **IF-074** | Provides | HomeHub (the Owner and agents: charts, debugging, later analysis) | Implemented | v1 | SR-122, SR-123, SR-124 | v1 hub metrics log (SR-122..SR-124), all JSONL, one object per line, UTC epochs. … |
 | **IF-075** | Provides | OtterTube (desktop app's update check) and HomeHub (the publisher) | Implemented | v1 | SR-125, SR-126, SR-127 | v1 OtterTube update channel (SR-125..SR-127). On the OtterTube site (IF-073; LAN only, the site knob … |
 | **IF-076** | Provides | event sources: the hub detector (stack/camera-motion); later an ONVIF adapter and the panel's spool | Implemented | v1 | SR-128, SR-129 | v1 camera motion-event record and store (SR-128). One compact JSON object per line, at most 512 bytes: {v: 1 … |
-| **IF-077** | Provides | whoever reads motion clips: the Owner over a share (later), Jellyfin never | Implemented | v1 | SR-129, SR-130, SR-131 | v1 motion clips tree (SR-129..SR-131). &lt;CLIPS_ROOT>/&lt;camera>/&lt;local YYYY-MM-DD>/&lt;camera>_&lt;local … |
+| **IF-077** | Provides | whoever reads motion clips: the Owner over the hidden, admin-only, read-only Clips share (SR-148), Jellyfin never | Implemented | v1 | SR-129, SR-130, SR-131 | v1 motion clips tree (SR-129..SR-131). &lt;CLIPS_ROOT>/&lt;camera>/&lt;local YYYY-MM-DD>/&lt;camera>_&lt;local … |
 | **IF-078** | Consumes | FileBackup (its IF-001, the OCI image contract; ids are repo-local) | Implemented | v1 | SR-018, SR-132, SR-133, SR-134 | v1 the hub's side of FileBackup's image contract, per store layout (SR-133). legacy (default): compose … |
+| **IF-079** | Provides | OfficeWallNaglight (the door broker) | Implemented | v1 | SR-146, SR-147 | v1 hub door event feed (SR-146, SR-147). TCP on &lt;hub LAN_IP>:&lt;CAMERA_&lt;C>_MOTION_FEED_PORT>, off at 0 (the … |
+| **IF-081** | Provides | EntertainmentPC (MINI-SERV's low-power manager and wake logic); later the wall panel if the Owner asks | Draft | v1 | SR-157, SR-158 | v1 living-room presence events (SR-157, SR-158). TCP on &lt;hub LAN_IP>:&lt;CAMERA_LIVINGROOM_PRESENCE_FEED_PORT> … |
+| **IF-082** | Provides | EntertainmentPC (MINI-SERV: its own detection and the voice assistant's microphone) | Draft | v1 | SR-155, SR-156 | v1 living-room camera relay (SR-155, SR-156). rtsp://&lt;hub LAN_IP>:&lt;CAMERA_LIVINGROOM_RELAY_RTSP_PORT … |
 <!-- END GENERATED IF INDEX -->
 
 ## Notes on selected interfaces (hand-written)

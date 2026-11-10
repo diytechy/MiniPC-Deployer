@@ -1,0 +1,49 @@
+# homehub-camera-presence@<camera> - room presence from one relayed camera
+# (SR-157..SR-160; stack/camera-presence/README.md). One frame a second from the
+# camera's own relay, video only; state changes on the IF-081 feed and in
+# /var/lib/homehub-presence/<camera>/status.json. It writes no frame anywhere.
+#
+# The knob is CAMERA_<CAMERA>_PRESENCE_ENABLED, read by ExecCondition (a clean
+# skip when off). It SHIPS OFF: the deploy step is the declared cost test first.
+# 78 = refused (zones still the placeholder, a model not the pinned bytes, the
+# runtime missing, a knob malformed): an alert, no restart loop.
+#
+# The detector runs on /opt/homehub-presence/venv (onnxruntime;
+# install-presence-runtime.sh). CPUQuota bounds the detector; the decoder runs
+# in docker's cgroup under its own --cpus 0.3. Both are ceilings: the budget is
+# `camera_presence.py cost`'s verdict.
+[Unit]
+Description=Camera presence (%i): is someone in the room, outside the excluded zones
+Documentation=file:///opt/homehub/stack/camera-presence/README.md
+Wants=docker.service network-online.target homehub-camera-relay@%i.service
+After=docker.service network-online.target homehub-camera-relay@%i.service homehub-firstboot.service
+AssertPathExists=/opt/homehub/stack/camera-presence/camera_presence.py
+# A missing runtime fails the unit once (an assert is not restarted), never a 203/EXEC loop.
+AssertPathExists=/opt/homehub-presence/venv/bin/python
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/homehub/stack
+ExecCondition=/usr/bin/python3 /opt/homehub/stack/camera-presence/camera_presence.py --camera %i condition
+ExecStart=/opt/homehub-presence/venv/bin/python /opt/homehub/stack/camera-presence/camera_presence.py --camera %i run
+ExecStopPost=-/usr/bin/docker rm -f homehub-camera-presence-%i
+SyslogIdentifier=homehub-camera-presence
+StateDirectory=homehub-presence
+StateDirectoryMode=0750
+Restart=on-failure
+RestartSec=15
+RestartPreventExitStatus=78
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+CPUAccounting=true
+CPUQuota=35%
+MemoryAccounting=true
+MemoryMax=512M
+TasksMax=64
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

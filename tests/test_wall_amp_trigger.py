@@ -13,6 +13,17 @@ WALL = ROOT / "stack" / "autoinstall" / "wall"
 MODULE_PATH = WALL / "panel-amp-trigger.py"
 
 
+def test_firstboot_restarts_the_amp_after_mode_enablement_llr1440():
+    """A paired release must load the new settle into the running daemon."""
+    firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
+    start = firstboot.index("apply_audio_mode() {")
+    helper = firstboot[start:firstboot.index("\n}\n", start)]
+    applied = helper.index('if ! /usr/local/sbin/wall-audio-mode "$mode"')
+    restart = helper.index("systemctl try-restart wall-amp-trigger.service")
+    assert restart > applied
+    assert '||\n        warn "audio: wall-amp-trigger did not restart' in helper
+
+
 def load_module():
     spec = importlib.util.spec_from_file_location("panel_amp_trigger", MODULE_PATH)
     module = importlib.util.module_from_spec(spec)

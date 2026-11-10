@@ -453,6 +453,15 @@ status query; service start first establishes OFF, and suspend proceeds only
 after service shutdown has verified OFF. The second relay channel is outside
 this service's ownership.
 
+In Speaker, every relay close holds the fade floor for 8.5 seconds before the
+one-second fade to unity (SR-143, LLR-1440; Owner 2026-11-09). Firstboot
+try-restarts the active detector after mode application, which owns its
+enablement, so a paired release loads the installed code. Shutdown verifies
+relay OFF before restoring fade unity; startup verifies OFF again. The
+MIN_ON/MIN_OFF contact dwells govern transitions within a run; their timestamps
+are not persisted across a restart. A release can briefly silence the speakers
+and require one settle. A restart failure warns for operator inspection.
+
 ### The merged bus becomes the visualizer, and ProjectM's bounded exception (SR-041, LLR-950..958, IF-020)
 
 Two things are easy to misread from the rows. First, WHERE the signal is tapped

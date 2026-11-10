@@ -1980,6 +1980,17 @@ apply_audio_mode() {
         fail_step "audio: \`wall-audio-mode $mode\` FAILED. The switch may be HALF applied (mode file and symlink moved, legs not), which can leave two chains driving one adapter. Re-run by hand and read its output: sudo /usr/local/sbin/wall-audio-mode $mode"
         return 0
     fi
+    # SR-143, Owner 2026-11-09: 8.5 s. Mode application above owns amp
+    # enablement (and normally stops/starts it). Re-assert the installed code
+    # explicitly for a paired release, as for wall-volume-keys: enable alone
+    # leaves a long-lived daemon running the previous timing. SIGTERM opens
+    # and verifies the relay before restoring fade unity; startup verifies OFF
+    # again, and the next Speaker close takes the full settle. This may cost a
+    # short silence and one settle. MIN_ON/MIN_OFF protect loop transitions;
+    # their in-memory timestamps do not survive a service restart.
+    # An inactive unit stays inactive; a restart failure warns for inspection.
+    systemctl try-restart wall-amp-trigger.service >/dev/null 2>&1 ||
+        warn "audio: wall-amp-trigger did not restart — the amplifier may run the previous code until a reboot. Check: systemctl status wall-amp-trigger"
     local line
     for line in "$@"; do log "$line"; done
     return 0

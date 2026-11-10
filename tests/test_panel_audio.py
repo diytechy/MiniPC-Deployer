@@ -504,7 +504,9 @@ def test_firstboot_refuses_to_call_an_unapplied_audio_mode_a_success():
     body_start = firstboot.index("apply_audio_mode() {")
     body = firstboot[body_start:firstboot.index("\nesac\n", body_start)]
     assert body.count("fail_step") == 2, body
-    assert "warn " not in body
+    # Applying the mode must fail the step; only the subsequent daemon
+    # refresh, after a successful apply, may warn without failing firstboot.
+    assert "warn " not in body[:body.index("systemctl try-restart")]
     # Every arm goes through the helper, and no arm applies a mode any other way.
     case_start = firstboot.index('case "${WALL_AUDIO_MODE:-trigger}" in')
     case = firstboot[case_start:firstboot.index("\nesac\n", case_start)]
@@ -543,12 +545,13 @@ PAYLOAD=/payload
 log()  { echo "LOG $*"; }
 warn() { echo "WARN $*"; }
 fail_step() { PROVISION_FAILED=1; echo "ERROR $*" >&2; }
+systemctl() { echo "$*" >> systemctl.calls; return ${SYSTEMCTL_RESULT:-0}; }
 %s
 apply_audio_mode %s "success line one" "success line two"
 echo "REACHED_END failed=$PROVISION_FAILED"
 """
 
-    def run(mode, applier_body):
+    def run(mode, applier_body, restart_result=0):
         with tempfile.TemporaryDirectory() as tmp:
             if applier_body is not None:
                 stub = Path(tmp) / "wall-audio-mode"
@@ -559,8 +562,13 @@ echo "REACHED_END failed=$PROVISION_FAILED"
             # which keeps the script POSIX on a Windows dev box too.
             script = (harness % (helper, mode)).replace(
                 "/usr/local/sbin/wall-audio-mode", "./wall-audio-mode")
-            return subprocess.run(["bash", "-c", script], cwd=tmp,
-                                  capture_output=True, text=True)
+            result = subprocess.run(["bash", "-c",
+                                     "SYSTEMCTL_RESULT=%d\n" % restart_result + script],
+                                    cwd=tmp, capture_output=True, text=True)
+            calls = Path(tmp) / "systemctl.calls"
+            assert (calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []) == (
+                ["try-restart wall-amp-trigger.service"] if applier_body == "exit 0\n" else [])
+            return result
 
     missing = run("bus", None)
     assert "REACHED_END failed=1" in missing.stdout, missing
@@ -577,6 +585,10 @@ echo "REACHED_END failed=$PROVISION_FAILED"
     assert ok.stderr.strip() == ""
     assert "LOG success line one" in ok.stdout
     assert "LOG success line two" in ok.stdout
+
+    restart_failed = run("bus", "exit 0\n", restart_result=1)
+    assert "REACHED_END failed=0" in restart_failed.stdout
+    assert "WARN audio: wall-amp-trigger did not restart" in restart_failed.stdout
 
 
 def test_changed_module_options_rebuild_the_initramfs():

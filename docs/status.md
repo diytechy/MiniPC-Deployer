@@ -3255,3 +3255,29 @@ as a follow-up. Suites 335 passed; mutations 6-8 each caught. Full suite
 (-n 12, round 0): 6250 passed, 2 failed - test_tc1507 (known Windows path
 separators) and test_an_undeclared_method_still_starts_one, which passes
 alone with and without this branch (load-sensitive under -n 12).
+
+## 2026-11-10 - released: previews readable, MIN_OFF across restarts; the living-room training capture deployed
+
+Paired panel release of `cf4f7db` (with OfficeWallNaglight `153ba82`),
+transaction d7d8db30a6aa4cc1b90fbff78bc2c754, 00:13 CST, on the Owner's word:
+installed-verified-awaiting-visual-acceptance. On the panel: wall-volume-keys
+runs as wall-volkeys, /run/wall-volume-gesture is a real 0755 directory the
+kiosk user reads, no unit failed, no firstboot warning; relay-off-since read
+8.349 and survived firstboot's restart. A synthetic Mute preview, which drew
+nothing before, drew MUTED on the glass.
+
+Training capture (SR-162, LLR-1519..1523, TC-1757..1763; merge b20f2ef):
+Codex gpt-6.1-sol medium GO and Opus medium GO on dae67d6; their minors
+fixed in 2f4e0e4 (guard refusal retried every 60 s, 400 GiB quota and 300 GiB
+per stream, refused setup fails the condition, dry-run on a fresh drive, a
+running-deadline test and a setgid/ACL test on Linux). Full suite 6260 passed,
+2 failed (the two known ones). Deployed by hand to the hub 06:28Z: the
+module, unit and relay file (hashes equal to the merge), seven .env keys
+appended in place (backup /root/rollback-20261110/env-before-capture),
+ensure (root:root 0750 tree, no ACL, project 7106 inherited, 409600 MiB;
+second run no actions), relay restarted serving /livingroom-main video only,
+both units enabled and running until 2026-11-13T06:40:00Z. First segments
+of both streams decode clean (h264 1920x1080 and 768x432, 15 fps, no audio);
+two upstream connections; ~0.5% CPU per container. Not proven: a daytime
+rate, a reboot or relay restart inside the window, a drive drop. The hub's
+other stack files changed since f4d7e8c (25) all already match HEAD.

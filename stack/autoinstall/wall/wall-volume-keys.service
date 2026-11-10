@@ -24,10 +24,25 @@ After=wall-volume-request.socket
 [Service]
 Type=simple
 # Reading /dev/input/event* is the whole job, so this runs as a member of the
-# input group rather than as root. DynamicUser gives it an identity that owns
-# nothing and persists nothing.
-DynamicUser=true
+# input group rather than as root.
+#
+# A STATIC IDENTITY, NOT DynamicUser (2026-11-09). This unit was DynamicUser
+# until then, and on systemd 255 a DynamicUser unit's RuntimeDirectory is NOT
+# /run/wall-volume-gesture: it is /run/private/wall-volume-gesture behind a
+# symlink, and /run/private is root 0700. The kiosk runs as `panel`, so its
+# read of the preview document below failed with EACCES on every poll and the
+# renderer was never handed a single preview -- measured on the panel: `ls
+# /run/wall-volume-gesture/` as panel is "Permission denied". The overlay only
+# ever rose from the confirmed audio-state file, which is why it looked fine
+# while unmuted and showed nothing at all on Mute, where the applier refuses
+# the set and that file does not change (WSN-120 never reached the glass).
+# `wall-firstboot.sh` creates this system user before it installs the unit.
+# It owns no files outside the runtime directory, as the dynamic one did not.
+User=wall-volume-keys
+Group=wall-volume-keys
 SupplementaryGroups=input audio
+# The two DynamicUser implied that are not already spelled out below.
+RemoveIPC=true
 # THE PREVIEW DOCUMENT'S DIRECTORY, AND THE DEFECT IT REPAIRS. Measured on the
 # panel 2026-09-19: every press since WSN-063 shipped logged
 #
@@ -40,10 +55,12 @@ SupplementaryGroups=input audio
 # plan's whole preview protocol would have inherited the same silence.
 #
 # It is deliberately NOT `RuntimeDirectory=wall-panel`: systemd chowns a
-# RuntimeDirectory to the unit's user on every start, which would hand a
-# dynamic uid the directory root writes the audio state into. This daemon gets
-# its own, at 0755 so the kiosk can read the document, and Preserve=yes so a
+# RuntimeDirectory to the unit's user on every start, which would hand this
+# uid the directory root writes the audio state into. This daemon gets its
+# own, at 0755 so the kiosk can read the document, and Preserve=yes so a
 # restart mid-gesture does not take the directory out from under a reader.
+# The 0755 was not enough on its own while the unit was DynamicUser: see the
+# identity note above for the parent directory that defeated it.
 RuntimeDirectory=wall-volume-gesture
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes

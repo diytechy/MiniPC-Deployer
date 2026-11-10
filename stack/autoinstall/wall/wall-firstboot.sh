@@ -1728,7 +1728,19 @@ if [ -x /usr/local/sbin/wall-audio-output ]; then
     fi
 fi
 
-for _u in wall-volume-request.socket wall-volume-request@.service wall-line-in.service wall-volume-keys.service wall-kiosk-loop.service wall-amp-trigger.service          wall-usb-hub-reset@.service           wall-spdif-in.service wall-bus-speaker.service wall-speaker-out.service           wall-bus-headset.service wall-bus-bt-headset.service wall-bus-builtin.service wall-headset-present.service           wall-audio-state.service wall-audio-resume.service           wall-audio-apply.service wall-audio-apply.path           wall-mic-rear.service wall-bt-call.service           wall-bus-visualizer.service; do
+# wall-volume-keys runs as a STATIC system user (2026-11-09): as DynamicUser
+# its preview directory sat under root-only /run/private and the kiosk could
+# never read it. See the unit's identity note. Created before the unit is
+# installed, so no start can meet a User= that does not exist yet.
+if ! getent group wall-volume-keys >/dev/null 2>&1; then
+    groupadd --system wall-volume-keys
+fi
+if ! id -u wall-volume-keys >/dev/null 2>&1; then
+    useradd --system --gid wall-volume-keys --home-dir /nonexistent \
+        --shell /usr/sbin/nologin wall-volume-keys
+fi
+
+for _u in wall-volume-request.socket wall-volume-request@.service wall-line-in.service wall-volume-keys.service wall-kiosk-loop.service wall-amp-trigger.service          wall-usb-hub-reset@.service          wall-spdif-in.service wall-bus-speaker.service wall-speaker-out.service           wall-bus-headset.service wall-bus-bt-headset.service wall-bus-builtin.service wall-headset-present.service           wall-audio-state.service wall-audio-resume.service           wall-audio-apply.service wall-audio-apply.path           wall-mic-rear.service wall-bt-call.service           wall-bus-visualizer.service; do
     [ -f "$PAYLOAD/$_u" ] && install -m 0644 "$PAYLOAD/$_u" "/etc/systemd/system/$_u"
 done
 
@@ -1948,6 +1960,13 @@ case "${WALL_VOLUME_KEYS_ENABLED:-true}" in
             # costs the buttons, not the audio, so it warns.
             systemctl try-restart wall-volume-keys.service >/dev/null 2>&1 ||
                 warn "audio: wall-volume-keys did not restart — the volume buttons may run the previous code until a reboot. Check: systemctl status wall-volume-keys"
+            # THE READER'S VIEW, NOT THE WRITER'S (2026-11-09). The directory
+            # was 0755 for seven weeks while the kiosk could not open it,
+            # because its parent was root-only. Ask as the kiosk user.
+            if [ -d /run/wall-volume-gesture ] && id -u panel >/dev/null 2>&1 &&
+                ! runuser -u panel -- test -r /run/wall-volume-gesture/. 2>/dev/null; then
+                warn "audio: the kiosk user cannot read /run/wall-volume-gesture — volume previews and MUTED will not reach the panel. Check: ls -ld /run/wall-volume-gesture /run/private"
+            fi
         fi ;;
 esac
 

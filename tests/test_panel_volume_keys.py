@@ -56,9 +56,13 @@ def test_every_rocker_event_has_readout_sequence_sr028(level, louder):
         assert state["volume_event_seq"] == seq
     assert policy.normalize(state)["volume_event_seq"] == 2
 
-def test_rocker_keeps_dynamic_identity_and_only_unix_socket_sr028():
+def test_rocker_keeps_an_unprivileged_identity_and_only_unix_socket_sr028():
     unit = (WALL / "wall-volume-keys.service").read_text()
-    assert "DynamicUser=true" in unit
+    assert "User=wall-volume-keys" in unit and "Group=wall-volume-keys" in unit
+    assert "SupplementaryGroups=input audio" in unit
+    for implied in ("NoNewPrivileges=true", "PrivateTmp=true", "ProtectHome=true",
+                    "RestrictSUIDSGID=true", "RemoveIPC=true"):
+        assert implied in unit, implied
     assert "RestrictAddressFamilies=AF_UNIX" in unit
     assert "ProtectSystem=strict" in unit
     sock = (WALL / "wall-volume-request.socket").read_text()
@@ -854,6 +858,28 @@ def test_the_preview_directory_is_the_daemons_own(tmp_path):
     assert "RuntimeDirectory=wall-volume-gesture" in unit
     assert "RuntimeDirectoryMode=0755" in unit
     assert "/run/wall-panel/volume-gesture.json" not in keys.GESTURE_FILE
+
+
+def test_the_preview_directory_is_reachable_by_the_kiosk_wsn120():
+    """The second defect on the same path, 2026-11-09, pinned at its cause.
+
+    Under DynamicUser, systemd 255 puts a RuntimeDirectory at
+    /run/private/<name> (root 0700) behind a /run/<name> symlink, so the 0755
+    above never reached the kiosk user: every preview read was EACCES, no
+    preview ever reached the renderer, and MUTED (WSN-120) could not appear.
+    A DynamicUser line coming back would silently do the same again.
+    """
+    unit = (WALL / "wall-volume-keys.service").read_text(encoding="utf-8")
+    directives = [line.strip() for line in unit.splitlines()
+                  if line.strip() and not line.lstrip().startswith("#")]
+    assert not any(line.startswith("DynamicUser=") for line in directives)
+    firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
+    created = firstboot.index("useradd --system --gid wall-volume-keys")
+    loop = firstboot.index("for _u in wall-volume-request.socket")
+    assert "wall-volume-keys.service" in firstboot[loop:firstboot.index("done", loop)]
+    assert created < loop, "the user must exist before the unit can start"
+    # And firstboot asks the reader, not the writer.
+    assert "runuser -u panel -- test -r /run/wall-volume-gesture/." in firstboot
 
 
 # ── the apply actor: one in flight, one replaceable, and no queue ──────────

@@ -377,6 +377,9 @@ def test_a_restart_after_a_long_quiet_spell_closes_the_relay_without_waiting(
     """
     import time
     module, relay = restart_module, _RestartRelay()
+    # A wide MIN_OFF so the upper bound below has a second of room for a
+    # thread start on a busy machine.
+    monkeypatch.setattr(module, "MIN_OFF_SECONDS", 2.0)
     _RestartLevel.loud = False
 
     _first_start, stop = _restart_daemon(module, monkeypatch, relay)

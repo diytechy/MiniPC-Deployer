@@ -752,6 +752,46 @@ def test_the_whole_loop_sleeps_wakes_and_restores_unity_llr1436(daemon):
     assert all(argv[:6] == FADE_ARGV_HEAD for argv in rig.mixer.argvs)
 
 
+def test_every_relay_on_path_revokes_the_off_since_ledger_llr1482(daemon, tmp_path, monkeypatch):
+    """Both ways the loop energizes the relay -- the attack rule and the sleep
+    machine's wake -- revoke the off-since ledger before the ON (LLR-1482).
+
+    A ledger left standing across an ON would let the NEXT process believe
+    the relay had been open since before it was closed, and skip MIN_OFF.
+    """
+    rig = daemon
+    module = rig.module
+    real = load_module()
+    real.SAFE_STATE_FILE = str(tmp_path / "off-verified")
+    monkeypatch.setattr(module, "SAFE_STATE_FILE", real.SAFE_STATE_FILE)
+    monkeypatch.setattr(module, "record_safe_state", real.record_safe_state)
+    ledger = tmp_path / module.RELAY_OFF_SINCE_NAME
+    present_at_on = []
+    closes = rig.actuator.start
+
+    def start():
+        present_at_on.append(ledger.exists())
+        return closes()
+
+    rig.actuator.start = start
+    rig.thread.start()
+
+    # The attack rule closes it: the start-up OFF had written the ledger.
+    assert wait_until(lambda: present_at_on)
+    assert present_at_on == [False]
+    assert wait_until(lambda: rig.mixer.value == 60)
+    # Dark: the sleep machine opens it, which is a verified OFF.
+    rig.facts["lit"] = False
+    assert wait_until(lambda: rig.world.index_of("relay", "OFF") is not None)
+    assert wait_until(ledger.exists)
+    # Lit again: the sleep machine's wake closes it, and revokes first.
+    rig.facts["lit"] = True
+    assert wait_until(lambda: len(present_at_on) == 2)
+    assert present_at_on == [False, False]
+    rig.stop()
+    assert ledger.exists(), "the shutdown OFF is verified too"
+
+
 def test_the_loop_with_the_setting_off_is_todays_behaviour_llr1436(daemon):
     rig = daemon
     rig.facts["sleeps"] = False

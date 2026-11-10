@@ -946,14 +946,18 @@ def record_safe_state(verified, now=None):
     The relay's off-since instant goes with it (see RELAY_OFF_SINCE_NAME):
     revoked with the proof, and kept, not refreshed, while the proof stands.
     """
+    if not verified:
+        # The S3 proof first and each on its own: a failure to remove the
+        # ledger must never leave the proof standing over an energized relay.
+        for path in (SAFE_STATE_FILE, _relay_off_since_path()):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log("could not revoke %s: %s" % (path, exc))
+        return
     try:
-        if not verified:
-            for path in (_relay_off_since_path(), SAFE_STATE_FILE):
-                try:
-                    os.unlink(path)
-                except FileNotFoundError:
-                    pass
-            return
         tmp = SAFE_STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="ascii") as handle:
             handle.write("OFF\n")

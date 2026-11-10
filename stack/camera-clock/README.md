@@ -85,6 +85,14 @@ sudo systemctl enable --now homehub-camera-clock@livingroom.timer
   directory, so it never finds a log switch file. If closing its log is
   refused, the pass fails.
 
+**Proven on the hub 2026-11-09 20:32 (deploy):** the unit's own pass, inside every
+restriction above, logged in and read the camera (`ok: true`, drift -1 s). The
+first pass had failed `NET_DVR_Init` with SDK error 41: the library starts a
+thread pool of 129-160 tasks at Init, and `TasksMax` was 32. It is 512 now.
+**A vendor-library failure inside this unit is first a sandbox question**:
+bisect with `systemd-run` carrying the unit's properties minus one, never by
+running it from a root shell.
+
 **Not proven:**
 
 - **Summer time.** The only runs were in standard time. If the camera applies

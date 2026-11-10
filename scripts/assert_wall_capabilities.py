@@ -89,6 +89,7 @@ ALLOWED_SITE_FILES = {
     # both served by the live hub site since the 2026-10-21 paired releases.
     "js/door-chime-mute.js",
     "js/drill-wake.js",
+    "js/entry-pad.js",
     "js/event-id.js",
     "js/feed-contact.js",
     "js/gauge-brand.js",

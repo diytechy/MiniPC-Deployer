@@ -888,19 +888,81 @@ def required_tools(method):
     raise ConfigurationError("unknown amplifier actuator %r" % method)
 
 
-def record_safe_state(verified):
-    """Publish or revoke the artifact consumed by the S3 power path."""
+# MIN_OFF ACROSS A RESTART (2026-11-09). `changed_at` is process state, and it
+# used to start at 0.0, so MIN_OFF held only within one process: a restart
+# while audio played could close the relay well inside ten seconds of the
+# previous process opening it. That restart happens on every boot --
+# `wall-audio-mode` stops and starts this unit once firstboot has run, about
+# 25 s after the unit's own start -- and on every release, relay replug and
+# crash. So the relay's last verified OFF is kept beside the safe-state proof,
+# in /run (one boot: CLOCK_MONOTONIC is the same clock in every process of
+# that boot, and a reboot clears both together).
+#
+# THE INVARIANT: the file holds the EARLIEST verified OFF since the relay
+# could last have been energized. Every path that may energize it revokes the
+# proof first (`record_safe_state(False)`), which removes this file too; a
+# verified OFF writes it only when it is absent, so a stop of an idle daemon
+# does not move the instant forward and charge the next process a fresh ten
+# seconds of silence for an OFF that happened minutes ago.
+RELAY_OFF_SINCE_NAME = "relay-off-since"
+
+
+def _relay_off_since_path():
+    return os.path.join(os.path.dirname(SAFE_STATE_FILE), RELAY_OFF_SINCE_NAME)
+
+
+def relay_off_since(now, path=None):
+    """The monotonic second of the relay's last verified OFF, or None.
+
+    None means "not known", which the caller must read as "it may have been
+    ON until now": no file (a new boot, or a process that died with the relay
+    possibly energized), an unreadable one, or a value that cannot be an
+    instant of this boot that has already happened.
+    """
+    path = _relay_off_since_path() if path is None else path
     try:
-        if not verified:
+        with open(path, encoding="ascii") as handle:
+            value = float(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+    if not math.isfinite(value) or value < 0.0 or value > now:
+        return None
+    return value
+
+
+def _note_relay_off(now):
+    path = _relay_off_since_path()
+    if relay_off_since(now, path) is not None:
+        return
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="ascii") as handle:
+        handle.write("%.3f\n" % now)
+    os.replace(tmp, path)
+
+
+def record_safe_state(verified, now=None):
+    """Publish or revoke the artifact consumed by the S3 power path.
+
+    The relay's off-since instant goes with it (see RELAY_OFF_SINCE_NAME):
+    revoked with the proof, and kept, not refreshed, while the proof stands.
+    """
+    if not verified:
+        # The S3 proof first and each on its own: a failure to remove the
+        # ledger must never leave the proof standing over an energized relay.
+        for path in (SAFE_STATE_FILE, _relay_off_since_path()):
             try:
-                os.unlink(SAFE_STATE_FILE)
+                os.unlink(path)
             except FileNotFoundError:
                 pass
-            return
+            except OSError as exc:
+                log("could not revoke %s: %s" % (path, exc))
+        return
+    try:
         tmp = SAFE_STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="ascii") as handle:
             handle.write("OFF\n")
         os.replace(tmp, SAFE_STATE_FILE)
+        _note_relay_off(time.monotonic() if now is None else now)
     except OSError as exc:
         log("could not update amplifier safe-state proof: %s" % exc)
 
@@ -1442,6 +1504,16 @@ def main():
     # every service start, including disabled and non-trigger modes.
     safe = ensure_off_bounded(actuator)
     record_safe_state(safe)
+    # When the relay last went OFF, for MIN_OFF. A previous process's verified
+    # OFF survives in the ledger; anything less certain -- a new boot, a
+    # predecessor that died with the relay possibly ON, an unverified OFF just
+    # now -- counts the OFF as happening here, at this start. That costs at
+    # most MIN_OFF of extra silence, and only when audio is already playing
+    # in the first seconds after a start whose predecessor left no proof.
+    started_off = time.monotonic()
+    proven = relay_off_since(started_off) if safe else None
+    if proven is not None:
+        started_off = proven
 
     stopping = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -1482,7 +1554,7 @@ def main():
     on = False
     above_since = None
     below_since = None
-    changed_at = 0.0
+    changed_at = started_off
     last_actuator_attempt = -1e9
     last_off_attempt = -1e9
     started_at = time.monotonic()
@@ -1580,6 +1652,11 @@ def main():
             last_off_attempt = now
             safe = stop_and_record(actuator) is not False
             if safe:
+                # The relay may have been energized until this very write --
+                # latched across a lost node, say -- so MIN_OFF counts from
+                # here, not from the start or the failed attempt (Codex Sol
+                # reproduced OFF->ON in 1.3 s without this).
+                changed_at = now
                 log("relay reconciled to a verified OFF")
 
         loud = any(lv.above(ON_DBFS) for lv in levels)

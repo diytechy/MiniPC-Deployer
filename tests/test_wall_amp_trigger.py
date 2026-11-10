@@ -210,6 +210,229 @@ def test_suspend_proof_exists_only_after_verified_off(tmp_path):
     assert not marker.exists()
 
 
+def test_relay_off_since_keeps_the_earliest_verified_off_and_dies_with_the_proof(tmp_path):
+    """MIN_OFF across restarts (2026-11-09): the ledger beside the S3 proof.
+
+    A verified OFF records its instant only when none is held, so an idle
+    daemon's later OFFs do not move it forward; revoking the proof before the
+    relay may be energized removes it, so a dead process cannot vouch for an
+    OFF that a later ON overtook.
+    """
+    module = load_module()
+    module.SAFE_STATE_FILE = str(tmp_path / "off-verified")
+    ledger = tmp_path / module.RELAY_OFF_SINCE_NAME
+
+    assert module.relay_off_since(100.0) is None
+    module.record_safe_state(True, now=10.0)
+    assert module.relay_off_since(100.0) == 10.0
+    module.record_safe_state(True, now=50.0)   # still off: the earlier instant stands
+    assert module.relay_off_since(100.0) == 10.0
+    module.record_safe_state(False)            # about to energize
+    assert not ledger.exists() and not (tmp_path / "off-verified").exists()
+    assert module.relay_off_since(100.0) is None
+    module.record_safe_state(True, now=60.0)   # the next real OFF
+    assert module.relay_off_since(100.0) == 60.0
+
+    # Nothing that cannot be an instant of this boot that has already happened.
+    for text in ("", "soon", "nan", "inf", "-1", "200.0"):
+        ledger.write_text(text, encoding="ascii")
+        assert module.relay_off_since(100.0) is None, text
+
+
+class _RestartLevel:
+    """A capture source whose loudness the test sets for every instance."""
+
+    loud = False
+    pcm = "speaker_tap"
+
+    def __init__(self, pcm, _offset):
+        self.pcm = pcm
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def above(self, _threshold):
+        return _RestartLevel.loud
+
+    def report(self):
+        return self.pcm
+
+
+class _RestartRelay:
+    """One physical relay shared by successive daemon processes."""
+
+    device = "/dev/wall-amp-relay"
+
+    def __init__(self):
+        self.on = False
+        self.events = []   # (monotonic, "ON" | "OFF"), physical transitions only
+
+    def _set(self, on):
+        import time
+        if on != self.on:
+            self.events.append((time.monotonic(), "ON" if on else "OFF"))
+        self.on = on
+        return True
+
+    def ensure_off(self):
+        return self._set(False)
+
+    def start(self):
+        return self._set(True)
+
+    def stop(self):
+        return self._set(False)
+
+    def maintain(self, _now=None):
+        return self.on
+
+
+def _restart_daemon(module, monkeypatch, relay):
+    """Start the real main() loop once in trigger mode; return its stopper."""
+    import threading
+    import time
+    handlers = []
+    monkeypatch.setattr(module, "build_actuator", lambda *_a, **_kw: relay)
+    monkeypatch.setattr(module, "required_tools", lambda _method: ())
+    monkeypatch.setattr(module, "current_mode", lambda: "trigger")
+    monkeypatch.setattr(module, "Level", _RestartLevel)
+    monkeypatch.setattr(module, "publish_bus_telemetry", lambda *_a, **_kw: None)
+    monkeypatch.setattr(module.signal, "signal",
+                        lambda _sig, handler: handlers.append(handler))
+    monkeypatch.setenv("WALL_AMP_ENABLED", "true")
+    started = time.monotonic()
+    thread = threading.Thread(target=module.main, daemon=True)
+    thread.start()
+
+    def stop():
+        deadline = time.monotonic() + 5.0
+        while not handlers and time.monotonic() < deadline:
+            time.sleep(0.01)
+        handlers[0](15, None)
+        thread.join(5.0)
+        assert not thread.is_alive(), "the daemon did not stop"
+
+    return started, stop
+
+
+def _wait_for(predicate, seconds=5.0):
+    import time
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+@pytest.fixture
+def restart_module(monkeypatch, tmp_path):
+    module = load_module()
+    for name, value in (("ATTACK_SECONDS", 0.0), ("MIN_OFF_SECONDS", 0.6),
+                        ("MIN_ON_SECONDS", 0.0), ("HOLD_OFF_SECONDS", 3600.0),
+                        ("BLOCK_SECONDS", 0.02), ("RELAY_WAIT_SECONDS", 0.0)):
+        monkeypatch.setattr(module, name, value)
+    monkeypatch.setattr(module, "SAFE_STATE_FILE", str(tmp_path / "off-verified"))
+    return module
+
+
+def test_a_restart_cannot_close_the_relay_inside_min_off_of_its_predecessors_off(
+        restart_module, monkeypatch):
+    """The 2026-11-09 follow-up: `changed_at = 0.0` let any restart skip MIN_OFF.
+
+    The first process closes the relay on loud audio and is stopped, which
+    opens it. The second starts at once with the audio still loud: it may not
+    close the relay until MIN_OFF after that OFF. Before the ledger it closed it
+    in one 20 ms block.
+    """
+    module, relay = restart_module, _RestartRelay()
+    _RestartLevel.loud = True
+
+    first_start, stop = _restart_daemon(module, monkeypatch, relay)
+    assert _wait_for(lambda: relay.on), "the first process never closed the relay"
+    # A fresh boot (no ledger) counts its own start-up OFF.
+    assert relay.events[0][0] - first_start >= module.MIN_OFF_SECONDS - 0.02
+    stop()
+    off_at = relay.events[-1]
+    assert off_at[1] == "OFF"
+
+    _second_start, stop = _restart_daemon(module, monkeypatch, relay)
+    assert _wait_for(lambda: relay.on), "the second process never closed the relay"
+    stop()
+    on_at = [moment for moment, kind in relay.events if kind == "ON"][1]
+    assert on_at - off_at[0] >= module.MIN_OFF_SECONDS - 0.02, (on_at - off_at[0])
+
+
+def test_a_restart_after_a_long_quiet_spell_closes_the_relay_without_waiting(
+        restart_module, monkeypatch):
+    """And the fix costs nothing when the relay has long been open.
+
+    The first process runs quiet past MIN_OFF and is stopped. Its stop is a
+    verified OFF too, but it must not move the ledger forward: the relay has
+    been open since the first start-up, so the second process closes it on
+    the first loud block rather than waiting a fresh MIN_OFF.
+    """
+    import time
+    module, relay = restart_module, _RestartRelay()
+    # A wide MIN_OFF so the upper bound below has a second of room for a
+    # thread start on a busy machine.
+    monkeypatch.setattr(module, "MIN_OFF_SECONDS", 2.0)
+    _RestartLevel.loud = False
+
+    _first_start, stop = _restart_daemon(module, monkeypatch, relay)
+    time.sleep(module.MIN_OFF_SECONDS + 0.2)
+    stop()
+    assert relay.events == []
+
+    _RestartLevel.loud = True
+    second_start, stop = _restart_daemon(module, monkeypatch, relay)
+    assert _wait_for(lambda: relay.on)
+    stop()
+    assert relay.events[0][1] == "ON"
+    assert relay.events[0][0] - second_start < module.MIN_OFF_SECONDS / 2, (
+        relay.events[0][0] - second_start)
+
+
+def test_a_late_reconciled_off_starts_the_dwell_llr1482(restart_module, monkeypatch):
+    """Codex Sol, 2026-11-09 review: an OFF the loop only verifies later.
+
+    The relay is latched ON and its node is not answering at start, so the
+    start-up OFF is unverified. The reconcile block keeps commanding OFF and
+    gets through 0.5 s in. With audio loud, the relay may not close again
+    until MIN_OFF after THAT verified OFF -- before this it closed MIN_OFF
+    after the start, about 0.1 s after the OFF.
+    """
+    import time
+    module = restart_module
+    monkeypatch.setattr(module, "ACTUATOR_FAST_RETRY_SECONDS", 0.05)
+
+    class LatchedThenReachable(_RestartRelay):
+        def __init__(self):
+            super().__init__()
+            self.on = True
+            self.reachable_at = None
+
+        def ensure_off(self):
+            return False
+
+        def stop(self):
+            if self.reachable_at is None or time.monotonic() < self.reachable_at:
+                return False
+            return self._set(False)
+
+    relay = LatchedThenReachable()
+    relay.reachable_at = time.monotonic() + 0.5
+    _RestartLevel.loud = True
+    _start, stop = _restart_daemon(module, monkeypatch, relay)
+    assert _wait_for(lambda: [kind for _t, kind in relay.events] == ["OFF", "ON"])
+    stop()
+    (off_at, _), (on_at, _) = relay.events[:2]
+    assert on_at - off_at >= module.MIN_OFF_SECONDS - 0.02, (on_at - off_at)
+
+
 def _sigterm_run(module, monkeypatch, actuator):
     """Drive main() through one SIGTERM inside the running loop.
 

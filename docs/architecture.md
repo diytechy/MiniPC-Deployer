@@ -463,9 +463,11 @@ application defers and the daemon is bound to the absent adapter; a failed apply
 is reported through fail_step. No additional firstboot restart is needed.
 
 An additional restart can interrupt the fresh daemon after its relay closes,
-then close it again on the next start, violating both contact dwells. The
-MIN_ON/MIN_OFF timestamps are not persisted across restarts; that pre-existing
-gap is separate from this value change, and changed_at remains unchanged.
+then close it again on the next start, violating both contact dwells. MIN_OFF
+now holds across a restart too (LLR-1482, 2026-11-09): the relay's earliest
+verified OFF since it was last possibly energized is kept beside the S3 proof in
+/run/wall-amp-trigger, and a new process starts its dwell from it. MIN_ON needs
+no such record, because a stop always opens the relay whatever its age.
 
 ### The merged bus becomes the visualizer, and ProjectM's bounded exception (SR-041, LLR-950..958, IF-020)
 

@@ -118,8 +118,10 @@ class CaptureSettings:
     Contract:
       Config:  CAMERA_<C>_CAPTURE_ENABLED (false); _STREAMS ("main,sub");
                _UNTIL (UTC YYYY-mm-ddTHH:MM:SSZ, required when enabled);
-               _SEGMENT_SEC (600, 60..3600); _CAP_MIB (per stream, 153600);
-               _QUOTA_MIB (the camera's project, 204800); _STALL_SEC (30).
+               _SEGMENT_SEC (600, 60..3600); _CAP_MIB (per stream, 307200);
+               _QUOTA_MIB (the camera's project, 409600); _STALL_SEC (30).
+               Sized from a night measurement (main ~940 kbps): even 8 Mbps
+               all day for 72 h is ~240 GiB, so neither limit should act.
                [stack/.env]
       Raises:  Invalid naming the key, never a value it did not validate.
     The attributes segment_sec, cap_mib and stall_sec are the ones the door
@@ -145,8 +147,8 @@ class CaptureSettings:
                 raise Invalid("%s must be UTC YYYY-mm-ddTHH:MM:SSZ" % knob(camera, "UNTIL"))
         self.until_text = raw_until
         self.segment_sec = mc.knob_int(env, knob(camera, "SEGMENT_SEC"), 600, 60, 3600)
-        self.cap_mib = mc.knob_int(env, knob(camera, "CAP_MIB"), 153600, 1024, 1 << 22)
-        self.quota_mib = mc.knob_int(env, knob(camera, "QUOTA_MIB"), 204800, 1024, 1 << 22)
+        self.cap_mib = mc.knob_int(env, knob(camera, "CAP_MIB"), 307200, 1024, 1 << 22)
+        self.quota_mib = mc.knob_int(env, knob(camera, "QUOTA_MIB"), 409600, 1024, 1 << 22)
         self.stall_sec = mc.knob_int(env, knob(camera, "STALL_SEC"), 30, 5, 600)
         # Hub paths, POSIX wherever this is imported (the dev PC's runner too).
         self.camera_root = posixpath.join(TRAINING_ROOT, self.camera)
@@ -464,6 +466,10 @@ def ensure(env_file: str, camera: str, apply: bool = True, paths: Optional[clips
 
     def make_private_dir(parent: str, name: str) -> str:
         path = os.path.join(parent, name)
+        if not apply and not os.path.isdir(parent):
+            # A dry run on a fresh drive: the parent is itself only planned.
+            act("create %s" % path)
+            return path
         fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             if os.fstat(fd).st_dev != want_dev:
@@ -574,9 +580,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raise Invalid("condition needs a stream")
             s = CaptureSettings(mc.read_knobs(args.env_file), camera, stream)
             state, why = window_state(s, time.time())
-            mc.log("%s: %s" % (s.label, ("starting - " if state == "run" else "clean skip - ") + why),
+            mc.log("%s: %s" % (s.label, {"run": "starting - ", "skip": "clean skip - "}.get(state, "REFUSED - ") + why),
                    warning=state == "refuse")
-            return 0 if state == "run" else 1
+            # 255 fails the start (a visible error); 1 is a clean skip.
+            return {"run": 0, "skip": 1}.get(state, 255)
         if args.verb == "ensure":
             door_relay.emit(ensure(args.env_file, camera, apply=not args.dry_run))
             return 0
@@ -589,7 +596,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
     except (Invalid, scratch.Refused) as exc:
         mc.log("camera capture: REFUSED - %s" % exc, warning=True)
-        return EXIT_REFUSED
+        return 255 if args.verb == "condition" else EXIT_REFUSED
     p.print_help()
     return EXIT_REFUSED
 

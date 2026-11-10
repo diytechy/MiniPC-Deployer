@@ -270,17 +270,98 @@ def test_tc1763_ensure_makes_a_private_tree_in_its_project(tmp_path, monkeypatch
     envf = write_env(tmp_path)
     first = cc.ensure(envf, "livingroom", act_log=lambda t: None)
     cam = str(mount / "Training" / "livingroom")
-    assert projects[cam] == (cc.TRAINING_PROJECT, True) and quotas[cc.TRAINING_PROJECT] == 204800 * cc.MIB
+    assert projects[cam] == (cc.TRAINING_PROJECT, True) and quotas[cc.TRAINING_PROJECT] == 409600 * cc.MIB
     for d in (mount / "Training", mount / "Training" / "livingroom", mount / "Training" / "livingroom" / "main"):
         assert oct(os.stat(str(d)).st_mode & 0o7777) == oct(0o750)
     assert first["actions"]
     assert cc.ensure(envf, "livingroom", act_log=lambda t: None)["actions"] == [], "idempotent"
 
 
+@pytest.mark.skipif(not hasattr(os, "getxattr"), reason="ensure's ACL handling needs Linux xattrs")
+def test_tc1763_ensure_strips_the_drives_setgid_and_default_acl(tmp_path, monkeypatch):  # pragma: no cover - Linux
+    """/srv/media is root:household 2775 with a default ACL (group rwx, other r-x)
+    on the hub: a plain mkdir under it inherits both. ensure must end root-only.
+    Codex Sol review, 2026-11-10: the first test started from a bare parent."""
+    import shutil
+    import subprocess
+    mount = tmp_path / "media"
+    mount.mkdir()
+    os.chmod(str(mount), 0o2775)
+    acl = shutil.which("setfacl") is not None
+    if acl:
+        subprocess.run(["setfacl", "-d", "-m", "g::rwx,o::rx", str(mount)], check=True)
+    dev = os.stat(str(mount)).st_dev
+    entry = {"majmin": "%d:%d" % (os.major(dev), os.minor(dev)), "source": "/dev/sdx1"}
+    monkeypatch.setattr(cc.clips, "MEDIA_MOUNT", str(mount))
+    monkeypatch.setattr(cc, "TRAINING_ROOT", str(mount / "Training"))
+    monkeypatch.setattr(cc.clips, "media_mount_state", lambda _p: (True, "ok", entry))
+    monkeypatch.setattr(cc.scratch, "get_project", lambda p: (0, False))
+    monkeypatch.setattr(cc.scratch, "set_project", lambda p, i: None)
+    monkeypatch.setattr(cc.scratch, "get_project_quota", lambda d, i: (0, 0))
+    monkeypatch.setattr(cc.scratch, "set_project_quota", lambda d, i, m: None)
+    monkeypatch.setattr(os, "chown", lambda *a: None)
+    envf = write_env(tmp_path)
+    plan = cc.ensure(envf, "livingroom", apply=False, act_log=lambda t: None)
+    assert not (mount / "Training").exists(), "a dry run on a fresh drive creates nothing"
+    assert any("livingroom/main" in a.replace(os.sep, "/") for a in plan["actions"]), plan["actions"]
+    cc.ensure(envf, "livingroom", act_log=lambda t: None)
+    for d in (mount / "Training", mount / "Training" / "livingroom", mount / "Training" / "livingroom" / "sub"):
+        assert os.stat(str(d)).st_mode & 0o7777 == 0o750, (d, oct(os.stat(str(d)).st_mode))
+        for attr in ("system.posix_acl_default", "system.posix_acl_access"):
+            with pytest.raises(OSError):
+                os.getxattr(str(d), attr)
+    if not acl:
+        pytest.skip("setfacl is not installed: the setgid half ran, the ACL half did not")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="select() on a pipe (Linux)")
+def test_tc1762_a_running_capture_stops_itself_at_the_end_with_exit_0(tmp_path, monkeypatch):  # pragma: no cover
+    """The deadline timer, not just the start check (Codex Sol review)."""
+    import io as _io
+    envf = write_env(tmp_path)
+    monkeypatch.setattr(cc, "TRAINING_ROOT", str(tmp_path / "Training"))
+    monkeypatch.setattr(cc.dr, "mc", cc.dr.mc)  # run_service relabels it; put it back afterwards
+    monkeypatch.setattr(cc, "training_guard", lambda *a: (True, "ok"))
+    monkeypatch.setattr(cc.subprocess, "run", lambda *a, **k: None)
+    logged = []
+    monkeypatch.setattr(cc.mc, "log", lambda message, warning=False: logged.append(message))
+    read_end, write_end = os.pipe()
+
+    class Proc:
+        stdout = os.fdopen(read_end, "rb", buffering=0)
+        stderr = _io.BytesIO(b"")
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+    monkeypatch.setattr(cc.door_relay, "start_consumer", lambda *a, **k: Proc())
+    started = time.monotonic()
+    try:
+        code = cc.run_service(envf, "livingroom", "sub", clock=lambda: UNTIL_EPOCH - 1.0)
+    finally:
+        os.close(write_end)
+    assert code == 0 and time.monotonic() - started < 5.0
+    assert any("the capture window ended" in m for m in logged), logged
+
+
+def test_tc1762_the_condition_fails_a_refused_setup_and_skips_a_disabled_one(tmp_path, monkeypatch):
+    """Opus review: a refusal must not read as a clean skip in systemd."""
+    monkeypatch.setattr(cc.mc, "log", lambda *a, **k: None)
+    no_end = write_env(tmp_path, CAMERA_LIVINGROOM_CAPTURE_UNTIL=None)
+    assert cc.main(["--env-file", no_end, "--instance", "livingroom-main", "condition"]) == 255
+    bad = write_env(tmp_path, CAMERA_LIVINGROOM_CAPTURE_STREAMS="main,hd")
+    assert cc.main(["--env-file", bad, "--instance", "livingroom-main", "condition"]) == 255
+    off = write_env(tmp_path, CAMERA_LIVINGROOM_CAPTURE_ENABLED="false")
+    assert cc.main(["--env-file", off, "--instance", "livingroom-main", "condition"]) == 1
+
+
 def test_tc1763_the_unit_drops_cap_sys_resource_and_binds_to_the_drive():
     unit = (STACK / "camera-capture" / "homehub-camera-capture@.service").read_text(encoding="utf-8")
     for line in ("CapabilityBoundingSet=~CAP_SYS_RESOURCE", "BindsTo=srv-media.mount",
-                 "RequiresMountsFor=/srv/media", "RestartPreventExitStatus=2 75 76", "Restart=on-failure",
+                 "RequiresMountsFor=/srv/media", "RestartPreventExitStatus=2 75\n", "RestartSec=60",
+                 "Restart=on-failure",
                  "--instance %i condition", "--instance %i run",
                  "ExecStopPost=-/usr/bin/docker rm -f homehub-camera-capture-%i",
                  "WantedBy=multi-user.target srv-media.mount"):

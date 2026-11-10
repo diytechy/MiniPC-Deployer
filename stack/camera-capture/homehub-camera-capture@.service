@@ -5,8 +5,10 @@
 # It runs only inside CAMERA_<C>_CAPTURE_UNTIL (ExecCondition), stops itself at
 # that instant with exit 0, and is enabled so a reboot inside the window
 # resumes it. CAP_SYS_RESOURCE is dropped so the quota project's hard limit
-# binds; a full quota (75), a guard refusal (76) or a refused configuration (2)
-# is not restarted. BindsTo= the media drive's mount: a drive that goes stops
+# binds; a full quota (75) or a refused configuration (2) is not restarted. A
+# guard refusal (76) IS retried every minute (review, 2026-11-10): an unattended
+# three-day capture must not end for good on one transient refusal, and the
+# guard refuses each retry for as long as the cause lasts. BindsTo= the media drive's mount: a drive that goes stops
 # the capture, and its return starts it again (WantedBy=srv-media.mount).
 [Unit]
 Description=Camera training capture (%i): copy-only segments of one stream on /srv/media
@@ -24,8 +26,8 @@ ExecCondition=/usr/bin/python3 /opt/homehub/stack/camera-capture/camera_capture.
 ExecStart=/usr/bin/python3 /opt/homehub/stack/camera-capture/camera_capture.py --instance %i run
 ExecStopPost=-/usr/bin/docker rm -f homehub-camera-capture-%i
 Restart=on-failure
-RestartSec=15
-RestartPreventExitStatus=2 75 76
+RestartSec=60
+RestartPreventExitStatus=2 75
 CapabilityBoundingSet=~CAP_SYS_RESOURCE
 NoNewPrivileges=true
 UMask=0027

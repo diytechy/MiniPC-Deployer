@@ -11,7 +11,7 @@ days from 2026-11-10 (the Owner's ruling of HomeHub open-items A81).
 | Source | the camera's relay: `/livingroom` (sub, 768x432) and `/livingroom-main` (1920x1080, needs `CAMERA_LIVINGROOM_RELAY_MAIN_PATH`) |
 | Files | `/srv/media/Training/livingroom/<stream>/YYYY-MM-DD/livingroom-<stream>-YYYYmmddTHHMMSSZ.ts`, 10-minute segments, UTC names |
 | Access | root only (`root:root 0750`, no ACL, on no share) |
-| Budget | quota project 7106, hard limit `CAMERA_LIVINGROOM_CAPTURE_QUOTA_MIB` (200 GiB) for both streams |
+| Budget | quota project 7106, hard limit `CAMERA_LIVINGROOM_CAPTURE_QUOTA_MIB` (400 GiB) for both streams |
 | Never | audio (`-an`, and no consumer asks), decoding, anything off the hub |
 
 ## Start a capture

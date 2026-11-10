@@ -1,0 +1,42 @@
+# homehub-camera-capture@<camera>-<stream>.service - a bounded training capture
+# of one camera stream onto the media drive (SR-162; camera_capture.py has the
+# design). Instances today: livingroom-main, livingroom-sub.
+#
+# It runs only inside CAMERA_<C>_CAPTURE_UNTIL (ExecCondition), stops itself at
+# that instant with exit 0, and is enabled so a reboot inside the window
+# resumes it. CAP_SYS_RESOURCE is dropped so the quota project's hard limit
+# binds; a full quota (75) or a refused configuration (2) is not restarted. A
+# guard refusal (76) IS retried every minute (review, 2026-11-10): an unattended
+# three-day capture must not end for good on one transient refusal, and the
+# guard refuses each retry for as long as the cause lasts. BindsTo= the media drive's mount: a drive that goes stops
+# the capture, and its return starts it again (WantedBy=srv-media.mount).
+[Unit]
+Description=Camera training capture (%i): copy-only segments of one stream on /srv/media
+Documentation=file:///opt/homehub/stack/camera-capture/README.md
+RequiresMountsFor=/srv/media
+BindsTo=srv-media.mount
+After=srv-media.mount docker.service network-online.target homehub-firstboot.service
+Wants=docker.service network-online.target
+AssertPathExists=/opt/homehub/stack/camera-capture/camera_capture.py
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/homehub/stack
+ExecCondition=/usr/bin/python3 /opt/homehub/stack/camera-capture/camera_capture.py --instance %i condition
+ExecStart=/usr/bin/python3 /opt/homehub/stack/camera-capture/camera_capture.py --instance %i run
+ExecStopPost=-/usr/bin/docker rm -f homehub-camera-capture-%i
+Restart=on-failure
+RestartSec=60
+RestartPreventExitStatus=2 75
+CapabilityBoundingSet=~CAP_SYS_RESOURCE
+NoNewPrivileges=true
+UMask=0027
+CPUAccounting=true
+CPUQuota=25%
+MemoryAccounting=true
+MemoryMax=192M
+TasksMax=64
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target srv-media.mount

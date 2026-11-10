@@ -135,6 +135,18 @@ class CameraRelaySettings:
         self.path = plain("UPSTREAM_PATH")
         if not self.path.startswith("/") or re.search(r"[\s?#]", self.path):
             raise Invalid("%s must start with / and hold no space, ? or #" % knob(camera, "UPSTREAM_PATH"))
+        # THE MAIN STREAM, OPTIONAL (2026-11-10, the training capture). Served as
+        # /<stream>-main beside /<stream>, always video only: nothing on the hub
+        # or beyond asks the main stream for sound. Unset, the relay is as before.
+        self.main_path = plain("MAIN_PATH") or None
+        if self.main_path is not None and (not self.main_path.startswith("/")
+                                           or re.search(r"[\s?#]", self.main_path)):
+            raise Invalid("%s must start with / and hold no space, ? or #" % knob(camera, "MAIN_PATH"))
+        if self.main_path == self.path:
+            raise Invalid("%s is the same path as %s" % (knob(camera, "MAIN_PATH"), knob(camera, "UPSTREAM_PATH")))
+        self.main_stream = (self.stream + "-main") if self.main_path else None
+        if self.main_stream is not None and not door_relay.STREAM_RE.fullmatch(self.main_stream):
+            raise Invalid("%s is too long to name a -main stream as well" % knob(camera, "STREAM"))
         self.username = door_relay.env_secret_value(raw.get(knob(camera, "UPSTREAM_USERNAME"), "")) or "admin"
         self.password = door_relay.env_secret_value(raw.get(knob(camera, "UPSTREAM_PASSWORD"), ""))
         for key, value in (("UPSTREAM_USERNAME", self.username), ("UPSTREAM_PASSWORD", self.password)):
@@ -158,9 +170,19 @@ class CameraRelaySettings:
             raise Invalid("%s is missing or not a port number" % key)
         return int(text)
 
-    def upstream_url(self) -> str:
+    def upstream_url(self, path: Optional[str] = None) -> str:
         q = lambda s: urllib.parse.quote(s, safe="")  # noqa: E731
-        return "rtsp://%s:%s@%s:%d%s" % (q(self.username), q(self.password), self.host, self.port, self.path)
+        return "rtsp://%s:%s@%s:%d%s" % (q(self.username), q(self.password), self.host, self.port,
+                                         path or self.path)
+
+    def for_main(self) -> "CameraRelaySettings":
+        """These settings as a consumer of the relay's /<stream>-main stream.
+        Raises Invalid when the relay serves no main stream."""
+        if self.main_stream is None:
+            raise Invalid("%s is not set: the relay serves no main stream" % knob(self.camera, "MAIN_PATH"))
+        main = copy.copy(self)
+        main.stream = self.main_stream
+        return main
 
     def consumer_url(self) -> str:
         q = lambda s: urllib.parse.quote(s, safe="")  # noqa: E731
@@ -180,6 +202,8 @@ def relay_config(s: CameraRelaySettings) -> Dict[str, object]:
     """
     cfg = door_relay.relay_config(s)
     cfg["streams"] = {s.stream: s.upstream_url() + ("" if s.audio else "#media=video")}
+    if s.main_path:
+        cfg["streams"][s.main_stream] = s.upstream_url(s.main_path) + "#media=video"
     return cfg
 
 
@@ -333,8 +357,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         door_relay.write_private(out, (json.dumps(relay_config(s), indent=1) + "\n").encode("utf-8"))
         mc.log("%s: relay config written to %s (0600): rtsp %s:%d (auth), api 127.0.0.1:%d (auth), "
                "webrtc/srtp/rtmp off, stream /%s from the camera on port %d (%s; consumers get video "
-               "unless they ask)" % (tag, out, s.lan_ip, s.rtsp_port, s.api_port, s.stream, s.port,
-                                     "video and audio" if s.audio else "video only"))
+               "unless they ask)%s" % (tag, out, s.lan_ip, s.rtsp_port, s.api_port, s.stream, s.port,
+                                       "video and audio" if s.audio else "video only",
+                                       "; and /%s, the main stream, video only" % s.main_stream
+                                       if s.main_stream else ""))
         return 0
     if args.verb == "redact-run":
         cmd = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd

@@ -15,6 +15,22 @@ WALL = ROOT / "stack" / "autoinstall" / "wall"
 MODULE_PATH = WALL / "panel-amp-trigger.py"
 
 
+def test_firstboot_installs_the_amp_before_applying_audio_mode_llr1440():
+    """The mode script must restart onto the newly installed detector.
+
+    Implements: SR-143, LLR-1440.
+    """
+    lines = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8").splitlines()
+    loop = next(i for i, line in enumerate(lines)
+                if line.startswith("for _f in ") and "panel-amp-trigger.py" in line.split())
+    install = next(i for i in range(loop, len(lines))
+                   if lines[i].strip() ==
+                   'install -m 0755 "$PAYLOAD/$_f" "/usr/local/lib/wall-panel/$_f"')
+    first_apply = next(i for i, line in enumerate(lines)
+                       if line.lstrip().startswith("apply_audio_mode "))
+    assert install < first_apply, "install the new detector before the mode script restarts it"
+
+
 @pytest.mark.parametrize("mode", ["bus", "trigger"])
 @pytest.mark.parametrize("same_mode", [True, False], ids=["unchanged", "changed"])
 @pytest.mark.parametrize("running", [True, False], ids=["active", "inactive"])

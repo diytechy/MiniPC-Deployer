@@ -453,6 +453,20 @@ status query; service start first establishes OFF, and suspend proceeds only
 after service shutdown has verified OFF. The second relay channel is outside
 this service's ownership.
 
+In Speaker, every relay close holds the fade floor for 8.5 seconds before the
+one-second fade to unity (SR-143, LLR-1440; Owner 2026-11-09). Firstboot installs
+the new detector before applying the audio mode. With the adapter present,
+wall-audio-mode records the active units, stops the amplifier daemon and starts
+it in bus and trigger modes even when the mode is unchanged. That existing
+stop/start loads the new code on a release. With the adapter absent, mode
+application defers and the daemon is bound to the absent adapter; a failed apply
+is reported through fail_step. No additional firstboot restart is needed.
+
+An additional restart can interrupt the fresh daemon after its relay closes,
+then close it again on the next start, violating both contact dwells. The
+MIN_ON/MIN_OFF timestamps are not persisted across restarts; that pre-existing
+gap is separate from this value change, and changed_at remains unchanged.
+
 ### The merged bus becomes the visualizer, and ProjectM's bounded exception (SR-041, LLR-950..958, IF-020)
 
 Two things are easy to misread from the rows. First, WHERE the signal is tapped

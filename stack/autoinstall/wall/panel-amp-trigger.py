@@ -33,11 +33,12 @@ position, with the persisted preference on (the default), this daemon also
 follows the panel's backlight: when the screen goes dark the speaker leg is
 faded to silence through its own softvol, THEN the relay is opened and verified;
 when the screen lights with audio present the relay is closed and verified, the
-boards get five seconds to start, and the fade comes back up. See SpeakerSleep.
+boards get 8.5 seconds to start, and the fade comes back up. See SpeakerSleep.
 
 THE SETTLE IS ABOUT THE RELAY, NOT THE SCREEN (SR-143, Owner 2026-11-05: "wait 5
 seconds after relay turns on before fading in audio, otherwise can fade in as
-soon as presence is detected"). In the Speaker position every close of the relay
+soon as presence is detected"; Owner 2026-11-09: 8.5 s settle, with the one-second
+ramp unchanged). In the Speaker position every close of the relay
 is followed by the same settle and fade, whichever rule closed it, and whether
 or not the sleep preference is on. A relay that is already closed has nothing to
 settle, so the fade starts at once.
@@ -251,9 +252,9 @@ AMIXER = "/usr/bin/amixer"
 FADE_OUT_SECONDS = _env("WALL_AMP_SLEEP_FADE_OUT_SECONDS", 2.0, lo=0.1, hi=10.0)
 FADE_IN_SECONDS = _env("WALL_AMP_SLEEP_FADE_IN_SECONDS", 1.0, lo=0.1, hi=10.0)
 # After the relay closes, how long the amplifier boards get before audio
-# returns. A cold start is when they reliably select AUX. Five seconds is the
-# Owner's figure (SR-143, 2026-11-05); it was one until then.
-WAKE_SETTLE_SECONDS = _env("WALL_AMP_SLEEP_WAKE_SETTLE_SECONDS", 5.0, lo=0.0, hi=10.0)
+# returns. A cold start is when they reliably select AUX. The Owner's wait is
+# 8.5 seconds (SR-143, 2026-11-09); previously five (2026-11-05), and one before.
+WAKE_SETTLE_SECONDS = _env("WALL_AMP_SLEEP_WAKE_SETTLE_SECONDS", 8.5, lo=0.0, hi=10.0)
 FADE_STEP_SECONDS = 0.05
 # How often the files above are re-read when no ramp is running.
 SLEEP_SAMPLE_SECONDS = 0.5

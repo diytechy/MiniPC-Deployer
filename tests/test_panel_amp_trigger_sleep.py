@@ -272,7 +272,7 @@ def test_a_call_becoming_active_while_dark_turns_the_relay_on_at_unity_llr1436()
     go_dark(rig, audio=False)
     rig.world.events.clear()
     # No audio, screen still dark: the CALL alone wakes the room.
-    rig.run(7.0, lit=False, call=True, audio=False)
+    rig.run(10.5, lit=False, call=True, audio=False)
     assert rig.world.index_of("relay", "ON") is not None
     assert rig.fade_values()[-1] == 60, "the stage is back at unity for the call"
     assert rig.sleeper.phase == rig.module.SpeakerSleep.LIT
@@ -302,7 +302,7 @@ def test_dark_to_lit_with_audio_closes_the_relay_waits_then_fades_in_llr1436():
     go_dark(rig, audio=True)
     rig.world.events.clear()
     lit_at = rig.world.now
-    rig.run(7.0, lit=True, audio=True)
+    rig.run(10.5, lit=True, audio=True)
 
     relay_on = rig.world.index_of("relay", "ON")
     first_write = rig.world.index_of("amixer")
@@ -311,7 +311,7 @@ def test_dark_to_lit_with_audio_closes_the_relay_waits_then_fades_in_llr1436():
     on_time = rig.world.events[relay_on][0]
     first_time = rig.world.events[first_write][0]
     assert on_time - lit_at < 0.2, "the relay closes at once"
-    assert first_time - on_time >= 5.0, "then five seconds for the boards to start"
+    assert first_time - on_time >= 8.5, "then 8.5 seconds for the boards to start"
     values = rig.fade_values()
     assert values == sorted(values) and values[-1] == 60
     assert values[0] <= 4, "the ramp starts from the floor"
@@ -860,7 +860,7 @@ def test_a_partial_fade_in_failure_is_retried_on_the_beat_not_every_30s_llr1436(
     rig = Rig()
     go_dark(rig)
     rig.mixer.fail_values = {60}               # the top step never lands
-    rig.run(8.0, lit=True)
+    rig.run(10.5, lit=True)
     assert rig.sleeper.phase == rig.module.SpeakerSleep.LIT
     assert rig.sleeper.unity_known is False
     rig.mixer.fail_values = set()
@@ -982,6 +982,7 @@ def test_the_real_loop_honours_the_dwell_through_a_backlight_flap_llr1437(
 # ── SR-143: the settle follows the relay, not the screen ─────────────────────
 # Owner, 2026-11-05: "When in speaker mode, wait 5 seconds after relay turns on
 # before fading in audio, otherwise can fade in as soon as presence is detected."
+# Owner 2026-11-09: 8.5 s settle; the one-second fade is unchanged.
 
 def close_by_attack_rule(rig):
     """What main()'s attack branch does in the Speaker position."""
@@ -991,14 +992,45 @@ def close_by_attack_rule(rig):
     rig.sleeper.relay_closed(rig.world.now)
 
 
-def test_the_settle_is_five_seconds_by_default_llr1440(monkeypatch):
+def test_the_settle_is_8s5_by_default_llr1440(monkeypatch):
     monkeypatch.delenv("WALL_AMP_SLEEP_WAKE_SETTLE_SECONDS", raising=False)
-    assert load_module().WAKE_SETTLE_SECONDS == 5.0
+    assert load_module().WAKE_SETTLE_SECONDS == 8.5
+
+
+def test_real_default_holds_until_8s5_then_starts_the_one_second_ramp_llr1440(monkeypatch):
+    """Owner 2026-11-09: 8.5 s at the real boundary, no timing override."""
+    monkeypatch.delenv("WALL_AMP_SLEEP_WAKE_SETTLE_SECONDS", raising=False)
+    rig = Rig()
+    settled_lit(rig)
+    rig.relay_is_on = False
+    close_by_attack_rule(rig)
+    on_at = rig.world.now
+
+    def tick(elapsed):
+        rig.world.now = on_at + elapsed
+        rig.sleeper.step(rig.world.now, False, True, False, True,
+                         relay_is_on=True, relay_changed_at=on_at)
+
+    for elapsed in (0.0, 5.0, 8.0, 8.499):
+        tick(elapsed)
+        assert rig.sleeper.phase == rig.module.SpeakerSleep.SETTLING
+        assert rig.mixer.value == rig.module.FADE_FLOOR
+    assert rig.fade_values() == [0], "nothing rises before 8.5 seconds"
+    tick(8.5)
+    assert rig.sleeper.phase == rig.module.SpeakerSleep.FADING_IN
+    assert rig.mixer.value == 0, "the ramp starts at the floor at 8.5 seconds"
+    tick(8.55)
+    assert 0 < rig.mixer.value < 60
+    tick(9.0)
+    assert rig.mixer.value == 30, "halfway through the unchanged one-second ramp"
+    tick(9.5)
+    assert rig.mixer.value == 60
+    assert rig.sleeper.phase == rig.module.SpeakerSleep.LIT
 
 
 @pytest.mark.parametrize("enabled", [True, False], ids=["sleep-on", "sleep-off"])
 def test_the_attack_rules_close_silences_settles_and_fades_llr1440(enabled):
-    """Floor before the relay, nothing for five seconds, then the ramp to unity.
+    """Floor before the relay, nothing for 8.5 seconds, then the ramp to unity.
     The sleep preference has no say: this is the amplifier starting."""
     rig = Rig()
     settled_lit(rig)
@@ -1006,13 +1038,13 @@ def test_the_attack_rules_close_silences_settles_and_fades_llr1440(enabled):
     close_by_attack_rule(rig)
     on_at = rig.world.now
     assert rig.sleeper.governing, "the hold-off rule must not act mid-settle"
-    rig.run(7.0, enabled=enabled, lit=True)
+    rig.run(10.5, enabled=enabled, lit=True)
 
     floor = rig.world.index_of("amixer", 0)
     relay_on = rig.world.index_of("relay", "ON")
     assert floor is not None and floor < relay_on, "silent before the relay closes"
     ups = [(t, d) for t, d in rig.world.of("amixer") if d > 0]
-    assert ups and ups[0][0] - on_at >= 5.0, ups[:1]
+    assert ups and ups[0][0] - on_at >= 8.5, ups[:1]
     assert ups[-1][1] == 60 and rig.sleeper.phase == rig.module.SpeakerSleep.LIT
     assert not rig.sleeper.governing, "the relay is the existing rule's again"
 
@@ -1022,7 +1054,7 @@ def test_a_dark_screen_does_not_stop_the_hold_with_the_preference_off_llr1440():
     settled_lit(rig)
     rig.relay_is_on = False
     close_by_attack_rule(rig)
-    rig.run(7.0, enabled=False, lit=False)
+    rig.run(10.5, enabled=False, lit=False)
     assert rig.fade_values()[-1] == 60
     assert rig.world.of("relay") == [(rig.world.of("relay")[0][0], "ON")], "no OFF"
     assert rig.sleeper.phase == rig.module.SpeakerSleep.LIT
@@ -1069,16 +1101,16 @@ def test_a_relay_still_closed_after_the_fade_out_fades_in_at_once_llr1440():
 
 
 def test_a_screen_bounce_cannot_shorten_the_settle_llr1440():
-    """Dark then lit again inside the five seconds: the boards still get them."""
+    """Dark then lit again inside the 8.5 seconds: the boards still get them."""
     rig = Rig()
     go_dark(rig, audio=True)
     rig.world.events.clear()
     rig.run(1.0, lit=True)                       # relay ON, settling
     on_at = rig.world.of("relay")[0][0]
     rig.run(1.0, lit=False)                      # dark again, relay still held ON
-    rig.run(7.0, lit=True)
+    rig.run(10.5, lit=True)
     ups = [(t, d) for t, d in rig.world.of("amixer") if d > 0]
-    assert ups and ups[0][0] - on_at >= 5.0, ups[:1]
+    assert ups and ups[0][0] - on_at >= 8.5, ups[:1]
     assert rig.fade_values()[-1] == 60
     assert [d for _, d in rig.world.of("relay")] == ["ON"]
 
@@ -1132,9 +1164,9 @@ def test_the_preference_going_off_cannot_cut_a_wake_settle_short_llr1440():
     rig.world.events.clear()
     rig.run(1.0, lit=True)                       # relay ON, settling
     on_at = rig.world.of("relay")[0][0]
-    rig.run(7.0, enabled=False, lit=True)
+    rig.run(10.5, enabled=False, lit=True)
     ups = [(t, d) for t, d in rig.world.of("amixer") if d > 0]
-    assert ups and ups[0][0] - on_at >= 5.0, ups[:1]
+    assert ups and ups[0][0] - on_at >= 8.5, ups[:1]
     assert rig.fade_values()[-1] == 60
     assert rig.sleeper.phase == rig.module.SpeakerSleep.LIT
 
@@ -1165,7 +1197,7 @@ def test_a_failed_restart_mid_fade_in_does_not_stop_the_machine_llr1440():
     settled_lit(rig)
     rig.relay_is_on = False
     close_by_attack_rule(rig)
-    rig.run(5.3, lit=True)
+    rig.run(8.8, lit=True)
     assert rig.sleeper.phase == rig.module.SpeakerSleep.FADING_IN
     rig.sleeper.hold_for_relay()                 # main() then finds start() failed
     rig.run(1.0, lit=True)

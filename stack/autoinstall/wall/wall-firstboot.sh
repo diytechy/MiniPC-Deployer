@@ -1731,13 +1731,15 @@ fi
 # wall-volume-keys runs as a STATIC system user (2026-11-09): as DynamicUser
 # its preview directory sat under root-only /run/private and the kiosk could
 # never read it. See the unit's identity note. Created before the unit is
-# installed, so no start can meet a User= that does not exist yet.
-if ! getent group wall-volume-keys >/dev/null 2>&1; then
-    groupadd --system wall-volume-keys
+# installed, so no start can meet a User= that does not exist yet. The name
+# differs from the unit's on purpose: a running DynamicUser instance answers
+# to `wall-volume-keys` through nss-systemd, and these checks would skip.
+if ! getent group wall-volkeys >/dev/null 2>&1; then
+    groupadd --system wall-volkeys
 fi
-if ! id -u wall-volume-keys >/dev/null 2>&1; then
-    useradd --system --gid wall-volume-keys --home-dir /nonexistent \
-        --shell /usr/sbin/nologin wall-volume-keys
+if ! id -u wall-volkeys >/dev/null 2>&1; then
+    useradd --system --gid wall-volkeys --home-dir /nonexistent \
+        --shell /usr/sbin/nologin wall-volkeys
 fi
 
 for _u in wall-volume-request.socket wall-volume-request@.service wall-line-in.service wall-volume-keys.service wall-kiosk-loop.service wall-amp-trigger.service          wall-usb-hub-reset@.service          wall-spdif-in.service wall-bus-speaker.service wall-speaker-out.service           wall-bus-headset.service wall-bus-bt-headset.service wall-bus-builtin.service wall-headset-present.service           wall-audio-state.service wall-audio-resume.service           wall-audio-apply.service wall-audio-apply.path           wall-mic-rear.service wall-bt-call.service           wall-bus-visualizer.service; do

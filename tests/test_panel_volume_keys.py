@@ -58,7 +58,7 @@ def test_every_rocker_event_has_readout_sequence_sr028(level, louder):
 
 def test_rocker_keeps_an_unprivileged_identity_and_only_unix_socket_sr028():
     unit = (WALL / "wall-volume-keys.service").read_text()
-    assert "User=wall-volume-keys" in unit and "Group=wall-volume-keys" in unit
+    assert "User=wall-volkeys" in unit and "Group=wall-volkeys" in unit
     assert "SupplementaryGroups=input audio" in unit
     for implied in ("NoNewPrivileges=true", "PrivateTmp=true", "ProtectHome=true",
                     "RestrictSUIDSGID=true", "RemoveIPC=true"):
@@ -874,7 +874,14 @@ def test_the_preview_directory_is_reachable_by_the_kiosk_wsn120():
                   if line.strip() and not line.lstrip().startswith("#")]
     assert not any(line.startswith("DynamicUser=") for line in directives)
     firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
-    created = firstboot.index("useradd --system --gid wall-volume-keys")
+    # The static name must not be the one the DynamicUser instance had: while
+    # that instance runs, nss-systemd answers getent/id for it, so firstboot
+    # would skip the useradd and the restart onto the new unit would fail with
+    # 217/USER until the next boot (Codex Sol, 2026-11-09 review).
+    static = next(line.split("=", 1)[1] for line in directives if line.startswith("User="))
+    assert static != "wall-volume-keys"
+    assert "getent group %s " % static in firstboot and "id -u %s " % static in firstboot
+    created = firstboot.index("useradd --system --gid %s " % static)
     loop = firstboot.index("for _u in wall-volume-request.socket")
     assert "wall-volume-keys.service" in firstboot[loop:firstboot.index("done", loop)]
     assert created < loop, "the user must exist before the unit can start"

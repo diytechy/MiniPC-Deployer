@@ -38,8 +38,14 @@ Type=simple
 # the set and that file does not change (WSN-120 never reached the glass).
 # `wall-firstboot.sh` creates this system user before it installs the unit.
 # It owns no files outside the runtime directory, as the dynamic one did not.
-User=wall-volume-keys
-Group=wall-volume-keys
+#
+# NOT NAMED wall-volume-keys, which is the name the old DynamicUser identity
+# had: while that instance still runs (a release installs this file under a
+# running daemon), nss-systemd answers getent/id for it, so firstboot would
+# skip creating the account, useradd would refuse it, and the restart onto
+# this unit would fail with 217/USER until the next boot (Codex Sol, review).
+User=wall-volkeys
+Group=wall-volkeys
 SupplementaryGroups=input audio
 # The two DynamicUser implied that are not already spelled out below.
 RemoveIPC=true

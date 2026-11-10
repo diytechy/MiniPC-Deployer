@@ -3242,3 +3242,16 @@ unchanged) pass. Not proven: nothing on the panel yet. The static user,
 systemd's move of the old private directory, the kiosk's first real
 previews (the whole schema-2 lead, never seen on the glass before) and MUTED
 need the paired release and the Owner's presses.
+Review round 1: Opus medium GO with minors (fixed: the S3 proof is revoked
+before the ledger, each on its own; a real-loop test that the sleep wake
+revokes too; a wider timing margin). Codex Sol medium CHANGES-REQUIRED:
+(1) the static user had the DynamicUser's name, which nss-systemd answers
+for while the old instance runs, so firstboot would skip the useradd during
+a release - renamed wall-volkeys; (2a) an OFF verified late by the reconcile
+block did not restart the dwell (OFF->ON 1.3 s) - fixed, with a real-loop
+test; (2b) heartbeat recovery's start() commands OFF then ON 0.25 s apart -
+pre-existing, zero occurrences in the panel journal since 2026-09-20, left
+as a follow-up. Suites 335 passed; mutations 6-8 each caught. Full suite
+(-n 12, round 0): 6250 passed, 2 failed - test_tc1507 (known Windows path
+separators) and test_an_undeclared_method_still_starts_one, which passes
+alone with and without this branch (load-sensitive under -n 12).

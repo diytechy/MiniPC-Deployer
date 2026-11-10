@@ -1652,6 +1652,11 @@ def main():
             last_off_attempt = now
             safe = stop_and_record(actuator) is not False
             if safe:
+                # The relay may have been energized until this very write --
+                # latched across a lost node, say -- so MIN_OFF counts from
+                # here, not from the start or the failed attempt (Codex Sol
+                # reproduced OFF->ON in 1.3 s without this).
+                changed_at = now
                 log("relay reconciled to a verified OFF")
 
         loud = any(lv.above(ON_DBFS) for lv in levels)

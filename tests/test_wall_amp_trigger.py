@@ -396,6 +396,43 @@ def test_a_restart_after_a_long_quiet_spell_closes_the_relay_without_waiting(
         relay.events[0][0] - second_start)
 
 
+def test_a_late_reconciled_off_starts_the_dwell_llr1482(restart_module, monkeypatch):
+    """Codex Sol, 2026-11-09 review: an OFF the loop only verifies later.
+
+    The relay is latched ON and its node is not answering at start, so the
+    start-up OFF is unverified. The reconcile block keeps commanding OFF and
+    gets through 0.5 s in. With audio loud, the relay may not close again
+    until MIN_OFF after THAT verified OFF -- before this it closed MIN_OFF
+    after the start, about 0.1 s after the OFF.
+    """
+    import time
+    module = restart_module
+    monkeypatch.setattr(module, "ACTUATOR_FAST_RETRY_SECONDS", 0.05)
+
+    class LatchedThenReachable(_RestartRelay):
+        def __init__(self):
+            super().__init__()
+            self.on = True
+            self.reachable_at = None
+
+        def ensure_off(self):
+            return False
+
+        def stop(self):
+            if self.reachable_at is None or time.monotonic() < self.reachable_at:
+                return False
+            return self._set(False)
+
+    relay = LatchedThenReachable()
+    relay.reachable_at = time.monotonic() + 0.5
+    _RestartLevel.loud = True
+    _start, stop = _restart_daemon(module, monkeypatch, relay)
+    assert _wait_for(lambda: [kind for _t, kind in relay.events] == ["OFF", "ON"])
+    stop()
+    (off_at, _), (on_at, _) = relay.events[:2]
+    assert on_at - off_at >= module.MIN_OFF_SECONDS - 0.02, (on_at - off_at)
+
+
 def _sigterm_run(module, monkeypatch, actuator):
     """Drive main() through one SIGTERM inside the running loop.
 

@@ -46,4 +46,7 @@ LockPersonality=true
 IPAddressDeny=any
 IPAddressAllow=localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
 MemoryMax=128M
-TasksMax=32
+# THE SDK STARTS A THREAD POOL AT NET_DVR_Init (measured on the hub 2026-11-09, every other
+# restriction here in place): 128 tasks fail Init with SDK error 41 (resource allocation),
+# 160 succeed. 512 is over three times that; the hub default is ~9185.
+TasksMax=512

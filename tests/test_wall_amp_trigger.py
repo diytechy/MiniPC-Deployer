@@ -1,6 +1,8 @@
 """The amplifier detector can command the jack or the measured LCUS-2 relay."""
 
 import importlib.util
+import shutil
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -13,15 +15,82 @@ WALL = ROOT / "stack" / "autoinstall" / "wall"
 MODULE_PATH = WALL / "panel-amp-trigger.py"
 
 
-def test_firstboot_restarts_the_amp_after_mode_enablement_llr1440():
-    """A paired release must load the new settle into the running daemon."""
-    firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
-    start = firstboot.index("apply_audio_mode() {")
-    helper = firstboot[start:firstboot.index("\n}\n", start)]
-    applied = helper.index('if ! /usr/local/sbin/wall-audio-mode "$mode"')
-    restart = helper.index("systemctl try-restart wall-amp-trigger.service")
-    assert restart > applied
-    assert '||\n        warn "audio: wall-amp-trigger did not restart' in helper
+@pytest.mark.parametrize("mode", ["bus", "trigger"])
+@pytest.mark.parametrize("same_mode", [True, False], ids=["unchanged", "changed"])
+@pytest.mark.parametrize("running", [True, False], ids=["active", "inactive"])
+def test_mode_application_stops_then_starts_the_amp_even_if_unchanged_llr1440(
+        tmp_path, mode, same_mode, running):
+    """Execute the release's mode paths; hardware/system calls stay in the sandbox.
+
+    Firstboot installs the new detector before applying the mode. Its existing
+    stop/start must load that code even when the requested mode is unchanged.
+    Implements: SR-143, LLR-1440.
+    """
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("no POSIX bash")
+    source = (WALL / "wall-audio-mode").read_text(encoding="utf-8")
+
+    def extract(name):
+        start = source.index("\n%s() {\n" % name) + 1
+        return source[start:source.index("\n}\n", start) + 3]
+
+    # Execute the real entry-point case and the real enable/start helpers.
+    # Only unrelated effects and the systemd boundary are replaced. In
+    # particular, start_if_enabled is NOT a fake that could conceal a missing
+    # call in either mode's start branch.
+    functions = "\n".join(extract(name) for name in (
+        "remember_active", "was_active", "start_if_enabled", "apply_trigger", "apply_bus"))
+    entry = source[source.index('case "${1:-}" in'):]
+    mode_file = tmp_path / "audio-mode"
+    mode_file.write_text(mode if same_mode else "panel", encoding="utf-8")
+    harness = r'''
+set -eu
+FAILED=0
+ACTIVE_BEFORE=""
+ADAPTER=TestAdapter
+BUILTIN=TestBuiltin
+AMP_RUNNING=%s
+CONF_DIR="%s/conf"
+MODE_FILE="%s"
+id() { echo 0; }
+adapter_present() { return 0; }
+stop_mic_legs_or_refuse() { return 0; }
+restart_kiosk() { :; }
+clear_ipc() { :; }
+sleep() { :; }
+alsactl() { :; }
+mix() { :; }
+require_mode_selection() { printf '%%s\n' "$1" > "$MODE_FILE"; }
+systemctl() {
+    case "$1" in
+        is-active)
+            case "$*" in
+                *wall-amp-trigger.service) [ "$AMP_RUNNING" = 1 ] ;;
+                *) return 3 ;;
+            esac ;;
+        is-enabled) echo enabled ;;
+        *) echo "unexpected systemctl: $*" >&2; exit 99 ;;
+    esac
+}
+unit() {
+    printf '%%s\n' "$*" >> calls
+    case " $* " in
+        *" wall-amp-trigger.service "*)
+            case "$1" in stop) AMP_RUNNING=0 ;; start) AMP_RUNNING=1 ;; esac ;;
+    esac
+}
+%s
+%s
+''' % (int(running), tmp_path.as_posix(), mode_file.as_posix(), functions, entry)
+    script = tmp_path / "mode-harness.sh"
+    script.write_bytes(harness.encode("utf-8"))
+    result = subprocess.run([bash, script.as_posix(), mode], cwd=tmp_path,
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = [line.split() for line in (tmp_path / "calls").read_text().splitlines()]
+    amp_actions = [call[0] for call in calls if "wall-amp-trigger.service" in call[1:]]
+    assert amp_actions == ["stop", "enable", "start"], calls
 
 
 def load_module():

@@ -12,8 +12,8 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
-**2026-11-09 - amplifier settle is 8.5 seconds (SR-143, Owner 2026-11-09); built on `amp-settle-8s5`, NOT merged or deployed.** One-second fade-in, fade-out and already-closed relay behaviour are unchanged. Firstboot explicitly refreshes the active amp daemon after mode application. Active gate stays G1; no gate advanced.
-- **Proven:** amp 92 passed; wall-firstboot files 1621 passed / 16 skipped; focused audio/restart 86 passed / 2 skipped; G1 smoke PASS (334 passed / 4 skipped); hermetic shell 902 PASS / 0 FAIL plus unprivileged guards 21 PASS / 0 SKIP. Full harness retains the known metrics path failure and an additional unchanged sibling inventory mismatch; detailed results and override audit are in the dated entry below.
+**2026-11-09 - amplifier settle is 8.5 seconds (SR-143, Owner 2026-11-09); built on `amp-settle-8s5`, NOT merged or deployed.** One-second fade-in, fade-out and already-closed relay behaviour are unchanged. The mode script's existing stop/start loads the new daemon code on a release; the redundant firstboot restart from 007972d is removed in fix round 1. Active gate stays G1; no gate advanced.
+- **Fix-round validation:** amp 92 passed; combined audio/amp files plus all 25 wall-firstboot files and mode-selection coverage: 1628 passed / 17 skipped. New mode-path regression: 8 passed; removing either mode's amp start gives 4 failed / 4 passed, then 8 passed after restoration. Config validation, firstboot bash syntax, LF and diff checks pass; trace integrity 0 with the existing 25 orphans. Prior full-run baseline findings remain in the dated audit below.
 - **Next awaiting Owner:** review, integration and paired release, then live timing/listening acceptance. No live restart, panel config inspection, image or VM test; no merge or push.
 
 **2026-11-07 - the USB audio adapter's Mute and volume buttons are merged (SR-150; `a8596b8`, release-restart fix `7e82911`); NOT deployed.** The panel's CM106 exposes HID Mute / Volume- / Volume+, which `panel-volume-keys.py` already opened. The rocker's orientation swap now reaches only the i8042 rocker; a held adapter button (one press, one release, no autorepeat, captured on the panel) steps on the press and every 106 ms past 500 ms; Mute in bus mode is a toggle (`mute-toggle` on the volume socket, state `mute_return`), restoring the mic only when the button itself entered Mute; `92-wall-volume-keys.rules` re-enumerates on replug; firstboot now restarts the key reader so a paired release matches a re-image. Reviewed to GO by Codex Sol medium and Opus medium.
@@ -3171,8 +3171,36 @@ the hub's NVMe scratch volume holds the files.
 
 **2026-11-09 - amplifier relay settle is 8.5 seconds (SR-143; branch `amp-settle-8s5`); NOT merged or deployed.** Owner 2026-11-09: 8.5 s replaces the five-second wait after relay close. The one-second fade-in, two-second fade-out and immediate fade for an already-closed relay are unchanged. Active gate remains G1; no gate advanced. Hats: System Engineer, Software Engineer, Test Engineer and Docs, in sequence under the Owner's build brief.
 - **Changed:** code and commented env default; SR-140/SR-143, LLR-1436/LLR-1440 and TC-1659/TC-1660 amended in place with the dated source. A real-default fake-clock test proves the floor through 8.499 s, ramp start at 8.5 s and unity at 9.5 s; it failed against the old default before implementation.
-- **Release refresh:** firstboot try-restarts the amp after successful mode application (which delegates enablement to wall-audio-mode and normally already stops/starts it); failure warns and provisioning continues. SIGTERM verifies relay OFF before restoring fade unity, and startup verifies OFF again; the next Speaker close settles normally. MIN_ON/MIN_OFF remain loop contact protection, with timestamps reset across service restarts. Expect a brief silence and one settle; no persistent dwell machinery added.
+- **Release refresh (corrected in fix round 1):** firstboot installs the new detector before wall-audio-mode runs. With the adapter present that script records, stops and starts the amp in bus and trigger even when the mode is unchanged, loading the new code. With the adapter absent it defers and BindsTo keeps the daemon stopped; failed application reports fail_step. The extra try-restart in 007972d was unsafe: it could stop a relay just closed by the fresh daemon and close it again immediately, violating MIN_ON/MIN_OFF. Both reviewers reproduced this. Fix round 1 removes it and its tests; changed_at = 0.0 and the separately tracked cross-restart dwell gap remain unchanged.
 - **Proven:** amplifier suite 92 passed; all 25 test files found by `rg -l 'wall-firstboot' tests -g '*.py'`: 1621 passed, 16 skipped; focused audio/restart suites 86 passed, 2 skipped; G1 smoke harness 334 passed, 4 skipped, 6176 deselected (all five harness steps PASS). Config validation, bash syntax, changed Python/shell LF checks and diff whitespace passed. WSL Ubuntu hermetic runner: 902 PASS / 0 FAIL across 25 suites as ordinary user citest; its privileged-account guard skips were covered separately as unprivileged smokeacct (21 PASS / 0 FAIL / 0 SKIP). Kids-output suite skipped because jq is absent. Trace integrity 0; existing 25 orphans unchanged. Flow checker finds diagram 3 missing a requirement citation; all runtime Mermaid blocks are byte-identical to the base, so that finding is pre-existing.
 - **Full harness result:** 6237 passed, 274 skipped, 3 failed. The long-running pytest process collected the old no-warning assertion before its correction; a fresh run of that assertion plus the behavioural refresh and amp-restart cases passed (3 passed), as did the full focused file selections above. Remaining baseline failures: test_hub_metrics.py tc1507 (Windows path separators, known in the brief) and test_wall_site_inventory_sibling.py TC-1232 (the sibling ships js/entry-pad.js absent from this branch inventory). The latter was reproduced independently (1 failed, 1 passed); both its test and scripts/assert_wall_capabilities.py are byte-identical to the supplied base. This unrelated inventory mismatch is a finding for its owner, not changed here. test_gen_if_index.py did not fail in this run. Other full-harness steps passed.
 - **Override audit (read-only):** neither wall.env.example nor HomeHub scripts/deploy/config.wall.psd1 declares the settle knob; firstboot only seeds amp-trigger.env if absent and rewrites enablement/actuator/device/channel, not settle. The unit loads amp-trigger.env directly. A retained commented five-second line cannot pin the value; an uncommented WALL_AMP_SLEEP_WAKE_SETTLE_SECONDS=5 (or a local systemd environment override) can. No live panel config was inspected.
 - **Next awaiting Owner:** review and integration/release through the paired lane, then live timing/listening acceptance. No image, VM, live service restart or hardware timing was verified; no HomeHub edit, merge, push or branch/worktree change.
+
+## 2026-11-09 - amplifier settle fix round 1
+
+Both reviewers rejected the extra firstboot amp restart in 007972d. Removed
+that block and warning, restored the original panel-audio harness/assertion,
+and deleted the test requiring the redundant restart. The 8.5-second default
+and settle tests are unchanged. The mode script's existing stop/start is the
+release refresh; changed_at = 0.0 is untouched. No gate advanced (G1).
+
+New test: test_mode_application_stops_then_starts_the_amp_even_if_unchanged_llr1440
+in tests/test_wall_amp_trigger.py executes the real mode entry point, mode
+helpers and start_if_enabled with only unrelated effects/systemd stubbed.
+Eight cases cover bus/trigger, unchanged/changed mode, and active/inactive amp;
+each asserts exactly stop, enable, start for the amp. Existing source-string
+coverage did not prove all of these paths. Removing only trigger's amp start
+caused 4 failed / 4 passed; removing only bus's start caused 4 failed / 4 passed.
+The production mode script was restored byte-for-byte; all 8 cases then passed.
+
+Validation: tests/test_panel_amp_trigger_sleep.py: 92 passed. The 25 test files
+found by rg -l 'wall-firstboot' tests -g '*.py', plus
+tests/test_wall_audio_mode_selection.py: 1628 passed / 17 skipped; this includes
+panel-audio, wall-amp-trigger, wall-audio-switch and adapter-volume suites.
+bash -n on wall-firstboot.sh, validate_config.py, LF and diff checks pass.
+trace.py --strict-integrity: integrity 0, existing 25 orphans unchanged.
+The detector and mode script are unchanged from 007972d; firstboot and the
+panel-audio tests match its parent byte-for-byte. No full harness or live panel
+rerun this round. No sibling edits, merge, push or branch/worktree change.
+Next: Owner review and paired release, then live timing acceptance.

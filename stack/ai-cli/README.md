@@ -316,3 +316,51 @@ Everything the script reads from `.env` is `AI_USAGE_ENABLED`, `AI_USAGE_SOURCES
 `AI_CLI_ENABLED_ROUTES`, `AI_CLI_PROVISION` and `AI_CLI_PROVISION_RETRY_MINUTES`;
 it never sources the file. Tests: `tests/test_provision_ai_clis.py` (needs Linux;
 run it under `wsl -d Ubuntu`).
+
+## Signing the gauge logins back in: `gauge_login.py`
+
+One tool for every gauge sign-in (Owner 2026-11-10). It is the only thing that
+needs running when a ring or the weight bar goes grey; `ai-cli-status.sh` stays
+the read-only report of what is installed.
+
+```
+sudo python3 /opt/homehub/stack/ai-cli/gauge_login.py            # menu: table, then offer each dead one
+sudo python3 .../gauge_login.py status [--json]                  # the table; always exits 0
+sudo python3 .../gauge_login.py login <source>                   # one sign-in, then verify (needs a terminal)
+```
+
+From the dev PC: HomeHub `RefreshGaugeLogins.cmd` (runs the above over `ssh -t`).
+The files are not executable on the hub: always run them through `python3`.
+
+* **Sources:** `claude`, `claude2`, `codex`, `gemini`, `opencode`, `google-health`
+  (alias `weight`), plus `myair` and `tracker-sheet`, which have no tool-run
+  sign-in and print their manual step.
+* **States:** `live`, `DEAD` (credential present, feeder cannot use it, a blanked
+  Claude file, or a Claude refresh token past its deadline), `owed` (no usable
+  credential), `off` (not in `AI_USAGE_SOURCES`, or `AI_USAGE_ENABLED` /
+  `WEIGHT_ENABLED` not true), `unknown` (no feeder run read it in the last 20
+  minutes), `post-failing` (the login works, the POST to the tracker does not),
+  `manual`. Claude rows carry the deadline from the credential's
+  `refreshTokenExpiresAt` (epoch milliseconds) and `DUE SOON` at 3 days or less.
+* **`live` means** the newest completed `homehub-ai-usage.service` run that read
+  the source (within 20 min) has at least one of its gauges `live posted`,
+  optional ones included. Since 2026-10-31 Claude's session gauge is
+  `UNAVAILABLE` on a working login, so "every required gauge live" (the rule
+  `ai-cli-status.sh` used until then) read a good login as unverified; both now
+  use this rule. Google Health reads `homehub-weight.service` the same way
+  (60 min window; its timer fires every 15).
+* **The sign-in runs in your terminal**, as the AI account with the unit's
+  environment, from its home. The vendor's own prompts are yours to answer; the
+  tool never sees a pasted code. OpenCode's key is the one thing it prompts for
+  (hidden, via stdin to a writer running as the account, mode 600, atomic, other
+  providers kept). `claude2` fingerprints account 1's credential and
+  `~/.claude.json` first and says so loudly if either changed.
+* **The verdict is the feeder, not an exit code** (`claude auth login` exits 1
+  after `Login successful.`; the usage unit exits 1 whenever any source is
+  unavailable). After a sign-in it waits up to 3 minutes for the first run that
+  started after it and read the source, then prints `RESULT: PASS` or `FAIL`
+  with the gauge lines it saw.
+* **Never printed:** tokens, keys, pasted codes, any credential field other than
+  Claude's deadline. `.env` is read, values are never shown.
+* Tests: `tests/test_gauge_login.py`. Not proven by them: a real vendor
+  sign-in, a real `runuser`, a real journal. The hub run is the evidence.

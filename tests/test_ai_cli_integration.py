@@ -595,11 +595,17 @@ def test_present_credential_is_not_verified_until_the_feeder_logged_live_llr1117
     out = _status(box)
     assert "login claude: verified" in out and "consumer operation verified" in out
     NOT = "login claude: credential present (not verified)"
-    # One REQUIRED gauge UNAVAILABLE in the latest completed run.
+    # One gauge UNAVAILABLE and another live is still a working login (2026-11-10:
+    # the vendor has sent `five_hour: null` since 2026-10-31, so the session gauge is
+    # UNAVAILABLE every cycle on a perfectly good Claude login).
     box.journal({"gauges": [(required[0], "UNAVAILABLE")] + live[1:]})
+    assert "login claude: verified" in _status(box)
+    # EVERY gauge of the source UNAVAILABLE in the latest completed run: not proof.
+    box.journal({"gauges": [(k, "UNAVAILABLE") for k, _ in live]})
     assert NOT in _status(box)
-    # SOL: an old good run followed by a PARTIAL new one (a required gauge never printed).
-    box.journal({"gauges": live, "age": 600}, {"gauges": live[:1], "age": 60})
+    # An old good run followed by a new one in which nothing is live: the new one decides.
+    box.journal({"gauges": live, "age": 600},
+                {"gauges": [(k, "UNAVAILABLE") for k, _ in live], "age": 60})
     assert NOT in _status(box)
     # SOL: a new invocation that FAILS EARLY (no cycle-end line, nothing useful) does not
     # borrow the older good run's success.
@@ -612,9 +618,10 @@ def test_present_credential_is_not_verified_until_the_feeder_logged_live_llr1117
     assert NOT in _status(box)                                   # service not running: it died
     assert "login claude: verified" in _status(
         box, AI_CLI_USAGE_SERVICE_STATE="activating", AI_CLI_USAGE_INVOCATION_ID="runC")
-    # A stale OPTIONAL gauge live, then the required ones UNAVAILABLE: not proof.
+    # An OPTIONAL gauge live with the required ones UNAVAILABLE: it is a gauge of the
+    # same login, so it proves the credential (Owner brief 2026-11-10).
     box.journal({"gauges": [(optional[0], "live")] + [(k, "UNAVAILABLE") for k in required]})
-    assert NOT in _status(box)
+    assert "login claude: verified" in _status(box)
     # Evidence past the age cap is dropped (default 20 minutes).
     box.journal({"gauges": live, "age": 3600})
     assert NOT in _status(box)
@@ -1452,8 +1459,11 @@ def test_live_but_post_failed_is_credentials_ok_not_verified_llr1117(tmp_path):
     assert "login claude: credentials OK, posting failing" in out
     assert "login claude: verified" not in out and "consumer operation verified" not in out
     assert "LOGINS OWED: none" in out
-    # One required gauge posted, one not: still not verified.
+    # One live gauge posted, one live gauge not: posting is failing, not verified.
     box.journal({"gauges": [live[0] + ("posted",), failed[1]]})
+    assert "login claude: credentials OK, posting failing" in _status(box)
+    # A live gauge whose POST failed beside an UNAVAILABLE one that posted: same.
+    box.journal({"gauges": [failed[0], (live[1][0], "UNAVAILABLE", "posted")]})
     assert "login claude: credentials OK, posting failing" in _status(box)
     box.journal({"gauges": live})
     assert "login claude: verified" in _status(box)

@@ -215,8 +215,12 @@ else:
 
 
 def required_gauges():
-    """{source: [required gauge ids]} from the FEEDER's own GAUGE_SPECS (the other
-    side of the contract), or None when the feeder cannot be loaded here."""
+    """{source: [gauge ids]} from the FEEDER's own GAUGE_SPECS (the other side of
+    the contract), or None when the feeder cannot be loaded here. EVERY gauge of
+    the source, optional ones included: since 2026-10-31 the vendor sends
+    `five_hour: null`, so Claude's session gauge is UNAVAILABLE every cycle while
+    the login works, and a rule needing every required gauge live read a working
+    login as unverified. One live gauge proves the credential."""
     import importlib.util
     path = os.path.join(HERE, "..", "ai-usage", "ai_usage_feeder.py")
     try:
@@ -226,8 +230,7 @@ def required_gauges():
         spec.loader.exec_module(module)
         out = {}
         for gauge in module.GAUGE_SPECS:
-            if not gauge.optional:
-                out.setdefault(gauge.source, []).append(gauge.key)
+            out.setdefault(gauge.source, []).append(gauge.key)
         return out
     except Exception:
         return None
@@ -311,17 +314,18 @@ def usage_service_invocation():
 def feeder_evidence():
     """(verified, posting_failing): sets of sources.
 
-    verified = every REQUIRED gauge of the source is `live` AND `posted` in the
-    most recent COMPLETED feeder invocation, recent enough to mean something.
-    posting_failing = every required gauge is `live` but at least one POST FAILED:
-    the credentials work, the delivery does not - never called verified.
+    verified = AT LEAST ONE gauge of the source is `live` in the most recent
+    COMPLETED feeder invocation that read it, recent enough to mean something,
+    and every live one was `posted`.
+    posting_failing = a gauge is `live` but a POST of a live gauge FAILED: the
+    credentials work, the delivery does not - never called verified.
 
     - The newest invocation decides. If it never printed its `cycle complete` line
       it died part-way (or never printed): NOT verified - an older good run does
       not cover for it. The one exception is a run that is going right now AND is
       that same newest journal invocation: then the previous completed run is the
       latest finished evidence.
-    - Optional gauges (Claude's Fable band) are never proof.
+    - Optional gauges (Claude's Fable band) count like any other.
     - Evidence older than EVIDENCE_MAX_AGE_SECONDS is dropped.
     - A SOURCE THE RUN SKIPPED is judged by the newest earlier completed run that
       read it (SR-095, 2026-10-22): the feeder reads each source on its own
@@ -361,8 +365,9 @@ def feeder_evidence():
         if run_ is None:
             continue
         got = [run_["gauges"].get(k) for k in keys]
-        if all(g is not None and g[0] == "live" for g in got):
-            (verified if all(g[1] for g in got) else failing).add(src)
+        live = [g for g in got if g is not None and g[0] == "live"]
+        if live:
+            (verified if all(g[1] for g in live) else failing).add(src)
     return verified, failing
 
 

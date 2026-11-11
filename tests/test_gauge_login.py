@@ -65,7 +65,7 @@ class Sandbox(object):
             "GAUGE_LOGIN_SYSTEMCTL": "no-such-systemctl-for-the-tests",
             "GAUGE_LOGIN_VERIFY_SECONDS": verify_seconds, "GAUGE_LOGIN_POLL_SECONDS": "0",
             "GAUGE_LOGIN_ASSUME_TTY": "1", "GAUGE_LOGIN_PYTHON": sys.executable,
-            "GAUGE_LOGIN_MINT": "mint-stub", "PATH": os.environ.get("PATH", ""),
+            "GAUGE_LOGIN_MINT": "mint-stub", "GAUGE_LOGIN_RETRY_SECONDS": "0", "PATH": os.environ.get("PATH", ""),
         }
 
     def ctx(self, **extra):
@@ -821,3 +821,111 @@ def test_eof_at_the_menu_prompt_exits_130_too(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr("builtins.input", lambda prompt="": (_ for _ in ()).throw(EOFError))
     assert gl.cmd_menu(sb.ctx()) == 130
     assert "aborted - nothing verified" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- which field names the invocation
+
+def test_a_manager_end_line_is_attributed_by_INVOCATION_ID_even_when_the_other_field_differs():
+    """Logged by PID 1, the entry's INVOCATION_ID is the unit's run; a _SYSTEMD_INVOCATION_ID on
+    it would be init.scope's."""
+    rows = [
+        {"MESSAGE": "weight: weight     live         posted", "_SYSTEMD_INVOCATION_ID": "W",
+         "__REALTIME_TIMESTAMP": "1000000"},
+        {"MESSAGE": "homehub-weight.service: Deactivated successfully.", "INVOCATION_ID": "W",
+         "_SYSTEMD_INVOCATION_ID": "init-scope", "__REALTIME_TIMESTAMP": "2000000"},
+    ]
+    runs = gl.parse_invocations("\n".join(json.dumps(r) for r in rows), gl.HEALTH_LINE, gl.HEALTH_END)
+    assert [r["id"] for r in runs] == ["W"], runs
+    assert runs[0]["complete"] == 2.0 and "weight" in runs[0]["gauges"]
+    # The feeder's own output keeps preferring _SYSTEMD_INVOCATION_ID.
+    row = {"MESSAGE": "ai-usage: ai-usage-codex  live  posted", "_SYSTEMD_INVOCATION_ID": "S",
+           "INVOCATION_ID": "other", "__REALTIME_TIMESTAMP": "1000000"}
+    assert gl.parse_invocations(json.dumps(row), gl.USAGE_LINE, gl.CYCLE_END)[0]["id"] == "S"
+
+
+def test_the_weight_end_line_includes_the_pre_v249_wording():
+    assert gl.HEALTH_END.search("homehub-weight.service: Succeeded.")
+
+
+# ---------------------------------------------------------------- the status-versus-run race
+
+def _scripted_running(monkeypatch, *answers):
+    seq = list(answers)
+    monkeypatch.setattr(gl, "_running_now", lambda ctx, name: seq.pop(0) if seq else None)
+
+
+GOOD_CLAUDE = live("ai-usage-claude-weekly")
+RACE_RUNS = ({"gauges": GOOD_CLAUDE, "age": 70, "id": "A"},
+             {"gauges": GOOD_CLAUDE, "complete": False, "age": 2, "id": "B"})
+
+
+@pytest.mark.parametrize("before,after", [("B", None), (None, "B"), ("B", "B")])
+def test_either_systemd_query_naming_the_newest_run_counts_as_running_now(tmp_path, monkeypatch, before, after):
+    """before=B: the journal read caught the run mid-way and the unit was already inactive by the
+    time of the later query. after=B: a run began between the first query and the read."""
+    sb = Sandbox(tmp_path, USAGE, )
+    sb.claude_cred()
+    sb.usage_journal(*RACE_RUNS)
+    _scripted_running(monkeypatch, before, after)
+    # Decided on the FIRST pass: no pause, no second journal read.
+    monkeypatch.setattr(gl.time, "sleep", lambda secs: pytest.fail("the first pass should have decided"))
+    assert row_of(sb.ctx(GAUGE_LOGIN_RETRY_SECONDS="0"), "claude")["state"] == "live"
+
+
+@pytest.mark.parametrize("answers", [(None, None, "B", None), (None, None, None, "B")])
+def test_a_run_that_is_active_only_at_the_second_look_is_running_now(tmp_path, monkeypatch, answers):
+    sb = Sandbox(tmp_path, USAGE)
+    sb.claude_cred()
+    sb.usage_journal(*RACE_RUNS)
+    _scripted_running(monkeypatch, *answers)
+    assert row_of(sb.ctx(GAUGE_LOGIN_RETRY_SECONDS="0"), "claude")["state"] == "live"
+
+
+def test_neither_query_naming_it_and_no_completion_is_unknown_with_its_own_detail(tmp_path, monkeypatch):
+    sb = Sandbox(tmp_path, USAGE)
+    sb.claude_cred()
+    sb.usage_journal(*RACE_RUNS)
+    _scripted_running(monkeypatch)
+    row = row_of(sb.ctx(GAUGE_LOGIN_RETRY_SECONDS="0"), "claude")
+    assert row["state"] == "unknown"
+    assert "newest feeder run did not finish" in row["detail"] and "re-run status in a minute" in row["detail"]
+    # ...and the OTHER cause keeps its own wording.
+    sb.usage_journal({"gauges": GOOD_CLAUDE, "age": 3000, "id": "A"})
+    row = row_of(sb.ctx(), "claude")
+    assert row["state"] == "unknown" and "no feeder run read it in the last 20 min" in row["detail"]
+
+
+def test_a_run_that_finishes_during_the_pause_is_picked_up_by_the_journal_reread(tmp_path, monkeypatch):
+    sb = Sandbox(tmp_path, USAGE)
+    sb.claude_cred()
+    sb.usage_journal(*RACE_RUNS)
+    _scripted_running(monkeypatch)
+    pauses = []
+
+    def finish_during_pause(seconds):
+        pauses.append(seconds)
+        sb.usage_journal(RACE_RUNS[0], {"gauges": GOOD_CLAUDE, "age": 1, "id": "B"})     # B now complete
+
+    monkeypatch.setattr(gl.time, "sleep", finish_during_pause)
+    assert row_of(sb.ctx(), "claude")["state"] == "live"
+    assert len(pauses) == 1                                  # one re-read, no more
+
+
+def test_a_finished_newest_run_is_judged_without_any_pause(tmp_path, monkeypatch):
+    sb = Sandbox(tmp_path, USAGE)
+    sb.claude_cred()
+    sb.usage_journal({"gauges": GOOD_CLAUDE, "id": "A"})
+    monkeypatch.setattr(gl.time, "sleep", lambda s: pytest.fail("no pause is owed when the run finished"))
+    assert row_of(sb.ctx(), "claude")["state"] == "live"
+
+
+@pytest.mark.parametrize("before,after", [("W2", None), (None, "W2")])
+def test_the_same_race_is_handled_for_the_weight_unit(tmp_path, monkeypatch, before, after):
+    sb = _health_box(tmp_path)
+    sb.weight_journal({"gauges": GOOD_WEIGHT, "age": 600, "id": "W1"},
+                      {"gauges": GOOD_WEIGHT, "ended": False, "age": 2, "id": "W2"})
+    _scripted_running(monkeypatch, before, after)
+    assert row_of(sb.ctx(GAUGE_LOGIN_RETRY_SECONDS="0"), "google-health")["state"] == "live"
+    _scripted_running(monkeypatch)
+    row = row_of(sb.ctx(GAUGE_LOGIN_RETRY_SECONDS="0"), "google-health")
+    assert row["state"] == "unknown" and "did not finish" in row["detail"]

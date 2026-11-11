@@ -96,7 +96,7 @@ AUTH_USAGE = re.compile(r"ai-usage:\s+([a-z0-9]+): authentication failure\b")
 # schema over a perfectly good key.
 AUTH_NOKEY = re.compile(r"ai-usage:\s+(claude2?): credential \S+ carries no usable key")
 # How a oneshot's invocation ends in the journal: the manager's own lines carry the invocation id.
-HEALTH_END = re.compile(r"homehub-weight\.service: (?:Deactivated successfully|Failed with result)")
+HEALTH_END = re.compile(r"homehub-weight\.service: (?:Deactivated successfully|Succeeded|Failed with result)")
 AUTH_HEALTH = re.compile(r"^(?:weight|heart):\s.*\bsign-in failure \d+ of \d+")
 
 MANUAL_STEPS = {
@@ -314,7 +314,14 @@ def parse_invocations(text, line_re, end_re=None):
             continue
         if not isinstance(entry, dict):
             continue
-        inv = entry.get("_SYSTEMD_INVOCATION_ID") or entry.get("INVOCATION_ID")
+        message = entry.get("MESSAGE")
+        # A manager-originated end line (logged by PID 1) carries the UNIT's run in INVOCATION_ID;
+        # _SYSTEMD_INVOCATION_ID on such an entry, if present, would be init.scope's. Everything
+        # else (the feeder's own output) is stamped with _SYSTEMD_INVOCATION_ID.
+        if isinstance(message, str) and end_re is not None and HEALTH_END.search(message):
+            inv = entry.get("INVOCATION_ID") or entry.get("_SYSTEMD_INVOCATION_ID")
+        else:
+            inv = entry.get("_SYSTEMD_INVOCATION_ID") or entry.get("INVOCATION_ID")
         if not inv:
             continue
         try:
@@ -329,7 +336,6 @@ def parse_invocations(text, line_re, end_re=None):
         if ts:
             rec["first"] = min(rec["first"], ts) if rec["first"] else ts
             rec["last"] = max(rec["last"], ts)
-        message = entry.get("MESSAGE")
         if not isinstance(message, str):
             continue
         if end_re is not None and end_re.search(message):
@@ -384,40 +390,68 @@ def _running_now(ctx, name):
     return run_quiet(ctx.systemctl + ["show", "-p", "InvocationID", "--value", unit], 10)[1].strip() or None
 
 
-def feeder_evidence(ctx, name):
-    """What the feeder last saw of this source, or None (= unknown).
-
-    ai-cli-status.sh's rule, for BOTH units: the NEWEST invocation decides. One that never
-    finished (no `cycle complete` / no manager end line) died part-way, so it means unknown
-    and an older good run does not cover for it - except the run going right now
-    (systemctl is-active + InvocationID match), where the previous finished run is the
-    latest finished evidence.
-    Usage unit: a run that printed no gauge line for the source did not read it (each source
-    has its own schedule), so the walk goes back to the one that did, stopping at a run that
-    did not finish and at the age limit. Weight unit: every run reads everything, so a
-    finished newest run with no gauge lines (it exited before posting) is unknown."""
+def _decide(ctx, name, runs, active_ids):
+    """(evidence | None, reason). reason is "unfinished" when the newest run did not finish and
+    is not a run known to be going right now, else "none" (nothing read the source recently)."""
     now = ctx.now()
     health = KIND[name] == "health"
     limit = WEIGHT_EVIDENCE_MAX_AGE if health else USAGE_EVIDENCE_MAX_AGE
-    runs = invocations_for(ctx, name)
     if not runs:
-        return None
+        return None, "none"
     newest = len(runs) - 1
-    if runs[-1]["complete"] is None and len(runs) > 1 and _running_now(ctx, name) == runs[-1]["id"]:
+    if runs[-1]["complete"] is None and len(runs) > 1 and runs[-1]["id"] in active_ids:
         newest -= 1
     if runs[newest]["complete"] is None:
-        return None
+        return None, "unfinished"
     for inv in reversed(runs[:newest + 1]):
         stamp = _stamp(name, inv)
-        if stamp is None or now - stamp > limit:
-            return None
+        if stamp is None:
+            return None, "unfinished"
+        if now - stamp > limit:
+            return None, "none"
         live, failed, mine = judge(name, inv)
         if mine:
             return {"live": live, "failed": failed, "gauges": mine, "at": stamp,
-                    "auth": name in inv["auth"]}
+                    "auth": name in inv["auth"]}, ""
         if health:
-            return None
-    return None
+            return None, "none"
+    return None, "none"
+
+
+def feeder_verdict(ctx, name):
+    """(evidence | None, reason): what the feeder last saw of this source.
+
+    ai-cli-status.sh's rule, for BOTH units: the NEWEST invocation decides. One that never
+    finished (no `cycle complete` / no manager end line) died part-way, so it means unknown
+    and an older good run does not cover for it - except the run going right now, where the
+    previous finished run is the latest finished evidence.
+    Usage unit: a run that printed no gauge line for the source did not read it (each source
+    has its own schedule), so the walk goes back to the one that did, stopping at a run that
+    did not finish and at the age limit. Weight unit: every run reads everything, so a
+    finished newest run with no gauge lines (it exited before posting) is unknown.
+
+    THE RACE. The units run for a second or two. Reading the journal and THEN asking systemd
+    whether the unit is active can see a run that had printed its lines but not its end, and a
+    unit already inactive: a healthy run judged dead. So systemd is asked BEFORE the journal
+    read and AFTER it, and the newest unfinished run counts as running now if EITHER answer
+    names it (the mirror race, a run starting between query and read, is the same test). A run
+    that still looks unfinished-and-dead gets the journal re-read once after a moment before
+    it is called unknown."""
+    before = _running_now(ctx, name)
+    runs = invocations_for(ctx, name)
+    after = _running_now(ctx, name)
+    ev, reason = _decide(ctx, name, runs, set(x for x in (before, after) if x))
+    if ev is None and reason == "unfinished":
+        time.sleep(float(ctx.environ.get("GAUGE_LOGIN_RETRY_SECONDS") or 1))
+        again_before = _running_now(ctx, name)
+        runs = invocations_for(ctx, name)
+        again_after = _running_now(ctx, name)
+        ev, reason = _decide(ctx, name, runs, set(x for x in (before, after, again_before, again_after) if x))
+    return ev, reason
+
+
+def feeder_evidence(ctx, name):
+    return feeder_verdict(ctx, name)[0]
 
 
 def first_run_after(ctx, name, since):
@@ -509,8 +543,10 @@ def source_row(ctx, name):
         if not _nonempty(path):
             row.update(state="owed", detail="no credential at " + path)
             return row
-    ev = feeder_evidence(ctx, name)
-    if ev is None:
+    ev, reason = feeder_verdict(ctx, name)
+    if ev is None and reason == "unfinished":
+        row["detail"] = "the newest feeder run did not finish (re-run status in a minute)"
+    elif ev is None:
         row["detail"] = "credential present; no feeder run read it in the last %d min" % (
             (WEIGHT_EVIDENCE_MAX_AGE if KIND[name] == "health" else USAGE_EVIDENCE_MAX_AGE) // 60)
     elif ev["live"]:

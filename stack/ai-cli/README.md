@@ -351,7 +351,9 @@ The files are not executable on the hub: always run them through `python3`.
   `ai-cli-status.sh` used until then) read a good login as unverified; both now
   use this rule. The newest invocation decides (a run that died part-way means
   `unknown`, unless it is the run going right now). Google Health reads `homehub-weight.service` the same way
-  (60 min window; its timer fires every 15).
+  (60 min window; its timer fires every 15), with the same newest-run rule; that unit prints
+  no `cycle complete`, so a run's end is the manager's `Deactivated successfully` /
+  `Failed with result` line, and a finished newest run that posted no gauge line is `unknown`.
 * **The sign-in runs in your terminal**, as the AI account with the unit's
   environment, from its home. The vendor's own prompts are yours to answer; the
   tool never sees a pasted code. OpenCode's key is the one thing it prompts for

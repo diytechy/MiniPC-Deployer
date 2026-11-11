@@ -103,14 +103,24 @@ class Sandbox(object):
         self.feeder_log.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
     def weight_journal(self, *runs):
+        """Each run: dict(gauges=[...], extra=[msg], age=s, id=str, ended=bool). An ended run
+        has the manager's `Deactivated successfully` line (carrying INVOCATION_ID, as the real
+        journal does); that line is how the weight unit's end is recognised."""
         rows = []
         for n, run in enumerate(runs):
+            iid = run.get("id", "w%02d" % n)
             ts = NOW - run.get("age", 60)
             lines = ["weight: %-10s %-12s %s" % (g[0], g[1], g[2] if len(g) > 2 else "posted")
-                     for g in run["gauges"]] + run.get("extra", [])
+                     for g in run.get("gauges", [])] + run.get("extra", [])
             for k, text in enumerate(lines):
-                rows.append(json.dumps({"MESSAGE": text, "_SYSTEMD_INVOCATION_ID": "w%02d" % n,
-                                        "__REALTIME_TIMESTAMP": str(int((ts - len(lines) + k) * 1e6))}))
+                rows.append(json.dumps({"MESSAGE": text, "_SYSTEMD_INVOCATION_ID": iid,
+                                        "__REALTIME_TIMESTAMP": str(int((ts - len(lines) - 1 + k) * 1e6))}))
+            if run.get("ended", True):
+                rows.append(json.dumps({"MESSAGE": "homehub-weight.service: Deactivated successfully.",
+                                        "INVOCATION_ID": iid, "__REALTIME_TIMESTAMP": str(int(ts * 1e6))}))
+            else:
+                rows.append(json.dumps({"MESSAGE": "Starting HomeHub weight feeder...", "INVOCATION_ID": iid,
+                                        "__REALTIME_TIMESTAMP": str(int((ts - len(lines) - 2) * 1e6))}))
         self.weight_log.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
 
@@ -715,3 +725,99 @@ def test_ctrl_c_at_the_menu_aborts_cleanly_and_ends_the_menu(tmp_path, monkeypat
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
     monkeypatch.setattr(gl, "cmd_login", lambda ctx, source: 130)
     assert gl.cmd_menu(sb.ctx()) == 130
+
+
+# ---------------------------------------------------------------- the weight unit's newest run
+
+def _health_box(tmp_path):
+    sb = Sandbox(tmp_path, ["WEIGHT_ENABLED=true"])
+    token = tmp_path / "token.json"
+    token.write_text('{"refresh_token": "%s"}' % CANARY_REFRESH, encoding="utf-8")
+    sb.env_file.write_text(sb.env_file.read_text(encoding="utf-8") + "WEIGHT_TOKEN_FILE=%s\n" % token.as_posix(),
+                           encoding="utf-8")
+    return sb
+
+
+GOOD_WEIGHT = [("weight", "live"), ("weight-waist", "UNAVAILABLE")]
+
+
+def test_a_newer_weight_run_that_ended_without_posting_does_not_borrow_the_older_success(tmp_path):
+    sb = _health_box(tmp_path)
+    sb.weight_journal({"gauges": GOOD_WEIGHT, "age": 600, "id": "A"},
+                      {"gauges": [], "extra": ["weight: REFUSED, nothing posted - bad knob"], "age": 60, "id": "B"})
+    assert row_of(sb.ctx(), "google-health")["state"] == "unknown"
+    # A run that died with only the manager's lines counts the same.
+    sb.weight_journal({"gauges": GOOD_WEIGHT, "age": 600, "id": "A"}, {"gauges": [], "age": 60, "id": "B"})
+    assert row_of(sb.ctx(), "google-health")["state"] == "unknown"
+    # Control: with B absent the older run is live.
+    sb.weight_journal({"gauges": GOOD_WEIGHT, "age": 600, "id": "A"})
+    assert row_of(sb.ctx(), "google-health")["state"] == "live"
+
+
+def test_a_weight_run_that_has_not_ended_is_unknown_unless_it_is_the_one_running_now(tmp_path):
+    sb = _health_box(tmp_path)
+    sb.weight_journal({"gauges": GOOD_WEIGHT, "age": 600, "id": "A"},
+                      {"gauges": [], "ended": False, "age": 5, "id": "C"})
+    running = {"GAUGE_LOGIN_WEIGHT_SERVICE_STATE": "activating", "GAUGE_LOGIN_WEIGHT_INVOCATION_ID": "C"}
+    assert row_of(sb.ctx(**running), "google-health")["state"] == "live"          # previous run decides
+    assert row_of(sb.ctx(GAUGE_LOGIN_WEIGHT_SERVICE_STATE="inactive",
+                         GAUGE_LOGIN_WEIGHT_INVOCATION_ID="C"), "google-health")["state"] == "unknown"
+    assert row_of(sb.ctx(GAUGE_LOGIN_WEIGHT_SERVICE_STATE="active",
+                         GAUGE_LOGIN_WEIGHT_INVOCATION_ID="Z"), "google-health")["state"] == "unknown"
+
+
+def test_the_weight_end_line_is_what_the_manager_prints():
+    assert gl.HEALTH_END.search("homehub-weight.service: Deactivated successfully.")
+    assert gl.HEALTH_END.search("homehub-weight.service: Failed with result 'exit-code'.")
+    assert not gl.HEALTH_END.search("homehub-ai-usage.service: Deactivated successfully.")
+
+
+# ---------------------------------------------------------------- "no usable key" is auth for Claude only
+
+def test_carries_no_usable_key_is_an_auth_failure_only_for_claude():
+    for source in ("claude", "claude2"):
+        assert gl.auth_source("ai-usage: %s: credential /h/.credentials.json carries no usable key" % source) == source
+    # opencode: a renamed schema produced these words from a perfectly good key.
+    assert gl.auth_source("ai-usage: opencode: credential /h/auth.json carries no usable key") is None
+    assert gl.auth_source("ai-usage: gemini: credential /h/oauth_creds.json carries no usable key") is None
+    assert gl.auth_source(auth_failed("opencode")) == "opencode"               # the real auth line still counts
+
+
+def test_an_opencode_no_usable_key_line_leaves_the_source_unavailable_not_dead(tmp_path):
+    sb = Sandbox(tmp_path, USAGE)
+    sb.write(".local/share/opencode/auth.json", json.dumps({"opencode": {"type": "api", "key": CANARY_KEY}}))
+    sb.usage_journal({"gauges": [("ai-usage-opencode-weekly", "UNAVAILABLE"), ("ai-usage-opencode-monthly", "UNAVAILABLE")],
+                      "extra": ["ai-usage: opencode: credential /h/auth.json carries no usable key"]})
+    assert row_of(sb.ctx(), "opencode")["state"] == "unavailable"
+
+
+# ---------------------------------------------------------------- Ctrl+C anywhere in main()
+
+@pytest.mark.parametrize("where", ["Ctx", "build_status", "cmd_status"])
+def test_ctrl_c_before_the_menu_or_during_init_exits_130_without_a_traceback(tmp_path, monkeypatch, capsys, where):
+    sb = Sandbox(tmp_path, USAGE)
+    for key, value in sb.environ.items():
+        monkeypatch.setenv(key, value)
+
+    def interrupted(*a, **kw):
+        raise KeyboardInterrupt
+
+    if where == "Ctx":
+        monkeypatch.setattr(gl.Ctx, "__init__", interrupted)
+    else:
+        monkeypatch.setattr(gl, where, interrupted)
+    for argv in (["status"], ["menu"], [], ["login", "claude"]):
+        if where == "cmd_status" and argv != ["status"]:
+            continue                       # that entry point is only status's
+        if where == "build_status" and argv in (["status"], ["login", "claude"]):
+            continue                       # only the menu builds the table first
+        rc = gl.main(argv)
+        err = capsys.readouterr().err
+        assert rc == 130 and "aborted - nothing verified" in err and "Traceback" not in err, (where, argv)
+
+
+def test_eof_at_the_menu_prompt_exits_130_too(tmp_path, monkeypatch, capsys):
+    sb = _menu_box(tmp_path)
+    monkeypatch.setattr("builtins.input", lambda prompt="": (_ for _ in ()).throw(EOFError))
+    assert gl.cmd_menu(sb.ctx()) == 130
+    assert "aborted - nothing verified" in capsys.readouterr().err

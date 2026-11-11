@@ -90,7 +90,13 @@ HEALTH_LINE = re.compile(r"^(?:weight|heart):\s+([a-z-]+)\s+(live|UNAVAILABLE)\s
 #           token, OpenCode/vendor HTTP 401), and NoUsableKey "<source>: credential <path> carries
 #           no usable key".
 #   health: weight_feeder "<weight|heart>: sign-in failure N of M ..."
-AUTH_USAGE = re.compile(r"ai-usage:\s+([a-z0-9]+): (?:authentication failure\b|credential \S+ carries no usable key)")
+AUTH_USAGE = re.compile(r"ai-usage:\s+([a-z0-9]+): authentication failure\b")
+# "carries no usable key" is an auth failure ONLY for Claude: the feeder promotes NoUsableKey to
+# AuthFailure in _read_claude_account alone. For OpenCode the same words came from a renamed
+# schema over a perfectly good key.
+AUTH_NOKEY = re.compile(r"ai-usage:\s+(claude2?): credential \S+ carries no usable key")
+# How a oneshot's invocation ends in the journal: the manager's own lines carry the invocation id.
+HEALTH_END = re.compile(r"homehub-weight\.service: (?:Deactivated successfully|Failed with result)")
 AUTH_HEALTH = re.compile(r"^(?:weight|heart):\s.*\bsign-in failure \d+ of \d+")
 
 MANUAL_STEPS = {
@@ -291,7 +297,7 @@ def key_belongs(name, key):
 
 def auth_source(message):
     """The source a journal line says failed AUTHENTICATION, or None."""
-    m = AUTH_USAGE.search(message)
+    m = AUTH_USAGE.search(message) or AUTH_NOKEY.search(message)
     if m:
         return m.group(1)
     return "google-health" if AUTH_HEALTH.search(message) else None
@@ -340,16 +346,17 @@ def parse_invocations(text, line_re, end_re=None):
 def invocations_for(ctx, name):
     if KIND[name] == "health":
         return parse_invocations(ctx.journal("homehub-weight.service", "GAUGE_LOGIN_WEIGHT_LOG"),
-                                 HEALTH_LINE)
+                                 HEALTH_LINE, HEALTH_END)
     return parse_invocations(ctx.journal("homehub-ai-usage.service", "GAUGE_LOGIN_FEEDER_LOG"),
                              USAGE_LINE, CYCLE_END)
 
 
 def _stamp(name, inv):
-    """When an invocation counts as having finished, or None if it must not be used as
-    evidence: a usage run that never printed `cycle complete` died part-way (or is still
-    going); a health run has no such line, so its last line is its end."""
-    return inv["complete"] if KIND[name] == "usage" else (inv["last"] or None)
+    """When an invocation finished, or None if it must not be used as evidence. A usage run
+    ends with the feeder's own `cycle complete` line (one that never printed it died part-way
+    or is still going). The weight unit prints no such line, so its end is the manager's
+    `Deactivated successfully` / `Failed with result` line for the same invocation."""
+    return inv["complete"]
 
 
 def judge(name, inv):
@@ -360,29 +367,35 @@ def judge(name, inv):
     return live, failed, mine
 
 
-def _usage_running_now(ctx):
-    """The invocation id of the feeder run going RIGHT NOW, or None."""
-    state = ctx.environ.get("GAUGE_LOGIN_SERVICE_STATE")
+def _running_now(ctx, name):
+    """The invocation id of the feeder run going RIGHT NOW (systemctl is-active + InvocationID),
+    or None. Seams: GAUGE_LOGIN_SERVICE_STATE / _INVOCATION_ID (usage unit) and the
+    GAUGE_LOGIN_WEIGHT_ variants (weight unit)."""
+    health = KIND[name] == "health"
+    unit = "homehub-weight.service" if health else "homehub-ai-usage.service"
+    prefix = "GAUGE_LOGIN_WEIGHT_" if health else "GAUGE_LOGIN_"
+    state = ctx.environ.get(prefix + "SERVICE_STATE")
     if state is None:
-        state = run_quiet(ctx.systemctl + ["is-active", "homehub-ai-usage.service"], 10)[1].strip()
+        state = run_quiet(ctx.systemctl + ["is-active", unit], 10)[1].strip()
     if state not in ("active", "activating"):
         return None
-    if "GAUGE_LOGIN_INVOCATION_ID" in ctx.environ:
-        return ctx.environ["GAUGE_LOGIN_INVOCATION_ID"] or None
-    out = run_quiet(ctx.systemctl + ["show", "-p", "InvocationID", "--value",
-                                     "homehub-ai-usage.service"], 10)[1]
-    return out.strip() or None
+    if prefix + "INVOCATION_ID" in ctx.environ:
+        return ctx.environ[prefix + "INVOCATION_ID"] or None
+    return run_quiet(ctx.systemctl + ["show", "-p", "InvocationID", "--value", unit], 10)[1].strip() or None
 
 
 def feeder_evidence(ctx, name):
     """What the feeder last saw of this source, or None (= unknown).
 
-    ai-cli-status.sh's rule: the NEWEST invocation decides. A usage run that never printed
-    `cycle complete` died part-way, so it means unknown and an older good run does not cover
-    for it - except the run going right now (systemctl is-active + InvocationID match), where
-    the previous completed run is the latest finished evidence. A run that printed no gauge
-    line for the source did not read it (each source has its own schedule), so the walk goes
-    back to the one that did; it stops at a run that did not complete and at the age limit."""
+    ai-cli-status.sh's rule, for BOTH units: the NEWEST invocation decides. One that never
+    finished (no `cycle complete` / no manager end line) died part-way, so it means unknown
+    and an older good run does not cover for it - except the run going right now
+    (systemctl is-active + InvocationID match), where the previous finished run is the
+    latest finished evidence.
+    Usage unit: a run that printed no gauge line for the source did not read it (each source
+    has its own schedule), so the walk goes back to the one that did, stopping at a run that
+    did not finish and at the age limit. Weight unit: every run reads everything, so a
+    finished newest run with no gauge lines (it exited before posting) is unknown."""
     now = ctx.now()
     health = KIND[name] == "health"
     limit = WEIGHT_EVIDENCE_MAX_AGE if health else USAGE_EVIDENCE_MAX_AGE
@@ -390,12 +403,10 @@ def feeder_evidence(ctx, name):
     if not runs:
         return None
     newest = len(runs) - 1
-    if not health:
-        if runs[-1]["complete"] is None and len(runs) > 1 \
-                and _usage_running_now(ctx) == runs[-1]["id"]:
-            newest -= 1
-        if runs[newest]["complete"] is None:
-            return None
+    if runs[-1]["complete"] is None and len(runs) > 1 and _running_now(ctx, name) == runs[-1]["id"]:
+        newest -= 1
+    if runs[newest]["complete"] is None:
+        return None
     for inv in reversed(runs[:newest + 1]):
         stamp = _stamp(name, inv)
         if stamp is None or now - stamp > limit:
@@ -404,6 +415,8 @@ def feeder_evidence(ctx, name):
         if mine:
             return {"live": live, "failed": failed, "gauges": mine, "at": stamp,
                     "auth": name in inv["auth"]}
+        if health:
+            return None
     return None
 
 
@@ -846,7 +859,11 @@ def cmd_menu(ctx):
         print("REFUSED: the menu needs a terminal. Use `status` for the table, or run over `ssh -t`.",
               file=sys.stderr)
         return 2
-    rows = build_status(ctx)
+    try:
+        rows = build_status(ctx)
+    except (KeyboardInterrupt, EOFError):
+        print(chr(10) + "aborted - nothing verified", file=sys.stderr)
+        return 130
     print(render_table(rows))
     worst = 0
     # Ask only about what is dead or due: owed sources are deliberate deferrals (Claude 2,
@@ -891,14 +908,20 @@ def main(argv=None):
     p_login.add_argument("source")
     sub.add_parser("menu")
     args = parser.parse_args(argv)
-    ctx = Ctx()
-    if args.cmd == "status":
-        return cmd_status(ctx, args.json or args.json_sub)
-    if args.cmd == "login":
-        return cmd_login(ctx, args.source)
-    if args.json:
-        return cmd_status(ctx, True)
-    return cmd_menu(ctx)
+    # One guard around init AND dispatch: Ctx() and build_status() shell out and read journals,
+    # and a Ctrl+C there must not print a traceback either.
+    try:
+        ctx = Ctx()
+        if args.cmd == "status":
+            return cmd_status(ctx, args.json or args.json_sub)
+        if args.cmd == "login":
+            return cmd_login(ctx, args.source)
+        if args.json:
+            return cmd_status(ctx, True)
+        return cmd_menu(ctx)
+    except (KeyboardInterrupt, EOFError):
+        print(chr(10) + "aborted - nothing verified", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

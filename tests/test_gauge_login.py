@@ -94,6 +94,7 @@ class Sandbox(object):
             ts = NOW - run.get("age", 60)
             lines = ["ai-usage: %-32s %-12s %s" % (g[0], g[1], g[2] if len(g) > 2 else "posted")
                      for g in run.get("gauges", [])]
+            lines += run.get("extra", [])
             if run.get("complete", True):
                 lines.append("ai-usage: cycle complete gauges=%d failures=0" % len(run.get("gauges", [])))
             for k, text in enumerate(lines):
@@ -106,7 +107,7 @@ class Sandbox(object):
         for n, run in enumerate(runs):
             ts = NOW - run.get("age", 60)
             lines = ["weight: %-10s %-12s %s" % (g[0], g[1], g[2] if len(g) > 2 else "posted")
-                     for g in run["gauges"]]
+                     for g in run["gauges"]] + run.get("extra", [])
             for k, text in enumerate(lines):
                 rows.append(json.dumps({"MESSAGE": text, "_SYSTEMD_INVOCATION_ID": "w%02d" % n,
                                         "__REALTIME_TIMESTAMP": str(int((ts - len(lines) + k) * 1e6))}))
@@ -118,6 +119,12 @@ USAGE = ["AI_USAGE_ENABLED=true", "AI_USAGE_SOURCES=claude,claude2,codex,gemini,
 
 def live(*keys):
     return [(k, "live") for k in keys]
+
+
+def auth_failed(source):
+    """The line the feeder's own auth_line() prints for a failed authentication."""
+    entry = {"auth_since": 100, "auth_last": 160, "auth_attempts": 2}
+    return "ai-usage: " + feeder.auth_line(source, entry)
 
 
 def row_of(ctx, name):
@@ -134,12 +141,55 @@ def test_live_when_a_gauge_of_the_source_is_live(tmp_path):
     assert row["state"] == "live" and row["flag"] == ""
 
 
-def test_dead_when_the_credential_is_there_but_no_gauge_is_live(tmp_path):
+def test_dead_when_no_gauge_is_live_AND_the_feeder_printed_an_authentication_failure(tmp_path):
     sb = Sandbox(tmp_path, USAGE)
     sb.claude_cred()
     sb.usage_journal({"gauges": [("ai-usage-claude-session", "UNAVAILABLE"),
-                                 ("ai-usage-claude-weekly", "UNAVAILABLE")]})
+                                 ("ai-usage-claude-weekly", "UNAVAILABLE")],
+                      "extra": [auth_failed("claude")]})
     assert row_of(sb.ctx(), "claude")["state"] == "DEAD"
+
+
+def test_unavailable_without_an_auth_line_is_not_a_dead_login(tmp_path):
+    """A throttle, a network failure or a bad payload print UNAVAILABLE exactly like a dead
+    login; only the feeder's authentication line tells them apart."""
+    sb = Sandbox(tmp_path, USAGE)
+    sb.claude_cred()
+    throttle = "ai-usage: claude: HTTP 429 from the usage endpoint"
+    backoff = "ai-usage: " + feeder.backoff_line("claude", {"backoff": 1, "next_due": 460}, 400, 60)
+    for extra in ([], [throttle, backoff], ["ai-usage: claude: network error: timed out"]):
+        sb.usage_journal({"gauges": [("ai-usage-claude-session", "UNAVAILABLE"),
+                                     ("ai-usage-claude-weekly", "UNAVAILABLE")], "extra": extra})
+        row = row_of(sb.ctx(), "claude")
+        assert row["state"] == "unavailable", extra
+        assert "not a sign-in failure" in row["detail"]
+    # ...and another source's auth failure does not convict this one.
+    sb.usage_journal({"gauges": [("ai-usage-claude-weekly", "UNAVAILABLE")],
+                      "extra": [auth_failed("claude2")]})
+    assert row_of(sb.ctx(), "claude")["state"] == "unavailable"
+
+
+@pytest.mark.parametrize("source", ["claude", "claude2", "codex", "gemini", "opencode"])
+def test_every_usage_sources_authentication_line_is_recognised(source):
+    run = gl.parse_invocations(json.dumps({"MESSAGE": auth_failed(source), "_SYSTEMD_INVOCATION_ID": "x",
+                                           "__REALTIME_TIMESTAMP": "1"}), gl.USAGE_LINE, gl.CYCLE_END)
+    assert run[0]["auth"] == {source}
+
+
+def test_the_no_usable_key_and_real_feeder_failure_lines_are_recognised(tmp_path, monkeypatch, capsys):
+    cred = tmp_path / "blank.json"
+    cred.write_text(json.dumps({"claudeAiOauth": {"accessToken": "", "refreshToken": ""}}), encoding="utf-8")
+    rc, out, err = tq._main(tmp_path, monkeypatch, capsys, "claude",
+                            AI_USAGE_CLAUDE_CREDENTIALS=str(cred))
+    lines = [l for l in (out + err).splitlines() if l.startswith("ai-usage: ")]
+    assert any("carries no usable key" in l for l in lines), lines
+    rows = [json.dumps({"MESSAGE": l, "_SYSTEMD_INVOCATION_ID": "real", "__REALTIME_TIMESTAMP": str(i + 1)})
+            for i, l in enumerate(lines)]
+    run = gl.parse_invocations(chr(10).join(rows), gl.USAGE_LINE, gl.CYCLE_END)[0]
+    assert run["auth"] == {"claude"}, lines
+    assert gl.auth_source("ai-usage: claude: credential /x/.credentials.json carries no usable key") == "claude"
+    # A codex token_expired line alone is not the marker; the auth_line that follows it is.
+    assert gl.auth_source("ai-usage: codex: JSON-RPC error -32603: token_expired") is None
 
 
 def test_owed_when_there_is_no_usable_credential(tmp_path):
@@ -204,7 +254,7 @@ def test_claude_one_and_two_do_not_borrow_each_others_gauges(tmp_path):
     sb.usage_journal({"gauges": live("ai-usage-claude2-weekly") + [("ai-usage-claude-weekly", "UNAVAILABLE")]})
     ctx = sb.ctx()
     assert row_of(ctx, "claude2")["state"] == "live"
-    assert row_of(ctx, "claude")["state"] == "DEAD"
+    assert row_of(ctx, "claude")["state"] == "unavailable"
 
 
 def test_live_but_the_post_failed_is_its_own_state(tmp_path):
@@ -265,7 +315,8 @@ def test_a_run_that_did_not_read_the_source_defers_to_the_one_that_did(tmp_path)
                      {"gauges": live("ai-usage-claude-weekly"), "age": 60, "id": "B"})   # B never read codex
     assert row_of(sb.ctx(), "codex")["state"] == "live"
     # ...both ways: the earlier run that read it says it is dead.
-    sb.usage_journal({"gauges": [("ai-usage-codex", "UNAVAILABLE")], "age": 300, "id": "A"},
+    sb.usage_journal({"gauges": [("ai-usage-codex", "UNAVAILABLE")], "extra": [auth_failed("codex")],
+                      "age": 300, "id": "A"},
                      {"gauges": live("ai-usage-claude-weekly"), "age": 60, "id": "B"})
     assert row_of(sb.ctx(), "codex")["state"] == "DEAD"
     # ...and not past the age limit.
@@ -281,11 +332,50 @@ def test_a_run_that_never_printed_cycle_complete_is_not_evidence(tmp_path):
     assert row_of(sb.ctx(), "claude")["state"] == "unknown"
 
 
+def test_a_newest_run_that_died_part_way_does_not_borrow_an_older_good_one(tmp_path):
+    """A feeder that now crashes partway must not keep showing live for 20 minutes."""
+    sb = Sandbox(tmp_path, USAGE)
+    sb.claude_cred()
+    good = live("ai-usage-claude-weekly")
+    sb.usage_journal({"gauges": good, "age": 300, "id": "A"},
+                     {"gauges": [], "complete": False, "extra": ["Traceback (most recent call last):"],
+                      "age": 60, "id": "B"})
+    assert row_of(sb.ctx(), "claude")["state"] == "unknown"
+    # A run that died before printing anything (only the manager's lines) counts too.
+    sb.usage_journal({"gauges": good, "age": 300, "id": "A"})
+    sb.feeder_log.write_text(sb.feeder_log.read_text(encoding="utf-8") + json.dumps(
+        {"MESSAGE": "homehub-ai-usage.service: Failed with result 'exit-code'.", "INVOCATION_ID": "C",
+         "__REALTIME_TIMESTAMP": str(int((NOW - 10) * 1e6))}) + chr(10), encoding="utf-8")
+    assert row_of(sb.ctx(), "claude")["state"] == "unknown"
+
+
+def test_the_run_going_right_now_leaves_the_previous_completed_run_as_evidence(tmp_path):
+    sb = Sandbox(tmp_path, USAGE)
+    sb.claude_cred()
+    good = live("ai-usage-claude-weekly")
+    sb.usage_journal({"gauges": good, "age": 300, "id": "A"},
+                     {"gauges": [], "extra": ["ai-usage: starting"], "complete": False, "age": 5, "id": "C"})
+    now_running = {"GAUGE_LOGIN_SERVICE_STATE": "activating", "GAUGE_LOGIN_INVOCATION_ID": "C"}
+    assert row_of(sb.ctx(**now_running), "claude")["state"] == "live"
+    # The service is running but it is a DIFFERENT invocation: C died, so unknown.
+    assert row_of(sb.ctx(GAUGE_LOGIN_SERVICE_STATE="active", GAUGE_LOGIN_INVOCATION_ID="Z"),
+                  "claude")["state"] == "unknown"
+    # Not running at all: C died.
+    assert row_of(sb.ctx(GAUGE_LOGIN_SERVICE_STATE="inactive", GAUGE_LOGIN_INVOCATION_ID="C"),
+                  "claude")["state"] == "unknown"
+    # A good, B died, C running and silent: the previous run is B, which did not complete.
+    sb.usage_journal({"gauges": good, "age": 900, "id": "A"},
+                     {"gauges": [], "extra": ["ai-usage: starting"], "complete": False, "age": 300, "id": "B"},
+                     {"gauges": [], "extra": ["ai-usage: starting"], "complete": False, "age": 5, "id": "C"})
+    assert row_of(sb.ctx(**now_running), "claude")["state"] == "unknown"
+
+
 def test_the_newest_run_that_read_the_source_wins_over_older_ones(tmp_path):
     sb = Sandbox(tmp_path, USAGE)
     sb.claude_cred()
     sb.usage_journal({"gauges": live("ai-usage-claude-weekly"), "age": 400, "id": "A"},
-                     {"gauges": [("ai-usage-claude-weekly", "UNAVAILABLE")], "age": 60, "id": "B"})
+                     {"gauges": [("ai-usage-claude-weekly", "UNAVAILABLE")], "extra": [auth_failed("claude")],
+                      "age": 60, "id": "B"})
     assert row_of(sb.ctx(), "claude")["state"] == "DEAD"
 
 
@@ -319,6 +409,7 @@ def test_the_line_formats_are_the_ones_the_feeders_print():
     assert '"posted" if ok else "POST FAILED"' in source
     weight = (REPO / "stack" / "weight" / "weight_feeder.py").read_text(encoding="utf-8")
     assert '"weight: %-10s %-12s %s"' in weight and '"heart: %-10s %-12s %s"' in weight
+    assert '"%s: sign-in failure %d of %d%s"' in weight
     assert 'RATIO_GAUGE_ID = "weight-waist"' in weight and 'HEART_GAUGE_ID = "heart"' in weight
 
 
@@ -331,6 +422,9 @@ def test_google_health_reads_the_weight_services_journal(tmp_path):
     sb.weight_journal({"gauges": [("weight", "live"), ("weight-waist", "UNAVAILABLE"), ("heart", "UNAVAILABLE")]})
     assert row_of(sb.ctx(), "google-health")["state"] == "live"
     sb.weight_journal({"gauges": [("weight", "UNAVAILABLE")]})
+    assert row_of(sb.ctx(), "google-health")["state"] == "unavailable"
+    sb.weight_journal({"gauges": [("weight", "UNAVAILABLE")],
+                       "extra": ["weight: sign-in failure 2 of 2 - confirmed, the gauge is grey until the login is renewed"]})
     assert row_of(sb.ctx(), "google-health")["state"] == "DEAD"
     sb.weight_journal({"gauges": [("weight", "live")], "age": 7200})
     assert row_of(sb.ctx(), "google-health")["state"] == "unknown"
@@ -432,28 +526,55 @@ def test_verification_takes_the_first_run_after_the_signin_not_an_older_one(tmp_
     sb = Sandbox(tmp_path, USAGE)
     # A live run BEFORE the sign-in must not pass it; the run after it decides.
     sb.usage_journal({"gauges": live("ai-usage-claude-weekly"), "age": 200, "id": "before"})
-    passed, lines = gl.wait_for_verdict(sb.ctx(), "claude", NOW - 100)
-    assert not passed and "no completed feeder run" in lines[0]
+    verdict, lines = gl.wait_for_verdict(sb.ctx(), "claude", NOW - 100)
+    assert verdict == "fail" and "no completed feeder run" in lines[0]
     sb.usage_journal({"gauges": live("ai-usage-claude-weekly"), "age": 200, "id": "before"},
                      {"gauges": [("ai-usage-claude-session", "UNAVAILABLE"), ("ai-usage-claude-weekly", "live")],
                       "age": 10, "id": "after"})
-    passed, lines = gl.wait_for_verdict(sb.ctx(), "claude", NOW - 100)
-    assert passed
+    verdict, lines = gl.wait_for_verdict(sb.ctx(), "claude", NOW - 100)
+    assert verdict == "pass"
     assert "ai-usage-claude-weekly live posted" in lines and "ai-usage-claude-session UNAVAILABLE posted" in lines
 
 
-def test_verification_fails_and_shows_what_it_saw_when_nothing_is_live(tmp_path):
+def test_verification_fails_on_an_authentication_failure_and_shows_what_it_saw(tmp_path):
     sb = Sandbox(tmp_path, USAGE)
-    sb.usage_journal({"gauges": [("ai-usage-codex", "UNAVAILABLE")], "age": 10})
-    passed, lines = gl.wait_for_verdict(sb.ctx(), "codex", NOW - 100)
-    assert not passed and "ai-usage-codex UNAVAILABLE posted" in lines
+    sb.usage_journal({"gauges": [("ai-usage-codex", "UNAVAILABLE")], "extra": [auth_failed("codex")],
+                      "age": 10})
+    verdict, lines = gl.wait_for_verdict(sb.ctx(), "codex", NOW - 100)
+    assert verdict == "fail" and "ai-usage-codex UNAVAILABLE posted" in lines
+    assert "authentication failure" in lines[0]
+
+
+def test_unavailable_without_an_auth_line_after_signin_is_pending_not_fail(tmp_path, monkeypatch, capsys):
+    sb = Sandbox(tmp_path, USAGE)
+    sb.usage_journal({"gauges": [("ai-usage-codex", "UNAVAILABLE")],
+                      "extra": ["ai-usage: codex: HTTP 429 too many requests"], "age": 10})
+    verdict, lines = gl.wait_for_verdict(sb.ctx(), "codex", NOW - 100)
+    assert verdict == "pending"
+    assert "vendor did not answer yet (not an auth failure)" in lines[0]
+    assert "re-run status in a few minutes" in lines[0]
+    # ...and login reports it as not yet verified, not a bare FAIL (still non-zero).
+    sb.codex_home.mkdir(parents=True)
+    monkeypatch.setattr(gl, "spawn_interactive", lambda argv, timeout=0: 0)
+    sb.usage_journal({"gauges": [("ai-usage-codex", "UNAVAILABLE")], "age": -5})
+    rc = gl.login_one(sb.ctx(), "codex")
+    out = capsys.readouterr().out
+    assert rc == 1 and "NOT YET VERIFIED" in out and "RESULT: FAIL" not in out
+
+
+def test_a_pending_first_run_does_not_stop_a_later_live_run_passing(tmp_path):
+    sb = Sandbox(tmp_path, USAGE)
+    sb.usage_journal({"gauges": [("ai-usage-codex", "UNAVAILABLE")], "age": 20, "id": "first"},
+                     {"gauges": live("ai-usage-codex"), "age": 5, "id": "second"})
+    verdict, lines = gl.wait_for_verdict(sb.ctx(), "codex", NOW - 100)
+    assert verdict == "pass"
 
 
 def test_google_health_verification_reads_the_weight_journal(tmp_path):
     sb = Sandbox(tmp_path, ["WEIGHT_ENABLED=true"])
     sb.weight_journal({"gauges": [("weight", "live"), ("weight-waist", "live")], "age": 10})
-    passed, lines = gl.wait_for_verdict(sb.ctx(), "google-health", NOW - 100)
-    assert passed and "weight live posted" in lines
+    verdict, lines = gl.wait_for_verdict(sb.ctx(), "google-health", NOW - 100)
+    assert verdict == "pass" and "weight live posted" in lines
 
 
 # ---------------------------------------------------------------- opencode
@@ -493,13 +614,13 @@ def test_opencode_writer_preserves_other_providers_and_the_entrys_shape(tmp_path
     assert rc in (0, 1)       # the verdict here is the feeder's; the journal is empty
 
 
-def test_opencode_writer_creates_the_file_in_the_feeders_preferred_spelling(tmp_path):
+def test_opencode_writer_creates_the_file_in_the_spelling_the_cli_writes(tmp_path):
     sb = Sandbox(tmp_path, USAGE)
     ctx = sb.ctx()
     gl.write_opencode_key(ctx, CANARY_KEY)
     path = key_files(sb)
     data = json.loads(path.read_text(encoding="utf-8"))
-    assert data == {"opencode-go": {"type": "api", "key": CANARY_KEY}}
+    assert data == {"opencode": {"type": "api", "key": CANARY_KEY}}
     # ...and the feeder's own reader accepts exactly that.
     assert feeder._opencode_key(data) == CANARY_KEY
     if os.name != "nt":
@@ -531,3 +652,66 @@ def test_a_pasted_code_never_reaches_any_output(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr()
     for canary in ALL_CANARIES:
         assert canary not in out.out + out.err
+
+
+# ---------------------------------------------------------------- menu and Ctrl+C
+
+def _menu_box(tmp_path):
+    sb = Sandbox(tmp_path, USAGE)
+    sb.claude_cred(deadline=NOW + DAY)                         # live, DUE SOON
+    sb.usage_journal({"gauges": live("ai-usage-claude-weekly") + [("ai-usage-codex", "UNAVAILABLE")],
+                      "extra": [auth_failed("codex")]})
+    sb.codex_home.mkdir(parents=True)
+    (sb.codex_home / "auth.json").write_text("{}", encoding="utf-8")       # codex: DEAD
+    return sb                                                  # claude2, gemini, opencode: owed
+
+
+def test_the_menu_asks_only_about_dead_and_due_soon_and_lists_the_rest(tmp_path, monkeypatch, capsys):
+    sb = _menu_box(tmp_path)
+    asked = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": asked.append(prompt) or "")
+    assert gl.cmd_menu(sb.ctx()) == 0
+    out = capsys.readouterr().out
+    prompts = [p for p in asked if "now (" in p]
+    assert [p.split()[2] for p in prompts] == ["claude", "codex"], asked      # DUE SOON, DEAD
+    assert not any("claude2" in p or "gemini" in p or "opencode" in p for p in prompts)
+    assert "Not asked about (owed or unavailable): claude2, gemini, opencode" in out
+    assert "login <source>" in out
+
+
+def test_the_menu_signs_in_only_on_an_explicit_yes(tmp_path, monkeypatch, capsys):
+    sb = _menu_box(tmp_path)
+    ran = []
+    monkeypatch.setattr(gl, "cmd_login", lambda ctx, source: ran.append(source) or 0)
+    answers = iter(["n", "y", ""])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+    gl.cmd_menu(sb.ctx())
+    assert ran == ["codex"]
+
+
+def test_ctrl_c_during_a_signin_aborts_cleanly(tmp_path, monkeypatch, capsys):
+    sb = Sandbox(tmp_path, USAGE)
+
+    def interrupted(argv, timeout=0):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(gl, "spawn_interactive", interrupted)
+    rc = gl.cmd_login(sb.ctx(), "claude")
+    err = capsys.readouterr().err
+    assert rc == 130 and "aborted - nothing verified" in err and "Traceback" not in err
+
+
+def test_ctrl_c_at_the_menu_aborts_cleanly_and_ends_the_menu(tmp_path, monkeypatch, capsys):
+    sb = _menu_box(tmp_path)
+
+    def interrupted(prompt=""):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", interrupted)
+    assert gl.cmd_menu(sb.ctx()) == 130
+    assert "aborted - nothing verified" in capsys.readouterr().err
+    # Ctrl+C inside a sign-in the menu started stops the menu too.
+    answers = iter(["y"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+    monkeypatch.setattr(gl, "cmd_login", lambda ctx, source: 130)
+    assert gl.cmd_menu(sb.ctx()) == 130

@@ -83,6 +83,15 @@ GAUGES = {
 CYCLE_END = re.compile(r"ai-usage:\s+cycle complete\b")
 USAGE_LINE = re.compile(r"ai-usage:\s+(ai-usage-[a-z0-9-]+)\s+(live|UNAVAILABLE)\s+(posted|POST FAILED)")
 HEALTH_LINE = re.compile(r"^(?:weight|heart):\s+([a-z-]+)\s+(live|UNAVAILABLE)\s+(posted|POST FAILED)")
+# What the feeders print when a login is the reason a read failed (and ONLY then): a throttle,
+# a network failure or a bad payload print UNAVAILABLE gauges with none of these.
+#   usage:  ai_usage_feeder.auth_line()  "<source>: authentication failure, attempt N over Ns ..."
+#           (every AuthFailure: Claude's blanked key, Codex token_expired, Gemini's expired CLI
+#           token, OpenCode/vendor HTTP 401), and NoUsableKey "<source>: credential <path> carries
+#           no usable key".
+#   health: weight_feeder "<weight|heart>: sign-in failure N of M ..."
+AUTH_USAGE = re.compile(r"ai-usage:\s+([a-z0-9]+): (?:authentication failure\b|credential \S+ carries no usable key)")
+AUTH_HEALTH = re.compile(r"^(?:weight|heart):\s.*\bsign-in failure \d+ of \d+")
 
 MANUAL_STEPS = {
     "myair": (
@@ -280,9 +289,17 @@ def key_belongs(name, key):
     return key == "ai-usage-" + name or key.startswith("ai-usage-%s-" % name)
 
 
+def auth_source(message):
+    """The source a journal line says failed AUTHENTICATION, or None."""
+    m = AUTH_USAGE.search(message)
+    if m:
+        return m.group(1)
+    return "google-health" if AUTH_HEALTH.search(message) else None
+
+
 def parse_invocations(text, line_re, end_re=None):
     """The journal (JSON lines) grouped by systemd invocation, oldest first.
-    Each: {id, gauges{key:(state, posted)}, complete(ts|None), first, last}."""
+    Each: {id, gauges{key:(state, posted)}, auth{sources}, complete(ts|None), first, last}."""
     order, by_id = [], {}
     for line in text.splitlines():
         try:
@@ -299,7 +316,8 @@ def parse_invocations(text, line_re, end_re=None):
         except (TypeError, ValueError):
             ts = 0
         if inv not in by_id:
-            by_id[inv] = {"id": inv, "gauges": {}, "complete": None, "first": ts, "last": ts}
+            by_id[inv] = {"id": inv, "gauges": {}, "auth": set(), "complete": None,
+                          "first": ts, "last": ts}
             order.append(inv)
         rec = by_id[inv]
         if ts:
@@ -313,6 +331,9 @@ def parse_invocations(text, line_re, end_re=None):
         m = line_re.search(message)
         if m:
             rec["gauges"][m.group(1)] = (m.group(2), m.group(3) == "posted")
+        failed_source = auth_source(message)
+        if failed_source:
+            rec["auth"].add(failed_source)
     return [by_id[i] for i in order]
 
 
@@ -339,22 +360,50 @@ def judge(name, inv):
     return live, failed, mine
 
 
+def _usage_running_now(ctx):
+    """The invocation id of the feeder run going RIGHT NOW, or None."""
+    state = ctx.environ.get("GAUGE_LOGIN_SERVICE_STATE")
+    if state is None:
+        state = run_quiet(ctx.systemctl + ["is-active", "homehub-ai-usage.service"], 10)[1].strip()
+    if state not in ("active", "activating"):
+        return None
+    if "GAUGE_LOGIN_INVOCATION_ID" in ctx.environ:
+        return ctx.environ["GAUGE_LOGIN_INVOCATION_ID"] or None
+    out = run_quiet(ctx.systemctl + ["show", "-p", "InvocationID", "--value",
+                                     "homehub-ai-usage.service"], 10)[1]
+    return out.strip() or None
+
+
 def feeder_evidence(ctx, name):
-    """The newest completed run that READ this source, within the age limit, or None.
-    A run that printed no gauge line for the source did not read it (each source has its
-    own schedule), so the walk goes on to the run that did."""
+    """What the feeder last saw of this source, or None (= unknown).
+
+    ai-cli-status.sh's rule: the NEWEST invocation decides. A usage run that never printed
+    `cycle complete` died part-way, so it means unknown and an older good run does not cover
+    for it - except the run going right now (systemctl is-active + InvocationID match), where
+    the previous completed run is the latest finished evidence. A run that printed no gauge
+    line for the source did not read it (each source has its own schedule), so the walk goes
+    back to the one that did; it stops at a run that did not complete and at the age limit."""
     now = ctx.now()
-    limit = WEIGHT_EVIDENCE_MAX_AGE if KIND[name] == "health" else USAGE_EVIDENCE_MAX_AGE
-    for inv in reversed(invocations_for(ctx, name)):
-        stamp = _stamp(name, inv)
-        if stamp is None:
-            continue
-        live, failed, mine = judge(name, inv)
-        if not mine:
-            continue
-        if now - stamp > limit:
+    health = KIND[name] == "health"
+    limit = WEIGHT_EVIDENCE_MAX_AGE if health else USAGE_EVIDENCE_MAX_AGE
+    runs = invocations_for(ctx, name)
+    if not runs:
+        return None
+    newest = len(runs) - 1
+    if not health:
+        if runs[-1]["complete"] is None and len(runs) > 1 \
+                and _usage_running_now(ctx) == runs[-1]["id"]:
+            newest -= 1
+        if runs[newest]["complete"] is None:
             return None
-        return {"live": live, "failed": failed, "gauges": mine, "at": stamp}
+    for inv in reversed(runs[:newest + 1]):
+        stamp = _stamp(name, inv)
+        if stamp is None or now - stamp > limit:
+            return None
+        live, failed, mine = judge(name, inv)
+        if mine:
+            return {"live": live, "failed": failed, "gauges": mine, "at": stamp,
+                    "auth": name in inv["auth"]}
     return None
 
 
@@ -368,7 +417,7 @@ def first_run_after(ctx, name, since):
             continue
         live, failed, mine = judge(name, inv)
         if mine:
-            seen = {"live": live, "failed": failed, "gauges": mine}
+            seen = {"live": live, "failed": failed, "gauges": mine, "auth": name in inv["auth"]}
             if live:
                 return seen
     return seen
@@ -458,8 +507,13 @@ def source_row(ctx, name):
         else:
             row["state"] = "live"
             row["detail"] = "live: " + ", ".join(sorted(ev["live"]))
+    elif ev["auth"]:
+        row.update(state="DEAD", detail="the feeder reports an authentication failure for it")
     else:
-        row.update(state="DEAD", detail="the feeder cannot use it: no gauge live in its latest read")
+        row.update(state="unavailable",
+                   detail="the feeder could not read it this cycle; not a sign-in failure "
+                          "(a throttle, a network error or a bad reply look the same as a dead "
+                          "login in the gauges, but print no authentication failure)")
     return row
 
 
@@ -484,7 +538,8 @@ def render_table(rows):
     lines.append(fmt % header)
     for c in cells:
         lines.append(fmt % c)
-    need = [r for r in rows if r["state"] in ("DEAD", "owed", "unknown", "post-failing") or r["flag"]]
+    need = [r for r in rows if r["state"] in ("DEAD", "owed", "unknown", "post-failing", "unavailable")
+            or r["flag"]]
     if need:
         lines.append("")
         for r in need:
@@ -589,7 +644,7 @@ if present:
     for p in present:
         data[p]["key"] = key
 else:
-    data["opencode-go"] = {"type": "api", "key": key}
+    data["opencode"] = {"type": "api", "key": key}
 d = os.path.dirname(path)
 os.makedirs(d, mode=0o700, exist_ok=True)
 tmp = path + ".tmp-%d" % os.getpid()
@@ -664,7 +719,9 @@ def manual_step(ctx, name):
 
 def wait_for_verdict(ctx, name, since):
     """Poll for the first completed feeder run after `since` that read the source.
-    Returns (passed, message lines)."""
+    Returns (verdict, message lines); verdict is "pass", "fail" (live nowhere and the feeder
+    printed an authentication failure, no run at all, or a POST failure) or "pending" (the
+    feeder ran but the vendor did not answer, and nothing says the login is bad)."""
     timeout = float(ctx.environ.get("GAUGE_LOGIN_VERIFY_SECONDS") or 180)
     poll = float(ctx.environ.get("GAUGE_LOGIN_POLL_SECONDS") or 10)
     unit = "homehub-weight.service" if KIND[name] == "health" else "homehub-ai-usage.service"
@@ -678,19 +735,24 @@ def wait_for_verdict(ctx, name, since):
     seen = None
     while True:
         seen = first_run_after(ctx, name, since)
-        if (seen is not None and seen["live"]) or time.monotonic() >= deadline:
+        if seen is not None and (seen["live"] or seen["auth"]):
+            break                      # proven, or an authentication failure: no point waiting
+        if time.monotonic() >= deadline:
             break
         time.sleep(poll)
     if seen is None:
-        return False, ["no completed feeder run read %s within %d s of the sign-in" % (name, int(timeout))]
+        return "fail", ["no completed feeder run read %s within %d s of the sign-in" % (name, int(timeout))]
     lines = []
     for key, (state, posted) in sorted(seen["gauges"].items()):
         lines.append("%s %s %s" % (key, state, "posted" if posted else "POST FAILED"))
     if not seen["live"]:
-        return False, ["the feeder ran but no gauge of %s is live:" % name] + lines
+        if seen["auth"]:
+            return "fail", ["the feeder reports an authentication failure for %s:" % name] + lines
+        return "pending", ["signed in, but the vendor did not answer yet (not an auth failure) - "
+                           "re-run status in a few minutes. What the feeder saw:"] + lines
     if seen["failed"]:
-        return False, ["the login works but a live gauge's POST failed:"] + lines
-    return True, lines
+        return "fail", ["the login works but a live gauge's POST failed:"] + lines
+    return "pass", lines
 
 
 def login_one(ctx, name):
@@ -750,11 +812,15 @@ def login_one(ctx, name):
         print("RESULT: signed in; not verified (source not enabled).")
         return 1 if failed else 0
     print("verifying through the feeder (up to %s s)..." % (ctx.environ.get("GAUGE_LOGIN_VERIFY_SECONDS") or 180))
-    passed, lines = wait_for_verdict(ctx, name, since)
+    verdict, lines = wait_for_verdict(ctx, name, since)
     for line in lines:
         print("  " + line)
-    print("RESULT: %s" % ("PASS" if passed and not failed else "FAIL"))
-    return 0 if passed and not failed else 1
+    if verdict == "pending" and not failed:
+        print("RESULT: NOT YET VERIFIED (signed in; the vendor has not answered)")
+        return 1
+    passed = verdict == "pass" and not failed
+    print("RESULT: %s" % ("PASS" if passed else "FAIL"))
+    return 0 if passed else 1
 
 
 _read_secret = getpass.getpass
@@ -770,6 +836,9 @@ def cmd_login(ctx, source):
     except LoginError as exc:
         print("REFUSED: %s" % exc, file=sys.stderr)
         return 2
+    except KeyboardInterrupt:
+        print(chr(10) + "aborted - nothing verified", file=sys.stderr)
+        return 130
 
 
 def cmd_menu(ctx):
@@ -780,17 +849,35 @@ def cmd_menu(ctx):
     rows = build_status(ctx)
     print(render_table(rows))
     worst = 0
-    candidates = [r for r in rows if r["state"] in ("DEAD", "owed") or r["flag"]]
-    for r in candidates:
-        why = r["state"] + ("/" + r["flag"] if r["flag"] else "")
-        answer = input("\nSign in %s now (%s)? [y/N] " % (r["source"], why)).strip().lower()
-        if answer in ("y", "yes"):
-            worst = max(worst, cmd_login(ctx, r["source"]))
-    while True:
-        extra = input("\nAnother source by name (%s), or Enter to finish: " % ", ".join(ORDER)).strip()
-        if not extra:
-            break
-        worst = max(worst, cmd_login(ctx, extra))
+    # Ask only about what is dead or due: owed sources are deliberate deferrals (Claude 2,
+    # Gemini) and `unavailable` is not a sign-in problem, so those are listed, not asked.
+    asked = [r for r in rows if r["state"] == "DEAD" or r["flag"]]
+    listed = [r["source"] for r in rows if r["state"] in ("owed", "unavailable")]
+    try:
+        for r in asked:
+            why = r["state"] + ("/" + r["flag"] if r["flag"] else "")
+            answer = input("\nSign in %s now (%s)? [y/N] " % (r["source"], why)).strip().lower()
+            if answer in ("y", "yes"):
+                rc = cmd_login(ctx, r["source"])
+                if rc == 130:
+                    return rc
+                worst = max(worst, rc)
+        if not asked:
+            print("\nNothing is dead or due soon.")
+        if listed:
+            print("\nNot asked about (owed or unavailable): %s. To sign one in, type its name below "
+                  "or run: login <source>." % ", ".join(listed))
+        while True:
+            extra = input("\nSign in a source by name (%s), or Enter to finish: " % ", ".join(ORDER)).strip()
+            if not extra:
+                break
+            rc = cmd_login(ctx, extra)
+            if rc == 130:
+                return rc
+            worst = max(worst, rc)
+    except (KeyboardInterrupt, EOFError):
+        print("\naborted - nothing verified", file=sys.stderr)
+        return 130
     return worst
 
 

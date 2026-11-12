@@ -27,7 +27,9 @@ The hub's standing rule is that **no hub process takes the living-room
 camera's audio** (SR-156; HomeHub `DECISIONS_RATIFIED.md`, 2026-11-10). Only the
 Owner changes it (HomeHub open-items A86). Until that ruling is recorded and its
 date is in the third key, `run` exits 78 before a reader, an engine or a socket
-starts. Nobody else may fill that key in. When the ruling comes, SR-156 and
+starts. Nobody else may fill that key in. The first key is checked by `run` and
+`levels` themselves as well as by the unit's `ExecCondition`: started by hand
+with it false, both refuse the room's sound (review 2026-11-12). When the ruling comes, SR-156 and
 SN-055 are amended in the same change.
 
 `CAMERA_<C>_LISTENER_UNTIL` gives a trial an end: at that UTC instant the
@@ -64,8 +66,8 @@ stopped and removed: no sound reaches the listener at all. First match wins:
 | Wake word | sherpa-onnx keyword spotting, the phrase as the model's own tokens; one stream as shipped (`WAKE_STREAMS=2` hears a phrase said straight after other speech more reliably, at about twice the engine's cost) | |
 | Request | EntertainmentPC Core's timings: ends 0.7 s after speech stops, at 8 s, or after 3 s of nothing | |
 | Text | Moonshine tiny; the audio is zeroed | a burst of about half a second on the hub |
-| Post | one `POST /v1/utterance` to MINI-SERV with the token; a 503 or a lost answer is retried with the **same** `request_id` for 8 s; then dropped, never queued | |
-| Hold | nothing is heard for 3 s after a post (the reply is not a request) | |
+| Post | one `POST /v1/utterance` to MINI-SERV with the token; a 503 or a lost answer is retried with the **same** `request_id` for 8 s in all (an answer that arrives too slowly is cut off at that deadline); then dropped, never queued | |
+| Hold | nothing is heard for 3 s after the post's answer, however long the post took (the reply is not a request) | |
 
 **Measured on the hub (2026-11-11, synthetic audio, one stream, no gate):** the
 wake word costs 15.7 % of one core and the reader 0.8 %; a command's text
@@ -149,8 +151,8 @@ sudo /opt/homehub-voice/venv/bin/python /opt/homehub/stack/voice-listener/voice_
 
 What the microphone hears, as loudness only: the level's spread in dBFS, the
 background the gate learned, how often and for how long the gate would have
-opened. It reads the room, so it sits behind `SOURCE=relay` and the ruling's
-date like the service; it needs no MINI-SERV, loads no engine, posts nothing
+opened. It reads the room, so it sits behind the same three keys as the service
+(`ENABLED=true`, `SOURCE=relay`, the ruling's date); it needs no MINI-SERV, loads no engine, posts nothing
 and keeps nothing. It is the level test nobody has run: can this microphone
 tell speech from the room, with the television on?
 

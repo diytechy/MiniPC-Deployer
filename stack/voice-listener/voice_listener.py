@@ -9,13 +9,15 @@ MINI-SERV's own matcher decides and acts. The hub matches nothing, speaks
 nothing, and stores no sound.
 
 IT SHIPS OFF, AND THREE THINGS MUST ALL BE SET BEFORE IT HEARS THE ROOM:
-    CAMERA_<C>_LISTENER_ENABLED=true            the knob (ExecCondition)
+    CAMERA_<C>_LISTENER_ENABLED=true            the knob (ExecCondition, and refusals())
     CAMERA_<C>_LISTENER_SOURCE=relay            the template ships `none`
     CAMERA_<C>_LISTENER_ROOM_AUDIO_RULING=...   empty until the Owner has ruled
 The third exists because the hub's standing rule is that no hub process takes
 the living-room camera's audio (SR-156; HomeHub DECISIONS_RATIFIED 2026-11-10).
 Only the Owner can change that rule; until the ruling is recorded and named in
-this knob, `run` refuses (exit 78) before any reader starts. SOURCE=file plays
+this knob, `run` refuses (exit 78) before any reader starts. The knob is checked
+by `run` and `levels` themselves too, not only by the unit's ExecCondition, so
+a run started by hand cannot hear the room while it is false. SOURCE=file plays
 a recording of SYNTHETIC speech instead of a microphone (the cost test); it
 never posts and needs no ruling.
 
@@ -283,7 +285,11 @@ def wav_problem(path: str) -> Optional[str]:
 def refusals(s: ListenerSettings, env: Dict[str, str]) -> List[str]:
     """Every reason `run` would refuse, each naming a knob and never a value.
 
-    The first three are the locks on the room's sound. Implements: LLR-1547.
+    The first three are the locks on the room's sound: the source, then for
+    the relay the knob and the ruling. The knob is checked here as well as by
+    the unit's ExecCondition, because `run` and `levels` can be started by hand
+    and the promise is that nothing hears the room unless all three are set
+    (review 2026-11-12). Implements: LLR-1547.
     """
     k = lambda suffix: knob(s.camera, suffix)  # noqa: E731
     reasons = []   # type: List[str]
@@ -294,6 +300,9 @@ def refusals(s: ListenerSettings, env: Dict[str, str]) -> List[str]:
         if problem:
             reasons.append("%s %s (a recording of synthetic speech)" % (k("FILE"), problem))
         return reasons
+    if not s.enabled:
+        reasons.append("%s is not true: the room's sound is read only when it, %s=relay and %s are all set, "
+                       "whether the unit or a shell started this" % (k("ENABLED"), k("SOURCE"), k("ROOM_AUDIO_RULING")))
     if not s.ruling:
         reasons.append("%s is empty: a hub process may take the room's sound only after the Owner's ruling on the "
                        "hub's audio rule is recorded in HomeHub DECISIONS_RATIFIED.md; name its date here"
@@ -571,6 +580,7 @@ class Listener:
         self.counts = {"arms": 0, "disarms": 0, "stalls": 0, "skipped_frames": 0}
         self.armed_ms = 0.0
         pipeline.on_show = self._show      # each change is reported as it happens, "working" included
+        pipeline.clock = now_ms            # the hold after a post starts when the post returned (review 2026-11-12)
         self._last_step_ms = None   # type: Optional[int]
         self._armed_checked_ms = None   # type: Optional[int]
 
@@ -1043,9 +1053,9 @@ def levels(env_file: str, camera: str, seconds: float, sleep: Callable[[float], 
     """`levels`: what the relay's microphone hears, as loudness numbers only.
 
     The level test nobody has run yet: is speech louder than the room at this
-    microphone? It reads the room's sound, so it sits behind the same two locks
-    as the service (SOURCE=relay and the ruling's date) and the relay's own
-    switches; it needs no MINI-SERV, loads no engine, posts nothing and keeps
+    microphone? It reads the room's sound, so it sits behind the same three
+    locks as the service (ENABLED, SOURCE=relay and the ruling's date) and the
+    relay's own switches; it needs no MINI-SERV, loads no engine, posts nothing and keeps
     nothing: each frame becomes one number and is zeroed. Prints the level's
     spread in dBFS, the background the gate learned, and how often and for how
     long the gate would have opened. Implements: LLR-1553.

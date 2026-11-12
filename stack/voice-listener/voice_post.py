@@ -31,6 +31,7 @@ Implements: SR-167, LLR-1538..LLR-1540.
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import re
 import socket
@@ -163,6 +164,57 @@ def classify_answer(status: int, body: bytes) -> Tuple[str, bool, str, Optional[
     return REJECTED % status, False, "", None
 
 
+class _DeadlineReader(io.RawIOBase):
+    """The answer's bytes, read under one absolute deadline.
+
+    A socket timeout bounds each receive, not the answer: a peer that sends a
+    byte every second would keep http.client reading the status line, the
+    headers and the body for as long as it liked, and the listener's loop (its
+    hold, presence and end-date checks) waits on the post. Before each receive
+    the socket's timeout is set to what is left, and nothing is read once the
+    deadline has passed (review 2026-11-12). Implements: LLR-1539, LLR-1540.
+    """
+
+    def __init__(self, sock, deadline: float, clock: Callable[[], float]):
+        super().__init__()
+        self._sock, self._deadline, self._clock = sock, deadline, clock
+        self._raw = sock.makefile("rb", buffering=0)   # keeps the socket open until the answer is closed
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        left = self._deadline - self._clock()
+        if left <= 0:
+            raise socket.timeout("the answer was not complete within the deadline")
+        self._sock.settimeout(left)
+        return self._raw.readinto(buffer)
+
+    def close(self) -> None:
+        if not self.closed:
+            self._raw.close()
+        super().close()
+
+
+class _DeadlineSocket:
+    """What http.client's response is handed in place of the socket: it only
+    ever calls makefile("rb"), and gets the deadline reader."""
+
+    def __init__(self, sock, deadline: float, clock: Callable[[], float]):
+        self._sock, self._deadline, self._clock = sock, deadline, clock
+
+    def makefile(self, *_args, **_kwargs):
+        return io.BufferedReader(_DeadlineReader(self._sock, self._deadline, self._clock))
+
+
+def _response_under_deadline(deadline: float, clock: Callable[[], float]):
+    """A response_class for http.client.HTTPConnection whose every read of the
+    answer (status line, headers, body) ends at `deadline` on `clock`."""
+    def make(sock, *args, **kwargs):
+        return http.client.HTTPResponse(_DeadlineSocket(sock, deadline, clock), *args, **kwargs)
+    return make
+
+
 class ActionClient:
     """One caller of MINI-SERV's action interface.
 
@@ -170,7 +222,9 @@ class ActionClient:
       Inputs:  host: MINI-SERV's IPv4 address; port; token (token_ok);
                source_ip: the hub's LAN address, which every connection is
                bound to, because MINI-SERV admits that address and no other;
-               timeout_sec per attempt; deadline_sec for a whole post.
+               timeout_sec per attempt and deadline_sec for a whole post, each
+               a bound on the whole: connecting, sending and reading the entire
+               answer (a state call is one attempt of timeout_sec).
       Outputs: post_utterance -> PostResult; get_state -> (reachable, state,
                voice).
       Raises:  Invalid for an unusable token or address at construction.
@@ -201,11 +255,17 @@ class ActionClient:
         return "ActionClient(port %d, token not shown)" % self.port
 
     def _request(self, method: str, path: str, body: Optional[bytes], timeout: float) -> Tuple[int, bytes]:
+        """One attempt, over within `timeout` seconds of its start: the connect
+        and the send are bounded by the socket's timeout (the request is under
+        8 KiB, which the kernel's send buffer takes at once), and the answer by
+        an absolute deadline however slowly it arrives."""
+        deadline = self._clock() + timeout
         kwargs = {"timeout": timeout}   # type: Dict[str, object]
         if self.source_ip:
             kwargs["source_address"] = (self.source_ip, 0)
         conn = self._connect(self.host, self.port, **kwargs)
         try:
+            conn.response_class = _response_under_deadline(deadline, self._clock)
             headers = {"Authorization": "Bearer " + self._token, "Accept": "application/json",
                        "Connection": "close"}
             if body is not None:
@@ -233,7 +293,9 @@ class ActionClient:
                 return last
             attempts += 1
             try:
-                status, answer = self._request("POST", "/v1/utterance", body, min(self.timeout_sec, max(0.5, left)))
+                # What is left, never more: the post ends at deadline_sec, not
+                # up to half a second after it as a 0.5 s floor here allowed.
+                status, answer = self._request("POST", "/v1/utterance", body, min(self.timeout_sec, left))
             except (OSError, http.client.HTTPException, socket.timeout):
                 last = PostResult(UNDELIVERED_UNREACHABLE)
                 wait = 0.5

@@ -1251,8 +1251,9 @@ Built and shipped off; it needs the Owner's ruling before it may read the room
 own loop, a watcher thread that asks MINI-SERV for its state, and the reader
 container that decodes the relay's sound. The loop never waits on the other
 two: a slow MINI-SERV delays arming, never the audio, and a post blocks the
-loop only for one request, during which the sound that queues up is thrown
-away unheard.
+loop only for one request and at most its 8 s deadline (the answer's reading
+included), during which the sound that queues up is thrown away unheard. The
+hold after a post is counted from the post's return.
 
 ```mermaid
 sequenceDiagram
@@ -1281,9 +1282,9 @@ sequenceDiagram
             end
             opt wake phrase, then a request that ended
                 G->>G: speech-to-text; the audio is zeroed
-                G->>M: POST /v1/utterance, same request_id on a retry (LLR-1539, SR-167)
+                G->>M: POST /v1/utterance, same request_id on a retry, 8 s in all (LLR-1539, SR-167)
                 M-->>G: outcome code, kept as a count only
-                G-->>L: flush what queued up; hear nothing for the hold
+                G-->>L: flush what queued up; hear nothing for the hold, from the answer on
             end
         end
         L->>L: on a change of state: status file, feed line, journal (SR-169)

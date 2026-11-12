@@ -179,7 +179,8 @@ class Pipeline:
                -> str; post: callable(text, wake_checked) -> outcome code (a
                short word, never the text). feed(frame, now_ms) per frame;
                tick(now_ms) when none came; disarm() when the listener may no
-               longer hear.
+               longer hear. clock (attribute, optional): now_ms's clock, read
+               once a post has returned, so the hold after it starts then.
       Outputs: feed/tick return state events: dicts with `show`, and `reason`
                or `outcome` codes. Never a transcript, a level or a sample.
                `flush_source` is set when the audio that queued up while the
@@ -195,6 +196,14 @@ class Pipeline:
         # Called the moment the shown state changes, so "working" is visible WHILE
         # the request is transcribed and sent, not only once that is over.
         self.on_show = None    # type: Optional[Callable[[], None]]
+        # The clock the hold after a post is counted on, in the frames' own
+        # milliseconds. Speech-to-text and the post run inside one feed() and can
+        # take seconds (the post up to its 8 s deadline), and Bruno's reply starts
+        # only once MINI-SERV has answered: so the hold starts when the post
+        # returned, not at the frame that ended the request. The listener sets
+        # it to its own loop clock; None (the clips and measure harnesses, whose
+        # time counts the audio) uses that frame's time.
+        self.clock = None      # type: Optional[Callable[[], int]]
         self.flush_source = False
         self.hold_until_ms = 0
         self._speech_level = 0.0
@@ -329,7 +338,8 @@ class Pipeline:
         text = ""                                      # noqa: F841 - the only reference is dropped here
         self.counts["posted"] += 1
         self.outcomes[outcome] = self.outcomes.get(outcome, 0) + 1
-        self.hold_until_ms = now_ms + self.session.o.hold_after_post_ms
+        answered_ms = max(now_ms, self.clock()) if self.clock is not None else now_ms
+        self.hold_until_ms = answered_ms + self.session.o.hold_after_post_ms
         self._to_idle(events, outcome=outcome)
 
     def _to_idle(self, events: List[Dict[str, object]], **detail) -> None:

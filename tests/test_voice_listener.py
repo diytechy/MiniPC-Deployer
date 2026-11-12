@@ -23,9 +23,11 @@ import http.server
 import json
 import math
 import re
+import socket
 import struct
 import sys
 import threading
+import time
 import wave
 from pathlib import Path
 
@@ -193,7 +195,7 @@ def test_tc1781_no_source_and_no_ruling_are_refusals_that_name_the_knob():
     e = listener_env()
     assert vl.refusals(vl.ListenerSettings(e, "livingroom"), e) == [
         "CAMERA_LIVINGROOM_LISTENER_SOURCE is none: no audio source is configured"]
-    e = listener_env(SOURCE="relay", MINISERV_ACTION_PORT="8571", **RELAY_ON)
+    e = listener_env(ENABLED="true", SOURCE="relay", MINISERV_ACTION_PORT="8571", **RELAY_ON)
     reasons = vl.refusals(vl.ListenerSettings(e, "livingroom", {vl.TOKEN_KEY: TOKEN}), e)
     assert len(reasons) == 1 and reasons[0].startswith("CAMERA_LIVINGROOM_LISTENER_ROOM_AUDIO_RULING is empty")
     assert "Owner's ruling" in reasons[0]
@@ -203,12 +205,19 @@ def test_tc1781_with_the_ruling_named_every_other_gap_is_still_a_refusal():
     e = listener_env(SOURCE="relay", ROOM_AUDIO_RULING="ratified-2026-12-01")
     e["MAIN_BOX_IP"] = ""
     reasons = " | ".join(vl.refusals(vl.ListenerSettings(e, "livingroom"), e))
-    for key in ("CAMERA_LIVINGROOM_RELAY_ENABLED", "CAMERA_LIVINGROOM_RELAY_AUDIO", "MAIN_BOX_IP",
-                "MINISERV_ACTION_PORT", "MINISERV_ACTION_TOKEN"):
+    for key in ("CAMERA_LIVINGROOM_LISTENER_ENABLED", "CAMERA_LIVINGROOM_RELAY_ENABLED",
+                "CAMERA_LIVINGROOM_RELAY_AUDIO", "MAIN_BOX_IP", "MINISERV_ACTION_PORT", "MINISERV_ACTION_TOKEN"):
         assert key in reasons
-    full = listener_env(SOURCE="relay", ROOM_AUDIO_RULING="ratified-2026-12-01", MINISERV_ACTION_PORT="8571",
-                        **RELAY_ON)
+    full = listener_env(ENABLED="true", SOURCE="relay", ROOM_AUDIO_RULING="ratified-2026-12-01",
+                        MINISERV_ACTION_PORT="8571", **RELAY_ON)
     assert vl.refusals(vl.ListenerSettings(full, "livingroom", {vl.TOKEN_KEY: TOKEN}), full) == []
+    for off in (None, "false", "yes"):        # the knob is a lock of its own, not only the unit's condition
+        e = dict(full)
+        e.pop("CAMERA_LIVINGROOM_LISTENER_ENABLED")
+        if off is not None:
+            e["CAMERA_LIVINGROOM_LISTENER_ENABLED"] = off
+        assert [r.split(" ")[0] for r in vl.refusals(vl.ListenerSettings(e, "livingroom", {vl.TOKEN_KEY: TOKEN}), e)] \
+            == ["CAMERA_LIVINGROOM_LISTENER_ENABLED"]
 
 
 def write_wav(path, audio):
@@ -259,6 +268,39 @@ def test_tc1781_run_refuses_before_any_reader_engine_or_socket(tmp_path, monkeyp
     assert vl.run_service(path, "livingroom", str(tmp_path / "state"), str(tmp_path / "run")) == vl.EXIT_REFUSED
     assert "REFUSED" in logged[-1] and TOKEN not in " ".join(logged)
     assert not (tmp_path / "state").exists() and not (tmp_path / "run").exists()
+
+
+class Reached(Exception):
+    """Raised by a stand-in: the run got past every lock."""
+
+
+@pytest.mark.parametrize("enabled", [None, "false", "yes", "true"])
+def test_tc1781_run_started_by_hand_checks_the_knob_itself(tmp_path, monkeypatch, enabled):
+    """The unit's ExecCondition is not the only lock: with the source, the
+    ruling and everything else set, `run` from a shell still refuses the room's
+    sound unless ENABLED is exactly true (review 2026-11-12)."""
+    def reached(*_a, **_k):
+        raise Reached()
+    monkeypatch.setattr(vl, "build_engines", reached)
+    monkeypatch.setattr(vl.door_relay, "start_consumer", reached)
+    monkeypatch.setattr(vl.subprocess, "Popen", reached)
+    logged = []
+    monkeypatch.setattr(vl.mc, "log", lambda m, warning=False: logged.append(m))
+    path = relay_env(tmp_path)
+    keys = {"CAMERA_LIVINGROOM_LISTENER_SOURCE": "relay", "CAMERA_LIVINGROOM_LISTENER_ROOM_AUDIO_RULING":
+            "ratified-2026-12-01", "MINISERV_ACTION_PORT": "8571", "MAIN_BOX_IP": PEER, vl.TOKEN_KEY: TOKEN}
+    if enabled is not None:
+        keys["CAMERA_LIVINGROOM_LISTENER_ENABLED"] = enabled
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write("".join("%s=%s\n" % kv for kv in keys.items()))
+    state, run = tmp_path / "state", tmp_path / "run"
+    if enabled == "true":                        # the control: the knob was the only lock left shut
+        with pytest.raises(Reached):
+            vl.run_service(path, "livingroom", str(state), str(run))
+        return
+    assert vl.run_service(path, "livingroom", str(state), str(run)) == vl.EXIT_REFUSED
+    assert "REFUSED - CAMERA_LIVINGROOM_LISTENER_ENABLED is not true" in logged[-1] and TOKEN not in " ".join(logged)
+    assert not state.exists() and not run.exists()
 
 
 def test_tc1781_past_its_end_date_run_starts_nothing_and_ends_cleanly(tmp_path, monkeypatch):
@@ -808,6 +850,62 @@ def test_tc1790_not_ready_until_the_deadline_is_dropped(stand_in):
     assert result.outcome == vp.UNDELIVERED_NOT_READY and result.status == 503 and 2 <= result.attempts <= 4
 
 
+@pytest.fixture
+def trickler():
+    """A peer that answers a byte every 0.1 s for 8 s: a socket timeout of a
+    second never fires on it. start(part) trickles the headers or the body."""
+    stops = []
+
+    def start(part):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(8)
+        server.settimeout(0.2)
+        stop = threading.Event()
+        stops.append((server, stop))
+
+        def answer(conn):
+            with conn:
+                try:
+                    conn.recv(65536)                              # the request; its content does not matter here
+                    head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    conn.sendall(head + (b"Content-Length: 4000\r\n\r\n" if part == "body" else b"X-Slow: "))
+                    ends = time.monotonic() + 8.0
+                    while time.monotonic() < ends and not stop.is_set():
+                        conn.sendall(b"a")
+                        time.sleep(0.1)
+                except OSError:
+                    pass                                          # the client gave up and closed: as it should
+
+        def serve():
+            while not stop.is_set():
+                try:
+                    conn, _addr = server.accept()
+                except OSError:
+                    continue
+                threading.Thread(target=answer, args=(conn,), daemon=True).start()
+        threading.Thread(target=serve, daemon=True).start()
+        return server.getsockname()[1]
+    yield start
+    for server, stop in stops:
+        stop.set()
+        server.close()
+
+
+@pytest.mark.parametrize("part", ["headers", "body"])
+def test_tc1790_an_answer_that_trickles_in_is_cut_off_at_the_deadline(trickler, part):
+    """The deadline bounds the whole post, the answer's reading included; the
+    state poll is bounded by its own timeout the same way (review 2026-11-12)."""
+    c = vp.ActionClient("127.0.0.1", trickler(part), TOKEN, timeout_sec=1.0, deadline_sec=1.5)
+    started = time.monotonic()
+    result = c.post_utterance("show games", True)
+    took = time.monotonic() - started
+    assert result.outcome == vp.UNDELIVERED_UNREACHABLE and took < 3.0, (result, took)     # the trickle lasts 8 s
+    started = time.monotonic()
+    assert c.get_state() == (False, "", "")
+    assert time.monotonic() - started < 2.5
+
+
 def test_tc1790_text_the_interface_would_refuse_is_not_sent(stand_in):
     assert client(stand_in).post_utterance("x" * 501, True).outcome == vp.NOT_SENT_TEXT and StandIn.seen == []
 
@@ -1160,6 +1258,27 @@ def test_tc1795_a_request_runs_through_and_what_queued_up_meanwhile_is_dropped()
     assert [s for s in shown if s != "armed"][:3] == ["hearing", "listening", "working"]     # each as it happens
 
 
+def test_tc1795_the_hold_after_a_post_starts_when_the_post_returned_however_long_it_took():
+    """MINI-SERV took 5 s to answer, longer than the 3 s hold: Bruno's reply,
+    which starts once it has answered, is still not heard (review 2026-11-12)."""
+    rig = Rig()                                                 # HOLD_AFTER_POST_MS 3000, as shipped
+    sent = []
+
+    def slow_post(text, wake_checked):
+        sent.append(wake_checked)
+        rig.now[0] += 5000                                      # the loop's clock moved on while it waited
+        return "started"
+    rig.pipeline.post = slow_post
+    rig.play(REQUEST)
+    assert len(sent) == 1
+    fed = len(rig.wake.frames)
+    rig.play(tone(240, -22.0) + MARK + tone(800, -20.0) + quiet(400))      # the reply: 2.4 s from the answer at most
+    assert len(sent) == 1 and len(rig.wake.frames) == fed
+    rig.play(quiet(1040))                                       # whole frames, so the stand-in's mark stays aligned
+    rig.play(REQUEST)                                           # once the hold is over, a request is heard again
+    assert len(sent) == 2
+
+
 def test_tc1795_falling_behind_live_drops_the_backlog_rather_than_hearing_it_late():
     rig = Rig()
     rig.play(quiet(400))
@@ -1387,9 +1506,11 @@ def test_tc1807_levels_reads_the_room_as_numbers_only_and_behind_the_same_locks(
     run = lambda path: vl.levels(path, "livingroom", 10, sleep=lambda s: clock.__setitem__(0, clock[0] + s),  # noqa: E731
                                  clock=lambda: clock[0])
     assert run(env_file()) == vl.EXIT_REFUSED                       # as shipped: no source
-    assert run(env_file(SOURCE="relay")) == vl.EXIT_REFUSED         # the room's sound needs the ruling
-    assert made == []                                               # and no reader was built for either
-    assert run(env_file(SOURCE="relay", ROOM_AUDIO_RULING="ratified-2026-12-01")) == 0      # no MINI-SERV needed
+    assert run(env_file(ENABLED="true", SOURCE="relay")) == vl.EXIT_REFUSED      # the room's sound needs the ruling
+    assert run(env_file(SOURCE="relay", ROOM_AUDIO_RULING="ratified-2026-12-01")) == vl.EXIT_REFUSED   # and the knob
+    assert run(env_file(ENABLED="false", SOURCE="relay", ROOM_AUDIO_RULING="ratified-2026-12-01")) == vl.EXIT_REFUSED
+    assert made == []                                               # and no reader was built for any of them
+    assert run(env_file(ENABLED="true", SOURCE="relay", ROOM_AUDIO_RULING="ratified-2026-12-01")) == 0  # no MINI-SERV
     got = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert set(got) == {"camera", "seconds_heard", "level_dbfs", "background_dbfs", "gate_opens", "gate_open_pct"}
     assert got["seconds_heard"] == 5.2 and got["gate_opens"] == 1 and 20 < got["gate_open_pct"] < 60

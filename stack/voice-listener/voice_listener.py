@@ -570,6 +570,7 @@ class Listener:
         self.ended = False
         self.counts = {"arms": 0, "disarms": 0, "stalls": 0, "skipped_frames": 0}
         self.armed_ms = 0.0
+        pipeline.on_show = self._show      # each change is reported as it happens, "working" included
         self._last_step_ms = None   # type: Optional[int]
         self._armed_checked_ms = None   # type: Optional[int]
 

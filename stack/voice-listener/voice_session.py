@@ -192,6 +192,9 @@ class Pipeline:
         self.gate, self.limiter, self.session = gate, limiter, session
         self.wake, self.stt, self.post = wake, stt, post
         self.show = SHOW_ARMED
+        # Called the moment the shown state changes, so "working" is visible WHILE
+        # the request is transcribed and sent, not only once that is over.
+        self.on_show = None    # type: Optional[Callable[[], None]]
         self.flush_source = False
         self.hold_until_ms = 0
         self._speech_level = 0.0
@@ -205,8 +208,13 @@ class Pipeline:
 
     def _set(self, show: str, events: List[Dict[str, object]], **detail) -> None:
         if show != self.show or detail:
-            self.show = show
+            changed, self.show = show != self.show, show
             events.append(dict({"show": show}, **detail))
+            if changed and self.on_show is not None:
+                try:
+                    self.on_show()
+                except Exception:  # noqa: BLE001 - telling the household must never stop the hearing
+                    pass
 
     @property
     def holds_no_audio(self) -> bool:

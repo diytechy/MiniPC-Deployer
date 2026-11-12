@@ -552,6 +552,24 @@ def test_tc1788_a_second_request_is_heard_whether_or_not_the_caller_cleared_the_
     assert len(posts) == 2 and p.counts["wake_fires"] == 2
 
 
+def test_tc1788_working_is_shown_before_the_request_is_transcribed_not_after():
+    seen = []
+
+    class WatchingStt(FakeStt):
+        def transcribe(self, audio):
+            seen.append(("transcribing while shown as", p.show, list(told)))
+            return super().transcribe(audio)
+    told = []
+    p = pipeline(stt=WatchingStt())
+    p.on_show = lambda: told.append(p.show)
+    play(p, REQUEST)
+    assert seen == [("transcribing while shown as", "working", ["hearing", "listening", "working"])]
+    assert told == ["hearing", "listening", "working", "armed"]
+    p.on_show = lambda: 1 / 0                      # a reporter that fails must not stop the hearing
+    _events, now = play(p, REQUEST, 20000)
+    assert p.counts["posted"] == 2 and p.counts["engine_errors"] == 0
+
+
 def test_tc1788_the_engine_is_not_fed_while_the_room_is_quiet():
     wake = FakeWake()
     p = pipeline(wake)
@@ -1138,7 +1156,8 @@ def test_tc1795_a_request_runs_through_and_what_queued_up_meanwhile_is_dropped()
     rig.play(quiet(800))
     assert rig.posts == [(SAID, True)] and rig.source.flushes >= 1 and rig.listener.counts["skipped_frames"] >= 7
     shown = [r["state"] for r in rig.reports]
-    assert shown[0] == "armed" and "hearing" in shown and "listening" in shown and shown[-1] == "armed"
+    assert shown[0] == "armed" and shown[-1] == "armed"
+    assert [s for s in shown if s != "armed"][:3] == ["hearing", "listening", "working"]     # each as it happens
 
 
 def test_tc1795_falling_behind_live_drops_the_backlog_rather_than_hearing_it_late():

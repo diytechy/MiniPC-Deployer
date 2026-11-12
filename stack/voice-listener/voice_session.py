@@ -195,6 +195,7 @@ class Pipeline:
         self.flush_source = False
         self.hold_until_ms = 0
         self._speech_level = 0.0
+        self._request_ended = False      # within the frame being fed: the rest of its batch is not heard
         self.engine_errors_in_a_row = 0
         self.counts = {"frames": 0, "gate_opens": 0, "wake_fires": 0, "requests": 0, "posted": 0,
                        "no_speech": 0, "nothing_heard": 0, "engine_errors": 0, "duty_stops": 0}   # type: Dict[str, int]
@@ -231,6 +232,7 @@ class Pipeline:
         return events
 
     def _feed(self, frame, now_ms: int, events: List[Dict[str, object]]) -> None:
+        self._request_ended = False
         level = vg.frame_rms(frame)
         if self.session.state != IDLE:
             self._capture(frame, level, now_ms, events)
@@ -238,6 +240,7 @@ class Pipeline:
         threshold = self.gate.threshold()
         if not self.gate.is_open and not self.limiter.ready(now_ms):
             self.gate.floor.learn(level, vg.ms_for(len(frame)))
+            self.limiter.refused_ms += vg.ms_for(len(frame))    # counted: this is time spent deaf
             return                 # the duty ceiling is spent: deaf until it refills
         passed, change = self.gate.feed(frame, level, now_ms)
         if change == "opened":
@@ -245,7 +248,7 @@ class Pipeline:
             self._set(SHOW_HEARING, events)
         try:
             for piece in passed:
-                if self.flush_source:
+                if self._request_ended:
                     break              # a request just ended inside this batch: the rest is not heard
                 if self.session.state != IDLE:
                     self._capture(piece, vg.frame_rms(piece), now_ms, events)
@@ -265,7 +268,7 @@ class Pipeline:
                         self._set(SHOW_LISTENING, events)
         finally:
             self._wipe_pieces(passed, frame)
-        if change == "closed" and self.session.state == IDLE and not self.flush_source:
+        if change == "closed" and self.session.state == IDLE and not self._request_ended:
             self.wake.reset()
             self._set(SHOW_ARMED, events)
 
@@ -296,7 +299,8 @@ class Pipeline:
     # -- a request that ended ----------------------------------------------
 
     def _finish(self, end: RequestEnd, now_ms: int, events: List[Dict[str, object]]) -> None:
-        self.flush_source = True          # nothing said while we are busy is kept
+        self.flush_source = True          # nothing said while we are busy is kept: the caller drops what queued
+        self._request_ended = True
         if end.audio is None:
             self.counts["no_speech"] += 1
             self._to_idle(events, reason=end.reason)

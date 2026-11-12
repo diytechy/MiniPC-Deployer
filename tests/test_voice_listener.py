@@ -541,6 +541,15 @@ def test_tc1788_one_request_is_heard_transcribed_and_posted_once():
     assert p.holds_no_audio
 
 
+def test_tc1788_a_second_request_is_heard_whether_or_not_the_caller_cleared_the_flush_flag():
+    posts = Posts()
+    p = pipeline(post=posts)
+    _events, now = play(p, REQUEST)
+    assert p.flush_source is True                      # the caller's cue to drop what queued up; not a mute
+    play(p, REQUEST, now)
+    assert len(posts) == 2 and p.counts["wake_fires"] == 2
+
+
 def test_tc1788_the_engine_is_not_fed_while_the_room_is_quiet():
     wake = FakeWake()
     p = pipeline(wake)
@@ -590,6 +599,7 @@ def test_tc1788_the_duty_ceiling_stops_the_engine_and_says_so():
     events, _ = play(p, quiet(1600) + tone(6000, -20.0, 300.0))
     assert p.counts["duty_stops"] >= 1 and {"show": "armed", "reason": "duty"} in events
     assert len(wake.frames) * vg.FRAME_MS <= 800 + 0.10 * 7600 + vg.FRAME_MS
+    assert p.limiter.refused_ms >= 3000          # the time it was deaf is counted, not only the frame that stopped it
 
 
 # ── TC-1789 the utterance document ───────────────────────────────────────────

@@ -1,4 +1,4 @@
-"""Immich reads one photo tree, read-only, as an External Library (LLR-1560).
+"""Immich reads one photo tree, read-only, as an External Library (LLR-1570).
 
 HomeHub ruled (A17(i), 2026-08-30) that Immich reads the household's photo
 library read-only and is not a photo store, and its open item C49 asks the
@@ -77,6 +77,9 @@ def test_default_is_never_immichs_own_store_tc1820(immich_volumes):
     store, _, _ = _volume_for(immich_volumes, "/data")
     assert store == "${MEDIA_ROOT}/immich"
     assert default != store and not default.startswith(store + "/")
+    # ...nor a tree that CONTAINS the store: Jellyfin's ${MEDIA_ROOT} default
+    # would hand Immich its own thumbnails one directory down.
+    assert not store.startswith(default.rstrip("/") + "/")
 
 
 def test_upload_store_stays_writable_tc1820(immich_volumes):

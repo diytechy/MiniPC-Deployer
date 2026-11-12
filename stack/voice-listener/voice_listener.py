@@ -409,6 +409,11 @@ class RelayAudio:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait()
+        try:
+            proc.stdout.close()      # whatever was still in the pipe goes with it, unheard
+        except OSError:
+            pass
 
     def read_frames(self, limit: int) -> List[bytearray]:
         if self.proc is not None:

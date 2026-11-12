@@ -975,6 +975,40 @@ def test_tc1794_the_reader_asks_for_sound_only_inside_its_stdin_document(tmp_pat
         assert forbidden not in argv[argv.index("pipe:0"):]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="the reader's pipe is read without blocking: POSIX only, as on the hub")
+def test_tc1794_the_relay_source_reads_its_reader_s_pipe_and_removes_it_on_stop(tmp_path, monkeypatch):
+    import subprocess
+    import time as real_time
+    import camera_relay as cr
+    removed, started = [], []
+    monkeypatch.setattr(dr, "image_ref", lambda: "example/go2rtc:1@sha256:" + "0" * 64)
+    monkeypatch.setattr(vl.door_relay, "remove_containers", lambda *names, **_k: removed.append(names) or True)
+
+    def fake_consumer(argv, payload, stdout=None, stderr=None):
+        started.append((argv, payload))
+        child = "import sys, time; sys.stdout.buffer.write(bytes(%d)); sys.stdout.flush(); time.sleep(0.3)"
+        return subprocess.Popen([sys.executable, "-c", child % (vg.FRAME_BYTES * 12 + 100)], stdin=subprocess.DEVNULL,
+                                stdout=stdout, stderr=stderr)
+    monkeypatch.setattr(vl.door_relay, "start_consumer", fake_consumer)
+    source = vl.RelayAudio(cr.CameraRelaySettings(relay_env(tmp_path), "livingroom"), "livingroom", "?audio",
+                           log=lambda *a, **k: None)
+    assert source.running is False and source.fileno() is None and source.read_frames(25) == []
+    source.start()
+    assert source.running and isinstance(source.fileno(), int) and removed == [("homehub-voice-listener-livingroom",)]
+    assert b"/livingroom?audio'" in started[0][1]
+    frames, ended, deadline = [], False, real_time.time() + 10
+    while real_time.time() < deadline and not ended:
+        try:
+            frames += source.read_frames(5)                      # never blocks: nothing waiting is an empty list
+        except EOFError:
+            ended = True                                         # the reader ending is told apart from "nothing yet"
+        real_time.sleep(0.02)
+    assert len(frames) == 12 and all(len(f) == vg.FRAME_BYTES for f in frames) and ended
+    assert source.waiting_frames() == 0
+    source.stop()
+    assert source.running is False and len(removed) == 2 and source.read_frames(25) == []
+
+
 def test_tc1794_the_frame_queue_gives_whole_frames_and_forgets_on_flush():
     queue = vl.FrameQueue()
     queue.add(tone(200))                                         # two and a half frames

@@ -258,21 +258,29 @@ class ActionClient:
         """One attempt, over within `timeout` seconds of its start: the connect
         and the send are bounded by the socket's timeout (the request is under
         8 KiB, which the kernel's send buffer takes at once), and the answer by
-        an absolute deadline however slowly it arrives."""
-        deadline = self._clock() + timeout
+        an absolute deadline however slowly it arrives.
+
+        The deadline is on the real monotonic clock, never the injected one: it
+        bounds a real socket, and a test's frozen clock would stop it from ever
+        coming (review 2026-11-12). The answer is closed on every path, so an
+        attempt cut off mid-answer releases its socket at once."""
+        deadline = time.monotonic() + timeout
         kwargs = {"timeout": timeout}   # type: Dict[str, object]
         if self.source_ip:
             kwargs["source_address"] = (self.source_ip, 0)
         conn = self._connect(self.host, self.port, **kwargs)
         try:
-            conn.response_class = _response_under_deadline(deadline, self._clock)
+            conn.response_class = _response_under_deadline(deadline, time.monotonic)
             headers = {"Authorization": "Bearer " + self._token, "Accept": "application/json",
                        "Connection": "close"}
             if body is not None:
                 headers["Content-Type"] = "application/json"
             conn.request(method, path, body=body, headers=headers)
             answer = conn.getresponse()
-            return answer.status, answer.read(MAX_ANSWER_BYTES)
+            try:
+                return answer.status, answer.read(MAX_ANSWER_BYTES)
+            finally:
+                answer.close()
         finally:
             conn.close()
 

@@ -853,7 +853,9 @@ def test_tc1790_not_ready_until_the_deadline_is_dropped(stand_in):
 @pytest.fixture
 def trickler():
     """A peer that answers a byte every 0.1 s for 8 s: a socket timeout of a
-    second never fires on it. start(part) trickles the headers or the body."""
+    second never fires on it. start(part) trickles the headers, the body, or
+    the body of an answer marked Connection: close (http.client then hands the
+    connection to the response before the body is read)."""
     stops = []
 
     def start(part):
@@ -869,7 +871,9 @@ def trickler():
                 try:
                     conn.recv(65536)                              # the request; its content does not matter here
                     head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-                    conn.sendall(head + (b"Content-Length: 4000\r\n\r\n" if part == "body" else b"X-Slow: "))
+                    if part == "body-close":
+                        head += b"Connection: close\r\n"
+                    conn.sendall(head + (b"X-Slow: " if part == "headers" else b"Content-Length: 4000\r\n\r\n"))
                     ends = time.monotonic() + 8.0
                     while time.monotonic() < ends and not stop.is_set():
                         conn.sendall(b"a")
@@ -892,17 +896,24 @@ def trickler():
         server.close()
 
 
-@pytest.mark.parametrize("part", ["headers", "body"])
+@pytest.mark.parametrize("part", ["headers", "body", "body-close"])
 def test_tc1790_an_answer_that_trickles_in_is_cut_off_at_the_deadline(trickler, part):
     """The deadline bounds the whole post, the answer's reading included; the
-    state poll is bounded by its own timeout the same way (review 2026-11-12)."""
-    c = vp.ActionClient("127.0.0.1", trickler(part), TOKEN, timeout_sec=1.0, deadline_sec=1.5)
+    state poll is bounded by its own timeout the same way; and the socket's
+    deadline is real time even when a test hands the client a clock that never
+    moves (review 2026-11-12)."""
+    port = trickler(part)
+    c = vp.ActionClient("127.0.0.1", port, TOKEN, timeout_sec=1.0, deadline_sec=1.5)
     started = time.monotonic()
     result = c.post_utterance("show games", True)
     took = time.monotonic() - started
     assert result.outcome == vp.UNDELIVERED_UNREACHABLE and took < 3.0, (result, took)     # the trickle lasts 8 s
     started = time.monotonic()
     assert c.get_state() == (False, "", "")
+    assert time.monotonic() - started < 2.5
+    frozen = vp.ActionClient("127.0.0.1", port, TOKEN, timeout_sec=1.0, clock=lambda: 0.0)
+    started = time.monotonic()
+    assert frozen.get_state() == (False, "", "")
     assert time.monotonic() - started < 2.5
 
 

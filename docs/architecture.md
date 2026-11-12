@@ -1243,3 +1243,49 @@ sequenceDiagram
         C->>C: save copy status; never prune archive
     end
 ```
+
+### One pass of the hub voice listener: whether it may hear, and what leaves it (SR-163..SR-167, LLR-1535, LLR-1537, LLR-1539, LLR-1545)
+
+Built and shipped off; it needs the Owner's ruling before it may read the room
+(SR-163). See voice-listener/README.md. Three things run at once: the listener's
+own loop, a watcher thread that asks MINI-SERV for its state, and the reader
+container that decodes the relay's sound. The loop never waits on the other
+two: a slow MINI-SERV delays arming, never the audio, and a post blocks the
+loop only for one request, during which the sound that queues up is thrown
+away unheard.
+
+```mermaid
+sequenceDiagram
+    participant W as peer watcher (thread)
+    participant M as MINI-SERV action interface
+    participant L as listener loop
+    participant P as presence status file
+    participant R as reader container (relay sound)
+    participant G as gate, wake word, request
+    W->>M: GET /v1/state every 5 s (LLR-1540)
+    M-->>W: state, voice (two misses = unreachable)
+    loop every pass
+        L->>P: read presence (LLR-1534)
+        L->>L: arm decision: hold, peer, presence (LLR-1535, SR-164)
+        alt not armed
+            L->>R: stop and remove (nothing of the room is read)
+            L->>G: disarm: zero every buffer, new engine streams (SR-166)
+        else armed
+            L->>R: start if not running; read whole frames, never a backlog (LLR-1545)
+            R-->>L: 16 kHz mono frames on a pipe
+            L->>G: frame (LLR-1537)
+            alt quiet, or the duty ceiling is spent
+                G->>G: pre-roll only; the engine is not run (SR-165)
+            else sound stands out
+                G->>G: wake word on pre-roll then live frames
+            end
+            opt wake phrase, then a request that ended
+                G->>G: speech-to-text; the audio is zeroed
+                G->>M: POST /v1/utterance, same request_id on a retry (LLR-1539, SR-167)
+                M-->>G: outcome code, kept as a count only
+                G-->>L: flush what queued up; hear nothing for the hold
+            end
+        end
+        L->>L: on a change of state: status file, feed line, journal (SR-169)
+    end
+```

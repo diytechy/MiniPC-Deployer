@@ -95,10 +95,11 @@ class FakeWake:
 
 class FakeStt:
     def __init__(self, text=SAID):
-        self.text, self.audio_bytes = text, []
+        self.text, self.audio_bytes, self.handed = text, [], None
 
     def transcribe(self, audio):
         self.audio_bytes.append(len(audio))
+        self.handed = audio              # kept only to see that the pipeline zeroes it afterwards
         return self.text
 
 
@@ -536,6 +537,7 @@ def test_tc1788_one_request_is_heard_transcribed_and_posted_once():
     assert p.counts["wake_fires"] == 1 and p.counts["requests"] == 1 and p.counts["posted"] == 1
     assert p.outcomes == {"started": 1} and p.flush_source is True
     assert stt.audio_bytes and stt.audio_bytes[0] <= vg.bytes_for(8000)
+    assert stt.audio_bytes[0] > vg.bytes_for(1000) and len(stt.handed) == 0      # the request's sound is gone once read
     assert SAID not in json.dumps([events, p.counts, p.outcomes])
     p.disarm()
     assert p.holds_no_audio

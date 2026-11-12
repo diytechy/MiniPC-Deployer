@@ -67,7 +67,7 @@ stopped and removed: no sound reaches the listener at all. First match wins:
 | Request | EntertainmentPC Core's timings: ends 0.7 s after speech stops, at 8 s, or after 3 s of nothing | |
 | Text | Moonshine tiny; the audio is zeroed | a burst of about half a second on the hub |
 | Post | one `POST /v1/utterance` to MINI-SERV with the token; a 503 or a lost answer is retried with the **same** `request_id` for 8 s in all (an answer that arrives too slowly is cut off at that deadline); then dropped, never queued | |
-| Hold | nothing is heard for 3 s after the post ends, answered or dropped, however long it took (the reply is not a request) | |
+| Hold | nothing is heard for 3 s after the post call returns, whatever its outcome, however long it took (the reply is not a request) | |
 
 **Measured on the hub (2026-11-11, synthetic audio, one stream, no gate):** the
 wake word costs 15.7 % of one core and the reader 0.8 %; a command's text

@@ -224,8 +224,8 @@ class ActionClient:
                bound to, because MINI-SERV admits that address and no other;
                timeout_sec per attempt and deadline_sec for a whole post: an
                attempt's connect and send are bounded by a socket timeout, and
-               reading its entire answer by an absolute deadline of the same
-               length on the real clock (a state call is one attempt of
+               reading its answer (up to MAX_ANSWER_BYTES) by an absolute
+               deadline of the same length on the real clock (a state call is one attempt of
                timeout_sec); clock and sleep drive the retries only.
       Outputs: post_utterance -> PostResult; get_state -> (reachable, state,
                voice).

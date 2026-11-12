@@ -1,0 +1,79 @@
+# homehub-voice-listener@<camera> - the hub's voice listener for the living-room
+# assistant (SR-163..SR-169; stack/voice-listener/README.md). It reads the
+# camera's SOUND from the camera's own relay, waits for the wake phrase, turns
+# the request into text and posts the text to MINI-SERV. It keeps no sound.
+#
+# IT SHIPS OFF, behind three locks, all read from the stack .env:
+#   CAMERA_<CAMERA>_LISTENER_ENABLED=true          this unit's ExecCondition
+#   CAMERA_<CAMERA>_LISTENER_SOURCE=relay          the template ships `none`
+#   CAMERA_<CAMERA>_LISTENER_ROOM_AUDIO_RULING=... empty until the Owner has ruled
+# With any of them missing, `run` exits 78 before a reader, an engine or a
+# socket starts: an alert, no restart loop. The hub's standing rule is that no
+# hub process takes the living-room camera's audio (SR-156); only the Owner's
+# recorded ruling changes that.
+#
+# COST. Nice and CPUWeight put it behind everything else on the box (under
+# cgroup v2 it is the WEIGHT that orders units against each other; nice only
+# orders tasks inside one unit - the 2026-11-11 cost test's lesson). CPUQuota
+# is one core, so a speech-to-text burst (about half a second) is not stretched;
+# the standing cost is bounded by the gates and the duty ceiling in the code,
+# and judged by `voice_listener.py cost`, not by this ceiling. The audio reader
+# runs in docker's cgroup under its own --cpus 0.05 at the lowest weight.
+#
+# NOTHING KEPT. No swap for this unit (MemorySwapMax=0) and no core file
+# (LimitCORE=0), so sound in memory cannot reach a disk that way; the reader
+# container is read-only with no log driver. Only /var/lib/homehub-voice
+# (status: states and counts) and /run/homehub-voice (the keyword line, the
+# hold file) are written.
+#
+# NO WAY OUT OF THE HOUSE. The unit's own sockets may reach only this machine
+# and private (home network) addresses, the camera-clock unit's rule: third-
+# party speech code holding room sound must not be able to reach the internet.
+# It needs MINI-SERV and nothing else; docker is reached over a unix socket
+# (AF_NETLINK is left to the docker client, which may list interfaces; it is
+# not a way out). Not yet tried on the hub: the test plan's section 2.
+[Unit]
+Description=Voice listener (%i): wake phrase and request to text, posted to MINI-SERV; keeps no sound
+Documentation=file:///opt/homehub/stack/voice-listener/README.md
+Wants=docker.service network-online.target homehub-camera-relay@%i.service
+After=docker.service network-online.target homehub-camera-relay@%i.service homehub-firstboot.service
+AssertPathExists=/opt/homehub/stack/voice-listener/voice_listener.py
+# A missing runtime fails the unit once (an assert is not restarted), never a 203/EXEC loop.
+AssertPathExists=/opt/homehub-voice/venv/bin/python
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/homehub/stack
+ExecCondition=/usr/bin/python3 /opt/homehub/stack/voice-listener/voice_listener.py --camera %i condition
+ExecStart=/opt/homehub-voice/venv/bin/python /opt/homehub/stack/voice-listener/voice_listener.py --camera %i run
+ExecStopPost=-/usr/bin/docker rm -f homehub-voice-listener-%i
+SyslogIdentifier=homehub-voice-listener
+StateDirectory=homehub-voice
+StateDirectoryMode=0750
+RuntimeDirectory=homehub-voice
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=78
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+RestrictAddressFamilies=AF_INET AF_UNIX AF_NETLINK
+IPAddressDeny=any
+IPAddressAllow=localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+Nice=19
+CPUAccounting=true
+CPUWeight=1
+CPUQuota=100%
+MemoryAccounting=true
+MemoryMax=512M
+MemorySwapMax=0
+LimitCORE=0
+TasksMax=64
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

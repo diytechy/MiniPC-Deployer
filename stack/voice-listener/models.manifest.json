@@ -1,0 +1,124 @@
+{
+ "schema": "voice-models/1",
+ "note": "The models the hub voice listener may load, pinned by size and SHA-256. The files are NOT committed (this repository is public): install-voice-runtime.sh takes each archive as the publisher released it, refuses it unless its hash matches, extracts only the files listed here and checks each one again; voice_engines.model_files checks every file once more whenever an engine loads it. These are the same files as EntertainmentPC's Windows listener (its src/Voice.Engines/voice-models.json), which are the files the hub's cost test ran (HomeHub docs/HUB_VOICE_COST_TEST_2026-11-11.md, section 6), so the two listeners can be compared and swapped.",
+ "models": [
+  {
+   "id": "kws-gigaspeech-3.3m",
+   "role": "wake-word",
+   "folder": "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01",
+   "licence": "Apache-2.0 (front matter of the archive's README.md). A zipformer transducer trained by the k2-fsa team with icefall on GigaSpeech XL (10,000 hours of English); keywords are given as BPE tokens.",
+   "archive": {
+    "name": "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2",
+    "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2",
+    "size": 17626723,
+    "sha256": "f170013b4716e41b62b9bfd809687c207cef798ef9bc6534d524e17af9b6561a"
+   },
+   "files": [
+    {
+     "use": "encoder",
+     "name": "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+     "size": 4807159,
+     "sha256": "1e721676515bcd42a186979733981213c66c80db680e1cc582dfedf3be76e678"
+    },
+    {
+     "use": "decoder",
+     "name": "decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+     "size": 277985,
+     "sha256": "e40ff43297abe815e8898494c17e71bba2152d9d40fa3eb803f75d0f7533329a"
+    },
+    {
+     "use": "joiner",
+     "name": "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+     "size": 163380,
+     "sha256": "eae9da0c7e1e6c6a3f4cc42d167899c388f6c6701b94cb96320e4f55df79624c"
+    },
+    {
+     "use": "tokens",
+     "name": "tokens.txt",
+     "size": 5006,
+     "sha256": "fd2ded4050a55d2b1578870ba8697d02371980217806b7558bd0a5cc60f3ba53"
+    },
+    {
+     "use": "bpe",
+     "name": "bpe.model",
+     "size": 244837,
+     "sha256": "c8a2a0129c4ab8e463164c142f82d25649661b122c8cd0b7aab5c9e80b90ad24"
+    },
+    {
+     "use": "stock-keywords",
+     "name": "keywords.txt",
+     "size": 184,
+     "sha256": "b1740c4925d7c83337de2cffa04e8d35450fab2af8f583e65c54aad6257c4bd6"
+    },
+    {
+     "use": "stock-keywords-raw",
+     "name": "keywords_raw.txt",
+     "size": 102,
+     "sha256": "f8d067c3c84bcf9240988b17bd28ce7a21e86f5ad9c01a4f1d6e052f9c38053d"
+    },
+    {
+     "use": "licence",
+     "name": "README.md",
+     "size": 726,
+     "sha256": "74e42d37d63acd2366b042151d576fcc0c4917a41de339414a37f1e79f4e80e2"
+    },
+    {
+     "use": "self-test",
+     "name": "test_wavs/0.wav",
+     "size": 212044,
+     "sha256": "6bc58a4efdf20daac252b6b1502632601a71efe0308f6757dc1eda34891a7e4f"
+    },
+    {
+     "use": "self-test-2",
+     "name": "test_wavs/1.wav",
+     "size": 534924,
+     "sha256": "5143a6ba93c4b274e2c4ac22deb75c2c48936c853f0519add1de828b6c79cc5a"
+    }
+   ]
+  },
+  {
+   "id": "moonshine-tiny-en-int8",
+   "role": "speech-to-text",
+   "folder": "sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27",
+   "licence": "MIT (the archive's LICENSE, section 1: Moonshine's English models). Its section 2, a non-commercial licence, covers the other languages only.",
+   "archive": {
+    "name": "sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27.tar.bz2",
+    "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27.tar.bz2",
+    "size": 29858559,
+    "sha256": "9ec31b342d8fa3240c3b81b8f82e1cf7e3ac467c93ca5a999b741d5887164f8d"
+   },
+   "files": [
+    {
+     "use": "encoder",
+     "name": "encoder_model.ort",
+     "size": 13281600,
+     "sha256": "94e90a4654fc45cdfedb77c4c08e1739f48862998e58fada384b25118134f221"
+    },
+    {
+     "use": "merged-decoder",
+     "name": "decoder_model_merged.ort",
+     "size": 30412256,
+     "sha256": "cf524c4862d36e9e5ab032eddc73637efd822d70e868ac575cf1a46e1e4708a0"
+    },
+    {
+     "use": "tokens",
+     "name": "tokens.txt",
+     "size": 549350,
+     "sha256": "2870d843e14c1e187bf1913a521562a63b53933814bd7f2145120468f494a049"
+    },
+    {
+     "use": "licence",
+     "name": "LICENSE",
+     "size": 13344,
+     "sha256": "6148d7574a6554b7379b633cfd4c4fe5840c3f548d13bc83e00b52dc6fa00abd"
+    },
+    {
+     "use": "self-test",
+     "name": "test_wavs/0.wav",
+     "size": 184608,
+     "sha256": "148b936b43ce7c546a866e64da059f0458aee2d65e617f16e9d94f06e8d99ed6"
+    }
+   ]
+  }
+ ]
+}

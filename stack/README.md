@@ -458,7 +458,7 @@ explicitly enabled.
 
 | Profile | Service | Access (default) | Purpose |
 |---|---|---|---|
-| `immich` (+`immich-ml`) | Immich (+DB+Redis) | `https://photos.<domain>`; `http://<LAN_IP>:2283` until `IMMICH_BIND_IP=127.0.0.1` | photo backup, Google-Photos-style; ML is a separate heavy profile — leave off on the J4125, or cap it with `IMMICH_ML_MEM_LIMIT` |
+| `immich` (+`immich-ml`) | Immich (+DB+Redis) | `https://photos.<domain>`; `http://<LAN_IP>:2283` until `IMMICH_BIND_IP=127.0.0.1` | photo backup, Google-Photos-style; ML is a separate heavy profile — leave off on the J4125, or cap it with `IMMICH_ML_MEM_LIMIT`. Reads a photo tree **read-only** at `/external/library` (`IMMICH_EXTERNAL_LIBRARY_DIR`, default `${MEDIA_ROOT}/photos`): register that path as an External Library in Immich's UI; names from MWG face-region sidecars arrive when Administration → Settings → Metadata → import faces is on |
 | `photoprism` | PhotoPrism (+MariaDB) | `http://<LAN_IP>:2342` | photo library indexed in place (run at most ONE photo stack) |
 | `jellyfin` | Jellyfin | `https://jellyfin.<domain>`; `http://<LAN_IP>:8096` until `JELLYFIN_BIND_IP=127.0.0.1` | movies/TV; library path via `JELLYFIN_LIBRARY_DIR`; QSV `/dev/dri` wired up by firstboot when an iGPU is present |
 | `navidrome` | Navidrome | `https://music.<domain>`; `http://<LAN_IP>:4533` until `NAVIDROME_BIND_IP=127.0.0.1` | music, Subsonic API |

@@ -1,0 +1,10 @@
+# The hub voice listener's runtime (SR-168), for CPython 3.12 on x86-64 Linux
+# (Ubuntu 24.04, the hub). Exact versions and hashes: pip installs it with
+# --no-index --only-binary=:all: --require-hashes (install-voice-runtime.sh).
+# These are the three wheels the hub's cost test ran on 2026-11-11 (HomeHub
+# docs/HUB_VOICE_COST_TEST_2026-11-11.md, section 6). sherpa-onnx-core bundles
+# its own onnxruntime (1.28.2); numpy is the presence wheelhouse's numpy, byte
+# for byte. Nothing else is installed: no network client, no telemetry package.
+numpy==1.26.4 --hash=sha256:675d61ffbfa78604709862923189bad94014bef562cc35cf61d3a07bba02a7ed
+sherpa-onnx-core==2.0.1 --hash=sha256:f4ee0ab91c4ae596e0e49d7de32522a946295e038a652f1c1884d89014ee4ec2
+sherpa-onnx==2.0.1 --hash=sha256:c7780d8af6921c18e8e920376b32d7707294e5cd3838f4762cf746ab919bcc40

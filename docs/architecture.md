@@ -1284,7 +1284,7 @@ sequenceDiagram
                 G->>G: speech-to-text; the audio is zeroed
                 G->>M: POST /v1/utterance, same request_id on a retry, 8 s in all (LLR-1539, SR-167)
                 M-->>G: outcome code, kept as a count only
-                G-->>L: flush what queued up; hear nothing for the hold, from the answer on
+                G-->>L: flush what queued up; hear nothing for the hold, from the post's return on
             end
         end
         L->>L: on a change of state: status file, feed line, journal (SR-169)

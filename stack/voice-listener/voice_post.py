@@ -222,9 +222,11 @@ class ActionClient:
       Inputs:  host: MINI-SERV's IPv4 address; port; token (token_ok);
                source_ip: the hub's LAN address, which every connection is
                bound to, because MINI-SERV admits that address and no other;
-               timeout_sec per attempt and deadline_sec for a whole post, each
-               a bound on the whole: connecting, sending and reading the entire
-               answer (a state call is one attempt of timeout_sec).
+               timeout_sec per attempt and deadline_sec for a whole post: an
+               attempt's connect and send are bounded by a socket timeout, and
+               reading its entire answer by an absolute deadline of the same
+               length on the real clock (a state call is one attempt of
+               timeout_sec); clock and sleep drive the retries only.
       Outputs: post_utterance -> PostResult; get_state -> (reachable, state,
                voice).
       Raises:  Invalid for an unusable token or address at construction.

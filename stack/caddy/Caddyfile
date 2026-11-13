@@ -1130,8 +1130,12 @@ ntfy.{$DOMAIN} {
 # the Technitium record exists only while CAMERA_VIEW_ENABLED is true.
 # DELIVER THIS BLOCK AND docker-compose.yml TOGETHER and recreate caddy: a
 # caddy created from the older compose file has no CAMERA_VIEW_* in its
-# environment, and {$CAMERA_VIEW_AUTH_HASH} empty would stop it loading at all.
-{$CAMERA_VIEW_HOST} {
+# environment. Each variable here also carries a Caddyfile default (review
+# round 5), so that such a caddy, restarted or rebooted before the recreate,
+# still loads every site: the host an .invalid name (no certificate can be
+# had, nothing is served), the open range nobody, the login the lock no
+# password opens. They equal compose's defaults; the tests hold them equal.
+{$CAMERA_VIEW_HOST:cameras.invalid} {
     import acme_cloudflare
     @cv_off expression `{env.CAMERA_VIEW_ENABLED} != "true"`
     handle @cv_off {
@@ -1150,7 +1154,7 @@ ntfy.{$DOMAIN} {
         }
         # The open door: the LAN alone, the door's two streams alone, no login.
         @cv_door_open {
-            remote_ip {$CAMERA_VIEW_DOOR_OPEN_CIDR}
+            remote_ip {$CAMERA_VIEW_DOOR_OPEN_CIDR:0.0.0.0/32}
             path /api/ws
             expression `{query} == "src=door" || {query} == "src=door_flat"`
         }
@@ -1161,7 +1165,7 @@ ntfy.{$DOMAIN} {
             }
         }
         @cv_player_open {
-            remote_ip {$CAMERA_VIEW_DOOR_OPEN_CIDR}
+            remote_ip {$CAMERA_VIEW_DOOR_OPEN_CIDR:0.0.0.0/32}
             method GET HEAD
             path /stream.html /video-stream.js /video-rtc.js
         }
@@ -1174,7 +1178,7 @@ ntfy.{$DOMAIN} {
         # Everything else: the shared login first.
         handle {
             basic_auth {
-                {$CAMERA_VIEW_AUTH_USER} {$CAMERA_VIEW_AUTH_HASH}
+                {$CAMERA_VIEW_AUTH_USER:viewer} {$CAMERA_VIEW_AUTH_HASH:bG9ja2Vk}
             }
             @cv_stream {
                 path /api/ws

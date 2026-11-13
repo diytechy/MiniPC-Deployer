@@ -454,6 +454,22 @@ def read_host_networks(lan_ip: str) -> Tuple[Optional[object], List[object]]:
     return host_networks(out, lan_ip)
 
 
+# What Caddy's remote_ip takes for one IPv4 range: an address or address/prefix,
+# no netmask spelling and no leading zeros (Go's netip). Python's ipaddress
+# accepts 192.0.2.0/255.255.255.0, which would pass the check and then stop
+# Caddy loading every site (review round 5, F1 of the open-door piece).
+OCTET = r"(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
+IPV4_RANGE_RE = re.compile(r"%s(\.%s){3}(/(3[0-2]|[12]?[0-9]))?" % (OCTET, OCTET))
+
+
+def door_open_words(door_open: str) -> List[str]:
+    """CAMERA_VIEW_DOOR_OPEN_CIDR's words, with compose's nobody default
+    (exactly 0.0.0.0/32, alone) read as none: the one reading every caller uses
+    (review round 5 F2, F3)."""
+    words = door_open.split()
+    return [] if words == [DOOR_OPEN_NOBODY] else words
+
+
 def door_open_violations(door_open: str, lan_network: Optional[object], bridges: Sequence[object]) -> List[str]:
     """Why CAMERA_VIEW_DOOR_OPEN_CIDR may not open the door without a login.
 
@@ -463,19 +479,23 @@ def door_open_violations(door_open: str, lan_network: Optional[object], bridges:
     tailnet or IPv6. Empty is allowed (the door needs the login everywhere).
     Positions, never values. Implements: LLR-1590.
     """
-    words = door_open.split()
-    if not words or words == [DOOR_OPEN_NOBODY]:
+    words = door_open_words(door_open)
+    if not words:
         return []
     reasons = []
     if lan_network is None:
         return ["%s is set but no interface on this hub holds LAN_IP" % DOOR_OPEN_KEY]
     for i, word in enumerate(words, 1):
-        try:
-            net = ipaddress.ip_network(word, strict=False)
-        except ValueError:
-            reasons.append("%s entry %d of %d is not an IPv4 address or CIDR" % (DOOR_OPEN_KEY, i, len(words)))
+        if not IPV4_RANGE_RE.fullmatch(word):
+            if ":" in word:     # IPv6: never the LAN alone
+                reasons.append("%s entry %d of %d lies outside the hub's LAN (the door is open to the LAN alone)"
+                               % (DOOR_OPEN_KEY, i, len(words)))
+            else:
+                reasons.append("%s entry %d of %d is not an IPv4 address or CIDR as Caddy reads one"
+                               % (DOOR_OPEN_KEY, i, len(words)))
             continue
-        if net.version != 4 or not net.subnet_of(lan_network):
+        net = ipaddress.ip_network(word, strict=False)
+        if not net.subnet_of(lan_network):
             reasons.append("%s entry %d of %d lies outside the hub's LAN (the door is open to the LAN alone)"
                            % (DOOR_OPEN_KEY, i, len(words)))
         elif any(net.overlaps(b) for b in bridges if b.version == 4):
@@ -728,9 +748,8 @@ def caddy_violations(s: ViewSettings, caddy: Dict[str, str], lan_network, bridge
                                                             caddy.get(HASH_KEY, ""))]
     reasons += ["caddy's own " + r for r in source_violations(caddy.get("LAN_CIDR", ""), lan_network,
                                                              s.ruled_in, bridges)]
-    caddy_open = caddy.get(DOOR_OPEN_KEY, "").strip()
-    caddy_open = "" if caddy_open == DOOR_OPEN_NOBODY else caddy_open
-    if set(caddy_open.split()) != set(s.door_open.split()):
+    caddy_open = caddy.get(DOOR_OPEN_KEY, "")
+    if set(door_open_words(caddy_open)) != set(door_open_words(s.door_open)):
         reasons.append("caddy's %s differs from the .env: recreate caddy" % DOOR_OPEN_KEY)
     reasons += ["caddy's own " + r for r in door_open_violations(caddy_open, lan_network, bridges)]
     return reasons
@@ -825,7 +844,7 @@ def check(s: ViewSettings, lan_network, bridges, caddy: Dict[str, str],
     forms = [f for relay in s.relays() for f in door_relay.secret_forms(relay)]
     reasons += ["a relay credential is in %s" % hit for hit in credential_in_processes(forms)]
     return {"pass": not reasons, "reasons": reasons, "enabled": s.enabled, "door_flat_mode": s.flat_mode,
-            "streams": sorted(view_streams(s)), "door_open_to_the_lan": bool(s.door_open.split())}
+            "streams": sorted(view_streams(s)), "door_open_to_the_lan": bool(door_open_words(s.door_open))}
 
 
 # ── keep-warm: the `always` mode's consumer ──────────────────────────────────

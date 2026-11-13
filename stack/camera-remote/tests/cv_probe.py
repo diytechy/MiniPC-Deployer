@@ -129,7 +129,10 @@ def main(argv):
     kind, address, port, name, path = argv[1:6]
     auth = argv[argv.index("--auth") + 1] if "--auth" in argv else ""
     if "--auth-stdin" in argv:   # the real login: never in argv (HomeHub's trial)
-        auth = sys.stdin.readline().rstrip("\r\n")
+        auth = sys.stdin.readline(4096).rstrip("\r\n")
+        if ":" not in auth:  # review round 5: never probe unauthenticated by accident
+            print(json.dumps({"status": -1, "error": "--auth-stdin: no USER:PASS line on stdin"}))
+            return 2
     mse = argv[argv.index("--mse") + 1] if "--mse" in argv else ""
     try:
         result = http(address, port, name, path, auth) if kind == "http" else ws(address, port, name, path, auth, mse)

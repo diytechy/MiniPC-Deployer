@@ -168,7 +168,8 @@ sed -i "s|^CAMERA_VIEW_DOOR_OPEN_CIDR=.*|CAMERA_VIEW_DOOR_OPEN_CIDR=$LANNET|" "$
 cr render >"$WORK/render.log"; rc_render=$?
 modes="$(stat -c %a "$RUN" "$RUN/go2rtc.yaml" "$RUN/door.ffconcat" | tr '\n' ' ')"
 if [ "$rc_nologin" = 2 ] && grep -q 'CAMERA_VIEW_AUTH_HASH is empty' "$WORK/nologin.log" && [ ! -e "$WORK/nologin" ] \
-   && [ "$rc_broad" = 2 ] && [ ! -e "$WORK/refused" ] && [ "$rc_render" = 0 ] && [ "$modes" = "700 600 600 " ] \
+   && [ "$rc_broad" = 2 ] && grep -q 'LAN_CIDR is or holds private_ranges' "$WORK/refused.log" \
+   && ! grep -q 'CAMERA_VIEW_AUTH_HASH' "$WORK/refused.log" && [ ! -e "$WORK/refused" ] && [ "$rc_render" = 0 ] && [ "$modes" = "700 600 600 " ] \
    && ! grep -q 'exec:[^"]*rtsp://' "$RUN/go2rtc.yaml" && grep -q '^CAMERA_VIEW_AUTH_HASH=\$\$2' "$LS/.env" \
    && ! grep -qF "$HASH" "$WORK/import.log"; then
     ok "1 render: refused with no login set and with private_ranges (rc 2, nothing written); import-login doubles each \$ and prints no hash; then modes $modes, no URL in the exec line"
@@ -223,11 +224,11 @@ cut_block() {  # the real Caddyfile's block that starts with $1 at column 0
     printf '    admin localhost:12019\n    http_port 18080\n    https_port %s\n    auto_https disable_redirects\n    skip_install_trust\n}\n' "$PORT"
     printf '(acme_cloudflare) {\n    tls internal\n}\n'
     cut_block '(throttle) {'
-    cut_block '{$CAMERA_VIEW_HOST} {'
+    cut_block '{$CAMERA_VIEW_HOST:cameras.invalid} {'
 } >"$WORK/Caddyfile"
 # `caddy validate` provisions every module (the CEL lists, basic_auth with the
 # compose lock, remote_ip with the compose default for the open door).
-{ sed -n '1,/^}/p' "$WORK/Caddyfile"; printf '(acme_cloudflare) {\n    tls internal\n}\n'; cut_block '(throttle) {'; cut_block '{$CAMERA_VIEW_HOST} {'; } \
+{ sed -n '1,/^}/p' "$WORK/Caddyfile"; printf '(acme_cloudflare) {\n    tls internal\n}\n'; cut_block '(throttle) {'; cut_block '{$CAMERA_VIEW_HOST:cameras.invalid} {'; } \
     | sed 's/admin localhost:12019/admin off/' >"$WORK/Caddyfile.shipped"
 shipped_valid="$(docker run --rm -e CAMERA_VIEW_HOST=$NAME -e LAN_CIDR="$LANNET 100.64.0.0/10" -e CAMERA_VIEW_AUTH_USER=viewer \
     -e CAMERA_VIEW_AUTH_HASH=bG9ja2Vk -e CAMERA_VIEW_DOOR_OPEN_CIDR=0.0.0.0/32 -v "$WORK/Caddyfile.shipped:/etc/caddy/Caddyfile:ro" "$CADDY_IMAGE" \
@@ -258,7 +259,8 @@ grep -v '^CAMERA_VIEW_' "$LS/.env" >"$WORK/env.defaults"
 start_caddy "$WORK/env.defaults"
 off="$(st /) $(st /stream.html) $(wst '/api/ws?src=door')"
 if grep -qx 'CAMERA_VIEW_AUTH_HASH=bG9ja2Vk' "$WORK/caddy.env" && grep -qx 'CAMERA_VIEW_ENABLED=false' "$WORK/caddy.env" \
-   && grep -qx 'CAMERA_VIEW_DOOR_OPEN_CIDR=0.0.0.0/32' "$WORK/caddy.env" && [ "$off" = "404 404 404" ] && [ "$shipped_valid" = 1 ]; then
+   && grep -qx 'CAMERA_VIEW_DOOR_OPEN_CIDR=0.0.0.0/32' "$WORK/caddy.env" && [ "$off" = "404 404 404" ] && [ "$shipped_valid" = 1 ] \
+   && grep -q '@cv_door_open' "$WORK/Caddyfile.shipped" && grep -q 'basic_auth' "$WORK/Caddyfile.shipped"; then
     ok "3 compose defaults: caddy loads (the lock, nobody let in without a login) and the site answers 404 ($off); the block as shipped validates"
 else bad "3 defaults: $off; $(docker logs "$CADDY" 2>&1 | tail -n 3)"; fi
 

@@ -196,11 +196,23 @@ def test_tc1845_the_lan_or_part_of_it_may_take_the_door_without_a_login(value):
     ("10.0.0.0/8", "lies outside the hub's LAN"),
     ("fd7a:115c:a1e0::/48", "lies outside the hub's LAN"),
     ("private_ranges", "not an IPv4 address or CIDR"),
+    ("192.0.2.0/255.255.255.0", "not an IPv4 address or CIDR"),   # Caddy would refuse to load
+    ("192.0.2.011", "not an IPv4 address or CIDR"),
+    ("192.0.2.0/33", "not an IPv4 address or CIDR"),
     ("0.0.0.0/0", "lies outside the hub's LAN"),
+    ("192.0.2.0/24 100.64.0.0/10", "entry 2 of 2 lies outside the hub's LAN"),   # every word, not the first
 ])
 def test_tc1845_nothing_else_may(value, fragment):
     reasons = cr.door_open_violations(value, LAN, BRIDGES)
     assert any(fragment in r for r in reasons) and not any(value in r for r in reasons if value != "private_ranges")
+
+
+def test_tc1845_the_nobody_default_reads_as_no_open_range_everywhere(tmp_path):
+    # review round 5 F2, F3: the .env spelling compose's default by hand is the same as empty
+    s = settings(tmp_path, CAMERA_VIEW_DOOR_OPEN_CIDR=cr.DOOR_OPEN_NOBODY)
+    assert cr.door_open_words(cr.DOOR_OPEN_NOBODY) == [] and cr.door_open_words(" 192.0.2.0/24 ") == ["192.0.2.0/24"]
+    assert cr.caddy_violations(s, caddy_env(), LAN, BRIDGES) == []
+    assert cr.caddy_violations(settings(tmp_path), caddy_env(CAMERA_VIEW_DOOR_OPEN_CIDR=""), LAN, BRIDGES) == []
 
 
 def test_tc1845_a_lan_that_holds_a_bridge_and_no_lan_at_all():
@@ -227,6 +239,9 @@ def test_tc1846_each_knob_reaches_the_filter_and_v_fov_stays_square(tmp_path):
     vf = cr.view_config(s)["streams"]["door_flat"].split(" -vf ")[1].split(" ")[0]
     assert ("ih_fov=190:iv_fov=180:h_fov=104.5:v_fov=%.4f:yaw=-3:pitch=5.5:w=1280:h=720"
             % cr.vertical_fov(1280, 720, 104.5)) in vf
+    # square pixels, checked independently of vertical_fov (review round 5): flat maps tan(angle) linearly
+    v = float(re.search(r":v_fov=([0-9.]+):", vf).group(1))
+    assert abs(math.tan(math.radians(104.5) / 2) / 1280 - math.tan(math.radians(v) / 2) / 720) < 1e-6
 
 
 def test_tc1846_cylindrical_output_keeps_square_pixels(tmp_path):
@@ -314,25 +329,32 @@ def test_tc1828_the_living_room_is_video_only_through_its_own_relay(tmp_path):
     assert cfg["streams"]["livingroom"] == "rtsp://admin:ABCDEF@192.0.2.10:8564/livingroom#media=video"
     cfg = cr.view_config(settings(tmp_path, CAMERA_LIVINGROOM_RELAY_MAIN_PATH="/h264/ch1/main/av_stream",
                                   **LIVINGROOM))
-    assert set(cfg["streams"]) == set(cr.STREAMS)
+    assert set(cfg["streams"]) == set(cr.STREAMS) == {"door", "door_flat", "livingroom", "livingroom-main"}
     assert cfg["streams"]["livingroom-main"] == "rtsp://admin:ABCDEF@192.0.2.10:8564/livingroom-main#media=video"
     for name in ("livingroom", "livingroom-main"):    # never the relay's sound, which it offers on request
         assert "audio" not in cfg["streams"][name] and cfg["streams"][name].endswith("#media=video")
+    off = dict(LIVINGROOM, CAMERA_LIVINGROOM_RELAY_ENABLED="false")    # the switch decides, not the main path
+    cfg = cr.view_config(settings(tmp_path, CAMERA_LIVINGROOM_RELAY_MAIN_PATH="/h264/ch1/main/av_stream", **off))
+    assert set(cfg["streams"]) == {"door", "door_flat"}
 
 
 def test_tc1828_both_relays_logins_are_redacted(tmp_path):
     s = settings(tmp_path, **LIVINGROOM)
     line = "rtsp://admin:c%40m%20p%24ss%3A1@192.0.2.10:8554/door and ABCDEF and c@m p$ss:1 at 192.0.2.69:554"
     out = cr.redact_all(line, s.relays())
-    assert "ABCDEF" not in out and "c@m" not in out and "c%40m" not in out and "192.0.2.69" not in out
+    for secret in ("ABCDEF", "c@m p$ss:1", "c%40m%20p%24ss%3A1", "192.0.2.69"):
+        assert secret not in out, secret
 
 
 def test_tc1828_redact_run_takes_the_viewers_redactor(tmp_path):
     s = settings(tmp_path, **LIVINGROOM)
     out = io.StringIO()
-    rc = dr.redact_run(s.relay, [sys.executable, "-c", "print('ABCDEF c@m p$ss:1')"], out=out,
+    child = "import sys; print('ABCDEF c@m p$ss:1'); sys.stderr.write('err ABCDEF c@m p$ss:1\\n')"
+    rc = dr.redact_run(s.relay, [sys.executable, "-c", child], out=out,
                        redactor=lambda text: cr.redact_all(text, s.relays()))
-    assert rc == 0 and "ABCDEF" not in out.getvalue() and "c@m" not in out.getvalue()
+    assert rc == 0 and out.getvalue().count("\n") == 2      # stdout and stderr both came through
+    for secret in ("ABCDEF", "c@m p$ss:1"):   # whole spellings (secret_forms); a fragment is not one
+        assert secret not in out.getvalue(), secret
 
 
 def test_tc1828_the_config_is_the_same_in_both_modes(tmp_path):
@@ -470,6 +492,7 @@ def test_tc1831_anything_but_one_bcrypt_hash_is_refused(tmp_path, monkeypatch, b
 
 def test_tc1832_every_stream_is_behind_the_login():
     assert cr.LOGIN_STREAMS == cr.STREAMS and set(cr.DOOR_STREAMS) < set(cr.STREAMS)
+    assert set(cr.DOOR_STREAMS) == {"door", "door_flat"}   # the only streams the open door may name
 
 
 @pytest.mark.parametrize("value, fragment", [("", "is empty"), ("bG9ja2Vk", "shipped lock"),
@@ -580,7 +603,7 @@ def test_tc1833_file_modes(tmp_path):
 
 def site_block():
     text = (STACK / "caddy" / "Caddyfile").read_text(encoding="utf-8")
-    start = text.index("\n{$CAMERA_VIEW_HOST} {\n") + 1
+    start = text.index("\n{$CAMERA_VIEW_HOST:cameras.invalid} {\n") + 1
     end = text.index("\n}\n", start) + 2
     return text[start:end]
 
@@ -609,13 +632,13 @@ def test_tc1834_order_switch_then_lan_then_open_door_then_the_login():
 
 def test_tc1834_the_door_alone_is_open_and_only_to_the_open_range():
     b = site_block()
-    door = re.search(r"@cv_door_open \{\n\s+remote_ip \{\$CAMERA_VIEW_DOOR_OPEN_CIDR\}\n\s+path /api/ws\n"
+    door = re.search(r"@cv_door_open \{\n\s+remote_ip \{\$CAMERA_VIEW_DOOR_OPEN_CIDR:0\.0\.0\.0/32\}\n\s+path /api/ws\n"
                      r"\s+expression `(.*)`\n\s+\}", b)
     assert door, "the open door's websocket matcher"
     names = re.findall(r'\{query\} == "src=([a-z_]+)"', door.group(1))
     assert sorted(names) == sorted(cr.DOOR_STREAMS)
     assert re.fullmatch(r'\{query\} == "src=[a-z_]+"( \|\| \{query\} == "src=[a-z_]+")*', door.group(1))
-    assert re.search(r"@cv_player_open \{\n\s+remote_ip \{\$CAMERA_VIEW_DOOR_OPEN_CIDR\}\n\s+method GET HEAD\n"
+    assert re.search(r"@cv_player_open \{\n\s+remote_ip \{\$CAMERA_VIEW_DOOR_OPEN_CIDR:0\.0\.0\.0/32\}\n\s+method GET HEAD\n"
                      r"\s+path /stream.html /video-stream.js /video-rtc.js\n\s+\}", b)
     assert "basic_auth" not in handle(b, "@cv_door_open") and "basic_auth" not in handle(b, "@cv_player_open")
 
@@ -626,7 +649,7 @@ def test_tc1834_everything_else_is_behind_the_login_and_names_every_stream():
     assert login, "the login streams' matcher"
     assert sorted(re.findall(r'"src=([a-z_-]+)"', login.group(1))) == sorted(cr.LOGIN_STREAMS)
     assert re.fullmatch(r'"src=[a-z_-]+"(, "src=[a-z_-]+")*', login.group(1))
-    assert ("handle {\n            basic_auth {\n                {$CAMERA_VIEW_AUTH_USER} {$CAMERA_VIEW_AUTH_HASH}\n"
+    assert ("handle {\n            basic_auth {\n                {$CAMERA_VIEW_AUTH_USER:viewer} {$CAMERA_VIEW_AUTH_HASH:bG9ja2Vk}\n"
             "            }\n            @cv_stream {") in b
     assert b.count("basic_auth") == 1
 
@@ -655,6 +678,18 @@ def test_tc1834_every_variable_is_passed_by_caddys_compose_environment():
     assert "CAMERA_VIEW_DOOR_OPEN_CIDR: ${CAMERA_VIEW_DOOR_OPEN_CIDR:-%s}" % cr.DOOR_OPEN_NOBODY in block
     assert "CAMERA_VIEW_ENABLED: ${CAMERA_VIEW_ENABLED:-false}" in block
     assert "- %s:/srv/camera-view:ro" % cr.STATE_DIR in block
+
+
+def test_tc1834_every_variable_in_the_site_block_carries_compose_s_default():
+    # review round 5: a caddy created before the camera page (no CAMERA_VIEW_* in its
+    # environment) and restarted with this file must still load every site
+    b = site_block()
+    used = re.findall(r"\{\$(CAMERA_VIEW_[A-Z_]+)(:[^}]*)?\}", b)   # the block starts at its address
+    expected = {"CAMERA_VIEW_HOST": "cameras.invalid", "CAMERA_VIEW_DOOR_OPEN_CIDR": cr.DOOR_OPEN_NOBODY,
+                "CAMERA_VIEW_AUTH_USER": cr.DEFAULT_USER, "CAMERA_VIEW_AUTH_HASH": cr.LOCKED_HASH}
+    # every occurrence, not the last of each name (review round 5)
+    assert len(used) == 5 and all(default[1:] == expected[name] for name, default in used), used
+    assert {name for name, _ in used} == set(expected)
 
 
 # ── TC-1835 compose: the viewer's service ────────────────────────────────────

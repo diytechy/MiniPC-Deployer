@@ -38,8 +38,16 @@ random input; per read): faceyolo 320 = 208 ms, 192 = 74 ms; yolov8n 256 =
 145 ms, 320 = 223 ms, 448 = 447 ms, 640 = 934 ms. At 0.5 fps an empty room costs
 face + body every 2 s (about 22 % of one core before the decoders); a person
 facing the camera, face only (about 10 %); a lying spell, the room's 22 % plus
-one 640 read per keyframe (about 23 %). The live figures and the verdict are in
-HomeHub `docs/LIVING_ROOM_PRESENCE_LIVE_2026-11-13.md`.
+one 640 read per keyframe (about 23 %).
+
+**Measured live, 2026-11-13** (`cost`, the room empty, so face and body every
+sample and the couch check never asked): detector 22.5 %, room decoder 2.3 %,
+couch decoder 2.4 %: **27.2 % of one core** against the 30 % budget, the hub's
+PSI within 0.3 of its baseline. The unit's quota period is 1 s
+(`CPUQuotaPeriodSec`): at systemd's 100 ms every inference was throttled to
+half speed and the unit's own throttling raised the hub's PSI by 7 points. A
+lying spell (the couch check running) costs about 45-50 % while it lasts; not
+measured live. Details: HomeHub `docs/LIVING_ROOM_PRESENCE_LIVE_2026-11-13.md`.
 
 ## Output
 

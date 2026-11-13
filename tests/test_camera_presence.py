@@ -866,3 +866,21 @@ def test_tc1765_whole_motion_max_1_is_off():
     judge = cp.RoomJudge(settings(CAMERA_LIVINGROOM_PRESENCE_WHOLE_MOTION_MAX="1"))
     assert judge.motion(0.3, 1.0) == 0.3
     assert cp.RoomJudge(settings()).motion(0.3, 0.5) == 0.0
+
+
+# -- the live run of 2026-11-13: a timestamp jump fed a backlog of duplicates --
+
+
+def test_tc1775_the_pacer_judges_at_most_fps_frames_of_wall_time():
+    pacer = cp.Pacer(0.5)
+    judged = [t for t in [0.0, 0.3, 0.6, 1.0, 1.7, 2.0, 3.0, 3.4, 5.5] if pacer.due(t)]
+    assert judged == [0.0, 1.7, 3.4, 5.5]
+    steady = cp.Pacer(0.5)
+    assert all(steady.due(2.0 * i) for i in range(10))           # a steady 0.5 fps stream loses nothing
+
+
+def test_tc1775_the_unit_stop_fits_its_timeout():
+    u = (STACK / "camera-presence" / "homehub-camera-presence@.service").read_text(encoding="utf-8")
+    assert "TimeoutStopSec=60" in u.splitlines()
+    src = (STACK / "camera-presence" / "camera_presence.py").read_text(encoding="utf-8")
+    assert "remove_containers(container_name(camera), timeout=15)" in src

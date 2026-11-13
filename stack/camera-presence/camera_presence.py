@@ -622,6 +622,26 @@ class Evaluator:
         return found
 
 
+class Pacer:
+    """Judge at most FPS frames a second of WALL time. The decoder's fps filter
+    paces by the stream's timestamps, and a jump in them (an RTP glitch, a camera
+    whose clock was set) makes it emit a backlog of duplicates as fast as the
+    pipe drains: measured on the hub 2026-11-13, 1.6 frames a second for four
+    minutes and 74 % of a core, every one a stale repeat. A frame that comes
+    sooner than 0.8/FPS after the last judged one is read and dropped, so a
+    backlog drains at pipe speed and costs no inference. Implements: LLR-1529."""
+
+    def __init__(self, fps: float):
+        self.min_gap = 0.8 / fps
+        self.last = None  # type: Optional[float]
+
+    def due(self, mono: float) -> bool:
+        if self.last is not None and mono - self.last < self.min_gap:
+            return False
+        self.last = mono
+        return True
+
+
 class RoomJudge:
     """One sample's decision with the 2026-11-12 settings, pure (no model, no
     I/O): the dark-frame skip, the whole-frame motion gate, and the presence
@@ -996,7 +1016,8 @@ def run_service(env_file: str, camera: str, state_dir: str = STATE_DIR) -> int:
               ("%s at %g after %gs quiet, from /%s" % (s.couch_model, s.couch_conf, s.couch_after_sec,
                                                        relay.main_stream)) if couch else "off"))
     status = {"camera": camera, "pid": os.getpid(), "started_utc_ms": int(time.time() * 1000), "frames": 0,
-              "last_frame_utc_ms": None, "changes": 0, "dark_skipped": 0}
+              "last_frame_utc_ms": None, "changes": 0, "dark_skipped": 0, "paced": 0}
+    pacer = Pacer(s.fps)
     frame_bytes = FRAME_W * FRAME_H * 3
     buffer = bytearray()
     fd = proc.stdout.fileno()
@@ -1052,11 +1073,14 @@ def run_service(env_file: str, camera: str, state_dir: str = STATE_DIR) -> int:
                 frame = np.frombuffer(bytes(buffer[:frame_bytes]), dtype=np.uint8).reshape(FRAME_H, FRAME_W, 3)
                 del buffer[:frame_bytes]
                 started = time.monotonic()
+                status["last_frame_utc_ms"] = int(time.time() * 1000)
+                if not pacer.due(started):
+                    status["paced"] = int(status["paced"]) + 1     # a backlog's duplicate: read, not judged
+                    continue
                 grey = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY), (MOTION_W, MOTION_H),
                                   interpolation=cv2.INTER_AREA)
                 bright, room_motion, whole_motion = measures.update(grey)
                 status["frames"] = int(status["frames"]) + 1
-                status["last_frame_utc_ms"] = int(time.time() * 1000)
                 if judge.dark(bright):
                     status["dark_skipped"] = int(status["dark_skipped"]) + 1
                     continue
@@ -1096,10 +1120,12 @@ def run_service(env_file: str, camera: str, state_dir: str = STATE_DIR) -> int:
             except Exception as exc:  # noqa: BLE001 - the room decoder's cleanup below must still run
                 mc.log("camera presence [%s]: couch reader not ended cleanly (%s)" % (camera, type(exc).__name__),
                        warning=True)
-        subprocess.run(["docker", "rm", "-f", container_name(camera)], stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, timeout=60)
+        # Bounded, so the whole stop fits TimeoutStopSec (60): a docker rm that
+        # hung past 24 s got the unit SIGKILLed on 2026-11-13; ExecStopPost
+        # removes both containers again anyway.
+        door_relay.remove_containers(container_name(camera), timeout=15)
         try:
-            proc.wait(timeout=10)
+            proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
     return code

@@ -54,7 +54,7 @@ CPUQuotaPeriodSec=1s
 MemoryAccounting=true
 MemoryMax=512M
 TasksMax=64
-TimeoutStopSec=30
+TimeoutStopSec=60
 
 [Install]
 WantedBy=multi-user.target

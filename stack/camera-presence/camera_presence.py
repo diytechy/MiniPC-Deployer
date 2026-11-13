@@ -929,6 +929,11 @@ def couch_reader(s: PresenceSettings, relay: camera_relay.CameraRelaySettings, c
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait(timeout=5)     # reaped, not left a zombie (review 2026-11-13)
+        try:
+            proc.stdout.close()      # this thread's own pipe; stderr ends with the process for its logger
+        except (OSError, AttributeError):
+            pass
 
     return KeyframeReader(start, stop, COUCH_W, height,
                           lambda m, warning=False: mc.log("camera presence [%s]: %s" % (camera, m), warning=warning))
@@ -974,14 +979,13 @@ def run_service(env_file: str, camera: str, state_dir: str = STATE_DIR) -> int:
                    stderr=subprocess.DEVNULL, timeout=60)
     argv, payload = decoder_command(relay, camera, s.fps)
     proc = door_relay.start_consumer(argv, payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stopping = []
+    signal.signal(signal.SIGTERM, lambda *_: stopping.append(1))
+    signal.signal(signal.SIGINT, lambda *_: stopping.append(1))
     reader = couch = None
     if couch_model is not None:
         reader = couch_reader(s, relay, camera)
         couch = CouchCheck(s, couch_model, reader)
-        reader.begin()
-    stopping = []
-    signal.signal(signal.SIGTERM, lambda *_: stopping.append(1))
-    signal.signal(signal.SIGINT, lambda *_: stopping.append(1))
     log_stream(proc.stderr, camera, "ffmpeg", relay)
     mc.log("camera presence [%s]: reading /%s from its relay on port %d at %g fps (video only); face %s, body %s "
            "(%s at %g); hold %gs; dark below %g skipped; whole-frame motion from %g ignored; %d exclude zone(s); "
@@ -1011,6 +1015,8 @@ def run_service(env_file: str, camera: str, state_dir: str = STATE_DIR) -> int:
                             "decoder_restarts": reader.restarts}
         return rec
     try:
+        if reader is not None:
+            reader.begin()          # inside the try: the finally ends it whatever happens next
         while not stopping:
             try:
                 ready, writable, _x = select.select([fd] + out.read_fds(), out.write_fds(), [], 1.0)
@@ -1085,7 +1091,11 @@ def run_service(env_file: str, camera: str, state_dir: str = STATE_DIR) -> int:
         write_status(state_dir, camera, dict(status_record(), stopped_utc_ms=int(time.time() * 1000)))
         out.close()
         if reader is not None:
-            reader.end()
+            try:
+                reader.end()
+            except Exception as exc:  # noqa: BLE001 - the room decoder's cleanup below must still run
+                mc.log("camera presence [%s]: couch reader not ended cleanly (%s)" % (camera, type(exc).__name__),
+                       warning=True)
         subprocess.run(["docker", "rm", "-f", container_name(camera)], stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=60)
         try:

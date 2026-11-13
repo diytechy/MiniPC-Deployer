@@ -1269,6 +1269,15 @@ services:
       IMMICH_MACHINE_LEARNING_ENABLED: ${IMMICH_ML_ENABLED}
     volumes:
       - ${MEDIA_ROOT}/immich:/data
+      # The photo tree Immich reads as an External Library, READ-ONLY: Immich
+      # views the library, it does not own it, so it can neither delete an
+      # original nor write a sidecar into it (HomeHub A17(i)). Register the
+      # container path /external/library in Immich's UI (Administration ->
+      # External Libraries); the mount alone imports nothing. The default is
+      # the public layout's photo folder (PhotoPrism's originals below), never
+      # ${MEDIA_ROOT}/immich: that is Immich's own store, and an empty knob must
+      # not offer Immich its own thumbnails as a library.
+      - ${IMMICH_EXTERNAL_LIBRARY_DIR:-${MEDIA_ROOT}/photos}:/external/library:ro
     ports:
       # LAN UI/API until IMMICH_BIND_IP=127.0.0.1 (Phase B); then photos.<domain>
       # only — re-point the mobile app's server URL (auto-backup) first.

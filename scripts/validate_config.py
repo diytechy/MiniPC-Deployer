@@ -764,6 +764,10 @@ def main():
         # Wants=+After= docker; their one hard binding is BindsTo=srv-scratch.mount.
         ("ottertube/homehub-ottertube-download.service", "autoinstall/firstboot.sh"),
         ("ottertube/homehub-ottertube-media.service", "autoinstall/firstboot.sh"),
+        # Enrolled 2026-11-12 with the tailnet keep-source rule (SR-175): After=
+        # docker and tailscaled, ordering only, so firstboot's docker stop
+        # cannot reach it. setup-tailscale.sh installs it; firstboot runs that.
+        ("tailscale/homehub-tailnet-keep-source.service", "autoinstall/firstboot.sh"),
     ):
         unit_text, script_text = load(stack / unit_rel), load(stack / script_rel)
         if not unit_text or not script_text:

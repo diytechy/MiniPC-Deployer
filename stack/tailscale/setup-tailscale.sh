@@ -45,6 +45,13 @@
 # FAILS. Setting it back to false is the hub half of a switch-off: move every
 # device to None FIRST, or one still pointing here loses its internet.
 #
+# TAILNET CLIENTS KEEP THEIR OWN ADDRESS AT THE STACK (SR-175): converging also
+# installs homehub-tailnet-keep-source.service, whose one mangle rule stops
+# tailscaled masquerading tailnet traffic into the docker bridges, so Caddy's
+# LAN gate sees the client's tailnet address. Knob
+# TAILSCALE_KEEP_SOURCE_TO_DOCKER (default true); tailnet-keep-source.sh has
+# the reasons. --check-only reports it, and drift there fails the check.
+#
 # Usage: setup-tailscale.sh [--check-only]
 # Exit 0 = converged, or disabled, or waiting for the Owner to authorise.
 #        1 = failed.
@@ -250,6 +257,17 @@ if [ "$MODE" = "--check-only" ]; then
         fi
     fi
 
+    # The keep-source rule, read-only (SR-175). Its own lines, prefixed; drift
+    # or an unreadable chain fails this check like a missing route does.
+    if ks_out="$(TAILNET_KEEP_SOURCE_ENV_FILE="$ENV_FILE" bash "$HERE/tailnet-keep-source.sh" status 2>&1)"; then
+        ks_rc=0
+    else
+        ks_rc=$?
+    fi
+    printf '%s
+' "$ks_out" | sed 's/^/check: /'
+    [ "$ks_rc" -eq 0 ] || rc=1
+
     # Deliberately NOT checked and deliberately not claimed: whether the
     # identity account carries multi-factor authentication. This box cannot
     # observe that, and a test that read only local state and reported it green
@@ -387,6 +405,31 @@ case "$PREFS_EXIT:$TAILSCALE_ADVERTISE_EXIT_NODE" in
 esac
 [ "$PREFS_CORPDNS" = "false" ] \
     || fail "CorpDNS is true after --accept-dns=false - Technitium must stay this box's resolver"
+
+# ---------------------------------------------------------------------------
+# 3c. Tailnet clients keep their own address at the stack (SR-175).
+# ---------------------------------------------------------------------------
+# Installs and runs the unit, then reads the rule back. A failure WARNS and
+# does not fail this run: the tunnel, the LAN route and SSH all work without
+# the rule, and a failed run here makes firstboot announce that the box has no
+# remote access, which would be false. --check-only fails on it instead.
+log "Keep-source rule: installing and applying it (TAILSCALE_KEEP_SOURCE_TO_DOCKER)"
+if TAILNET_KEEP_SOURCE_ENV_FILE="$ENV_FILE" bash "$HERE/tailnet-keep-source.sh" install; then
+    ks_rc=0
+else
+    ks_rc=$?
+fi
+case "$ks_rc" in
+    0) ;;
+    # Exit 3 is status's drift, after the unit ran: the DRIFT line above names
+    # the cause (a LAN_CIDR without the tailnet range, a unit left disabled),
+    # and re-running install would not change it.
+    3) log "WARNING: the keep-source rule was applied, but its status reports drift -"
+       log "         the DRIFT line above says what to change." ;;
+    *) log "WARNING: the keep-source rule is NOT in place - a tailnet client reaching a"
+       log "         LAN-only site through Caddy is refused as a Docker address. Retry:"
+       log "         sudo bash $HERE/tailnet-keep-source.sh install" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # 4. Report honestly.

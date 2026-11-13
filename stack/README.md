@@ -428,6 +428,12 @@ pinned `admin` network — one REJECT per address family, above Tailscale's
 an ntfy alert on drift. A failed fence does **not** stop Technitium (D-A5): it
 is the household resolver.
 
+A tailnet client reaches every published port with its **own** address, so
+Caddy's `@lan` gate admits it: `stack/tailscale/tailnet-keep-source.sh` keeps one
+mangle rule that stops tailscaled masquerading tailnet traffic into the docker
+bridges (SR-175; knob `TAILSCALE_KEEP_SOURCE_TO_DOCKER`, default true; IPv4 only).
+Its unit is installed by `setup-tailscale.sh`, and `--check-only` reports it.
+
 ### Healthchecks
 
 Each tool's healthcheck has been **run against its pinned image** (2026-08-01).
@@ -458,7 +464,7 @@ explicitly enabled.
 
 | Profile | Service | Access (default) | Purpose |
 |---|---|---|---|
-| `immich` (+`immich-ml`) | Immich (+DB+Redis) | `https://photos.<domain>`; `http://<LAN_IP>:2283` until `IMMICH_BIND_IP=127.0.0.1` | photo backup, Google-Photos-style; ML is a separate heavy profile — leave off on the J4125, or cap it with `IMMICH_ML_MEM_LIMIT` |
+| `immich` (+`immich-ml`) | Immich (+DB+Redis) | `https://photos.<domain>`; `http://<LAN_IP>:2283` until `IMMICH_BIND_IP=127.0.0.1` | photo backup, Google-Photos-style; ML is a separate heavy profile — leave off on the J4125, or cap it with `IMMICH_ML_MEM_LIMIT`. Reads a photo tree **read-only** at `/external/library` (`IMMICH_EXTERNAL_LIBRARY_DIR`, default `${MEDIA_ROOT}/photos`): register that path as an External Library in Immich's UI; names from MWG face-region sidecars arrive when Administration → Settings → Metadata → import faces is on, for sidecars present when a photo is first imported; a sidecar added or changed later needs Immich's "refresh metadata" job (a rescan only compares the photo's modification time) |
 | `photoprism` | PhotoPrism (+MariaDB) | `http://<LAN_IP>:2342` | photo library indexed in place (run at most ONE photo stack) |
 | `jellyfin` | Jellyfin | `https://jellyfin.<domain>`; `http://<LAN_IP>:8096` until `JELLYFIN_BIND_IP=127.0.0.1` | movies/TV; library path via `JELLYFIN_LIBRARY_DIR`; QSV `/dev/dri` wired up by firstboot when an iGPU is present |
 | `navidrome` | Navidrome | `https://music.<domain>`; `http://<LAN_IP>:4533` until `NAVIDROME_BIND_IP=127.0.0.1` | music, Subsonic API |

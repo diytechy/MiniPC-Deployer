@@ -111,6 +111,19 @@ Provisioned by `stack/autoinstall/user-data`:
   at a vanished exit node has no internet. Before/after evidence: HomeHub
   `scripts/verify/exit-node-check.sh snapshot | diff <name> | verify`.
   Plan: HomeHub `docs/EXIT_NODE_PLAN_2026-09-22.md`.
+- **Tailnet clients keep their own address at the stack (SR-175), on by default.**
+  tailscaled masquerades everything it forwards, and a published port is a
+  forwarded packet, so until 2026-11-12 Caddy saw a tailnet client as a Docker
+  bridge address and every LAN-only site answered "LAN only".
+  `homehub-tailnet-keep-source.service` (installed by `setup-tailscale.sh`) adds
+  one rule, `iptables -t mangle -A POSTROUTING -s 100.64.0.0/10 -o br-+ -j MARK
+  --set-xmark 0x0/0x40000`, which clears tailscaled's mark only on traffic into
+  the docker bridges; the exit node and the subnet route to other LAN devices
+  are masqueraded as before. IPv4 only (a v6 published port goes through
+  docker-proxy, which no mark can change). Knob
+  `TAILSCALE_KEEP_SOURCE_TO_DOCKER=true|false`. Check:
+  `sudo bash /opt/homehub/stack/tailscale/tailnet-keep-source.sh status` (also in
+  `setup-tailscale.sh --check-only`); rollback: `... remove`, then the knob false.
 
 ### The remote workflow (from the Owner's workstation, over the LAN)
 

@@ -704,6 +704,7 @@ def test_tc1838_a_session_asks_for_door_flat_in_mse_and_reports_flowing_once():
     ([UPGRADED], "eof"),
     ([], "eof"),                                   # closed before any answer
     ([b"HTTP/1.1 101 Switching"], "eof"),          # closed part-way through the answer
+    ([__import__("socket").timeout()], "no answer"),  # accepted, never answered
 ])
 def test_tc1838_a_session_ends_for_each_reason(script, why):
     assert cr.warm_session(FakeSock(script), "door_flat", lambda: 0.0, lambda: None).startswith(why)

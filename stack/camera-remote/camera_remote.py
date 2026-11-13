@@ -746,8 +746,8 @@ class FrameReader:
 def warm_session(sock, stream: str, clock, on_flowing) -> str:
     """One connection: upgrade, ask for MSE, read until something ends it.
 
-    Returns why it ended: "refused <status>", "error <go2rtc's text>",
-    "closed", "silent" (no video for WARM_SILENCE_SEC) or "eof". Calls
+    Returns why it ended: "refused <status>", "no answer", "error <go2rtc's
+    text>", "closed", "silent" (no video for WARM_SILENCE_SEC) or "eof". Calls
     on_flowing() once, at the session's first video bytes. Implements: LLR-1587.
     """
     sock.sendall(ws_upgrade_request("/api/ws?src=%s" % stream, base64.b64encode(os.urandom(16)).decode()))
@@ -756,6 +756,8 @@ def warm_session(sock, stream: str, clock, on_flowing) -> str:
         status = reader.head()
     except EOFError:      # the viewer closed before answering (stopping, or not ready)
         return "eof"
+    except socket.timeout:   # accepted but never answered (review round 3, piece d, F1)
+        return "no answer"
     if status != 101:
         return "refused %d" % status
     sock.sendall(ws_client_frame(json.dumps({"type": "mse", "value": ""}).encode("utf-8"), os.urandom(4)))

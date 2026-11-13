@@ -179,6 +179,21 @@ def test_duplicates_and_a_stale_spec_collapse_to_exactly_one_rule_sr175(tmp_path
     assert box.rules == [OTHER, OURS]
 
 
+@_needs_bash
+def test_a_rule_whose_comment_only_starts_with_the_marker_is_left_alone_sr175(tmp_path):
+    """A comment holding a space is printed in quotes; it is not ours, and
+    deleting it by a split spec would fail. It must be neither counted nor
+    touched (review F1/F2, 2026-11-12)."""
+    quoted = OURS[:7] + ["homehub-tailnet-keep-source by hand"] + OURS[8:]
+    box = _Box(tmp_path, rules=[quoted])
+    r = box.run("apply")
+    assert r.returncode == 0, r.out
+    assert box.rules == [quoted, OURS]
+    assert box.run("status").returncode == 0
+    assert box.run("remove").returncode == 0
+    assert box.rules == [quoted]
+
+
 # --- TC-1853 --------------------------------------------------------------
 @_needs_bash
 @pytest.mark.parametrize("env_lines", [

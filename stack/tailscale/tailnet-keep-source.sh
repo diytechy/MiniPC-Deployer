@@ -154,14 +154,17 @@ desired() {
 # reader: under pipefail the producer's SIGPIPE becomes the status).
 read_chain() { LISTING="$(ipt -S POSTROUTING 2>&1)"; }
 
-# count_marked COMMENT_PREFIX -> how many rules carry a comment starting with it.
-# Our marker is matched as a whole word; the TEST prefix as a prefix.
-count_marked() {
+# marked PREFIX WHOLE -> the `-A POSTROUTING` lines whose comment is PREFIX
+# (WHOLE=1) or starts with it (WHOLE=0). Matched on the raw line: iptables prints
+# a comment holding a space in double quotes, so such a rule never matches and
+# is never deleted (both markers are single words). awk reads its whole input,
+# so nothing upstream can take SIGPIPE under pipefail.
+marked() {
     printf '%s\n' "$LISTING" | awk -v p="$1" -v whole="$2" '
-        /^-A POSTROUTING / { l = $0 " "; gsub(/"/, "", l)
-            if (whole == "1" ? index(l, "--comment " p " ") : index(l, "--comment " p)) n++ }
-        END { print n + 0 }'
+        /^-A POSTROUTING / { l = $0 " "
+            if (whole == "1" ? index(l, " --comment " p " ") : index(l, " --comment " p)) print }'
 }
+count_marked() { marked "$1" "$2" | awk 'END { print NR }'; }
 
 # inspect -> sets OURS (rules carrying MARKER), TESTS (TEST rules) and EXACT
 # (1 when exactly one rule carries MARKER and `-C` confirms it is this RULE).
@@ -178,20 +181,17 @@ inspect() {
 # purge COMMENT_PREFIX WHOLE -> delete every matching rule BY SPEC, re-reading
 # after each delete, so nothing anyone else inserts meanwhile is removed by a
 # stale rule number. Bounded so a delete that "succeeds" without effect cannot
-# spin. A comment holding a space would split here; neither marker has one.
+# spin. The line splits on spaces safely because `marked` never returns a rule
+# with a quoted (space-holding) comment.
 purge() {
-    local prefix="$1" whole="$2" line spec n=0
+    local prefix="$1" whole="$2" line n=0
     local -a argv
     while :; do
         read_chain || { log "cannot list mangle POSTROUTING"; return 1; }
-        line="$(printf '%s\n' "$LISTING" | awk -v p="$prefix" -v whole="$whole" '
-            /^-A POSTROUTING / && !s { l = $0 " "; gsub(/"/, "", l)
-                if (whole == "1" ? index(l, "--comment " p " ") : index(l, "--comment " p)) { print; s = 1 } }')"
+        line="$(marked "$prefix" "$whole" | awk 'NR == 1')"
         [ -n "$line" ] || break
         if [ "$n" -ge 20 ]; then log "still finding '$prefix' rules after 20 deletes - stopping"; return 1; fi
-        spec="-D ${line#-A }"
-        spec="${spec//\"/}"
-        read -r -a argv <<<"$spec"
+        read -r -a argv <<<"-D ${line#-A }"
         ipt "${argv[@]}" || { log "could not delete [$line]"; return 1; }
         n=$((n + 1))
     done

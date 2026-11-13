@@ -45,7 +45,8 @@ def main(argv):
     if verb == "-S":
         print("-P %s ACCEPT" % chain)
         for r in rules:
-            print("-A %s %s" % (chain, " ".join(r)))
+            # iptables quotes an argument that holds a space (a comment).
+            print("-A %s %s" % (chain, " ".join('"%s"' % x if " " in x else x for x in r)))
         return 0
     if verb == "-C":
         return 0 if spec in rules else 1

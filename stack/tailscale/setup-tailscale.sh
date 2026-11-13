@@ -414,11 +414,22 @@ esac
 # the rule, and a failed run here makes firstboot announce that the box has no
 # remote access, which would be false. --check-only fails on it instead.
 log "Keep-source rule: installing and applying it (TAILSCALE_KEEP_SOURCE_TO_DOCKER)"
-if ! TAILNET_KEEP_SOURCE_ENV_FILE="$ENV_FILE" bash "$HERE/tailnet-keep-source.sh" install; then
-    log "WARNING: the keep-source rule is NOT in place - a tailnet client reaching a"
-    log "         LAN-only site through Caddy is refused as a Docker address. Retry:"
-    log "         sudo bash $HERE/tailnet-keep-source.sh install"
+if TAILNET_KEEP_SOURCE_ENV_FILE="$ENV_FILE" bash "$HERE/tailnet-keep-source.sh" install; then
+    ks_rc=0
+else
+    ks_rc=$?
 fi
+case "$ks_rc" in
+    0) ;;
+    # Exit 3 is status's drift, after the unit ran: the DRIFT line above names
+    # the cause (a LAN_CIDR without the tailnet range, a unit left disabled),
+    # and re-running install would not change it.
+    3) log "WARNING: the keep-source rule was applied, but its status reports drift -"
+       log "         the DRIFT line above says what to change." ;;
+    *) log "WARNING: the keep-source rule is NOT in place - a tailnet client reaching a"
+       log "         LAN-only site through Caddy is refused as a Docker address. Retry:"
+       log "         sudo bash $HERE/tailnet-keep-source.sh install" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # 4. Report honestly.

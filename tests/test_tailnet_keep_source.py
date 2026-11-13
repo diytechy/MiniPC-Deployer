@@ -286,6 +286,22 @@ def test_converging_the_tunnel_installs_and_applies_the_rule_sr175(tmp_path):
     assert "WARNING: the keep-source rule" not in r.out
 
 
+@_needs_bash
+def test_converging_with_lan_cidr_drift_says_so_not_that_the_rule_is_missing_sr175(tmp_path):
+    """Review F4 (2026-11-13): install exits 3 when the rule is in place but
+    status reports drift; converge must not then claim the rule is missing."""
+    from test_tailscale_subnet_router import _FakeHub
+    hub = _FakeHub(tmp_path, knob="false", ipt_rules=[])
+    hub.env_file.write_text(hub.env_file.read_text(encoding="utf-8").replace(
+        'LAN_CIDR="192.168.1.0/24 100.64.0.0/10"', "LAN_CIDR=private_ranges"), encoding="utf-8")
+    r = hub.run()
+    assert r.returncode == 0, r.out
+    assert hub.ipt_rules == [OURS]
+    assert "LAN_CIDR does not admit" in r.out
+    assert "its status reports drift" in r.out
+    assert "is NOT in place" not in r.out
+
+
 def test_setup_tailscale_installs_it_when_converging_and_reports_it_in_check_sr175():
     live = _live(SETUP.read_text(encoding="utf-8"))
     assert 'tailnet-keep-source.sh" install' in live

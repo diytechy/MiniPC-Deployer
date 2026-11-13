@@ -1288,7 +1288,9 @@ sequenceDiagram
             F->>R: one consumer session
         end
         V-->>B: fMP4 over MSE from the next keyframe
-    else anything else (absent, repeated, encoded, foreign, name=)
+    else not the open door, and no login or a wrong one
+        C-->>B: 401 (basic_auth, SR-172)
+    else anything else after the login (absent, repeated, encoded, foreign, name=)
         C-->>B: 403
     end
     Note over V,R: last consumer gone (on_demand): FFmpeg and the relay session stop

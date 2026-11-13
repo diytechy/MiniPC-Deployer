@@ -91,6 +91,11 @@ command -v docker >/dev/null || { echo "SKIP: no docker"; exit 0; }
 python3 -c 'import bcrypt' 2>/dev/null || { echo "SKIP: python3 bcrypt is missing"; exit 0; }
 docker image inspect "$CADDY_IMAGE" >/dev/null 2>&1 || { echo "SKIP: $CADDY_IMAGE is not built here"; exit 0; }
 if [ -e "$RUN" ] || [ -e "$STATE" ]; then echo "SKIP: $RUN or $STATE exists (a real viewer?)"; exit 0; fi
+# A keep-warm left by an interrupted run reconnects to the same socket path and
+# holds door_flat open, so the consumer counts of checks 8 and 9 never reach 0
+# (found 2026-11-13: one six hours old). ps, not pgrep -f, which matches itself.
+stray="$(ps -eo pid=,args= | awk '/[c]amera_remote\.py .*keep-warm/ {print $1}' | tr '\n' ' ')"
+if [ -n "$stray" ]; then echo "SKIP: a keep-warm from an earlier run is still running (pid $stray): stop it first"; exit 0; fi
 LAN="$(ip -4 -o addr show scope global | awk '{split($4,a,"/"); print a[1]; exit}')"
 LANNET="$(ip -4 -o addr show scope global | awk '{print $4; exit}' | python3 -c 'import ipaddress,sys; print(ipaddress.ip_network(sys.stdin.read().strip(), strict=False))')"
 [ -n "$LAN" ] || { echo "SKIP: no non-loopback IPv4 address"; exit 0; }
@@ -290,7 +295,7 @@ if [ "$open5" = "200 200 200 101 101" ] && [ "$login5" = "401 401 302 401 401 10
 else bad "5 login/open: open=$open5 login=$login5 closed=$closed5 root=$root raw=$raw"; fi
 
 # ── 6 refused, even with the login ───────────────────────────────────────────
-refused=""
+refused="" unauth=""
 for p in /api/streams /api/config /api /index.html /add.html /config.html '/api/frame.mp4?src=door' \
          '/api/stream.mp4?src=door' '/api/stream.m3u8?src=door' '/api/frame.jpeg?src=door' /api/log; do
     s="$(st "$p" "$GOOD")"; [ "$s" = 403 ] || refused="$refused $p=$s"
@@ -299,9 +304,14 @@ for q in '' '?' '?src=door&src=door' '?src=%64oor' '?src=door%5Fflat' '?src=corn
          '?src=rtsp%3A%2F%2F127.0.0.1%3A8654%2FH.264' '?SRC=door' '?src=door&name=door' '?name=door&src=door' \
          '?src=door&' '?src=door;name=x' '?src=door_flat&src=door' '?src=livingroom&name=door'; do
     s="$(wst "/api/ws$q" "$GOOD")"; [ "$s" = 403 ] || refused="$refused ws$q=$s"
+    # without the login, from inside the open range: only the two exact door queries skip it (review round 5)
+    s="$(wst "/api/ws$q")"; [ "$s" = 401 ] || unauth="$unauth ws$q=$s"
 done
-[ -z "$refused" ] && ok "6 refused with the login: 11 other paths and 14 websocket queries (src absent, repeated, encoded, foreign, a URL, SRC, name=, trailing &, ;) -> 403" \
-    || bad "6 not refused:$refused"
+# a listed name the viewer does not serve (no living-room relay in the lab): an answer, never video
+lr="$(probe ws "$LAN" "$PORT" "$NAME" '/api/ws?src=livingroom' --auth "$GOOD" --mse 3)"
+[ -z "$refused$unauth" ] && [ "$(echo "$lr" | field binary_bytes)" = 0 ] \
+    && ok "6 refused with the login: 11 other paths and 14 websocket queries (src absent, repeated, encoded, foreign, a URL, SRC, name=, trailing &, ;) -> 403; the same 14 without it from the open range -> 401; src=livingroom with no relay: no video" \
+    || bad "6 not refused:$refused; open range without the login:$unauth; livingroom=$lr"
 
 # ── 7 door_flat as shipped, without the hub's graphics ───────────────────────
 flat="$(probe ws "$LAN" "$PORT" "$NAME" '/api/ws?src=door_flat' --mse 8)"

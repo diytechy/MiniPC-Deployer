@@ -139,8 +139,9 @@
       try { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } catch (e) { /* gone */ }
     }
     if (history.state && history.state.camera) {
+      const shown = view;
       history.back();
-      setTimeout(() => { if (view) showGrid(); }, 600);   // a browser that drops the popstate
+      setTimeout(() => { if (view === shown) showGrid(); }, 600);   // a browser that drops the popstate
     } else {
       showGrid();
     }

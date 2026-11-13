@@ -650,7 +650,7 @@ def view_config(s: ViewSettings, encoder: str = "vaapi") -> Dict[str, object]:
 def view_streams(s: ViewSettings, encoder: str = "vaapi") -> Dict[str, str]:
     """The streams: the door's two, and each indoor camera's video while its
     relay is on (its sub stream as <name>, its main as <name>-main when the relay
-    serves one). Every relay source is `#media=video`: no sound is ever asked for
+    serves one, else the sub stream under that name too). Every relay source is `#media=video`: no sound is ever asked for
     (a relay offers its camera's sound only to a consumer that asks).
     Implements: SR-170, LLR-1576.
     """
@@ -660,8 +660,10 @@ def view_streams(s: ViewSettings, encoder: str = "vaapi") -> Dict[str, str]:
         relay = s.indoor[name]
         if relay:
             streams[name] = relay.consumer_url() + "#media=video"
-            if relay.main_stream:
-                streams[name + "-main"] = relay.for_main().consumer_url() + "#media=video"
+            # The page's full view always asks for <name>-main: the main stream
+            # where the relay serves one, else the sub stream again (review F1).
+            main = relay.for_main() if relay.main_stream else relay
+            streams[name + "-main"] = main.consumer_url() + "#media=video"
     return streams
 
 

@@ -325,7 +325,9 @@ LIVINGROOM = {"CAMERA_LIVINGROOM_RELAY_ENABLED": "true", "CAMERA_LIVINGROOM_RELA
 
 def test_tc1828_the_living_room_is_video_only_through_its_own_relay(tmp_path):
     cfg = cr.view_config(settings(tmp_path, **LIVINGROOM))
-    assert set(cfg["streams"]) == {"door", "door_flat", "livingroom"}
+    # no main path: the full view's name serves the sub stream again (review F1)
+    assert set(cfg["streams"]) == {"door", "door_flat", "livingroom", "livingroom-main"}
+    assert cfg["streams"]["livingroom-main"] == cfg["streams"]["livingroom"]
     assert cfg["streams"]["livingroom"] == "rtsp://admin:ABCDEF@192.0.2.10:8564/livingroom#media=video"
     cfg = cr.view_config(settings(tmp_path, CAMERA_LIVINGROOM_RELAY_MAIN_PATH="/h264/ch1/main/av_stream",
                                   **LIVINGROOM))

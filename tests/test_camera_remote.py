@@ -323,7 +323,7 @@ def test_tc1831_the_hash_goes_in_doubled_and_is_never_printed(tmp_path, monkeypa
 
 @pytest.mark.parametrize("blob", [b"", b"\n", b"hunter2\n", b"bG9ja2Vk\n", (HASH + "\n" + HASH).encode(),
                                   b"$2b$09$" + b"a" * 53, b"$2b$12$" + b"a" * 52, b"$1$" + b"a" * 60,
-                                  b"x" * 300])
+                                  b"x" * 300, "\u201c$2b$12$".encode("utf-8") + b"a" * 53])
 def test_tc1831_anything_but_one_bcrypt_hash_is_refused(tmp_path, monkeypatch, blob):
     env = write_env(tmp_path)
     before = Path(env).read_text(encoding="utf-8")
@@ -394,6 +394,14 @@ def test_tc1833_the_login_is_compared_only_while_a_stream_is_behind_it(tmp_path)
     assert not any(HASH in r for r in reasons)
     assert cr.caddy_violations(s, caddy_env(CAMERA_VIEW_AUTH_HASH=HASH), LAN, BRIDGES,
                                login_streams=("livingroom",)) == []
+
+
+def test_tc1833_the_order_of_lan_cidr_words_decides_nothing(tmp_path):
+    assert cr.caddy_violations(settings(tmp_path), caddy_env(LAN_CIDR="100.64.0.0/10 192.0.2.0/24"), LAN, BRIDGES) == []
+
+
+def test_tc1833_an_unlistable_proc_is_a_named_reason(tmp_path):
+    assert cr.credential_in_processes(["x"], str(tmp_path / "no-proc")) == ["%s could not be listed" % (tmp_path / "no-proc")]
 
 
 def test_tc1833_no_caddy_is_a_failure(tmp_path):

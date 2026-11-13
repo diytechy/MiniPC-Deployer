@@ -560,7 +560,9 @@ def caddy_violations(s: ViewSettings, caddy: Dict[str, str], lan_network, bridge
     reasons = []
     if (caddy.get("CAMERA_VIEW_ENABLED") == "true") != s.enabled:
         reasons.append("caddy's CAMERA_VIEW_ENABLED differs from the .env: recreate caddy")
-    if caddy.get("LAN_CIDR", "").split() != s.lan_cidr.split():
+    # As sets (review round 2 F5): the order of the words decides nothing, and
+    # caddy's own value goes through the allow-list below either way.
+    if set(caddy.get("LAN_CIDR", "").split()) != set(s.lan_cidr.split()):
         reasons.append("caddy's LAN_CIDR differs from the .env: recreate caddy")
     if login_streams:   # the login matters only while a stream is behind it
         if caddy.get("CAMERA_VIEW_AUTH_USER") != s.user:
@@ -613,7 +615,11 @@ def credential_in_processes(forms: Sequence[str], proc_root: str = "/proc") -> L
     """
     hits = []
     wanted = [f.encode("utf-8") for f in forms if f]
-    for entry in sorted(os.listdir(proc_root)) if os.path.isdir(proc_root) else []:
+    try:
+        entries = sorted(os.listdir(proc_root))
+    except OSError:   # review round 2 F3: a named reason, never a traceback
+        return ["%s could not be listed" % proc_root]
+    for entry in entries:
         if not entry.isdigit() or str(os.getpid()) == entry:
             continue
         for leaf in ("cmdline", "environ"):

@@ -207,7 +207,8 @@ Anything on the hub: the VA-API encode inside this service (measured on the
 hub on 2026-11-12 in the same image, by hand, not through this code), the
 CPU of `always`, the bandwidth at `-g 20`, a phone's browser (MSE, the CSP,
 basic auth over a websocket for a later login stream), the tailnet source
-address Caddy sees, the Technitium record, systemd's handling of the two units
-(the lab runs their Exec lines without systemd: BindsTo/WantedBy across a
-viewer restart, the warm unit's sandbox), a reimage (nothing here is in
+address Caddy sees, the Technitium record, systemd on the hub (the two unit files ran
+under WSL's systemd 255 in lab check 13: the warm unit pulled in and back
+after a viewer restart, its sandbox reaching the socket; `systemctl stop`
+leaves the viewer `failed` with compose's exit 130), a reimage (nothing here is in
 firstboot: like the relays, the units are installed by hand).

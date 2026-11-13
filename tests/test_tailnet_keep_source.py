@@ -38,6 +38,8 @@ OURS = ["-s", "100.64.0.0/10", "-o", "br-+", "-m", "comment", "--comment",
 TEST_RULE = ["-s", "100.64.0.0/10", "-o", "br-+", "-m", "comment", "--comment",
              "tailnet-to-docker-keep-source-TEST-20261112", "-j", "MARK",
              "--set-xmark", "0x0/0x40000"]
+# The hub's shape: quoted, the LAN, a VPN range and the tailnet range.
+LAN_CIDR = 'LAN_CIDR="192.168.1.0/24 10.6.0.0/24 100.64.0.0/10"'
 # Somebody else's rule in the same chain: must survive every mode.
 OTHER = ["-o", "eno1", "-p", "udp", "-m", "udp", "--dport", "68", "-j", "CHECKSUM",
          "--checksum-fill"]
@@ -70,7 +72,7 @@ exit 0
 class _Box:
     """A stand-in hub: a mangle table, a systemd and a stack .env."""
 
-    def __init__(self, tmp_path, *, env_lines=("TAILSCALE_ENABLED=true",), rules=()):
+    def __init__(self, tmp_path, *, env_lines=("TAILSCALE_ENABLED=true", LAN_CIDR), rules=()):
         py = Path(sys.executable).as_posix()
         self.bin = tmp_path / "bin"
         self.bin.mkdir()
@@ -214,7 +216,7 @@ def test_the_knob_off_or_no_tailnet_withdraws_the_rule_sr175(tmp_path, env_lines
 @_needs_bash
 @pytest.mark.parametrize("value", ["yes", "1", "True", "on"])
 def test_a_knob_that_is_not_exactly_true_or_false_is_refused_unchanged_sr175(tmp_path, value):
-    box = _Box(tmp_path, env_lines=("TAILSCALE_ENABLED=true",
+    box = _Box(tmp_path, env_lines=("TAILSCALE_ENABLED=true", LAN_CIDR,
                                     "TAILSCALE_KEEP_SOURCE_TO_DOCKER=%s" % value),
                rules=[TEST_RULE])
     r = box.run("apply")
@@ -313,11 +315,30 @@ def test_status_reads_only_and_names_the_drift_sr175(tmp_path, rules, unit_rc, e
 
 @_needs_bash
 def test_status_calls_a_rule_left_on_while_the_knob_is_off_drift_sr175(tmp_path):
-    box = _Box(tmp_path, env_lines=("TAILSCALE_ENABLED=true",
+    box = _Box(tmp_path, env_lines=("TAILSCALE_ENABLED=true", LAN_CIDR,
                                     "TAILSCALE_KEEP_SOURCE_TO_DOCKER=false"), rules=[OURS])
     r = box.run("status")
     assert r.returncode == 3, r.out
     assert "want the rule OFF" in r.out
+
+
+@_needs_bash
+@pytest.mark.parametrize("lan_cidr,ok", [
+    ("LAN_CIDR=private_ranges", False),
+    ("", False),
+    ('LAN_CIDR="192.168.1.0/24 100.64.0.0/16"', False),
+    ('LAN_CIDR="100.0.0.0/8"', True),
+    ("LAN_CIDR='192.168.1.0/24 100.64.0.0/10' # LAN and tailnet", True),
+])
+def test_status_says_when_lan_cidr_would_refuse_the_kept_source_sr175(tmp_path, lan_cidr, ok):
+    """Review F1 (2026-11-12): with the template's `private_ranges` a tailnet
+    client passed only because it was masqueraded to a 172.x address; with the
+    rule on it is 100.x and refused. The rule stays on; status says so."""
+    box = _Box(tmp_path, env_lines=("TAILSCALE_ENABLED=true", lan_cidr), rules=[OURS])
+    r = box.run("status")
+    assert r.returncode == (0 if ok else 3), r.out
+    assert ("LAN_CIDR does not admit" in r.out) is (not ok)
+    assert box.run("apply").returncode == 0, "apply judges the rule, not LAN_CIDR"
 
 
 # --- TC-1857 --------------------------------------------------------------

@@ -363,7 +363,8 @@ class _FakeHub:
         self.log = tmp_path / "calls.jsonl"
         self.log.write_text("", encoding="utf-8")
 
-        lines = ["TAILSCALE_ENABLED=true", "TAILSCALE_ADVERTISE_ROUTES=%s" % LAN]
+        lines = ["TAILSCALE_ENABLED=true", "TAILSCALE_ADVERTISE_ROUTES=%s" % LAN,
+                 'LAN_CIDR="%s 100.64.0.0/10"' % LAN]
         if knob is not None:
             lines.append("TAILSCALE_ADVERTISE_EXIT_NODE=%s" % knob)
         self.env_file = tmp_path / "stack.env"

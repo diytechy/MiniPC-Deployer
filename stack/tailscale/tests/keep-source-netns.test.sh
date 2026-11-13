@@ -14,9 +14,10 @@
 #   container   172.31.0.2 on ct0      <->  br-lab0 (172.31.0.1) on the hub
 #   lan ns      192.0.2.2 on lan0      <->  eno1 (192.0.2.1) on the hub
 # The hub forwards, DNATs 192.0.2.1:8443 to the container (Docker's published
-# port), and carries tailscaled's rules as v1.104.5 writes them: ts-forward
-# marks everything from tailscale0 with 0x40000/0xff0000, ts-postrouting
-# (first in nat POSTROUTING) masquerades every marked packet. The lan ns has no
+# port), and carries tailscaled's rules as the hub lists them (v1.104.5):
+# ts-forward (mark from tailscale0, accept marked, drop tailnet sources going
+# back out, accept the rest), ts-postrouting (first in nat POSTROUTING,
+# masquerade marked) and the two CONNMARK rules in mangle PREROUTING/OUTPUT. The lan ns has no
 # route back to the tailnet, like a real LAN device whose gateway is the router.
 #
 # What it proves:
@@ -72,7 +73,8 @@ mkdir -p "$W/bin"
 printf '#!/bin/sh\nexit 0\n' >"$W/bin/systemctl"; chmod 0755 "$W/bin/systemctl"
 export PATH="$W/bin:$PATH"
 export TAILNET_KEEP_SOURCE_ENV_FILE="$W/stack.env" TAILNET_KEEP_SOURCE_LOCK="$W/ks.lock"
-printf 'TAILSCALE_ENABLED=true\n' >"$TAILNET_KEEP_SOURCE_ENV_FILE"
+ENV_ON='TAILSCALE_ENABLED=true\nLAN_CIDR="192.0.2.0/24 100.64.0.0/10"\n'
+printf "$ENV_ON" >"$TAILNET_KEEP_SOURCE_ENV_FILE"
 
 # A child network namespace held open by a sleeper; its pid goes in NS. Never
 # called through $(...): the sleeper would hold the substitution's pipe open,
@@ -116,6 +118,18 @@ lab() {
     iptables -w 5 -N ts-forward && iptables -w 5 -I FORWARD 1 -j ts-forward || return 1
     iptables -w 5 -A ts-forward -i tailscale0 -j MARK --set-xmark 0x40000/0xff0000 || return 1
     iptables -w 5 -A ts-forward -m mark --mark 0x40000/0xff0000 -j ACCEPT || return 1
+    iptables -w 5 -A ts-forward -s 100.64.0.0/10 -o tailscale0 -j DROP || return 1
+    iptables -w 5 -A ts-forward -o tailscale0 -j ACCEPT || return 1
+    # The CONNMARK pair needs xt_connmark, which the WSL2 kernel lacks: added
+    # where the kernel has it, a SKIP line where it does not.
+    if iptables -w 5 -t mangle -A PREROUTING -m conntrack --ctstate RELATED,ESTABLISHED -m connmark ! --mark 0x0/0xff0000 \
+            -j CONNMARK --restore-mark --nfmask 0xff0000 --ctmask 0xff0000 2>/dev/null \
+       && iptables -w 5 -t mangle -A OUTPUT -m conntrack --ctstate NEW -m mark ! --mark 0x0/0xff0000 \
+            -j CONNMARK --save-mark --nfmask 0xff0000 --ctmask 0xff0000 2>/dev/null; then
+        CONNMARK_LAB=yes
+    else
+        CONNMARK_LAB=no
+    fi
     iptables -w 5 -t nat -N ts-postrouting && iptables -w 5 -t nat -I POSTROUTING 1 -j ts-postrouting || return 1
     iptables -w 5 -t nat -A ts-postrouting -m mark --mark 0x40000/0xff0000 -j MASQUERADE || return 1
 
@@ -142,6 +156,9 @@ if ! lab; then
     finish
 fi
 
+if [ "$CONNMARK_LAB" = yes ]; then pass "N0 tailscaled's CONNMARK pair is in the lab"
+else skip "N0 tailscaled's CONNMARK pair: this kernel has no xt_connmark; the lab runs without it"; fi
+
 count() { iptables -w 5 -t mangle -S POSTROUTING | grep -c -- "--comment $1" || true; }
 TEST_RULE=(-s 100.64.0.0/10 -o br-+ -m comment --comment tailnet-to-docker-keep-source-TEST-20261112 -j MARK --set-xmark 0x0/0x40000)
 
@@ -166,12 +183,12 @@ out="$(bash "$SCRIPT" status 2>&1)"; rc=$?
 check "N6a status exits 0 [$out]" "$rc" "0"
 case "$out" in *"ON as configured"*) pass "N6b status says ON as configured" ;; *) fail "N6b status: $out" ;; esac
 
-printf 'TAILSCALE_ENABLED=true\nTAILSCALE_KEEP_SOURCE_TO_DOCKER=false\n' >"$TAILNET_KEEP_SOURCE_ENV_FILE"
+printf "${ENV_ON}TAILSCALE_KEEP_SOURCE_TO_DOCKER=false\n" >"$TAILNET_KEEP_SOURCE_ENV_FILE"
 bash "$SCRIPT" apply >/dev/null 2>&1
 check "N7a knob false: no rule of its own" "$(count homehub-tailnet-keep-source)" "0"
 check "N7b knob false: the container sees the bridge gateway again" "$(seen 192.0.2.1 8443)" "172.31.0.1"
 
-printf 'TAILSCALE_ENABLED=true\n' >"$TAILNET_KEEP_SOURCE_ENV_FILE"
+printf "$ENV_ON" >"$TAILNET_KEEP_SOURCE_ENV_FILE"
 bash "$SCRIPT" apply >/dev/null 2>&1
 iptables -w 5 -t mangle -A POSTROUTING "${TEST_RULE[@]}"
 out="$(bash "$SCRIPT" remove 2>&1)"; rc=$?

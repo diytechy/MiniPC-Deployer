@@ -72,8 +72,11 @@
 # setup-tailscale.sh --check-only folds it in.
 #
 # THE KNOB: TAILSCALE_KEEP_SOURCE_TO_DOCKER=true|false, default true, because
-# LAN_CIDR already says tailnet clients pass the LAN gate; false withdraws the
-# rule (the unit keeps it withdrawn across reboots). With TAILSCALE_ENABLED not
+# SR-042 already requires LAN_CIDR to admit the tailnet range; false withdraws
+# the rule (the unit keeps it withdrawn across reboots). `status` calls it
+# drift when the rule is on and LAN_CIDR does NOT admit the range (the
+# template's `private_ranges` does not): such a box let tailnet clients in only
+# by accident, masqueraded to a 172.x bridge address, and refuses them now. With TAILSCALE_ENABLED not
 # true there is no tailnet and the rule is withdrawn too. Anything else than
 # exactly true or false is refused and nothing changes.
 #
@@ -211,6 +214,27 @@ take_lock() {
 
 unit_enabled() { systemctl is-enabled --quiet "$UNIT" 2>/dev/null; }
 
+# Does LAN_CIDR, Caddy's `@lan` allow-list (space-separated), hold an IPv4
+# network that contains the whole tailnet range? With the rule on, Caddy sees
+# tailnet clients as 100.x, so without that a tailnet client is refused. The
+# template's `private_ranges` does not (RFC1918 and loopback only): on such a
+# box tailnet clients passed only by accident, masqueraded to a 172.x bridge
+# address. Not a reason to leave the rule off; a reason to say so loudly.
+lan_cidr_admits_tailnet() {
+    local -a toks
+    local tok len num mask want=$(( (100 << 24) | (64 << 16) ))   # TAILNET_V4's network
+    read -r -a toks <<<"$(_env LAN_CIDR)"
+    for tok in "${toks[@]}"; do
+        [[ "$tok" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]] || continue
+        len=$((10#${BASH_REMATCH[5]}))
+        [ "$len" -le 10 ] || continue
+        num=$(( (10#${BASH_REMATCH[1]} << 24) | (10#${BASH_REMATCH[2]} << 16) | (10#${BASH_REMATCH[3]} << 8) | 10#${BASH_REMATCH[4]} ))
+        mask=$(( len == 0 ? 0 : (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+        [ $(( num & mask )) -eq $(( want & mask )) ] && return 0
+    done
+    return 1
+}
+
 # report -> prints one verdict line; returns 0 in place, 3 drift, 1 unreadable.
 # Requires desired() to have run.
 report() {
@@ -226,6 +250,9 @@ report() {
     fi
     if [ "$TESTS" -ne 0 ]; then
         drift="${drift}${drift:+; }$TESTS hand-made $TEST_MARKER_PREFIX* rule(s) still present"
+    fi
+    if [ "$WANT" = on ] && ! lan_cidr_admits_tailnet; then
+        drift="${drift}${drift:+; }LAN_CIDR does not admit the tailnet range $TAILNET_V4 (SR-042), so with the rule on a tailnet client gets 403 at every LAN-only site: add the range to LAN_CIDR, or set TAILSCALE_KEEP_SOURCE_TO_DOCKER=false"
     fi
     if [ -n "$drift" ]; then log "DRIFT - $drift"; return 3; fi
     if [ "$WANT" = on ]; then

@@ -28,7 +28,8 @@
 #   TRACKER_SUBDOMAIN, ACTUAL_SUBDOMAIN, MAIN_BOX_IP, EXTRA_SUBDOMAINS (SR-012),
 #   WALL_HOST (the kiosk site — the panel resolves it through this box),
 #   OTTERTUBE_SITE_ENABLED (empty: OTTERTUBE_ENABLED) + OTTERTUBE_SUBDOMAIN
-#   (the OtterTube site and update channel, SN-051, SR-126).
+#   (the OtterTube site and update channel, SN-051, SR-126),
+#   CAMERA_VIEW_ENABLED + CAMERA_VIEW_SUBDOMAIN (the camera page, SN-057).
 #
 # Exit codes: 0 success; nonzero (with a message) on any API failure — so the
 # first-boot unit is marked failed and the operator can see it, rather than the
@@ -391,6 +392,14 @@ main() {
     local __ot_site="${OTTERTUBE_SITE_ENABLED:-${OTTERTUBE_ENABLED:-}}"
     if [ "$__ot_site" = true ]; then
         add_a "$TOKEN" "${OTTERTUBE_SUBDOMAIN:-ottertube}.${DOMAIN}" "$LAN_IP"
+    fi
+
+    # THE CAMERA PAGE (SN-057, SR-171): an A record only, and only while the
+    # page is on (exactly `true`, as caddy reads it). IPv4 only on purpose:
+    # the page's gate admits tailnet IPv4 and refuses IPv6 as shipped, so the
+    # name must not lead a phone to the hub over IPv6.
+    if [ "${CAMERA_VIEW_ENABLED:-}" = true ]; then
+        add_a "$TOKEN" "${CAMERA_VIEW_SUBDOMAIN:-cameras}.${DOMAIN}" "$LAN_IP"
     fi
 
     # Tier-2 opt-in subdomains (SR-012): bare labels from EXTRA_SUBDOMAINS in

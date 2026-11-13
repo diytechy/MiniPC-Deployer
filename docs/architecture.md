@@ -184,6 +184,7 @@ graph LR
 | `stack/monitoring/` | SN-048: the hub's record-and-alert monitors (telemetry, low-disk alarm, watched jobs, liveness with evidence) and the one alert helper (SR-085..SR-091), plus the metrics log and its direct backup-drive archive (SR-122..SR-124) |
 | [`stack/scratch/`](../stack/scratch/README.md) | SN-050: the NVMe scratch volume (18 GiB ext4 LV with one hard project quota per writer), its non-destructive provisioner and the mount guard every writer runs before each new file (SR-102..SR-104, IF-071) |
 | [`stack/door/`](../stack/door/README.md) | SN-050: the door relay (go2rtc pinned by digest; the doorbell's one RTSP session re-served on the LAN), the copy-only recorder onto `/srv/scratch/door`, and the gate/cutover/cost tooling (SR-105..SR-107, IF-070) |
+| [`stack/camera-remote/`](../stack/camera-remote/README.md) | SN-057: the camera page - a third go2rtc (the relays' pinned image) re-serving the door relay to `cameras.<domain>` through Caddy, MSE only, no listener (a unix socket Caddy binds), the door with no login on the LAN and the tailnet, one straightened door picture (`door_flat`: the panel's v360 projection, `h264_vaapi`), kept running in `always` mode by a warm consumer unit; the source allow-list over `LAN_CIDR` (SR-170..SR-174, IF-087) |
 | [`stack/ottertube/`](../stack/ottertube/README.md) | SN-051: OtterTube on the hub - the daily per-item ytdl-sub run of the private curated list onto `/srv/scratch/ottertube`, OtterTube's own indexer (hard-linked publication), the read-only media server and Caddy's LAN-only OtterTube site (SR-113..SR-117, IF-072, IF-073); the site also serves the desktop app's signed update channel from `updates/` (SR-125, SR-127, IF-075), and the site and the library are switched separately (`OTTERTUBE_SITE_ENABLED`, empty following `OTTERTUBE_ENABLED`; SR-126) |
 | `sim/` | V1 homehub-sim — the full stack vs fictional stand-ins (Dex, Samba, mock shims) |
 | `vmtest/` | V3 — the real autoinstall ISO booted in Hyper-V (SIM secrets only) |
@@ -1242,6 +1243,52 @@ sequenceDiagram
         end
         C->>C: save copy status; never prune archive
     end
+```
+
+### The camera page: one request through the gate, and the straightened picture kept warm (SR-170..SR-174, LLR-1576, LLR-1577, LLR-1579, LLR-1586, LLR-1587)
+
+Built and shipped off; see camera-remote/README.md. Caddy is the only way in,
+and the viewer has no port: Caddy reaches go2rtc's API on a unix socket. go2rtc
+opens the relay (and, for door_flat, starts the straightening FFmpeg) when the
+first consumer of a stream arrives and stops it after the last. In `always`
+mode the warm unit is a consumer that never leaves, so the picture is already
+running when a page asks.
+
+```mermaid
+sequenceDiagram
+    participant B as phone browser (LAN or tailnet)
+    participant C as Caddy cameras.<domain>
+    participant V as viewer go2rtc (unix socket)
+    participant K as warm unit (always mode)
+    participant F as FFmpeg v360 + h264_vaapi
+    participant R as door relay (LAN_IP:8554)
+    Note over V: render refused unless LAN_CIDR passes the allow-list (LLR-1579, SR-173)
+    opt CAMERA_VIEW_DOOR_FLAT_MODE=always (SR-174, LLR-1587)
+        K->>V: /api/ws?src=door_flat, MSE; reads and drops; reconnects with backoff
+        V->>F: exec: start (input: the 0600 ffconcat file, no URL in argv) (LLR-1577)
+        F->>R: one consumer session with the relay login
+        R-->>F: 1536x1536 H.264
+        F-->>V: 960x540 H.264, MPEG-TS on stdout
+    end
+    B->>C: GET /
+    C->>C: switch on? else 404; source in LAN_CIDR? else 403 (SR-171, LLR-1586)
+    C-->>B: 302 /stream.html?src=door_flat&mode=mse
+    B->>C: GET /stream.html, /video-stream.js, /video-rtc.js
+    C->>V: proxied (Authorization and cookies stripped)
+    B->>C: websocket /api/ws?src=door_flat
+    alt query exactly src=door or src=door_flat
+        C->>V: proxied, no login (the Owner, 2026-11-12)
+        opt on_demand and no consumer yet
+            V->>F: exec: start
+            F->>R: one consumer session
+        end
+        V-->>B: fMP4 over MSE from the next keyframe
+    else src of a stream behind the login (none ships)
+        C->>C: basic_auth (SR-172)
+    else anything else (absent, repeated, encoded, foreign, name=)
+        C-->>B: 403
+    end
+    Note over V,R: last consumer gone (on_demand): FFmpeg and the relay session stop
 ```
 
 ### One pass of the hub voice listener: whether it may hear, and what leaves it (SR-163..SR-167, LLR-1535, LLR-1537, LLR-1539, LLR-1545)

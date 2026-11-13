@@ -70,6 +70,7 @@ only the Contract cell's opening words; the CSV holds the contract.
 | **IF-082** | Provides | EntertainmentPC (MINI-SERV: its own detection and the voice assistant's microphone) | Draft | v1 | SR-155, SR-156 | v1 living-room camera relay (SR-155, SR-156). rtsp://&lt;hub LAN_IP>:&lt;CAMERA_LIVINGROOM_RELAY_RTSP_PORT … |
 | **IF-085** | Consumes | EntertainmentPC (MINI-SERV's scene service: the action interface) | Draft | v1 | SR-164, SR-167 | v1 action interface of the living-room PC, the part the hub voice listener uses (SR-164, SR-167). OWNER AND … |
 | **IF-086** | Provides | EntertainmentPC (MINI-SERV: the on-screen listening indicator); later the wall panel if the Owner asks | Draft | v1 | SR-169 | v1 hub voice-listener state (SR-169). TCP on &lt;hub LAN_IP>:&lt;CAMERA_LIVINGROOM_LISTENER_FEED_PORT>, off at 0 … |
+| **IF-087** | Provides | Household phones and browsers on the LAN and the tailnet; later the wall panel (OfficeWallNaglight, its door view) | Draft | v1 | SR-170, SR-171, SR-172, SR-173, SR-174 | v1 camera page (SR-170..SR-174). https://cameras.&lt;domain>/ (CAMERA_VIEW_SUBDOMAIN), A record to the hub's LAN … |
 <!-- END GENERATED IF INDEX -->
 
 ## Notes on selected interfaces (hand-written)

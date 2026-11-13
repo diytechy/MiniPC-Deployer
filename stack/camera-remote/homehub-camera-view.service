@@ -1,0 +1,51 @@
+# homehub-camera-view - the camera page's viewer go2rtc (SR-170; stack/camera-remote/README.md).
+# The relays' pattern: SYSTEMD OWNS ITS LIFECYCLE, NOT DOCKER. The compose
+# service camera-view is `restart: "no"` behind profile camera-view, which this
+# unit is the only caller of: NEVER put it in COMPOSE_PROFILES.
+#
+# The knob is CAMERA_VIEW_ENABLED in the stack .env, read by ExecCondition:
+# off, the unit is a clean skip. Caddy's cameras.<domain> site reads its OWN
+# copy of the knob (caddy's environment, fixed when caddy is created), so
+# switching the page on or off is this unit AND a caddy recreate; `check` says
+# when the two disagree.
+#
+# `render` refuses unless the shared login is set and the hub's LAN_CIDR passes
+# the source allow-list (SR-173), so a page with a broad gate never starts.
+# The config and door_flat's input document hold the door relay's login: both
+# are rendered on every start into this unit's RuntimeDirectory (0700, root,
+# RAM, removed when the unit stops), 0600. The API socket lives in the
+# StateDirectory, a fixed path that caddy binds read-only.
+#
+# go2rtc logs a dropped source with its whole URL, credential included: the
+# output reaches the journal only through `redact-run`, and docker keeps no
+# log (the compose service has no log driver).
+[Unit]
+Description=Camera page viewer (go2rtc): the door relay re-served to cameras.<domain>, MSE only
+Documentation=file:///opt/homehub/stack/camera-remote/README.md
+# Wants=+After=, deliberately NOT Requires=docker.service: firstboot step 1b
+# stops docker to move /var/lib/docker, and Requires= would carry that stop
+# here (validate_config check 5b; the 2026-08-09 lesson).
+Wants=docker.service network-online.target
+After=docker.service network-online.target homehub-firstboot.service homehub-door-relay.service
+AssertPathExists=/opt/homehub/stack/camera-remote/camera_remote.py
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/homehub/stack
+ExecCondition=/usr/bin/python3 /opt/homehub/stack/camera-remote/camera_remote.py --env-file /opt/homehub/stack/.env condition
+ExecStartPre=/usr/bin/python3 /opt/homehub/stack/camera-remote/camera_remote.py --env-file /opt/homehub/stack/.env render
+ExecStartPre=-/usr/bin/docker rm -f homehub-camera-view
+ExecStart=/usr/bin/python3 /opt/homehub/stack/camera-remote/camera_remote.py --env-file /opt/homehub/stack/.env redact-run -- /usr/bin/docker compose --profile camera-view up --no-deps --no-log-prefix --exit-code-from camera-view camera-view
+ExecStop=/usr/bin/docker compose --profile camera-view stop --timeout 10 camera-view
+ExecStopPost=-/usr/bin/docker rm -f homehub-camera-view
+RuntimeDirectory=homehub-camera-view
+RuntimeDirectoryMode=0700
+StateDirectory=homehub-camera-view
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=180
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

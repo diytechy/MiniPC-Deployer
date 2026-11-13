@@ -182,6 +182,22 @@ services:
       # The Caddyfile accepts exactly `true`. Fixed at create time: recreate
       # caddy after changing either knob.
       OTTERTUBE_SITE_ENABLED: ${OTTERTUBE_SITE_ENABLED:-${OTTERTUBE_ENABLED:-false}}
+      # ── the camera page (SN-057, SR-171; stack/camera-remote) ────────────
+      # cameras.<domain>: LAN and tailnet only (LAN_CIDR above); the door's
+      # streams need no login (the Owner, 2026-11-12), and Caddy's basic_auth
+      # with ONE shared login is wired for streams other than the door's, of
+      # which none ships. The switch is read at REQUEST time (exactly `true`,
+      # else the site answers 404). The user and the hash are read at PARSE
+      # time, so each MUST be non-empty or Caddy refuses the whole file: hence
+      # the defaults. LOCKED (base64 of "locked") is no
+      # bcrypt hash, so with no login set every attempt is a 401. The real
+      # hash arrives in .env with each `$` doubled (camera_remote.py
+      # import-login; Materialize-Deploy does the same); NEVER hand-edit it.
+      # All fixed at create time: recreate caddy after changing any of them.
+      CAMERA_VIEW_HOST: ${CAMERA_VIEW_SUBDOMAIN:-cameras}.${DOMAIN}
+      CAMERA_VIEW_ENABLED: ${CAMERA_VIEW_ENABLED:-false}
+      CAMERA_VIEW_AUTH_USER: ${CAMERA_VIEW_AUTH_USER:-viewer}
+      CAMERA_VIEW_AUTH_HASH: ${CAMERA_VIEW_AUTH_HASH:-bG9ja2Vk}
     # THREE NETWORKS, and ALL must be named explicitly. Naming any network at
     # all opts a service OUT of the implicit `default`, so omitting `default`
     # here would cut Caddy off from tracker, actual and oauth2-proxy in one edit
@@ -227,6 +243,14 @@ services:
       # repository, so it arrives with the stack and no web-build delivery
       # touches it.
       - ./ottertube/landing:/srv/ottertube/landing:ro
+      # The camera page's viewer API socket (SR-170, SR-171): the directory,
+      # not the socket, so a viewer restart (go2rtc unlinks and recreates the
+      # socket) is seen at once. A fixed path under /var/lib, NOT /run: this
+      # container outlives the viewer's unit, and a bind of a directory the
+      # unit's stop removes would go stale. Short syntax on purpose: docker
+      # creates the directory if caddy starts first (root 0755; the unit's
+      # StateDirectoryMode tightens it to 0700 when it runs).
+      - /var/lib/homehub-camera-view:/srv/camera-view:ro
       # THE ACCESS LOG fail2ban READS, and it is a BIND MOUNT rather than a
       # named volume on purpose: fail2ban runs on the HOST and has to be able to
       # tail the file. Only the admin sign-in host and the LLM gateway log here
@@ -1731,6 +1755,74 @@ services:
         source: /run/homehub-camera-relay-livingroom/go2rtc.yaml
         target: /config/go2rtc.yaml
         read_only: true
+        bind:
+          create_host_path: false
+    logging:
+      driver: none
+    labels:
+      - "diun.enable=false"
+
+  # ── camera-view — the camera page's viewer go2rtc (SN-057, SR-170) ──────────
+  #
+  # The Owner's rulings of 2026-11-12 (HomeHub A89, plan 8.1, 8.2 for the
+  # door, 8.9): the door relay re-served to cameras.<domain> with no login on
+  # the LAN and the tailnet, MSE only, plus ONE straightened door picture made
+  # here (door_flat: FFmpeg's v360 on the processor, H.264 on the graphics),
+  # kept running when CAMERA_VIEW_DOOR_FLAT_MODE is `always` (the default;
+  # homehub-camera-view-warm.service). stack/camera-remote/.
+  #
+  # NO LISTENER: host networking only so the process can reach the relay on
+  # LAN_IP; the API is a unix socket in /var/lib/homehub-camera-view, which
+  # caddy binds read-only. RTSP, WebRTC, SRTP, RTMP and the API's TCP port are
+  # all off in the rendered config, and only five go2rtc modules load.
+  #
+  # LIFECYCLE: homehub-camera-view.service, its knob CAMERA_VIEW_ENABLED. The
+  # profile is NOT an enable switch; NEVER add it to COMPOSE_PROFILES. Same
+  # image (DOOR_RELAY_IMAGE, pinned by digest) and hardening as the relays, no
+  # log driver (a dropped source is logged with its credentialed URL; the
+  # unit's redact-run is the only way out).
+  #
+  # THE GRAPHICS: the render node for door_flat's h264_vaapi encode (plan 1.3:
+  # present on the host since 2026-11-04; a container sees it only when given
+  # it). root in the container is the node's owner on the host, so no
+  # capability is needed. cpus 1.0: the straightening measured 30 % of one
+  # core on the real stream (plan 1.5); every viewer of door_flat, and the
+  # warm unit, share one FFmpeg.
+  camera-view:
+    image: ${DOOR_RELAY_IMAGE}
+    container_name: homehub-camera-view
+    profiles: ["camera-view"]
+    network_mode: host
+    restart: "no"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 1.0
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    volumes:
+      - type: bind
+        source: /run/homehub-camera-view/go2rtc.yaml
+        target: /config/go2rtc.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      # door_flat's input: the relay's URL in an ffconcat document, so
+      # FFmpeg's argv names only this path (camera_remote.py).
+      - type: bind
+        source: /run/homehub-camera-view/door.ffconcat
+        target: /config/door.ffconcat
+        read_only: true
+        bind:
+          create_host_path: false
+      # Where go2rtc creates its API socket (the unit's StateDirectory, 0700).
+      - type: bind
+        source: /var/lib/homehub-camera-view
+        target: /run/camera-view
         bind:
           create_host_path: false
     logging:

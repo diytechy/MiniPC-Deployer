@@ -18,6 +18,7 @@ Documentation=file:///opt/homehub/stack/camera-remote/README.md
 BindsTo=homehub-camera-view.service
 After=homehub-camera-view.service
 AssertPathExists=/opt/homehub/stack/camera-remote/camera_remote.py
+AssertPathExists=/opt/homehub/stack/.env
 
 [Service]
 Type=simple

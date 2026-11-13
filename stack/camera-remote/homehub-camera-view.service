@@ -28,6 +28,8 @@ Documentation=file:///opt/homehub/stack/camera-remote/README.md
 Wants=docker.service network-online.target
 After=docker.service network-online.target homehub-firstboot.service homehub-door-relay.service
 AssertPathExists=/opt/homehub/stack/camera-remote/camera_remote.py
+# A missing .env must fail loudly, not read as "switched off" (review round 3 F4).
+AssertPathExists=/opt/homehub/stack/.env
 
 [Service]
 Type=simple
@@ -42,7 +44,9 @@ RuntimeDirectory=homehub-camera-view
 RuntimeDirectoryMode=0700
 StateDirectory=homehub-camera-view
 StateDirectoryMode=0700
-Restart=on-failure
+# always, not on-failure (review round 3 F2): a container ended by anything but
+# `systemctl stop` (an out-of-band `docker stop`, a clean go2rtc exit) comes back.
+Restart=always
 RestartSec=10
 TimeoutStartSec=180
 TimeoutStopSec=30

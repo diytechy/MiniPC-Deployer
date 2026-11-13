@@ -115,6 +115,7 @@ CONFIG_NAME = "go2rtc.yaml"
 FFCONCAT_NAME = "door.ffconcat"
 STATE_DIR = "/var/lib/homehub-camera-view"    # the unit's StateDirectory: the API socket
 CONTAINER = "homehub-camera-view"
+WARM_UNIT = "homehub-camera-view-warm.service"
 CADDY_CONTAINER = "caddy"
 # Inside the container (docker-compose.yml service camera-view binds these).
 CONFIG_IN_CONTAINER = "/config/go2rtc.yaml"
@@ -640,9 +641,29 @@ def credential_in_processes(forms: Sequence[str], proc_root: str = "/proc") -> L
     return hits
 
 
-def check(s: ViewSettings, lan_network, bridges, caddy: Dict[str, str]) -> Dict[str, object]:
-    """The whole check, as a record: {pass, reasons}. Implements: LLR-1583, LLR-1584."""
+def warm_unit_enabled() -> Optional[bool]:
+    """Whether homehub-camera-view-warm.service is enabled (None: systemctl could not say)."""
+    try:
+        out = subprocess.run(["systemctl", "is-enabled", WARM_UNIT], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, universal_newlines=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out in ("enabled", "enabled-runtime") if out else None
+
+
+def check(s: ViewSettings, lan_network, bridges, caddy: Dict[str, str],
+          warm_enabled: Optional[bool] = None) -> Dict[str, object]:
+    """The whole check, as a record: {pass, reasons}.
+
+    `warm_enabled` is whether the warm unit is enabled (None: unknown, not
+    judged): with the viewer on in `always`, a warm unit nobody enabled means
+    the picture starts only at the first viewer (review round 3 F6).
+    Implements: LLR-1583, LLR-1584.
+    """
     reasons = preflight(s, lan_network, bridges) + caddy_violations(s, caddy, lan_network, bridges)
+    if s.enabled and s.flat_mode == "always" and warm_enabled is False:
+        reasons.append("CAMERA_VIEW_DOOR_FLAT_MODE is always but %s is not enabled: the straightened picture "
+                       "would start only at the first viewer" % WARM_UNIT)
     try:
         if not stat.S_ISCHR(os.stat(RENDER_NODE).st_mode):
             reasons.append("%s is not a character device" % RENDER_NODE)
@@ -896,7 +917,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                % (tag, " and ".join(written), "/".join(API_PATHS), ",".join(MODULES), STREAM_RAW, STREAM_FLAT,
                   FLAT_WIDTH, FLAT_HEIGHT, FLAT_FPS, s.flat_mode))
         return 0
-    record = check(s, lan_network, bridges, read_caddy_env())
+    record = check(s, lan_network, bridges, read_caddy_env(), warm_unit_enabled())
     door_relay.emit(record)
     return 0 if record["pass"] else 1
 

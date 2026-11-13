@@ -411,6 +411,16 @@ def test_tc1833_an_unlistable_proc_is_a_named_reason(tmp_path):
     assert cr.credential_in_processes(["x"], str(tmp_path / "no-proc")) == ["%s could not be listed" % (tmp_path / "no-proc")]
 
 
+@pytest.mark.parametrize("enabled, mode, warm, flagged", [
+    ("true", "always", False, True), ("true", "always", True, False), ("true", "always", None, False),
+    ("true", "on_demand", False, False), ("false", "always", False, False)])
+def test_tc1833_always_needs_the_warm_unit_enabled(tmp_path, monkeypatch, enabled, mode, warm, flagged):
+    monkeypatch.setattr(cr, "credential_in_processes", lambda forms: [])
+    s = settings(tmp_path, CAMERA_VIEW_ENABLED=enabled, CAMERA_VIEW_DOOR_FLAT_MODE=mode)
+    reasons = cr.check(s, LAN, BRIDGES, caddy_env(CAMERA_VIEW_ENABLED=enabled), warm)["reasons"]
+    assert any("homehub-camera-view-warm.service is not enabled" in r for r in reasons) == flagged
+
+
 def test_tc1833_no_caddy_is_a_failure(tmp_path):
     assert any("could not be read" in r for r in cr.caddy_violations(settings(tmp_path), {}, LAN, BRIDGES))
 
@@ -553,7 +563,7 @@ def test_tc1836_the_viewer_unit_is_knob_gated_rendered_redacted_and_never_requir
     assert ("redact-run -- /usr/bin/docker compose --profile camera-view up --no-deps --no-log-prefix "
             "--exit-code-from camera-view camera-view") in text
     assert {"RuntimeDirectory=homehub-camera-view", "RuntimeDirectoryMode=0700", "StateDirectory=homehub-camera-view",
-            "StateDirectoryMode=0700"} <= set(live)
+            "StateDirectoryMode=0700", "Restart=always", "AssertPathExists=/opt/homehub/stack/.env"} <= set(live)
     assert cr.RUN_DIR == "/run/homehub-camera-view" and cr.STATE_DIR == "/var/lib/homehub-camera-view"
     assert not [l for l in live if l.startswith(("Requires=", "PartOf=")) and "docker" in l]
 
@@ -564,7 +574,7 @@ def test_tc1836_the_warm_unit_rides_on_the_viewer_and_touches_only_a_unix_socket
     assert any(l.startswith("ExecCondition=") and l.endswith(" condition-warm") for l in live)
     assert any(l.startswith("ExecStart=") and l.endswith(" keep-warm") for l in live)
     assert {"Restart=always", "RestrictAddressFamilies=AF_UNIX", "PrivateNetwork=yes", "NoNewPrivileges=yes",
-            "ProtectSystem=strict", "CapabilityBoundingSet="} <= set(live)
+            "ProtectSystem=strict", "CapabilityBoundingSet=", "AssertPathExists=/opt/homehub/stack/.env"} <= set(live)
 
 
 @pytest.mark.parametrize("enabled, mode, rc", [("true", "always", 0), ("true", "", 0), ("true", "on_demand", 1),

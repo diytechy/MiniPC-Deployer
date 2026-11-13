@@ -8,22 +8,30 @@ LAN and tailnet only; Caddy passes only go2rtc's player page, its two scripts
 and its stream websocket, in MSE mode (repackaged, never re-encoded); and the
 hub makes ONE straightened door picture, the wall panel's own projection,
 decoded and straightened on the processor and H.264-encoded on the graphics.
-THE DOOR NEEDS NO LOGIN (about 18:15: "a public view of the front of a house on
-a closed network, so anyone on the network should be able to see it"): any
-source the allow-list admits may watch it. Caddy's shared username-and-password
-login is kept, wired and inactive, for streams other than the door's; none
-ships (indoor cameras wait on 8.2), so LOGIN_STREAMS is empty.
+THE PAGE IS BEHIND CADDY'S ONE SHARED LOGIN, because it shows every camera
+(about 19:00: "the camera page can be behind a caddy login as it contains all
+cameras"; 8.2 answered: all cameras on the page, behind that login): the door,
+straightened and raw, and the living room's two relay streams, VIDEO ONLY,
+never its sound. THE DOOR ALONE stays open WITHOUT a login to the LAN alone
+(CAMERA_VIEW_DOOR_OPEN_CIDR; the earlier ruling, "a public view of the front of
+a house on a closed network"), so the wall panel can take it; a tailnet source
+always goes through the login. THE PROJECTION is knobs with the panel's values
+as defaults (CAMERA_VIEW_FLAT_*; the Owner finds it stretched horizontally).
 THE STRAIGHTENED PICTURE'S MODE (about 18:25: "an .env configuration ... start
 evaluations with always on"): CAMERA_VIEW_DOOR_FLAT_MODE, `always` (the
 default) or `on_demand`.
 
 THE VIEWER is a third go2rtc process (the relays' pinned image), compose
-service camera-view, run by homehub-camera-view.service. It serves exactly two
-streams, both read from the hub's door relay with the relay's own consumer
-login (the doorbell's; no new camera secret):
-    door       the relay's H.264 copied as it is (the raw fisheye circle);
-    door_flat  the straightened picture: go2rtc's `exec:` source runs FFmpeg
-               (in the same image) and reads its MPEG-TS from a pipe.
+service camera-view, run by homehub-camera-view.service. Its streams are read
+from the hub's relays with each relay's own consumer login (no new camera
+secret):
+    door             the door relay's H.264 copied as it is (the raw circle);
+    door_flat        the straightened picture: go2rtc's `exec:` source runs
+                     FFmpeg (in the same image), MPEG-TS read from a pipe;
+    livingroom       the living-room relay's sub stream, video only, and
+    livingroom-main  its main stream, video only - both only while
+                     CAMERA_LIVINGROOM_RELAY_ENABLED is true (the main stream
+                     only when that relay serves one).
 go2rtc opens a producer only when a consumer asks. With `on_demand` the
 relay session and the straightening FFmpeg exist only while someone watches.
 With `always`, homehub-camera-view-warm.service (`keep-warm`) is a consumer of
@@ -67,14 +75,15 @@ Verbs:
                    in any process's argv or environment. Exit 0 only on pass.
     import-login   CAMERA_VIEW_AUTH_HASH from STDIN (one line, a bcrypt hash;
                    never the password) into the stack .env; prints the key name.
-                   Only for streams behind the login, of which none ships.
+                   The login every stream is behind; render refuses without it.
     redact-run -- CMD   the unit's ExecStart wrapper (door_relay.redact_run with
-                   the door relay's credential: go2rtc logs a dropped source's
-                   whole URL).
+                   every relay's credential and camera address: go2rtc logs a
+                   dropped source's whole URL).
 
-PREFLIGHT (render and check): the door relay's settings; the door_flat mode;
-the shared login (a bcrypt hash, not the shipped lock) ONLY while a stream is
-behind it (none ships); and THE SOURCE ALLOW-LIST (review round 4,
+PREFLIGHT (render and check): the relays' settings; the door_flat mode; the
+projection; the shared login (a bcrypt hash, not the shipped lock: every stream
+is behind it); THE OPEN DOOR (CAMERA_VIEW_DOOR_OPEN_CIDR: empty, or IPv4 ranges
+inside the hub's LAN that overlap no docker bridge); and THE SOURCE ALLOW-LIST (review round 4,
 plan 6.9): every entry of the hub's LAN_CIDR - the `@lan remote_ip` gate in
 front of the page - must lie inside the hub's LAN (the network on the
 interface holding LAN_IP), Tailscale's 100.64.0.0/10, or a range the Owner
@@ -105,8 +114,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "monitoring"))
 sys.path.insert(0, os.path.join(HERE, "..", "door"))
+sys.path.insert(0, os.path.join(HERE, "..", "camera-relay"))
 import monitor_common as mc  # noqa: E402
 import door_relay  # noqa: E402
+import camera_relay  # noqa: E402
 
 Invalid = door_relay.Invalid
 
@@ -123,17 +134,22 @@ FFCONCAT_IN_CONTAINER = "/config/door.ffconcat"
 SOCKET_IN_CONTAINER = "/run/camera-view/api.sock"
 RENDER_NODE = "/dev/dri/renderD128"
 
-# The streams the page offers. Fixed by the rulings (8.1 A, 8.9 A; 8.2 still
-# open, so no indoor camera): Caddy's websocket gate names exactly these two,
-# and tests/test_camera_remote.py holds the two lists equal.
+# The streams the page may offer. Caddy's websocket gate names exactly these
+# (tests/test_camera_remote.py holds the lists equal). A name the config does
+# not define creates nothing in go2rtc (it has no scheme), so the gate may name
+# the living room's two even while its relay is off.
 STREAM_RAW = "door"
 STREAM_FLAT = "door_flat"
-STREAMS = (STREAM_FLAT, STREAM_RAW)
-# Streams any admitted source may watch (the Owner, 2026-11-12 18:15: the door
-# is a public view on a closed network) and streams behind Caddy's shared
-# login. Caddy's site names the same two lists; the tests hold them equal.
-PUBLIC_STREAMS = STREAMS
-LOGIN_STREAMS = ()   # none ships: indoor cameras wait on plan 8.2
+STREAM_LIVINGROOM = "livingroom"
+STREAM_LIVINGROOM_MAIN = "livingroom-main"
+STREAMS = (STREAM_FLAT, STREAM_RAW, STREAM_LIVINGROOM, STREAM_LIVINGROOM_MAIN)
+# Every stream is behind the shared login (the Owner, about 19:00); the door's
+# two are ALSO open, without a login, to CAMERA_VIEW_DOOR_OPEN_CIDR (the LAN).
+LOGIN_STREAMS = STREAMS
+DOOR_STREAMS = (STREAM_FLAT, STREAM_RAW)
+# What compose hands caddy when CAMERA_VIEW_DOOR_OPEN_CIDR is empty: an
+# address no packet comes from, so the open door route matches nobody.
+DOOR_OPEN_NOBODY = "0.0.0.0/32"
 # The straightened picture's mode (the Owner, 2026-11-12 18:25).
 FLAT_MODES = ("always", "on_demand")
 DEFAULT_FLAT_MODE = "always"
@@ -149,10 +165,17 @@ API_PATHS = ("/", "/api/ws")   # "/" is the static file server (the player page 
 # ffmpeg_args, corrected mode, with wall.env.example's defaults, which
 # config.wall.psd1 does not override): fisheye 180 x 180 to a flat 960x540
 # view 110 degrees across, v_fov derived for square pixels, linear
-# interpolation, 10 frames a second.
+# interpolation, 10 frames a second. These are the DEFAULTS of the
+# CAMERA_VIEW_FLAT_* knobs (the Owner, 2026-11-12: tune it, A65 Part 1).
 FLAT_WIDTH, FLAT_HEIGHT = 960, 540
 FLAT_INPUT_FOV = 180
 FLAT_HORIZONTAL_FOV = 110
+# The output projection: v360's `flat` (the panel's) or `cylindrical` (the
+# angle across is linear, so a wide view stretches its edges less; A65 Part 1).
+# NOT pannini: FFmpeg's pannini output reads its h_fov as the Pannini d
+# parameter (0..1) with a fixed field and no square-pixel control
+# (libavfilter/vf_v360.c pannini_to_xyz, 8.0.1).
+FLAT_OUTPUTS = ("flat", "cylindrical")
 FLAT_FPS = 10
 # RATE CONTROL IS THE ENCODER'S DEFAULT, on purpose (the Owner, 2026-11-12
 # about 18:45: h264_vaapi at its default quality, no rate cap; measured on the
@@ -185,7 +208,8 @@ LOCKED_HASH = "bG9ja2Vk"
 DEFAULT_USER = "viewer"
 HASH_KEY = "CAMERA_VIEW_AUTH_HASH"
 # The keys check reads out of caddy's own environment; nothing else is kept.
-CADDY_KEYS = ("LAN_CIDR", "CAMERA_VIEW_ENABLED", "CAMERA_VIEW_AUTH_USER", HASH_KEY)
+DOOR_OPEN_KEY = "CAMERA_VIEW_DOOR_OPEN_CIDR"
+CADDY_KEYS = ("LAN_CIDR", "CAMERA_VIEW_ENABLED", "CAMERA_VIEW_AUTH_USER", HASH_KEY, DOOR_OPEN_KEY)
 
 
 # ── settings ─────────────────────────────────────────────────────────────────
@@ -203,7 +227,11 @@ class ViewSettings:
                words); and the door relay's fields (door_relay.RelaySettings:
                LAN_IP, DOOR_RELAY_RTSP_PORT, _STREAM, the doorbell's login),
                because the viewer reads the relay as one of its consumers;
-               CAMERA_VIEW_DOOR_FLAT_MODE (always | on_demand; empty: always).
+               CAMERA_VIEW_DOOR_FLAT_MODE (always | on_demand; empty: always);
+               CAMERA_VIEW_DOOR_OPEN_CIDR (the LAN alone, whitespace words;
+               empty: the door needs the login everywhere); the projection
+               (FlatProjection); and, while CAMERA_LIVINGROOM_RELAY_ENABLED is
+               true, the living-room relay's fields (camera_relay).
                [stack/.env]
       Raises:  Invalid naming the key, never its value.
     Implements: LLR-1575.
@@ -223,6 +251,65 @@ class ViewSettings:
         self.flat_mode = env.get("CAMERA_VIEW_DOOR_FLAT_MODE", "").strip() or DEFAULT_FLAT_MODE
         if self.flat_mode not in FLAT_MODES:
             raise Invalid("CAMERA_VIEW_DOOR_FLAT_MODE must be always or on_demand")
+        self.door_open = env.get(DOOR_OPEN_KEY, "").strip()
+        self.flat = FlatProjection(env)
+        self.livingroom = (camera_relay.CameraRelaySettings(env_file, "livingroom")
+                           if env.get("CAMERA_LIVINGROOM_RELAY_ENABLED", "") == "true" else None)
+
+    def relays(self) -> List[object]:
+        """Every relay this viewer reads, for redaction and the credential scan."""
+        return [self.relay] + ([self.livingroom] if self.livingroom else [])
+
+
+def _number(env: Dict[str, str], key: str, default: float, low: float, high: float) -> float:
+    text = env.get(key, "").strip()
+    if not text:
+        return default
+    if not re.fullmatch(r"-?[0-9]{1,3}(\.[0-9]{1,3})?", text) or not low <= float(text) <= high:
+        raise Invalid("%s must be a number from %g to %g" % (key, low, high))
+    return float(text)
+
+
+class FlatProjection:
+    """The straightened picture's v360 settings, the panel's values by default.
+
+    Contract:
+      Config:  CAMERA_VIEW_FLAT_INPUT_FOV (180; one value, or HxV such as
+               190x180, each 1..360: the fisheye's field across and down);
+               CAMERA_VIEW_FLAT_HORIZONTAL_FOV (110; 1..179); CAMERA_VIEW_FLAT_SIZE
+               (960x540; even, 160..1920 by 90..1080); CAMERA_VIEW_FLAT_YAW (0;
+               -180..180); CAMERA_VIEW_FLAT_PITCH (0; -90..90);
+               CAMERA_VIEW_FLAT_OUTPUT (flat; flat | cylindrical). The vertical
+               field is always derived for square pixels. [stack/.env]
+      Raises:  Invalid naming the key.
+    Implements: LLR-1589.
+    """
+
+    def __init__(self, env: Optional[Dict[str, str]] = None):
+        env = env or {}
+        fov = env.get("CAMERA_VIEW_FLAT_INPUT_FOV", "").strip() or str(FLAT_INPUT_FOV)
+        parts = fov.split("x")
+        if len(parts) not in (1, 2):
+            raise Invalid("CAMERA_VIEW_FLAT_INPUT_FOV must be N or HxV")
+        try:
+            values = [_number({"v": part}, "v", 0, 1, 360) for part in parts] if all(parts) else []
+        except Invalid:
+            values = []
+        if not values:
+            raise Invalid("CAMERA_VIEW_FLAT_INPUT_FOV must be N or HxV, each from 1 to 360")
+        self.input_h, self.input_v = values[0], values[-1]
+        self.h_fov = _number(env, "CAMERA_VIEW_FLAT_HORIZONTAL_FOV", FLAT_HORIZONTAL_FOV, 1, 179)
+        size = re.fullmatch(r"([0-9]{3,4})x([0-9]{2,4})", env.get("CAMERA_VIEW_FLAT_SIZE", "").strip()
+                            or "%dx%d" % (FLAT_WIDTH, FLAT_HEIGHT))
+        if not size or int(size.group(1)) % 2 or int(size.group(2)) % 2 \
+                or not 160 <= int(size.group(1)) <= 1920 or not 90 <= int(size.group(2)) <= 1080:
+            raise Invalid("CAMERA_VIEW_FLAT_SIZE must be WIDTHxHEIGHT, even, 160..1920 by 90..1080")
+        self.width, self.height = int(size.group(1)), int(size.group(2))
+        self.yaw = _number(env, "CAMERA_VIEW_FLAT_YAW", 0, -180, 180)
+        self.pitch = _number(env, "CAMERA_VIEW_FLAT_PITCH", 0, -90, 90)
+        self.output = env.get("CAMERA_VIEW_FLAT_OUTPUT", "").strip() or FLAT_OUTPUTS[0]
+        if self.output not in FLAT_OUTPUTS:
+            raise Invalid("CAMERA_VIEW_FLAT_OUTPUT must be flat or cylindrical")
 
 
 def parse_ruled_in(text: str) -> Dict[str, object]:
@@ -367,6 +454,35 @@ def read_host_networks(lan_ip: str) -> Tuple[Optional[object], List[object]]:
     return host_networks(out, lan_ip)
 
 
+def door_open_violations(door_open: str, lan_network: Optional[object], bridges: Sequence[object]) -> List[str]:
+    """Why CAMERA_VIEW_DOOR_OPEN_CIDR may not open the door without a login.
+
+    The LAN ALONE (the Owner: the door is open on the LAN; a tailnet source
+    always goes through the login): every word an IPv4 network inside the
+    hub's LAN and overlapping no docker bridge; never private_ranges, the
+    tailnet or IPv6. Empty is allowed (the door needs the login everywhere).
+    Positions, never values. Implements: LLR-1590.
+    """
+    words = door_open.split()
+    if not words or words == [DOOR_OPEN_NOBODY]:
+        return []
+    reasons = []
+    if lan_network is None:
+        return ["%s is set but no interface on this hub holds LAN_IP" % DOOR_OPEN_KEY]
+    for i, word in enumerate(words, 1):
+        try:
+            net = ipaddress.ip_network(word, strict=False)
+        except ValueError:
+            reasons.append("%s entry %d of %d is not an IPv4 address or CIDR" % (DOOR_OPEN_KEY, i, len(words)))
+            continue
+        if net.version != 4 or not net.subnet_of(lan_network):
+            reasons.append("%s entry %d of %d lies outside the hub's LAN (the door is open to the LAN alone)"
+                           % (DOOR_OPEN_KEY, i, len(words)))
+        elif any(net.overlaps(b) for b in bridges if b.version == 4):
+            reasons.append("%s entry %d of %d overlaps a docker bridge on this hub" % (DOOR_OPEN_KEY, i, len(words)))
+    return reasons
+
+
 def login_violations(user: str, auth_hash: str) -> List[str]:
     """Why the shared login is not usable (empty: it is). Names keys only.
 
@@ -381,46 +497,54 @@ def login_violations(user: str, auth_hash: str) -> List[str]:
     return []
 
 
-def preflight(s: ViewSettings, lan_network, bridges, login_streams: Sequence[str] = LOGIN_STREAMS) -> List[str]:
+def preflight(s: ViewSettings, lan_network, bridges) -> List[str]:
     """Everything render needs before it may write a config.
 
-    The login is required only while a stream is behind it (`login_streams`;
-    none ships, so the door's page needs none). Implements: LLR-1579, LLR-1582.
+    The login is always required: every stream is behind it (LOGIN_STREAMS, the
+    Owner 2026-11-12, about 19:00). Implements: LLR-1579, LLR-1582, LLR-1590.
     """
-    login = login_violations(s.user, s.auth_hash) if login_streams else []
-    return login + source_violations(s.lan_cidr, lan_network, s.ruled_in, bridges)
+    return (login_violations(s.user, s.auth_hash)
+            + source_violations(s.lan_cidr, lan_network, s.ruled_in, bridges)
+            + door_open_violations(s.door_open, lan_network, bridges))
 
 
 # ── the go2rtc config and the straightening pipeline ─────────────────────────
 
 
-def vertical_fov(width: int, height: int, horizontal_fov: float) -> float:
-    """The flat view's vertical field of view for square pixels (degrees).
+def vertical_fov(width: int, height: int, horizontal_fov: float, output: str = "flat") -> float:
+    """The output's vertical field of view for square pixels (degrees).
 
-    The wall panel's formula (OfficeWallNaglight doorstream/service.py
+    flat, the wall panel's formula (OfficeWallNaglight doorstream/service.py
     flat_vertical_fov): v360's flat output maps pixels linearly onto
-    tan(fov/2), so square pixels need w/h = tan(h_fov/2)/tan(v_fov/2).
-    77.55 degrees for 960x540 at 110. Implements: LLR-1577.
+    tan(fov/2), so square pixels need w/h = tan(h_fov/2)/tan(v_fov/2); 77.55
+    degrees for 960x540 at 110. cylindrical: the angle across is linear and the
+    height is tan(v_fov/2) (vf_v360.c prepare_cylindrical_out), so square pixels
+    need w/h = (h_fov in radians / 2)/tan(v_fov/2). Implements: LLR-1577, LLR-1589.
     """
-    half = math.tan(math.radians(horizontal_fov) / 2) * height / width
+    if output == "cylindrical":
+        half = math.radians(horizontal_fov) / 2 * height / width
+    else:
+        half = math.tan(math.radians(horizontal_fov) / 2) * height / width
     return math.degrees(2 * math.atan(half))
 
 
-def flat_filter() -> str:
-    """The -vf chain: 10 fps, the panel's v360 projection, then up to the graphics.
+def flat_filter(p: Optional[FlatProjection] = None) -> str:
+    """The -vf chain: 10 fps, the v360 projection (the panel's by default), then
+    up to the graphics.
 
     Decoding and straightening stay on the processor (copying full frames
     back from the graphics measured 148 % of a core); only the encode is on
-    the graphics (plan 1.5). Implements: LLR-1577.
+    the graphics (plan 1.5). Implements: LLR-1577, LLR-1589.
     """
-    transform = ("v360=input=fisheye:output=flat:ih_fov=%d:iv_fov=%d:h_fov=%d:v_fov=%.4f:yaw=0:pitch=0:"
-                 "w=%d:h=%d:interp=linear" % (FLAT_INPUT_FOV, FLAT_INPUT_FOV, FLAT_HORIZONTAL_FOV,
-                                              vertical_fov(FLAT_WIDTH, FLAT_HEIGHT, FLAT_HORIZONTAL_FOV),
-                                              FLAT_WIDTH, FLAT_HEIGHT))
+    p = p or FlatProjection()
+    transform = ("v360=input=fisheye:output=%s:ih_fov=%g:iv_fov=%g:h_fov=%g:v_fov=%.4f:yaw=%g:pitch=%g:"
+                 "w=%d:h=%d:interp=linear" % (p.output, p.input_h, p.input_v, p.h_fov,
+                                              vertical_fov(p.width, p.height, p.h_fov, p.output),
+                                              p.yaw, p.pitch, p.width, p.height))
     return "fps=%d,%s,format=nv12,hwupload" % (FLAT_FPS, transform)
 
 
-def flat_argv(encoder: str = "vaapi") -> List[str]:
+def flat_argv(encoder: str = "vaapi", projection: Optional[FlatProjection] = None) -> List[str]:
     """door_flat's FFmpeg argv: no URL, no credential, no shell.
 
     Input: the ffconcat document at FFCONCAT_IN_CONTAINER (the relay's URL is
@@ -434,10 +558,10 @@ def flat_argv(encoder: str = "vaapi") -> List[str]:
     head = ["ffmpeg", "-hide_banner", "-nostats", "-loglevel", "error"]
     if encoder == "vaapi":
         hw = ["-init_hw_device", "vaapi=va:%s" % RENDER_NODE, "-filter_hw_device", "va"]
-        vf, codec = flat_filter(), ["-c:v", "h264_vaapi"]
+        vf, codec = flat_filter(projection), ["-c:v", "h264_vaapi"]
     elif encoder == "software":
         hw = []
-        vf = flat_filter().replace(",format=nv12,hwupload", ",format=yuv420p")
+        vf = flat_filter(projection).replace(",format=nv12,hwupload", ",format=yuv420p")
         codec = ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency"]
     else:
         raise ValueError("encoder is vaapi or software")
@@ -447,13 +571,13 @@ def flat_argv(encoder: str = "vaapi") -> List[str]:
             + codec + ["-g", str(FLAT_GOP), "-bf", "0", "-f", "mpegts", "-"])
 
 
-def flat_source(encoder: str = "vaapi") -> str:
+def flat_source(encoder: str = "vaapi", projection: Optional[FlatProjection] = None) -> str:
     """The go2rtc `exec:` source for door_flat.
 
     go2rtc splits it on whitespace (pkg/shell QuoteSplit), so no argument may
     hold a space or a quote; checked, not assumed. Implements: LLR-1577.
     """
-    argv = flat_argv(encoder)
+    argv = flat_argv(encoder, projection)
     if any(re.search(r"[\s'\"]", a) for a in argv):
         raise Invalid("an FFmpeg argument holds a space or a quote")
     return "exec:" + " ".join(argv)
@@ -480,11 +604,36 @@ def view_config(s: ViewSettings, encoder: str = "vaapi") -> Dict[str, object]:
         # info: a dropped source is logged with its whole URL, so the output
         # reaches the journal only through redact-run (the relays' rule).
         "log": {"level": "info", "format": "text"},
-        "streams": {
-            STREAM_RAW: s.relay.consumer_url() + "#media=video",
-            STREAM_FLAT: flat_source(encoder),
-        },
+        "streams": view_streams(s, encoder),
     }
+
+
+def view_streams(s: ViewSettings, encoder: str = "vaapi") -> Dict[str, str]:
+    """The streams: the door's two, and the living room's video while its relay
+    is on. Every relay source is `#media=video`: no sound is ever asked for (the
+    living-room relay offers its camera's sound only to a consumer that asks).
+    Implements: SR-170, LLR-1576.
+    """
+    streams = {STREAM_RAW: s.relay.consumer_url() + "#media=video",
+               STREAM_FLAT: flat_source(encoder, s.flat)}
+    if s.livingroom:
+        streams[STREAM_LIVINGROOM] = s.livingroom.consumer_url() + "#media=video"
+        if s.livingroom.main_stream:
+            streams[STREAM_LIVINGROOM_MAIN] = s.livingroom.for_main().consumer_url() + "#media=video"
+    return streams
+
+
+def living_room_note(streams: Dict[str, str]) -> str:
+    """The render line's words for the living room's streams, if any are served."""
+    living = [name for name in (STREAM_LIVINGROOM, STREAM_LIVINGROOM_MAIN) if name in streams]
+    return ", %s video only" % " and ".join(living) if living else ""
+
+
+def redact_all(text: str, relays: Sequence[object]) -> str:
+    """door_relay.redact for every relay's login and camera address in turn."""
+    for relay in relays:
+        text = door_relay.redact(text, relay)
+    return text
 
 
 def ffconcat_document(s: ViewSettings) -> bytes:
@@ -554,8 +703,7 @@ def caddy_env_from_inspect(inspect_json: str) -> Dict[str, str]:
     return out
 
 
-def caddy_violations(s: ViewSettings, caddy: Dict[str, str], lan_network, bridges,
-                     login_streams: Sequence[str] = LOGIN_STREAMS) -> List[str]:
+def caddy_violations(s: ViewSettings, caddy: Dict[str, str], lan_network, bridges) -> List[str]:
     """Caddy serves with the environment it was CREATED with; compare it to the .env.
 
     The gate that decides is the one in caddy's environment (the oracle), so
@@ -572,15 +720,19 @@ def caddy_violations(s: ViewSettings, caddy: Dict[str, str], lan_network, bridge
     # caddy's own value goes through the allow-list below either way.
     if set(caddy.get("LAN_CIDR", "").split()) != set(s.lan_cidr.split()):
         reasons.append("caddy's LAN_CIDR differs from the .env: recreate caddy")
-    if login_streams:   # the login matters only while a stream is behind it
-        if caddy.get("CAMERA_VIEW_AUTH_USER") != s.user:
-            reasons.append("caddy's CAMERA_VIEW_AUTH_USER differs from the .env: recreate caddy")
-        if caddy.get(HASH_KEY) != s.auth_hash:
-            reasons.append("caddy's %s differs from the .env: recreate caddy" % HASH_KEY)
-        reasons += ["caddy's own " + r for r in login_violations(caddy.get("CAMERA_VIEW_AUTH_USER", ""),
-                                                                caddy.get(HASH_KEY, ""))]
+    if caddy.get("CAMERA_VIEW_AUTH_USER") != s.user:
+        reasons.append("caddy's CAMERA_VIEW_AUTH_USER differs from the .env: recreate caddy")
+    if caddy.get(HASH_KEY) != s.auth_hash:
+        reasons.append("caddy's %s differs from the .env: recreate caddy" % HASH_KEY)
+    reasons += ["caddy's own " + r for r in login_violations(caddy.get("CAMERA_VIEW_AUTH_USER", ""),
+                                                            caddy.get(HASH_KEY, ""))]
     reasons += ["caddy's own " + r for r in source_violations(caddy.get("LAN_CIDR", ""), lan_network,
                                                              s.ruled_in, bridges)]
+    caddy_open = caddy.get(DOOR_OPEN_KEY, "").strip()
+    caddy_open = "" if caddy_open == DOOR_OPEN_NOBODY else caddy_open
+    if set(caddy_open.split()) != set(s.door_open.split()):
+        reasons.append("caddy's %s differs from the .env: recreate caddy" % DOOR_OPEN_KEY)
+    reasons += ["caddy's own " + r for r in door_open_violations(caddy_open, lan_network, bridges)]
     return reasons
 
 
@@ -670,10 +822,10 @@ def check(s: ViewSettings, lan_network, bridges, caddy: Dict[str, str],
     except OSError:
         reasons.append("%s is missing: the straightened picture cannot be encoded" % RENDER_NODE)
     reasons += file_mode_violations()
-    reasons += ["the relay credential is in %s" % hit
-                for hit in credential_in_processes(door_relay.secret_forms(s.relay))]
+    forms = [f for relay in s.relays() for f in door_relay.secret_forms(relay)]
+    reasons += ["a relay credential is in %s" % hit for hit in credential_in_processes(forms)]
     return {"pass": not reasons, "reasons": reasons, "enabled": s.enabled, "door_flat_mode": s.flat_mode,
-            "public_streams": list(PUBLIC_STREAMS), "login_streams": list(LOGIN_STREAMS)}
+            "streams": sorted(view_streams(s)), "door_open_to_the_lan": bool(s.door_open.split())}
 
 
 # ── keep-warm: the `always` mode's consumer ──────────────────────────────────
@@ -895,14 +1047,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             mc.log("%s warm: REFUSED - the viewer is off or the mode is not always" % tag, warning=True)
             return 78
         keep_warm(STATE_DIR + "/" + SOCKET_NAME, STREAM_FLAT, mc.log,
-                  lambda text: door_relay.redact(text, s.relay))
+                  lambda text: redact_all(text, s.relays()))
         return 0
     if args.verb == "redact-run":
         cmd = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
         if not cmd:
             mc.log("%s: redact-run needs -- CMD" % tag, warning=True)
             return 2
-        return door_relay.redact_run(s.relay, cmd)
+        return door_relay.redact_run(s.relay, cmd, redactor=lambda text: redact_all(text, s.relays()))
     lan_network, bridges = read_host_networks(s.relay.lan_ip)
     if args.verb == "render":
         reasons = preflight(s, lan_network, bridges)
@@ -913,9 +1065,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         written = render(s, args.out_dir)
         mc.log("%s: %s written (0600): no listener (api on the unix socket only, allow_paths %s; rtsp, "
                "webrtc, srtp, rtmp off), modules %s, streams %s (the relay's copy) and %s (straightened "
-               "%dx%d at %d fps, h264_vaapi; mode %s), each read from the door relay while it has a consumer"
+               "%dx%d at %d fps, h264_vaapi; mode %s)%s, each read from its relay while it has a consumer"
                % (tag, " and ".join(written), "/".join(API_PATHS), ",".join(MODULES), STREAM_RAW, STREAM_FLAT,
-                  FLAT_WIDTH, FLAT_HEIGHT, FLAT_FPS, s.flat_mode))
+                  s.flat.width, s.flat.height, FLAT_FPS, s.flat_mode,
+                  living_room_note(view_streams(s))))
         return 0
     record = check(s, lan_network, bridges, read_caddy_env(), warm_unit_enabled())
     door_relay.emit(record)

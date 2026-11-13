@@ -385,14 +385,16 @@ def redact(text: str, s: Optional[RelaySettings] = None) -> str:
     return text
 
 
-def redact_run(s: RelaySettings, argv: Sequence[str], out=None) -> int:
+def redact_run(s: RelaySettings, argv: Sequence[str], out=None, redactor=None) -> int:
     """Run argv with stdout+stderr merged through redact(), one line at a time
     (the relay unit's ExecStart). SIGTERM/SIGINT/SIGHUP are passed to the child;
     the child's exit status is returned (128+N for a signal). Nothing is
-    buffered past a line, so the journal keeps go2rtc's timing.
-    Implements: LLR-1225, LLR-1226.
+    buffered past a line, so the journal keeps go2rtc's timing. `redactor`
+    replaces redact(line, s) for a process that holds more than one relay's
+    login (camera_remote.py, SR-170). Implements: LLR-1225, LLR-1226.
     """
     out = out or sys.stdout
+    redactor = redactor or (lambda text: redact(text, s))
     proc = subprocess.Popen(list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT)
 
@@ -412,7 +414,7 @@ def redact_run(s: RelaySettings, argv: Sequence[str], out=None) -> int:
             pass
     try:
         for raw in iter(proc.stdout.readline, b""):
-            out.write(redact(raw.decode("utf-8", "replace").rstrip("\r\n"), s) + "\n")
+            out.write(redactor(raw.decode("utf-8", "replace").rstrip("\r\n")) + "\n")
             out.flush()
         rc = proc.wait()
     finally:

@@ -183,13 +183,14 @@ services:
       # caddy after changing either knob.
       OTTERTUBE_SITE_ENABLED: ${OTTERTUBE_SITE_ENABLED:-${OTTERTUBE_ENABLED:-false}}
       # ── the camera page (SN-057, SR-171; stack/camera-remote) ────────────
-      # cameras.<domain>: LAN and tailnet only (LAN_CIDR above); the door's
-      # streams need no login (the Owner, 2026-11-12), and Caddy's basic_auth
-      # with ONE shared login is wired for streams other than the door's, of
-      # which none ships. The switch is read at REQUEST time (exactly `true`,
-      # else the site answers 404). The user and the hash are read at PARSE
-      # time, so each MUST be non-empty or Caddy refuses the whole file: hence
-      # the defaults. LOCKED (base64 of "locked") is no
+      # cameras.<domain>: LAN and tailnet only (LAN_CIDR above), every camera
+      # behind Caddy's basic_auth with ONE shared login (the Owner,
+      # 2026-11-12); the door alone also open, with no login, to
+      # CAMERA_VIEW_DOOR_OPEN_CIDR (the LAN alone, for the wall panel). The
+      # switch is read at REQUEST time (exactly `true`, else the site answers
+      # 404). The user, the hash and the open range are read at PARSE time, so
+      # each MUST be non-empty or Caddy refuses the whole file: hence the
+      # defaults (0.0.0.0/32: no packet comes from it, so nobody is let in). LOCKED (base64 of "locked") is no
       # bcrypt hash, so with no login set every attempt is a 401. The real
       # hash arrives in .env with each `$` doubled (camera_remote.py
       # import-login; Materialize-Deploy does the same); NEVER hand-edit it.
@@ -198,6 +199,7 @@ services:
       CAMERA_VIEW_ENABLED: ${CAMERA_VIEW_ENABLED:-false}
       CAMERA_VIEW_AUTH_USER: ${CAMERA_VIEW_AUTH_USER:-viewer}
       CAMERA_VIEW_AUTH_HASH: ${CAMERA_VIEW_AUTH_HASH:-bG9ja2Vk}
+      CAMERA_VIEW_DOOR_OPEN_CIDR: ${CAMERA_VIEW_DOOR_OPEN_CIDR:-0.0.0.0/32}
     # THREE NETWORKS, and ALL must be named explicitly. Naming any network at
     # all opts a service OUT of the implicit `default`, so omitting `default`
     # here would cut Caddy off from tracker, actual and oauth2-proxy in one edit
@@ -1764,11 +1766,12 @@ services:
 
   # ── camera-view — the camera page's viewer go2rtc (SN-057, SR-170) ──────────
   #
-  # The Owner's rulings of 2026-11-12 (HomeHub A89, plan 8.1, 8.2 for the
-  # door, 8.9): the door relay re-served to cameras.<domain> with no login on
-  # the LAN and the tailnet, MSE only, plus ONE straightened door picture made
-  # here (door_flat: FFmpeg's v360 on the processor, H.264 on the graphics),
-  # kept running when CAMERA_VIEW_DOOR_FLAT_MODE is `always` (the default;
+  # The Owner's rulings of 2026-11-12 (HomeHub A89, plan 8.1, 8.2, 8.9): the
+  # hub's relays re-served to cameras.<domain> behind Caddy's shared login
+  # (the door also open to the LAN alone), MSE only, video only, plus ONE
+  # straightened door picture made here (door_flat: FFmpeg's v360 on the
+  # processor, H.264 on the graphics), kept running when
+  # CAMERA_VIEW_DOOR_FLAT_MODE is `always` (the default;
   # homehub-camera-view-warm.service). stack/camera-remote/.
   #
   # NO LISTENER: host networking only so the process can reach the relay on
@@ -1785,9 +1788,13 @@ services:
   # THE GRAPHICS: the render node for door_flat's h264_vaapi encode (plan 1.3:
   # present on the host since 2026-11-04; a container sees it only when given
   # it). root in the container is the node's owner on the host, so no
-  # capability is needed. cpus 1.0: the straightening measured 30 % of one
-  # core on the real stream (plan 1.5); every viewer of door_flat, and the
-  # warm unit, share one FFmpeg.
+  # capability is needed. The node is a HARD prerequisite: without it docker
+  # will not create the container, so not even the raw door plays (plan 1.3:
+  # present on the hub). cpus 1.0: the straightening measured 30 % of one core
+  # on the real stream (plan 1.5); every viewer of door_flat, and the warm
+  # unit, share one FFmpeg. mem 384m, not the relays' 256m: this one runs a
+  # 1536x1536 decode continuously in `always` (NOT measured; the trial reads
+  # `docker stats`).
   camera-view:
     image: ${DOOR_RELAY_IMAGE}
     container_name: homehub-camera-view
@@ -1800,7 +1807,7 @@ services:
     cap_drop:
       - ALL
     pids_limit: 128
-    mem_limit: 256m
+    mem_limit: 384m
     cpus: 1.0
     devices:
       - /dev/dri/renderD128:/dev/dri/renderD128
@@ -1819,7 +1826,10 @@ services:
         read_only: true
         bind:
           create_host_path: false
-      # Where go2rtc creates its API socket (the unit's StateDirectory, 0700).
+      # Where go2rtc creates its API socket (the unit's StateDirectory, 0700
+      # root). Caddy reaches it only because caddy also runs as root: a `user:`
+      # on caddy or a userns-remap would make the page 502 while caddy still
+      # reports healthy (the same class as the wall-shell config.json note).
       - type: bind
         source: /var/lib/homehub-camera-view
         target: /run/camera-view

@@ -1,5 +1,9 @@
 """The camera page's viewer (SN-057, SR-170..SR-174): stack/camera-remote.
 
+Rulings of 2026-11-12 under test: every camera behind Caddy's shared login;
+the door alone open, with no login, to the LAN alone (CAMERA_VIEW_DOOR_OPEN_CIDR);
+the living room's relay streams, video only; the projection as knobs.
+
 What runs here, on the dev PC: the settings and their refusals (keys, never
 values); the source allow-list over LAN_CIDR (review round 4); the rendered
 go2rtc config (no listener, five modules, two API paths, two streams); the
@@ -20,6 +24,7 @@ from __future__ import annotations
 import ipaddress
 import io
 import json
+import math
 import os
 import re
 import stat
@@ -49,6 +54,7 @@ def write_env(tmp_path, **over):
         "DOOR_RELAY_UPSTREAM_HOST": "192.0.2.20",
         "DOOR_RELAY_UPSTREAM_PASSWORD": '"c@m p$$ss:1"',
         "CAMERA_VIEW_ENABLED": "true",
+        "CAMERA_VIEW_AUTH_HASH": HASH.replace("$", "$$"),
     }
     lines.update(over)
     path = tmp_path / "env"
@@ -70,7 +76,8 @@ def settings(tmp_path, **over):
 
 def test_tc1825_defaults_need_no_login_and_mode_is_always(tmp_path):
     s = settings(tmp_path)
-    assert (s.enabled, s.user, s.auth_hash, s.flat_mode, s.ruled_in) == (True, "viewer", "", "always", {})
+    assert (s.enabled, s.user, s.auth_hash, s.flat_mode, s.ruled_in) == (True, "viewer", HASH, "always", {})
+    assert (s.door_open, s.livingroom) == ("", None)
     assert s.relay.password == PASSWORD and s.relay.consumer_url().startswith("rtsp://admin:c%40m%20p%24ss%3A1@")
 
 
@@ -174,6 +181,91 @@ def test_tc1826_messages_name_positions_not_the_households_addresses():
     assert reasons and not any("198.51" in r or "192.0.2" in r for r in reasons)
 
 
+# ── TC-1845 the open door: the LAN alone ─────────────────────────────────────
+
+
+@pytest.mark.parametrize("value", ["", cr.DOOR_OPEN_NOBODY, "192.0.2.0/24", "192.0.2.11", "192.0.2.11 192.0.2.0/25"])
+def test_tc1845_the_lan_or_part_of_it_may_take_the_door_without_a_login(value):
+    assert cr.door_open_violations(value, LAN, BRIDGES) == []
+
+
+@pytest.mark.parametrize("value, fragment", [
+    ("100.64.0.0/10", "lies outside the hub's LAN"),           # the tailnet always goes through the login
+    ("100.101.102.103", "lies outside the hub's LAN"),
+    ("192.0.2.0/23", "lies outside the hub's LAN"),
+    ("10.0.0.0/8", "lies outside the hub's LAN"),
+    ("fd7a:115c:a1e0::/48", "lies outside the hub's LAN"),
+    ("private_ranges", "not an IPv4 address or CIDR"),
+    ("0.0.0.0/0", "lies outside the hub's LAN"),
+])
+def test_tc1845_nothing_else_may(value, fragment):
+    reasons = cr.door_open_violations(value, LAN, BRIDGES)
+    assert any(fragment in r for r in reasons) and not any(value in r for r in reasons if value != "private_ranges")
+
+
+def test_tc1845_a_lan_that_holds_a_bridge_and_no_lan_at_all():
+    assert any("overlaps a docker bridge" in r
+               for r in cr.door_open_violations("192.0.2.0/24", LAN, [ipaddress.ip_network("192.0.2.128/25")]))
+    assert any("no interface" in r for r in cr.door_open_violations("192.0.2.0/24", None, []))
+    s_reasons = cr.preflight(type("S", (), {"user": "viewer", "auth_hash": HASH, "lan_cidr": "192.0.2.0/24",
+                                            "ruled_in": {}, "door_open": "100.64.0.0/10"})(), LAN, BRIDGES)
+    assert any("CAMERA_VIEW_DOOR_OPEN_CIDR" in r for r in s_reasons)
+
+
+# ── TC-1846 the projection as knobs ──────────────────────────────────────────
+
+
+def test_tc1846_the_defaults_are_the_panels():
+    assert cr.flat_filter(cr.FlatProjection()) == cr.flat_filter() == (
+        "fps=10,v360=input=fisheye:output=flat:ih_fov=180:iv_fov=180:h_fov=110:v_fov=77.5521:"
+        "yaw=0:pitch=0:w=960:h=540:interp=linear,format=nv12,hwupload")
+
+
+def test_tc1846_each_knob_reaches_the_filter_and_v_fov_stays_square(tmp_path):
+    s = settings(tmp_path, CAMERA_VIEW_FLAT_INPUT_FOV="190x180", CAMERA_VIEW_FLAT_HORIZONTAL_FOV="104.5",
+                 CAMERA_VIEW_FLAT_SIZE="1280x720", CAMERA_VIEW_FLAT_YAW="-3", CAMERA_VIEW_FLAT_PITCH="5.5")
+    vf = cr.view_config(s)["streams"]["door_flat"].split(" -vf ")[1].split(" ")[0]
+    assert ("ih_fov=190:iv_fov=180:h_fov=104.5:v_fov=%.4f:yaw=-3:pitch=5.5:w=1280:h=720"
+            % cr.vertical_fov(1280, 720, 104.5)) in vf
+
+
+def test_tc1846_cylindrical_output_keeps_square_pixels(tmp_path):
+    s = settings(tmp_path, CAMERA_VIEW_FLAT_OUTPUT="cylindrical", CAMERA_VIEW_FLAT_HORIZONTAL_FOV="110")
+    vf = cr.view_config(s)["streams"]["door_flat"].split(" -vf ")[1].split(" ")[0]
+    v = cr.vertical_fov(960, 540, 110, "cylindrical")
+    # square pixels: the width's radians per pixel equal the height's tan units per pixel
+    assert abs(math.radians(110) / 960 - 2 * math.tan(math.radians(v) / 2) / 540) < 1e-9
+    assert "output=cylindrical:ih_fov=180:iv_fov=180:h_fov=110:v_fov=%.4f:" % v in vf
+    assert cr.vertical_fov(960, 540, 110) == cr.vertical_fov(960, 540, 110, "flat") != v
+
+
+def test_tc1828_the_render_line_names_the_living_room_only_when_served():
+    assert cr.living_room_note({"door": "", "door_flat": ""}) == ""
+    assert cr.living_room_note({"door": "", "livingroom": ""}) == ", livingroom video only"
+    assert (cr.living_room_note({"livingroom-main": "", "livingroom": ""})
+            == ", livingroom and livingroom-main video only")
+
+
+@pytest.mark.parametrize("over, key", [
+    ({"CAMERA_VIEW_FLAT_OUTPUT": "pannini"}, "CAMERA_VIEW_FLAT_OUTPUT"),
+    ({"CAMERA_VIEW_FLAT_OUTPUT": "Flat"}, "CAMERA_VIEW_FLAT_OUTPUT"),
+    ({"CAMERA_VIEW_FLAT_INPUT_FOV": "0"}, "CAMERA_VIEW_FLAT_INPUT_FOV"),
+    ({"CAMERA_VIEW_FLAT_INPUT_FOV": "180x"}, "CAMERA_VIEW_FLAT_INPUT_FOV"),
+    ({"CAMERA_VIEW_FLAT_INPUT_FOV": "400"}, "CAMERA_VIEW_FLAT_INPUT_FOV"),
+    ({"CAMERA_VIEW_FLAT_HORIZONTAL_FOV": "180"}, "CAMERA_VIEW_FLAT_HORIZONTAL_FOV"),
+    ({"CAMERA_VIEW_FLAT_HORIZONTAL_FOV": "1e2"}, "CAMERA_VIEW_FLAT_HORIZONTAL_FOV"),
+    ({"CAMERA_VIEW_FLAT_SIZE": "961x540"}, "CAMERA_VIEW_FLAT_SIZE"),
+    ({"CAMERA_VIEW_FLAT_SIZE": "3840x2160"}, "CAMERA_VIEW_FLAT_SIZE"),
+    ({"CAMERA_VIEW_FLAT_YAW": "200"}, "CAMERA_VIEW_FLAT_YAW"),
+    ({"CAMERA_VIEW_FLAT_PITCH": "-91"}, "CAMERA_VIEW_FLAT_PITCH"),
+    ({"CAMERA_VIEW_FLAT_PITCH": "1:2"}, "CAMERA_VIEW_FLAT_PITCH"),
+])
+def test_tc1846_out_of_range_or_malformed_is_refused_by_key(tmp_path, over, key):
+    with pytest.raises(cr.Invalid) as exc:
+        settings(tmp_path, **over)
+    assert key in str(exc.value)
+
+
 # ── TC-1827 the hub's networks from `ip -j addr` ─────────────────────────────
 
 
@@ -203,10 +295,44 @@ def test_tc1828_no_listener_five_modules_two_paths_two_streams(tmp_path):
         assert cfg[module] == {"listen": ""}
     assert "username" not in cfg["api"] and "tls_listen" not in cfg["api"]
     assert cfg["exec"] == {"allow_paths": ["ffmpeg"]}
-    assert set(cfg["streams"]) == set(cr.STREAMS) == {"door", "door_flat"}
+    assert set(cfg["streams"]) == set(cr.DOOR_STREAMS) == {"door", "door_flat"}   # the living room's relay off
     assert cfg["streams"]["door"] == "rtsp://admin:c%40m%20p%24ss%3A1@192.0.2.10:8554/door#media=video"
     assert cfg["streams"]["door_flat"].startswith("exec:ffmpeg ")
     assert "preload" not in cfg and "publish" not in cfg   # always is the warm unit, not go2rtc's preload
+
+
+LIVINGROOM = {"CAMERA_LIVINGROOM_RELAY_ENABLED": "true", "CAMERA_LIVINGROOM_RELAY_RTSP_PORT": "8564",
+              "CAMERA_LIVINGROOM_RELAY_API_PORT": "1994", "CAMERA_LIVINGROOM_RELAY_UPSTREAM_HOST": "192.0.2.69",
+              "CAMERA_LIVINGROOM_RELAY_UPSTREAM_PATH": "/h264/ch1/sub/av_stream",
+              "CAMERA_LIVINGROOM_RELAY_UPSTREAM_PASSWORD": "ABCDEF", "CAMERA_LIVINGROOM_RELAY_AUDIO": "true",
+              "CAMERA_LIVINGROOM_RELAY_EXPECT_SIZE": "768x432"}
+
+
+def test_tc1828_the_living_room_is_video_only_through_its_own_relay(tmp_path):
+    cfg = cr.view_config(settings(tmp_path, **LIVINGROOM))
+    assert set(cfg["streams"]) == {"door", "door_flat", "livingroom"}
+    assert cfg["streams"]["livingroom"] == "rtsp://admin:ABCDEF@192.0.2.10:8564/livingroom#media=video"
+    cfg = cr.view_config(settings(tmp_path, CAMERA_LIVINGROOM_RELAY_MAIN_PATH="/h264/ch1/main/av_stream",
+                                  **LIVINGROOM))
+    assert set(cfg["streams"]) == set(cr.STREAMS)
+    assert cfg["streams"]["livingroom-main"] == "rtsp://admin:ABCDEF@192.0.2.10:8564/livingroom-main#media=video"
+    for name in ("livingroom", "livingroom-main"):    # never the relay's sound, which it offers on request
+        assert "audio" not in cfg["streams"][name] and cfg["streams"][name].endswith("#media=video")
+
+
+def test_tc1828_both_relays_logins_are_redacted(tmp_path):
+    s = settings(tmp_path, **LIVINGROOM)
+    line = "rtsp://admin:c%40m%20p%24ss%3A1@192.0.2.10:8554/door and ABCDEF and c@m p$ss:1 at 192.0.2.69:554"
+    out = cr.redact_all(line, s.relays())
+    assert "ABCDEF" not in out and "c@m" not in out and "c%40m" not in out and "192.0.2.69" not in out
+
+
+def test_tc1828_redact_run_takes_the_viewers_redactor(tmp_path):
+    s = settings(tmp_path, **LIVINGROOM)
+    out = io.StringIO()
+    rc = dr.redact_run(s.relay, [sys.executable, "-c", "print('ABCDEF c@m p$ss:1')"], out=out,
+                       redactor=lambda text: cr.redact_all(text, s.relays()))
+    assert rc == 0 and "ABCDEF" not in out.getvalue() and "c@m" not in out.getvalue()
 
 
 def test_tc1828_the_config_is_the_same_in_both_modes(tmp_path):
@@ -342,19 +468,16 @@ def test_tc1831_anything_but_one_bcrypt_hash_is_refused(tmp_path, monkeypatch, b
 # ── TC-1832 the login applies only to streams behind it ──────────────────────
 
 
-def test_tc1832_no_stream_is_behind_the_login_as_shipped(tmp_path):
-    assert cr.LOGIN_STREAMS == () and cr.PUBLIC_STREAMS == cr.STREAMS
-    assert cr.preflight(settings(tmp_path), LAN, BRIDGES) == []
+def test_tc1832_every_stream_is_behind_the_login():
+    assert cr.LOGIN_STREAMS == cr.STREAMS and set(cr.DOOR_STREAMS) < set(cr.STREAMS)
 
 
 @pytest.mark.parametrize("value, fragment", [("", "is empty"), ("bG9ja2Vk", "shipped lock"),
                                              ("$2b$12$short", "not a bcrypt hash")])
-def test_tc1832_a_stream_behind_the_login_needs_a_real_hash(tmp_path, value, fragment):
+def test_tc1832_the_page_needs_a_real_hash(tmp_path, value, fragment):
     s = settings(tmp_path, CAMERA_VIEW_AUTH_HASH=value.replace("$", "$$"))
-    reasons = cr.preflight(s, LAN, BRIDGES, login_streams=("livingroom",))
-    assert any(fragment in r for r in reasons)
-    s = settings(tmp_path, CAMERA_VIEW_AUTH_HASH=HASH.replace("$", "$$"))
-    assert cr.preflight(s, LAN, BRIDGES, login_streams=("livingroom",)) == []
+    assert any(fragment in r for r in cr.preflight(s, LAN, BRIDGES))
+    assert cr.preflight(settings(tmp_path), LAN, BRIDGES) == []
 
 
 # ── TC-1833 check: caddy's own environment, the files, the processes ─────────
@@ -373,12 +496,13 @@ def test_tc1833_only_the_viewers_keys_are_kept_from_caddys_environment():
 
 def caddy_env(**over):
     env = {"LAN_CIDR": "192.0.2.0/24 100.64.0.0/10", "CAMERA_VIEW_ENABLED": "true",
-           "CAMERA_VIEW_AUTH_USER": "viewer", "CAMERA_VIEW_AUTH_HASH": "bG9ja2Vk"}
+           "CAMERA_VIEW_AUTH_USER": "viewer", "CAMERA_VIEW_AUTH_HASH": HASH,
+           "CAMERA_VIEW_DOOR_OPEN_CIDR": cr.DOOR_OPEN_NOBODY}
     env.update(over)
     return env
 
 
-def test_tc1833_caddy_equal_to_the_env_passes_without_any_login(tmp_path):
+def test_tc1833_caddy_equal_to_the_env_passes(tmp_path):
     assert cr.caddy_violations(settings(tmp_path), caddy_env(), LAN, BRIDGES) == []
 
 
@@ -393,14 +517,18 @@ def test_tc1833_caddy_serving_something_else_fails(tmp_path, over, fragment):
     assert any(fragment in r for r in reasons), reasons
 
 
-def test_tc1833_the_login_is_compared_only_while_a_stream_is_behind_it(tmp_path):
-    s = settings(tmp_path, CAMERA_VIEW_AUTH_HASH=HASH.replace("$", "$$"))
-    assert cr.caddy_violations(s, caddy_env(), LAN, BRIDGES) == []
-    reasons = cr.caddy_violations(s, caddy_env(), LAN, BRIDGES, login_streams=("livingroom",))
-    assert any("CAMERA_VIEW_AUTH_HASH differs" in r for r in reasons)
-    assert not any(HASH in r for r in reasons)
-    assert cr.caddy_violations(s, caddy_env(CAMERA_VIEW_AUTH_HASH=HASH), LAN, BRIDGES,
-                               login_streams=("livingroom",)) == []
+def test_tc1833_the_login_and_the_open_door_are_compared_never_printed(tmp_path):
+    s = settings(tmp_path)
+    reasons = cr.caddy_violations(s, caddy_env(CAMERA_VIEW_AUTH_HASH="bG9ja2Vk"), LAN, BRIDGES)
+    assert any("CAMERA_VIEW_AUTH_HASH differs" in r for r in reasons) and not any(HASH in r for r in reasons)
+    assert any("shipped lock" in r for r in reasons)
+    reasons = cr.caddy_violations(s, caddy_env(CAMERA_VIEW_DOOR_OPEN_CIDR="192.0.2.0/24"), LAN, BRIDGES)
+    assert any("CAMERA_VIEW_DOOR_OPEN_CIDR differs" in r for r in reasons)
+    s = settings(tmp_path, CAMERA_VIEW_DOOR_OPEN_CIDR="192.0.2.0/24")
+    assert cr.caddy_violations(s, caddy_env(CAMERA_VIEW_DOOR_OPEN_CIDR="192.0.2.0/24"), LAN, BRIDGES) == []
+    reasons = cr.caddy_violations(settings(tmp_path, CAMERA_VIEW_DOOR_OPEN_CIDR="100.64.0.0/10"),
+                                  caddy_env(CAMERA_VIEW_DOOR_OPEN_CIDR="100.64.0.0/10"), LAN, BRIDGES)
+    assert any("caddy's own CAMERA_VIEW_DOOR_OPEN_CIDR entry 1 of 1 lies outside" in r for r in reasons)
 
 
 def test_tc1833_the_order_of_lan_cidr_words_decides_nothing(tmp_path):
@@ -467,7 +595,7 @@ def handle(block, matcher):
     raise AssertionError(matcher)
 
 
-def test_tc1834_order_switch_then_lan_then_the_paths():
+def test_tc1834_order_switch_then_lan_then_open_door_then_the_login():
     b = site_block()
     assert b.index("import acme_cloudflare") < b.index("@cv_off") < b.index("@lan remote_ip {$LAN_CIDR}")
     assert '@cv_off expression `{env.CAMERA_VIEW_ENABLED} != "true"`' in b
@@ -475,35 +603,43 @@ def test_tc1834_order_switch_then_lan_then_the_paths():
     assert b.rstrip().endswith('handle {\n        respond "cameras: LAN only" 403\n    }\n}')
     lan = handle(b, "@lan")
     assert "import throttle" in lan and "encode" not in lan
-    assert lan.rstrip().endswith('handle {\n            respond "cameras: not here" 403\n        }\n    }')
+    assert lan.index("@cv_door_open") < lan.index("@cv_player_open") < lan.index("basic_auth")
+    assert lan.rstrip().endswith('handle {\n                respond "cameras: not here" 403\n            }\n        }\n    }')
 
 
-def test_tc1834_the_door_streams_need_no_login_and_take_exactly_one_canonical_src():
+def test_tc1834_the_door_alone_is_open_and_only_to_the_open_range():
     b = site_block()
-    door = re.search(r"@cv_door_stream \{\n\s+path /api/ws\n\s+expression `(.*)`\n\s+\}", b)
-    assert door, "the door's websocket matcher"
+    door = re.search(r"@cv_door_open \{\n\s+remote_ip \{\$CAMERA_VIEW_DOOR_OPEN_CIDR\}\n\s+path /api/ws\n"
+                     r"\s+expression `(.*)`\n\s+\}", b)
+    assert door, "the open door's websocket matcher"
     names = re.findall(r'\{query\} == "src=([a-z_]+)"', door.group(1))
-    assert sorted(names) == sorted(cr.PUBLIC_STREAMS)
+    assert sorted(names) == sorted(cr.DOOR_STREAMS)
     assert re.fullmatch(r'\{query\} == "src=[a-z_]+"( \|\| \{query\} == "src=[a-z_]+")*', door.group(1))
-    assert "basic_auth" not in handle(b, "@cv_door_stream") and "basic_auth" not in handle(b, "@cv_player")
+    assert re.search(r"@cv_player_open \{\n\s+remote_ip \{\$CAMERA_VIEW_DOOR_OPEN_CIDR\}\n\s+method GET HEAD\n"
+                     r"\s+path /stream.html /video-stream.js /video-rtc.js\n\s+\}", b)
+    assert "basic_auth" not in handle(b, "@cv_door_open") and "basic_auth" not in handle(b, "@cv_player_open")
 
 
-def test_tc1834_the_login_is_wired_for_no_stream():
+def test_tc1834_everything_else_is_behind_the_login_and_names_every_stream():
     b = site_block()
-    login = re.search(r"@cv_login_stream \{\n\s+path /api/ws\n\s+expression `\{query\} in \[(.*)\]`\n\s+\}", b)
+    login = re.search(r"@cv_stream \{\n\s+path /api/ws\n\s+expression `\{query\} in \[(.*)\]`\n\s+\}", b)
     assert login, "the login streams' matcher"
-    assert re.findall(r'"src=([a-z_]+)"', login.group(1)) == list(cr.LOGIN_STREAMS) == []
-    h = handle(b, "@cv_login_stream")
-    assert "basic_auth {\n                {$CAMERA_VIEW_AUTH_USER} {$CAMERA_VIEW_AUTH_HASH}\n            }" in h
+    assert sorted(re.findall(r'"src=([a-z_-]+)"', login.group(1))) == sorted(cr.LOGIN_STREAMS)
+    assert re.fullmatch(r'"src=[a-z_-]+"(, "src=[a-z_-]+")*', login.group(1))
+    assert ("handle {\n            basic_auth {\n                {$CAMERA_VIEW_AUTH_USER} {$CAMERA_VIEW_AUTH_HASH}\n"
+            "            }\n            @cv_stream {") in b
     assert b.count("basic_auth") == 1
 
 
-def test_tc1834_only_the_player_and_the_two_redirects():
+def test_tc1834_only_the_player_and_the_redirects():
     b = site_block()
     assert re.search(r"@cv_player \{\n\s+method GET HEAD\n\s+path /stream.html /video-stream.js /video-rtc.js\n\s+\}", b)
-    assert "redir * /stream.html?src=door_flat&mode=mse 302" in handle(b, "/")
-    assert "redir * /stream.html?src=door&mode=mse 302" in handle(b, "/raw")
-    assert b.count("reverse_proxy unix//srv/camera-view/api.sock {") == 3
+    assert "redir * /stream.html?src=door_flat&src=livingroom&mode=mse 302" in handle(b, "/")
+    for path, src in (("/door", "door_flat"), ("/raw", "door"), ("/livingroom", "livingroom"),
+                      ("/livingroom-main", "livingroom-main")):
+        assert "redir * /stream.html?src=%s&mode=mse 302" % src in handle(b, path)
+    assert not re.search(r"redir /", b)        # `redir /x` reads /x as a matcher: every redirect a blank 200
+    assert b.count("reverse_proxy unix//srv/camera-view/api.sock {") == 4
     for proxy in re.findall(r"reverse_proxy unix//srv/camera-view/api.sock \{[^}]*\}", b):
         assert "header_up -Authorization" in proxy and "header_up -Cookie" in proxy
     assert not re.search(r"handle /api", b)
@@ -511,10 +647,12 @@ def test_tc1834_only_the_player_and_the_two_redirects():
 
 def test_tc1834_every_variable_is_passed_by_caddys_compose_environment():
     block = compose_block("caddy")
-    for var in ("CAMERA_VIEW_HOST", "CAMERA_VIEW_ENABLED", "CAMERA_VIEW_AUTH_USER", "CAMERA_VIEW_AUTH_HASH"):
+    for var in ("CAMERA_VIEW_HOST", "CAMERA_VIEW_ENABLED", "CAMERA_VIEW_AUTH_USER", "CAMERA_VIEW_AUTH_HASH",
+                "CAMERA_VIEW_DOOR_OPEN_CIDR"):
         assert re.search(r"^      %s: \$\{" % var, block, re.M), var
     assert "CAMERA_VIEW_AUTH_HASH: ${CAMERA_VIEW_AUTH_HASH:-%s}" % cr.LOCKED_HASH in block
     assert "CAMERA_VIEW_AUTH_USER: ${CAMERA_VIEW_AUTH_USER:-%s}" % cr.DEFAULT_USER in block
+    assert "CAMERA_VIEW_DOOR_OPEN_CIDR: ${CAMERA_VIEW_DOOR_OPEN_CIDR:-%s}" % cr.DOOR_OPEN_NOBODY in block
     assert "CAMERA_VIEW_ENABLED: ${CAMERA_VIEW_ENABLED:-false}" in block
     assert "- %s:/srv/camera-view:ro" % cr.STATE_DIR in block
 
@@ -600,13 +738,18 @@ def env_example(key):
     return m.group(1) if m else None
 
 
-def test_tc1837_the_template_ships_it_off_always_no_login_no_ruled_range():
+def test_tc1837_the_template_ships_it_off_always_no_hash_no_open_door_no_ruled_range():
     assert env_example("CAMERA_VIEW_ENABLED") == "false"
     assert env_example("CAMERA_VIEW_DOOR_FLAT_MODE") == "always" == cr.DEFAULT_FLAT_MODE
     assert env_example("CAMERA_VIEW_SUBDOMAIN") == "cameras"
     assert env_example("CAMERA_VIEW_AUTH_USER") == cr.DEFAULT_USER
     assert env_example("CAMERA_VIEW_AUTH_HASH") == ""
     assert env_example("CAMERA_VIEW_SOURCES_RULED_IN") == ""
+    assert env_example("CAMERA_VIEW_DOOR_OPEN_CIDR") == ""
+    assert (env_example("CAMERA_VIEW_FLAT_INPUT_FOV"), env_example("CAMERA_VIEW_FLAT_HORIZONTAL_FOV"),
+            env_example("CAMERA_VIEW_FLAT_SIZE"), env_example("CAMERA_VIEW_FLAT_YAW"),
+            env_example("CAMERA_VIEW_FLAT_PITCH"), env_example("CAMERA_VIEW_FLAT_OUTPUT")) == (
+        "180", "110", "960x540", "0", "0", "flat")
 
 
 def test_tc1837_the_dns_record_exists_only_while_the_page_is_on():

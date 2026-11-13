@@ -37,7 +37,7 @@
 #   {$LLM_GATEWAY_HOST}
 #   {$OTTERTUBE_HOST}
 #   {env.OTTERTUBE_SITE_ENABLED}   (read at request time, not at parse time)
-#   {$CAMERA_VIEW_HOST} {$CAMERA_VIEW_AUTH_USER} {$CAMERA_VIEW_AUTH_HASH}
+#   {$CAMERA_VIEW_HOST} {$CAMERA_VIEW_AUTH_USER} {$CAMERA_VIEW_AUTH_HASH} {$CAMERA_VIEW_DOOR_OPEN_CIDR}
 #   {env.CAMERA_VIEW_ENABLED}      (read at request time, not at parse time)
 
 {
@@ -1076,16 +1076,17 @@ ntfy.{$DOMAIN} {
 
 # ── {$CAMERA_VIEW_HOST} — the camera page (SN-057, SR-171, IF-087) ───────────
 # The Owner's rulings of 2026-11-12 (HomeHub open-items A89, cameras plan 8.1,
-# 8.2 for the door, 8.9): the door camera watched from a phone's browser, at
-# home and over the tailnet; only go2rtc's player page, its two scripts and its
-# stream websocket pass, MSE only. THE DOOR NEEDS NO LOGIN (about 18:15: "a
-# public view of the front of a house on a closed network, so anyone on the
-# network should be able to see it"): any source @lan admits may watch it.
-# Caddy's shared username-and-password login stays WIRED for streams other
-# than the door's, and none ships (indoor cameras wait on 8.2). The viewer is
-# stack/camera-remote's go2rtc, reached on a unix socket (no port anywhere);
-# go2rtc itself registers only its static files and /api/ws
-# (camera_remote.py), so this block is the SECOND of two allow-lists.
+# 8.2, 8.9): every camera watched from a phone's browser, at home and over the
+# tailnet, BEHIND CADDY'S ONE SHARED LOGIN, because the page shows every camera
+# ("the camera page can be behind a caddy login as it contains all cameras").
+# THE DOOR ALONE stays open WITHOUT a login to the LAN alone
+# ({$CAMERA_VIEW_DOOR_OPEN_CIDR}; "a public view of the front of a house on a
+# closed network"), so the wall panel can take it; a tailnet source always goes
+# through the login. Only go2rtc's player page, its two scripts and its stream
+# websocket pass, MSE only. The viewer is stack/camera-remote's go2rtc, reached
+# on a unix socket (no port anywhere); go2rtc itself registers only its static
+# files and /api/ws (camera_remote.py), so this block is the SECOND of two
+# allow-lists.
 #
 # IN ORDER:
 #   1. the switch, at request time (`true` exactly, from caddy's environment):
@@ -1094,33 +1095,34 @@ ntfy.{$DOMAIN} {
 #      allow-list (the LAN, 100.64.0.0/10 and ranges ruled in by name; NEVER
 #      private_ranges): the viewer's unit refuses to start otherwise, and
 #      `check` puts caddy's OWN LAN_CIDR through it. Anything else: 403.
-#   3. throttle (120 requests a minute per address), then exactly these, and
-#      403 for everything else (/api/streams, /api/config, the other go2rtc
-#      pages, frames, mp4, hls):
-#        /                 302 to the straightened door picture's player
-#        /raw              302 to the raw circle's player
+#   3. throttle (120 requests a minute per address).
+#   4. THE OPEN DOOR, no login, only for a source in CAMERA_VIEW_DOOR_OPEN_CIDR
+#      (the LAN alone; `check` refuses anything else; empty, compose hands
+#      0.0.0.0/32, which no packet comes from): the player page and its two
+#      scripts, and /api/ws with the raw query EXACTLY src=door or
+#      src=door_flat.
+#   5. everything else: basic_auth (one user, a bcrypt hash; the password
+#      never reaches the hub), then exactly these, and 403 for the rest
+#      (/api/streams, /api/config, the other go2rtc pages, frames, mp4, hls):
+#        /                 302 to the player with the straightened door and
+#                          the living room side by side
+#        /door /raw /livingroom /livingroom-main   302 to one camera's player
 #        /stream.html /video-stream.js /video-rtc.js   go2rtc's player, GET/HEAD
 #        /api/ws           THE STREAM GATE: the raw query must be EXACTLY
-#                          `src=door` or `src=door_flat` (no login), or
-#                          `src=<a stream behind the login>` (none ships: the
-#                          list is empty, so that handle matches nothing).
-#                          go2rtc's handler takes `src`, and a src that is not
-#                          a stream name CREATES a stream from it (an rtsp://
-#                          URL is accepted), and with `name=` it REPLACES an
-#                          existing stream's source (internal/streams
-#                          GetOrPatch, Patch). So: one `src`, canonical
-#                          spelling, nothing else - absent, repeated,
+#                          src=<one of the four names>. go2rtc's handler takes
+#                          `src`, and a src that is not a stream name CREATES a
+#                          stream from it (an rtsp:// URL is accepted), and
+#                          with `name=` it REPLACES an existing stream's source
+#                          (internal/streams GetOrPatch, Patch). So: one `src`,
+#                          canonical spelling, nothing else - absent, repeated,
 #                          percent-encoded, foreign or extra keys are all 403.
-#                          No method matcher: a browser may open the websocket
-#                          over HTTP/2 as an extended CONNECT (RFC 8441).
-#      The stream lists are camera_remote.py's PUBLIC_STREAMS and
-#      LOGIN_STREAMS; the tests hold them equal to these.
-#   ADDING A STREAM BEHIND THE LOGIN (after 8.2): its name in LOGIN_STREAMS
-#   and in @cv_login_stream's list below as "src=<name>", its source in the
-#   viewer's config, the hash through `camera_remote.py import-login`, and a
-#   caddy recreate. The login is basic_auth with ONE user and a bcrypt hash
-#   (CAMERA_VIEW_AUTH_*; compose hands a lock no password opens when unset).
-#   The browser's Authorization (that password, base64) and cookies are
+#                          A listed name the viewer does not serve (the living
+#                          room while its relay is off) creates nothing: it has
+#                          no scheme. No method matcher: a browser may open the
+#                          websocket over HTTP/2 as an extended CONNECT.
+#      The names are camera_remote.py's STREAMS and DOOR_STREAMS; the tests
+#      hold the lists equal.
+#   The browser's Authorization (the shared password, base64) and cookies are
 #   stripped before the viewer; go2rtc has no login of its own (its socket's
 #   directory is 0700 root).
 #
@@ -1146,49 +1148,72 @@ ntfy.{$DOMAIN} {
             Cache-Control "no-store"
             -Server
         }
-        # The door's two streams: no login.
-        @cv_door_stream {
+        # The open door: the LAN alone, the door's two streams alone, no login.
+        @cv_door_open {
+            remote_ip {$CAMERA_VIEW_DOOR_OPEN_CIDR}
             path /api/ws
             expression `{query} == "src=door" || {query} == "src=door_flat"`
         }
-        handle @cv_door_stream {
+        handle @cv_door_open {
             reverse_proxy unix//srv/camera-view/api.sock {
                 header_up -Authorization
                 header_up -Cookie
             }
         }
-        # Streams behind the shared login: NONE SHIPS (the list is empty).
-        @cv_login_stream {
-            path /api/ws
-            expression `{query} in []`
-        }
-        handle @cv_login_stream {
-            basic_auth {
-                {$CAMERA_VIEW_AUTH_USER} {$CAMERA_VIEW_AUTH_HASH}
-            }
-            reverse_proxy unix//srv/camera-view/api.sock {
-                header_up -Authorization
-                header_up -Cookie
-            }
-        }
-        @cv_player {
+        @cv_player_open {
+            remote_ip {$CAMERA_VIEW_DOOR_OPEN_CIDR}
             method GET HEAD
             path /stream.html /video-stream.js /video-rtc.js
         }
-        handle @cv_player {
+        handle @cv_player_open {
             reverse_proxy unix//srv/camera-view/api.sock {
                 header_up -Authorization
                 header_up -Cookie
             }
         }
-        handle / {
-            redir * /stream.html?src=door_flat&mode=mse 302
-        }
-        handle /raw {
-            redir * /stream.html?src=door&mode=mse 302
-        }
+        # Everything else: the shared login first.
         handle {
-            respond "cameras: not here" 403
+            basic_auth {
+                {$CAMERA_VIEW_AUTH_USER} {$CAMERA_VIEW_AUTH_HASH}
+            }
+            @cv_stream {
+                path /api/ws
+                expression `{query} in ["src=door", "src=door_flat", "src=livingroom", "src=livingroom-main"]`
+            }
+            handle @cv_stream {
+                reverse_proxy unix//srv/camera-view/api.sock {
+                    header_up -Authorization
+                    header_up -Cookie
+                }
+            }
+            @cv_player {
+                method GET HEAD
+                path /stream.html /video-stream.js /video-rtc.js
+            }
+            handle @cv_player {
+                reverse_proxy unix//srv/camera-view/api.sock {
+                    header_up -Authorization
+                    header_up -Cookie
+                }
+            }
+            handle / {
+                redir * /stream.html?src=door_flat&src=livingroom&mode=mse 302
+            }
+            handle /door {
+                redir * /stream.html?src=door_flat&mode=mse 302
+            }
+            handle /raw {
+                redir * /stream.html?src=door&mode=mse 302
+            }
+            handle /livingroom {
+                redir * /stream.html?src=livingroom&mode=mse 302
+            }
+            handle /livingroom-main {
+                redir * /stream.html?src=livingroom-main&mode=mse 302
+            }
+            handle {
+                respond "cameras: not here" 403
+            }
         }
     }
     handle {

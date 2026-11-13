@@ -15,32 +15,34 @@
 #
 # What changes from the hub, and only this: the Caddyfile's (acme_cloudflare)
 # snippet becomes `tls internal`, the global block moves Caddy to ports
-# 18080/18443, and the site block's EMPTY list of streams behind the login
-# names one lab stream so the wired login can be exercised; the rest of the
-# site block and the (throttle) snippet are the real file's, cut out by name. The doorbell is a test pattern. The graphics: this host's
+# 18080/18443; the site block and the (throttle) snippet are the real file's,
+# cut out by name. The doorbell is a test pattern; there is no living-room
+# relay (its two names stay on the gate's list and create nothing). The open
+# door is the lab host's own network, as the hub's config gives the hub's LAN.
+# The graphics: this host's
 # render node does not take the image's VA-API driver, so door_flat as shipped
 # FAILS here (check 7 proves that failure is clean); check 8 re-renders the
 # same pipeline with a software encoder (camera_remote.flat_argv's lab-only
 # "software"), which is what proves the straightening pipe to MSE.
 #
 # Checks:
-#   1  render with no login set (the door needs none): 0600 files in a 0700
-#      directory; no rtsp:// in the exec line; a private_ranges LAN_CIDR is
-#      refused and writes nothing; import-login doubles each `$`, prints nothing
+#   1  render refuses with no login set and with a private_ranges LAN_CIDR
+#      (writing nothing); import-login doubles each `$` and prints nothing;
+#      then 0600 files in a 0700 directory, no rtsp:// in the exec line
 #   2  the viewer from the unit's own ExecCondition/ExecStartPre/ExecStart
 #      lines: go2rtc holds NO listening socket; on its socket /api/streams,
 #      /api/config and /api are 404 and /stream.html is 200
 #   3  caddy from the compose defaults (no CAMERA_VIEW_* in .env): it loads
-#      (the login handle wired, with the lock) and the site answers 404 (off); the
-#      site block exactly as shipped (its login list empty) validates
-#   4  on with no login set: the door's page and both door streams open with no
-#      login; a stream behind the login (a lab name put in the shipped empty
-#      list) is a 401 to anyone, the lock's own text included
-#   5  on with the login set: the door still needs none; / and /raw 302 to the
-#      MSE player; the login stream: none or wrong 401, right 101
-#   6  refused (403): other API paths and pages, and the websocket with src
-#      absent, repeated, percent-encoded, foreign, an rtsp:// URL, upper-case
-#      SRC, an extra name=, a trailing & or a ;
+#      (the lock, the open range nobody) and the site answers 404 (off); the
+#      site block as shipped validates
+#   4  on with no login set and no open range: everything is a 401
+#   5  on with the login and the door open to the LAN: the player and both
+#      door streams with no login; /, the living room's streams and the rest
+#      need the login (none or wrong 401, right 101 / 302); with the open
+#      range emptied the door needs the login too
+#   6  refused (403) even with the login: other API paths and pages, and the
+#      websocket with src absent, repeated, percent-encoded, foreign, an
+#      rtsp:// URL, upper-case SRC, an extra name=, a trailing & or a ;
 #   7  door_flat as shipped on a host without the hub's graphics: the
 #      websocket answers an error that holds no credential, and no FFmpeg is
 #      left running
@@ -103,7 +105,7 @@ export HOMEHUB_MONITOR_OVERRIDE_FILE=/nonexistent
 # way Materialize-Deploy writes one (`$` doubled; whitespace quoted).
 LS="$WORK/stack"
 mkdir -p "$LS"
-cp -r "$STACK/camera-remote" "$STACK/door" "$STACK/monitoring" "$STACK/docker-compose.yml" "$LS/"
+cp -r "$STACK/camera-remote" "$STACK/camera-relay" "$STACK/door" "$STACK/monitoring" "$STACK/docker-compose.yml" "$LS/"   # camera_remote imports camera_relay (the living room's settings)
 PW='c@m p$ss:1'
 VIEWER_PW='lab viewer pass'
 PAT="$WORK/secret.pat"     # a FILE, so grep's own argv holds no secret
@@ -150,22 +152,27 @@ docker run -d --name cvlab-relay --network host --read-only --cap-drop ALL --sec
 HASH="$(printf '%s' "$VIEWER_PW" | python3 -c 'import bcrypt,sys; print(bcrypt.hashpw(sys.stdin.buffer.read(), bcrypt.gensalt(10)).decode())')"
 
 # ── 1 render ──────────────────────────────────────────────────────────────────
-# The door needs no login (2026-11-12), so render needs no hash; the import
-# verb is proven on a copy. on_demand for checks 2-8; always is check 9.
+# The page is behind the shared login (2026-11-12, 19:00), so render refuses
+# without a hash; then the hash goes in through import-login, and the door is
+# opened to the lab's LAN (the hub's config gives the LAN alone). on_demand for
+# checks 2-8; always is check 9.
 sed -i 's/^CAMERA_VIEW_DOOR_FLAT_MODE=.*/CAMERA_VIEW_DOOR_FLAT_MODE=on_demand/' "$LS/.env"
+cr render --out-dir "$WORK/nologin" >"$WORK/nologin.log" 2>&1; rc_nologin=$?
 cp "$LS/.env" "$WORK/env.broad"
 sed -i 's|^LAN_CIDR=.*|LAN_CIDR=private_ranges|' "$WORK/env.broad"
+printf '%s\n' "$HASH" | python3 "$LS/camera-remote/camera_remote.py" --env-file "$WORK/env.broad" import-login >/dev/null 2>&1
 python3 "$LS/camera-remote/camera_remote.py" --env-file "$WORK/env.broad" render --out-dir "$WORK/refused" >"$WORK/refused.log" 2>&1
 rc_broad=$?
-cp "$LS/.env" "$WORK/env.login"
-printf '%s\n' "$HASH" | python3 "$LS/camera-remote/camera_remote.py" --env-file "$WORK/env.login" import-login >"$WORK/import.log" 2>&1
+printf '%s\n' "$HASH" | cr import-login >"$WORK/import.log" 2>&1
+sed -i "s|^CAMERA_VIEW_DOOR_OPEN_CIDR=.*|CAMERA_VIEW_DOOR_OPEN_CIDR=$LANNET|" "$LS/.env"
 cr render >"$WORK/render.log"; rc_render=$?
 modes="$(stat -c %a "$RUN" "$RUN/go2rtc.yaml" "$RUN/door.ffconcat" | tr '\n' ' ')"
-if [ "$rc_broad" = 2 ] && [ ! -e "$WORK/refused" ] && [ "$rc_render" = 0 ] && [ "$modes" = "700 600 600 " ] \
-   && ! grep -q 'exec:[^"]*rtsp://' "$RUN/go2rtc.yaml" && grep -q '^CAMERA_VIEW_AUTH_HASH=\$\$2' "$WORK/env.login" \
+if [ "$rc_nologin" = 2 ] && grep -q 'CAMERA_VIEW_AUTH_HASH is empty' "$WORK/nologin.log" && [ ! -e "$WORK/nologin" ] \
+   && [ "$rc_broad" = 2 ] && [ ! -e "$WORK/refused" ] && [ "$rc_render" = 0 ] && [ "$modes" = "700 600 600 " ] \
+   && ! grep -q 'exec:[^"]*rtsp://' "$RUN/go2rtc.yaml" && grep -q '^CAMERA_VIEW_AUTH_HASH=\$\$2' "$LS/.env" \
    && ! grep -qF "$HASH" "$WORK/import.log"; then
-    ok "1 render with no login set: modes $modes; exec line holds no URL; private_ranges refused (rc 2, nothing written); import-login doubles each \$ and prints no hash"
-else bad "1 render: rc_broad=$rc_broad rc=$rc_render modes=$modes $(cat "$WORK/refused.log" "$WORK/render.log")"; fi
+    ok "1 render: refused with no login set and with private_ranges (rc 2, nothing written); import-login doubles each \$ and prints no hash; then modes $modes, no URL in the exec line"
+else bad "1 render: rc_nologin=$rc_nologin rc_broad=$rc_broad rc=$rc_render modes=$modes $(cat "$WORK/nologin.log" "$WORK/refused.log" "$WORK/render.log")"; fi
 
 # ── 2 the viewer, from the unit's own lines ──────────────────────────────────
 mkdir -m 0700 -p "$STATE"
@@ -210,29 +217,27 @@ else bad "2 viewer: condition=$cond sock=$([ -S "$STATE/api.sock" ] && echo y) l
 cut_block() {  # the real Caddyfile's block that starts with $1 at column 0
     awk -v start="$1" 'index($0, start) == 1 {on=1} on {print} on && /^}/ {exit}' "$STACK/caddy/Caddyfile"
 }
-# The site block as shipped, except that the (empty) list of streams behind
-# the login names one lab stream, so the wired login can be exercised.
+# The site block as shipped.
 {
     printf '{\n    order rate_limit before basic_auth\n    servers {\n        protocols h1 h2\n    }\n'
     printf '    admin localhost:12019\n    http_port 18080\n    https_port %s\n    auto_https disable_redirects\n    skip_install_trust\n}\n' "$PORT"
     printf '(acme_cloudflare) {\n    tls internal\n}\n'
     cut_block '(throttle) {'
-    cut_block '{$CAMERA_VIEW_HOST} {' | sed 's/{query} in \[\]/{query} in ["src=labprivate"]/'
+    cut_block '{$CAMERA_VIEW_HOST} {'
 } >"$WORK/Caddyfile"
-grep -q 'in \["src=labprivate"\]' "$WORK/Caddyfile" || bad "lab: the login list was not found in the site block"
-# The block exactly as shipped (its login list EMPTY) must validate too: Caddy
-# compiles the CEL `in []` and provisions basic_auth with the compose lock.
+# `caddy validate` provisions every module (the CEL lists, basic_auth with the
+# compose lock, remote_ip with the compose default for the open door).
 { sed -n '1,/^}/p' "$WORK/Caddyfile"; printf '(acme_cloudflare) {\n    tls internal\n}\n'; cut_block '(throttle) {'; cut_block '{$CAMERA_VIEW_HOST} {'; } \
     | sed 's/admin localhost:12019/admin off/' >"$WORK/Caddyfile.shipped"
 shipped_valid="$(docker run --rm -e CAMERA_VIEW_HOST=$NAME -e LAN_CIDR="$LANNET 100.64.0.0/10" -e CAMERA_VIEW_AUTH_USER=viewer \
-    -e CAMERA_VIEW_AUTH_HASH=bG9ja2Vk -v "$WORK/Caddyfile.shipped:/etc/caddy/Caddyfile:ro" "$CADDY_IMAGE" \
+    -e CAMERA_VIEW_AUTH_HASH=bG9ja2Vk -e CAMERA_VIEW_DOOR_OPEN_CIDR=0.0.0.0/32 -v "$WORK/Caddyfile.shipped:/etc/caddy/Caddyfile:ro" "$CADDY_IMAGE" \
     caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1 | grep -c 'Valid configuration')"
 caddy_env() {  # the caddy service's environment as compose interpolates it from $1
     docker compose -f "$LS/docker-compose.yml" --project-directory "$LS" --env-file "$1" config --format json 2>/dev/null \
       | python3 -c '
 import json,sys
 env=json.load(sys.stdin)["services"]["caddy"]["environment"]
-for k in ("LAN_CIDR","CAMERA_VIEW_HOST","CAMERA_VIEW_ENABLED","CAMERA_VIEW_AUTH_USER","CAMERA_VIEW_AUTH_HASH"):
+for k in ("LAN_CIDR","CAMERA_VIEW_HOST","CAMERA_VIEW_ENABLED","CAMERA_VIEW_AUTH_USER","CAMERA_VIEW_AUTH_HASH","CAMERA_VIEW_DOOR_OPEN_CIDR"):
     print("%s=%s" % (k, (env.get(k) or "").replace("$$", "$")))'
 }
 start_caddy() {  # $1: an env file for compose
@@ -253,41 +258,47 @@ grep -v '^CAMERA_VIEW_' "$LS/.env" >"$WORK/env.defaults"
 start_caddy "$WORK/env.defaults"
 off="$(st /) $(st /stream.html) $(wst '/api/ws?src=door')"
 if grep -qx 'CAMERA_VIEW_AUTH_HASH=bG9ja2Vk' "$WORK/caddy.env" && grep -qx 'CAMERA_VIEW_ENABLED=false' "$WORK/caddy.env" \
-   && [ "$off" = "404 404 404" ] && [ "$shipped_valid" = 1 ]; then
-    ok "3 compose defaults: caddy loads (the login wired, locked) and the site answers 404 ($off); the block as shipped (empty login list) validates"
+   && grep -qx 'CAMERA_VIEW_DOOR_OPEN_CIDR=0.0.0.0/32' "$WORK/caddy.env" && [ "$off" = "404 404 404" ] && [ "$shipped_valid" = 1 ]; then
+    ok "3 compose defaults: caddy loads (the lock, nobody let in without a login) and the site answers 404 ($off); the block as shipped validates"
 else bad "3 defaults: $off; $(docker logs "$CADDY" 2>&1 | tail -n 3)"; fi
 
-# ── 4 on with no hash: the door is open, a login stream is locked ────────────
+# ── 4 on with no hash and no open door: the lock, for everything ──────────────
 { grep -v '^CAMERA_VIEW_' "$LS/.env"; echo CAMERA_VIEW_ENABLED=true; } >"$WORK/env.lock"
 start_caddy "$WORK/env.lock"
-four="$(st /) $(st /stream.html) $(wst '/api/ws?src=door') $(wst '/api/ws?src=door_flat') $(wst '/api/ws?src=labprivate') $(wst '/api/ws?src=labprivate' 'viewer:bG9ja2Vk')"
-[ "$four" = "302 200 101 101 401 401" ] && ok "4 on with no login set: the door's page and both door streams open with no login; a stream behind the login is a 401 to anyone ($four)" \
+four="$(st /) $(st /stream.html) $(wst '/api/ws?src=door') $(wst '/api/ws?src=door_flat') $(wst '/api/ws?src=livingroom') $(st / 'viewer:bG9ja2Vk')"
+[ "$four" = "401 401 401 401 401 401" ] && ok "4 on with no login set and no open range: every page and stream is a 401, the lock's own text included ($four)" \
     || bad "4 on, no hash: $four"
 
-# ── 5 on with the login set ──────────────────────────────────────────────────
-cat "$WORK/env.login" >"$LS/.env.with-login"
-sed -i 's/^CAMERA_VIEW_ENABLED=.*/CAMERA_VIEW_ENABLED=true/' "$LS/.env.with-login"
-start_caddy "$LS/.env.with-login"
-root="$(probe http "$LAN" "$PORT" "$NAME" /)"
-raw="$(probe http "$LAN" "$PORT" "$NAME" /raw)"
-five="$(st /stream.html) $(st /video-stream.js) $(st /video-rtc.js) $(wst '/api/ws?src=door') $(wst '/api/ws?src=labprivate') $(wst '/api/ws?src=labprivate' 'viewer:wrong') $(wst '/api/ws?src=labprivate' "$GOOD")"
-if [ "$five" = "200 200 200 101 401 401 101" ] && [ "$(echo "$root" | field location)" = "/stream.html?src=door_flat&mode=mse" ] \
+# ── 5 on with the login, and the door open to the LAN ────────────────────────
+# The lab's requests come from its LAN address, inside the open range.
+start_caddy "$LS/.env"
+root="$(probe http "$LAN" "$PORT" "$NAME" / --auth "$GOOD")"
+raw="$(probe http "$LAN" "$PORT" "$NAME" /raw --auth "$GOOD")"
+open5="$(st /stream.html) $(st /video-stream.js) $(st /video-rtc.js) $(wst '/api/ws?src=door') $(wst '/api/ws?src=door_flat')"
+login5="$(st /) $(st / 'viewer:wrong') $(echo "$root" | field status) $(wst '/api/ws?src=livingroom') $(wst '/api/ws?src=livingroom' 'viewer:wrong') $(wst '/api/ws?src=livingroom' "$GOOD") $(wst '/api/ws?src=livingroom-main' "$GOOD")"
+# and with the open range emptied: the door needs the login too
+sed "s|^CAMERA_VIEW_DOOR_OPEN_CIDR=.*|CAMERA_VIEW_DOOR_OPEN_CIDR=|" "$LS/.env" >"$WORK/env.closed"
+start_caddy "$WORK/env.closed"
+closed5="$(st /stream.html) $(wst '/api/ws?src=door') $(wst '/api/ws?src=door' "$GOOD") $(st /stream.html "$GOOD")"
+start_caddy "$LS/.env"
+if [ "$open5" = "200 200 200 101 101" ] && [ "$login5" = "401 401 302 401 401 101 101" ] && [ "$closed5" = "401 401 101 200" ] \
+   && [ "$(echo "$root" | field location)" = "/stream.html?src=door_flat&src=livingroom&mode=mse" ] \
    && [ "$(echo "$raw" | field location)" = "/stream.html?src=door&mode=mse" ]; then
-    ok "5 with the login set: the door still needs none (/ and /raw 302 to the MSE player; page, scripts, websocket open); the login stream: none/wrong 401, right 101"
-else bad "5 with login: $five root=$root raw=$raw"; fi
+    ok "5 the door open to the LAN with no login (player and both door streams: $open5); everything else behind the login ($login5); with the open range empty the door needs it too ($closed5)"
+else bad "5 login/open: open=$open5 login=$login5 closed=$closed5 root=$root raw=$raw"; fi
 
-# ── 6 refused (no login involved) ────────────────────────────────────────────
+# ── 6 refused, even with the login ───────────────────────────────────────────
 refused=""
 for p in /api/streams /api/config /api /index.html /add.html /config.html '/api/frame.mp4?src=door' \
          '/api/stream.mp4?src=door' '/api/stream.m3u8?src=door' '/api/frame.jpeg?src=door' /api/log; do
-    s="$(st "$p")"; [ "$s" = 403 ] || refused="$refused $p=$s"
+    s="$(st "$p" "$GOOD")"; [ "$s" = 403 ] || refused="$refused $p=$s"
 done
-for q in '' '?' '?src=door&src=door' '?src=%64oor' '?src=door%5Fflat' '?src=livingroom' \
+for q in '' '?' '?src=door&src=door' '?src=%64oor' '?src=door%5Fflat' '?src=corner' \
          '?src=rtsp%3A%2F%2F127.0.0.1%3A8654%2FH.264' '?SRC=door' '?src=door&name=door' '?name=door&src=door' \
-         '?src=door&' '?src=door;name=x' '?src=door_flat&src=door'; do
-    s="$(wst "/api/ws$q")"; [ "$s" = 403 ] || refused="$refused ws$q=$s"
+         '?src=door&' '?src=door;name=x' '?src=door_flat&src=door' '?src=livingroom&name=door'; do
+    s="$(wst "/api/ws$q" "$GOOD")"; [ "$s" = 403 ] || refused="$refused ws$q=$s"
 done
-[ -z "$refused" ] && ok "6 refused: 11 other paths and 13 websocket queries (src absent, repeated, encoded, foreign, a URL, SRC, name=, trailing &, ;) -> 403" \
+[ -z "$refused" ] && ok "6 refused with the login: 11 other paths and 14 websocket queries (src absent, repeated, encoded, foreign, a URL, SRC, name=, trailing &, ;) -> 403" \
     || bad "6 not refused:$refused"
 
 # ── 7 door_flat as shipped, without the hub's graphics ───────────────────────

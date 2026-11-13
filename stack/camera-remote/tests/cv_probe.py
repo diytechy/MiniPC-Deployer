@@ -6,15 +6,17 @@ installed). It connects to ADDRESS:PORT, sends SNI and Host NAME, and prints
 one JSON line. The certificate is not verified (the lab's Caddy issues from
 its own local CA).
 
-    cv_probe.py http ADDRESS PORT NAME PATH [--auth USER:PASS]
+    cv_probe.py http ADDRESS PORT NAME PATH [--auth USER:PASS | --auth-stdin]
         -> {"status": 302, "location": "..."}
-    cv_probe.py ws ADDRESS PORT NAME PATH [--auth USER:PASS] [--mse SECONDS]
+    cv_probe.py ws ADDRESS PORT NAME PATH [--auth USER:PASS | --auth-stdin] [--mse SECONDS]
         -> {"status": 101, "text": [...first text frames...], "binary_bytes": N}
            With --mse it sends {"type":"mse"} after the upgrade, as go2rtc's
            player does, and reads frames for SECONDS.
 
 The password arrives in argv here, which is fine for a lab password and is
 why check 11's process scan looks for the RELAY's credential, not this one.
+On the hub's trial (HomeHub's runbook) the real shared login must not: there,
+--auth-stdin reads one line USER:PASS from stdin instead.
 """
 
 import base64
@@ -126,6 +128,8 @@ def ws(address, port, name, path, auth, mse_seconds):
 def main(argv):
     kind, address, port, name, path = argv[1:6]
     auth = argv[argv.index("--auth") + 1] if "--auth" in argv else ""
+    if "--auth-stdin" in argv:   # the real login: never in argv (HomeHub's trial)
+        auth = sys.stdin.readline().rstrip("\r\n")
     mse = argv[argv.index("--mse") + 1] if "--mse" in argv else ""
     try:
         result = http(address, port, name, path, auth) if kind == "http" else ws(address, port, name, path, auth, mse)

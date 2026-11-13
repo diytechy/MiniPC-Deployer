@@ -10,9 +10,12 @@
 # runtime missing, a knob malformed): an alert, no restart loop.
 #
 # The detector runs on /opt/homehub-presence/venv (onnxruntime;
-# install-presence-runtime.sh). CPUQuota bounds the detector; the decoder runs
-# in docker's cgroup under its own --cpus 0.3. Both are ceilings: the budget is
-# `camera_presence.py cost`'s verdict.
+# install-presence-runtime.sh). CPUQuota bounds the detector; the decoders run
+# in docker's cgroup under their own --cpus 0.3. All are ceilings: the budget is
+# `camera_presence.py cost`'s verdict. 50 %, not the 35 % of the 1 fps design:
+# while someone lies still the couch check adds one yolov8n_640 read (934 ms on
+# the hub, 2026-11-13) per ~4 s keyframe to the room's ~430 ms every 2 s, about
+# 45 % of a core, and a 35 % ceiling would drop room samples exactly then.
 [Unit]
 Description=Camera presence (%i): is someone in the room, outside the excluded zones
 Documentation=file:///opt/homehub/stack/camera-presence/README.md
@@ -41,7 +44,7 @@ PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
 CPUAccounting=true
-CPUQuota=35%
+CPUQuota=50%
 MemoryAccounting=true
 MemoryMax=512M
 TasksMax=64

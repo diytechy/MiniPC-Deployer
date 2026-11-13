@@ -1,6 +1,7 @@
 # homehub-camera-presence@<camera> - room presence from one relayed camera
-# (SR-157..SR-160; stack/camera-presence/README.md). One frame a second from the
-# camera's own relay, video only; state changes on the IF-081 feed and in
+# (SR-157..SR-160; stack/camera-presence/README.md). One frame every two seconds
+# from the camera's own relay, video only (and, with the couch check, the main
+# stream's keyframes cropped to the couch); state changes on the IF-081 feed and in
 # /var/lib/homehub-presence/<camera>/status.json. It writes no frame anywhere.
 #
 # The knob is CAMERA_<CAMERA>_PRESENCE_ENABLED, read by ExecCondition (a clean
@@ -9,9 +10,17 @@
 # runtime missing, a knob malformed): an alert, no restart loop.
 #
 # The detector runs on /opt/homehub-presence/venv (onnxruntime;
-# install-presence-runtime.sh). CPUQuota bounds the detector; the decoder runs
-# in docker's cgroup under its own --cpus 0.3. Both are ceilings: the budget is
-# `camera_presence.py cost`'s verdict.
+# install-presence-runtime.sh). CPUQuota bounds the detector; the decoders run
+# in docker's cgroup under their own --cpus 0.3. All are ceilings: the budget is
+# `camera_presence.py cost`'s verdict. 75 %, not the 35 % of the 1 fps design:
+# while someone lies still the couch check adds one yolov8n_640 read (934 ms on
+# the hub, 2026-11-13) per ~4 s keyframe to the room's ~430 ms every 2 s, about
+# 45 % of a core, and a 35 % ceiling would drop room samples exactly then.
+# The period is 1 s, not systemd's 100 ms: with 100 ms every single-threaded
+# inference is throttled to the quota's share however low the average is
+# (measured on the hub 2026-11-13: 521 throttles in two minutes, the room's
+# face + body pass 888 ms instead of 431 ms at 23 % average). 75 % of each
+# second lets a room pass run unthrottled and a 640 read finish in ~1.2 s.
 [Unit]
 Description=Camera presence (%i): is someone in the room, outside the excluded zones
 Documentation=file:///opt/homehub/stack/camera-presence/README.md
@@ -27,6 +36,7 @@ WorkingDirectory=/opt/homehub/stack
 ExecCondition=/usr/bin/python3 /opt/homehub/stack/camera-presence/camera_presence.py --camera %i condition
 ExecStart=/opt/homehub-presence/venv/bin/python /opt/homehub/stack/camera-presence/camera_presence.py --camera %i run
 ExecStopPost=-/usr/bin/docker rm -f homehub-camera-presence-%i
+ExecStopPost=-/usr/bin/docker rm -f homehub-camera-presence-%i-couch
 SyslogIdentifier=homehub-camera-presence
 StateDirectory=homehub-presence
 StateDirectoryMode=0750
@@ -39,11 +49,12 @@ PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
 CPUAccounting=true
-CPUQuota=35%
+CPUQuota=75%
+CPUQuotaPeriodSec=1s
 MemoryAccounting=true
 MemoryMax=512M
 TasksMax=64
-TimeoutStopSec=30
+TimeoutStopSec=60
 
 [Install]
 WantedBy=multi-user.target

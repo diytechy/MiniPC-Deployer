@@ -1,9 +1,11 @@
 {
- "about": "The presence detector's ONNX models, pinned by sha256 (camera_presence.verify_model refuses other bytes). The files are NOT committed (this repository is public): they are the panel presence study's exports of 2026-09-15 (HomeHub METHOD_PRESENCE_BODY_CLASSIFIER_2026-09-15.md sections 4 and 11), kept in the operator's model bundle beside the panel's sensor models. faceyolo is a single-class YOLOv8n face detector; yolov8n is the COCO detector (class 0, person). install-presence-runtime.sh copies them to /opt/homehub-presence/models.",
+ "about": "The presence detector's ONNX models, pinned by sha256 (camera_presence.verify_model refuses other bytes). The files are NOT committed (this repository is public): they are the panel presence study's exports of 2026-09-15 (HomeHub METHOD_PRESENCE_BODY_CLASSIFIER_2026-09-15.md sections 4 and 11; yolov8n_448 and yolov8n_640, the couch check's larger inputs of the same family, from the same export, measured offline 2026-11-11), kept in the operator's model bundle beside the panel's sensor models. faceyolo is a single-class YOLOv8n face detector; yolov8n is the COCO detector (class 0, person). install-presence-runtime.sh copies them to /opt/homehub-presence/models.",
  "models": {
   "faceyolo_320.onnx": {"sha256": "080ff98faf2eadb9f5ff688e4f5e97074243be301e1827ad50aaa20ab8801153", "bytes": 12139643, "input": 320, "classes": 1},
   "faceyolo_192.onnx": {"sha256": "25e6da96e3be305bb39096a563a8e8c35e555d784e087bf16e7d4a7fa48f4b21", "bytes": 12112747, "input": 192, "classes": 1},
   "yolov8n_256.onnx": {"sha256": "d5279c2fd8881a4ce75171e416216f66897a85e652bd77b1037dd1b1540dce67", "bytes": 12709937, "input": 256, "classes": 80},
-  "yolov8n_320.onnx": {"sha256": "d6f8906b328e29dd62efd2bd671020d0fa8c725c9b34bdf3b8ab938ed0a3f246", "bytes": 12725061, "input": 320, "classes": 80}
+  "yolov8n_320.onnx": {"sha256": "d6f8906b328e29dd62efd2bd671020d0fa8c725c9b34bdf3b8ab938ed0a3f246", "bytes": 12725061, "input": 320, "classes": 80},
+  "yolov8n_448.onnx": {"sha256": "15604abdb2d4c9a6602cd46ce6fa8168a9964376c3cfa2daaa0e9bb2317625a5", "bytes": 12765387, "input": 448, "classes": 80},
+  "yolov8n_640.onnx": {"sha256": "7a3a4e3f982d7485483580097d0abb4ade155b1542ad796ef2d48ed9daa63f34", "bytes": 12851143, "input": 640, "classes": 80}
  }
 }

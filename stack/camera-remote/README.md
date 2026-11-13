@@ -1,13 +1,14 @@
-# camera-remote — the camera page: the door camera from a phone's browser (SN-057)
+# camera-remote — the camera page: the hub's cameras from a phone's browser (SN-057)
 
 Implements **SR-170** (the viewer), **SR-171** (the page's gate in Caddy),
-**SR-172** (the shared login, kept for later), **SR-173** (the source
+**SR-172** (the shared login every camera is behind), **SR-173** (the source
 allow-list) and **SR-174** (the straightened door picture). Interface:
 **IF-087**. The plan and the rulings are HomeHub
 `docs/CAMERAS_REMOTE_VIEW_AND_RECORDING_PLAN_2026-11-11.md` (sections 6, 8.1,
 8.2, 8.9) and open-items A89. **Ships off.** Only the viewer part of plan
-section 6 is built: no alerts (8.3), no tailnet fence (8.6), no indoor camera
-(8.2).
+section 6 is built: no alerts (8.3), no tailnet fence for the cameras
+themselves (8.6: written up in HomeHub, not built), no corner camera (it is on
+no relay).
 
 ## What the Owner ruled (2026-11-12)
 
@@ -15,12 +16,17 @@ section 6 is built: no alerts (8.3), no tailnet fence (8.6), no indoor camera
   Caddy passes **only** go2rtc's player page, its two scripts and its stream
   websocket, in **MSE** mode (repackaged, never re-encoded), and blocks the
   rest of go2rtc's API.
-- **The door needs no login** (about 18:15: "a public view of the front of a
-  house on a closed network, so anyone on the network should be able to see
-  it"). Any source the allow-list admits may watch `door` and `door_flat`.
-  Caddy's own username-and-password prompt with **one shared login** stays
-  wired for streams other than the door's; **none ships** (indoor cameras wait
-  on 8.2).
+- **Every camera behind one shared login** (about 19:00: the page sits behind
+  Caddy's shared login "as it contains all cameras"; 8.2 answered): the door,
+  raw and straightened, and the living room's two relay streams, video only.
+- **The door alone stays open on the LAN, without the login**, for the wall
+  panel (the earlier ruling, about 18:15: "a public view of the front of a
+  house on a closed network"): the door's two streams and the player, to
+  `CAMERA_VIEW_DOOR_OPEN_CIDR`, the hub's LAN alone. A tailnet source always
+  goes through the login.
+- **The projection is knobs** (A65 Part 1, the straightened picture looks
+  "stretched a little far horizontally"): `CAMERA_VIEW_FLAT_*`, the panel's
+  values by default, tuned on the hub against a shape of known form.
 - **8.9:** the hub makes **one straightened door picture**, the wall panel's
   projection, decoded and straightened on the processor and H.264-encoded on
   the graphics.
@@ -42,13 +48,18 @@ section 6 is built: no alerts (8.3), no tailnet fence (8.6), no indoor camera
 
 ## The viewer
 
-- **Two streams**, both read from the hub's door relay with the relay's own
-  consumer login (the doorbell's; no new camera secret):
+- **Up to four streams**, each read from one of the hub's relays with that
+  relay's own consumer login (no new camera secret):
+  - `livingroom` and `livingroom-main`: the living-room relay's sub and main
+    streams, **video only** (`#media=video`: its camera's sound is never asked
+    for), served only while `CAMERA_LIVINGROOM_RELAY_ENABLED` is `true` (the
+    main stream only while that relay serves one, `_MAIN_PATH`);
   - `door`: the relay's H.264 copied as it is (the raw 1536x1536 circle);
   - `door_flat`: go2rtc's `exec:` source runs FFmpeg in the same image:
     `fps=10,v360=input=fisheye:output=flat:ih_fov=180:iv_fov=180:h_fov=110:v_fov=77.5521:yaw=0:pitch=0:w=960:h=540:interp=linear`
     (the panel's `doorstream/service.py` projection with `wall.env.example`'s
-    defaults, which `config.wall.psd1` does not override), then
+    defaults, which `config.wall.psd1` does not override; these are the
+    defaults of the projection knobs below), then
     `format=nv12,hwupload` and `h264_vaapi` on `/dev/dri/renderD128`, MPEG-TS
     to stdout, which go2rtc reads as a pipe. Rate control is the encoder's
     default (the ruling). Two settings differ from the encoder's defaults, both
@@ -77,7 +88,30 @@ section 6 is built: no alerts (8.3), no tailnet fence (8.6), no indoor camera
   difference from the relays' stdin rule, and it holds nothing the config
   beside it does not already hold.
 - **Output** reaches the journal only through `redact-run` (go2rtc logs a
-  dropped source with its whole URL); the container has no log driver.
+  dropped source with its whole URL), which removes every relay's login and
+  camera address; the container has no log driver.
+
+## The projection (A65 Part 1)
+
+| Knob | Default (the panel's) | Range |
+|---|---|---|
+| `CAMERA_VIEW_FLAT_INPUT_FOV` | `180` | the fisheye's field, one value or `HxV` (such as `190x180`), each 1..360 |
+| `CAMERA_VIEW_FLAT_HORIZONTAL_FOV` | `110` | the flat view's field across, 1..179; the vertical field is always derived for square pixels |
+| `CAMERA_VIEW_FLAT_SIZE` | `960x540` | even, 160..1920 by 90..1080 |
+| `CAMERA_VIEW_FLAT_YAW` | `0` | -180..180 |
+| `CAMERA_VIEW_FLAT_PITCH` | `0` | -90..90 |
+| `CAMERA_VIEW_FLAT_OUTPUT` | `flat` | `flat` or `cylindrical` (the angle across linear) |
+
+The numbers take up to three decimals; anything else is refused by name. Why
+the picture can look "stretched a little far horizontally": a flat view 110
+degrees across stretches things toward its left and right edges, as any very
+wide photo does, and the lens's 180 degrees is nominal. Tuned on the hub, one
+knob at a time: a narrower `HORIZONTAL_FOV` (about 90) or `OUTPUT=cylindrical`
+for the edges, then `INPUT_FOV` for the lens; after each change restart the
+viewer (`systemctl restart homehub-camera-view`; the warm unit follows) and
+compare one live frame on the LAN against a shape of known form (HomeHub's
+trial runbook). Not `pannini`: FFmpeg's pannini output reads `h_fov` as the
+Pannini parameter, with a fixed field and no square-pixel control.
 
 ## The two modes of `door_flat`
 
@@ -97,16 +131,30 @@ describes what that merge takes.
 ## The gate (Caddy)
 
 In order: the switch at request time (off: 404 to everything); `@lan remote_ip
-{$LAN_CIDR}` (anything else: 403); a rate limit; then exactly
+{$LAN_CIDR}` (anything else: 403); a rate limit; then **the open door**, with
+no login, only for a source inside `CAMERA_VIEW_DOOR_OPEN_CIDR` (empty: compose
+hands `0.0.0.0/32`, which no packet comes from):
+
+| Request (source in `CAMERA_VIEW_DOOR_OPEN_CIDR`) | Answer |
+|---|---|
+| `GET`/`HEAD` `/stream.html`, `/video-stream.js`, `/video-rtc.js` | go2rtc's player |
+| `/api/ws` with the raw query **exactly** `src=door` or `src=door_flat` | the stream |
+
+and **everything else behind the shared login** (`basic_auth`; none or a wrong
+one: 401), then exactly
 
 | Request | Answer |
 |---|---|
-| `/` | 302 to `/stream.html?src=door_flat&mode=mse` |
-| `/raw` | 302 to `/stream.html?src=door&mode=mse` |
+| `/` | 302 to `/stream.html?src=door_flat&src=livingroom&mode=mse` (both side by side) |
+| `/door`, `/raw`, `/livingroom`, `/livingroom-main` | 302 to that one stream's player (`/door` the straightened, `/raw` the circle) |
 | `GET`/`HEAD` `/stream.html`, `/video-stream.js`, `/video-rtc.js` | go2rtc's player |
-| `/api/ws` with the raw query **exactly** `src=door` or `src=door_flat` | the stream, no login |
-| `/api/ws` with the query exactly `src=<a stream behind the login>` | basic_auth, then the stream (none ships: the list is empty) |
+| `/api/ws` with the raw query **exactly** `src=` one of `door`, `door_flat`, `livingroom`, `livingroom-main` | the stream |
 | anything else | 403 |
+
+A listed name the viewer does not serve (the living room while its relay is
+off) creates nothing in go2rtc (it has no scheme): the player shows that tile's
+error and the door still plays. go2rtc's `stream.html` applies one `mode=` to
+every `src` it is given.
 
 **Why exactly one canonical `src`:** go2rtc's handler takes `src`, and a
 `src` that is not a stream name **creates** a stream from it (an `rtsp://`
@@ -134,13 +182,26 @@ Tailscale's `fd7a:115c:a1e0::/48`. Messages name entries by position, never
 by value. `check` puts **caddy's own** `LAN_CIDR` (read with `docker
 inspect`, every other variable dropped) through the same list.
 
-## The shared login (SR-172), kept for later
+## The open door (`CAMERA_VIEW_DOOR_OPEN_CIDR`)
 
-Not needed by the door. When a stream other than the door's is added (after
-8.2): its name goes in `camera_remote.LOGIN_STREAMS` and in the Caddyfile's
-`@cv_login_stream` list as `"src=<name>"`; HomeHub's deploy store holds the
-password (`CameraViewPassword`, optional) and derives the bcrypt hash
-(`CameraViewHash`); the hash reaches a live hub through a pipe:
+The sources that may take the door's two streams and the player **without**
+the login: the LAN alone (the hub's own LAN network, or narrower, such as the
+panel's address). `render` and `check` refuse an entry that is not IPv4, lies
+outside the hub's LAN (the tailnet, `100.64.0.0/10`, `private_ranges`, a
+broad range, IPv6) or overlaps a docker bridge, by position, never by value;
+`check` puts **caddy's own** value through the same rule and compares it with
+the `.env`. HomeHub's config sets it to the LAN identity value. Empty: the
+door needs the login everywhere.
+
+## The shared login (SR-172)
+
+**Required:** every stream is behind it, so `render` refuses without a real
+bcrypt hash (empty, the shipped lock, or anything else). To add a camera: its
+relay's settings in `ViewSettings`, its stream in `view_streams`, its name in
+`camera_remote.STREAMS` and in the Caddyfile's `@cv_stream` list as
+`"src=<name>"` (the tests hold the two lists equal). HomeHub's deploy store
+holds the password (`CameraViewPassword`, set or minted) and derives the
+bcrypt hash (`CameraViewHash`); the hash reaches a live hub through a pipe:
 
 ```sh
 # on the dev PC (the hash only; the password never leaves the store):
@@ -159,12 +220,14 @@ HomeHub's runbook (`docs/CAMERAS_PAGE_TRIAL_RUNBOOK_2026-11-12.md`) is the
 procedure with its checks; in short:
 
 ```sh
-# 1. payload: stack/camera-remote, stack/door (one function added), stack/caddy/Caddyfile,
+# 1. payload: stack/camera-remote, stack/door (redact_run's redactor), stack/caddy/Caddyfile,
 #    stack/docker-compose.yml, stack/provision/provision-technitium.sh -> /opt/homehub/stack
+#    (stack/camera-relay must be there too: the viewer reads the living room's settings through it)
 sudo install -m 0644 /opt/homehub/stack/camera-remote/homehub-camera-view.service \
                      /opt/homehub/stack/camera-remote/homehub-camera-view-warm.service /etc/systemd/system/
 sudo systemctl daemon-reload
-# 2. the CAMERA_VIEW_* keys from .env.example into /opt/homehub/stack/.env; read LAN_CIDR through the check:
+# 2. the CAMERA_VIEW_* keys from .env.example into /opt/homehub/stack/.env; CAMERA_VIEW_DOOR_OPEN_CIDR
+#    set to the LAN; the login's hash through import-login (above); read LAN_CIDR through the check:
 sudo python3 /opt/homehub/stack/camera-remote/camera_remote.py check     # must name nothing about LAN_CIDR
 # 3. switch on: CAMERA_VIEW_ENABLED=true; then caddy (recreated, so it reads its new environment), the
 #    name, the viewer and the warm unit:
@@ -186,17 +249,21 @@ Delivering the Caddyfile makes Caddy request a certificate for
 
 ## Tests
 
-- `tests/test_camera_remote.py` (pytest, TC-1825..TC-1838): settings and
-  refusals; the allow-list (every refused shape named in plan 6.9); the
-  config; the FFmpeg argv (no URL, the panel's projection, default rate
-  control); the input document and 0600 files; `import-login`; the login only
-  while a stream is behind it; `check`'s reading of caddy; the Caddyfile,
-  compose, unit and template contract; the warm consumer's websocket client
-  against fake sockets.
+- `tests/test_camera_remote.py` (pytest, TC-1825..TC-1838, TC-1845,
+  TC-1846): settings and refusals; the allow-list (every refused shape named
+  in plan 6.9); the open door (the LAN alone); the config (the living room's
+  streams video only, both relays' logins redacted); the FFmpeg argv (no URL,
+  the projection knobs with the panel's values by default, default rate
+  control); the input document and 0600 files; `import-login`; the login
+  required; `check`'s reading of caddy; the Caddyfile, compose, unit and
+  template contract; the warm consumer's websocket client against fake
+  sockets.
 - `tests/camera-view-lab.sh` (root + docker, WSL; TC-1839..TC-1843): a fake
   doorbell, the real door relay, the viewer run from its own unit lines
   through the real compose file, the hub's own Caddy image serving the real
-  site block. It cannot prove the hub's VA-API encode (WSL's render node does
+  site block: the open door from the lab's LAN, everything else behind the
+  login, and the door behind it too once the open range is emptied. It has
+  no living-room relay (its streams are proven by pytest only). It cannot prove the hub's VA-API encode (WSL's render node does
   not take the image's driver): door_flat as shipped is shown to fail cleanly
   there, and a software-encoded build of the same pipeline (a lab-only seam in
   `flat_argv`, reachable by no knob or verb) proves the pipe to MSE.
@@ -206,8 +273,10 @@ Delivering the Caddyfile makes Caddy request a certificate for
 Anything on the hub: the VA-API encode inside this service (measured on the
 hub on 2026-11-12 in the same image, by hand, not through this code), the
 CPU of `always`, the bandwidth at `-g 20`, a phone's browser (MSE, the CSP,
-basic auth over a websocket for a later login stream), the tailnet source
-address Caddy sees, the Technitium record, systemd on the hub (the two unit files ran
+the browser's basic-auth prompt and its credentials sent on the websocket),
+the living room's streams through a real relay (and whether its main stream
+plays over MSE on the phone), the projection knobs on the real door, the
+tailnet source address Caddy sees, the Technitium record, systemd on the hub (the two unit files ran
 under WSL's systemd 255 in lab check 13: the warm unit pulled in and back
 after a viewer restart, its sandbox reaching the socket; `systemctl stop`
 leaves the viewer `failed` with compose's exit 130), a reimage (nothing here is in

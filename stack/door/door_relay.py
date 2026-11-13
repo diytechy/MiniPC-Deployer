@@ -285,6 +285,39 @@ def set_env_keys(text: str, values: Dict[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def write_env_keys(env_file: str, values: Dict[str, str]) -> None:
+    """Set KEY=VALUE lines in the stack .env atomically, keeping its mode and owner.
+
+    `values` are already in the materialiser's representation (env_encode for
+    a secret). Written beside the file and renamed over it, so a reader never
+    sees half a file. Used by camera_remote.py import-login (SR-172); the older
+    importers above and in camera_relay.py / voice_listener.py still carry
+    their own copy of this body.
+    """
+    with open(env_file, encoding="utf-8") as handle:
+        current = handle.read()
+    st = os.stat(env_file)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(env_file)), prefix=".env.tmp-")
+    try:
+        if hasattr(os, "fchmod"):  # the hub; the dev PC's Windows test runner has neither
+            os.fchmod(fd, st.st_mode & 0o7777)
+            try:
+                os.fchown(fd, st.st_uid, st.st_gid)
+            except PermissionError:
+                pass
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(set_env_keys(current, values))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, env_file)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def import_upstream(env_file: str, blob: bytes) -> List[str]:
     """Write the five DOOR_RELAY_UPSTREAM_* keys; returns the key names written."""
     records = parse_upstream_records(blob)
@@ -352,14 +385,16 @@ def redact(text: str, s: Optional[RelaySettings] = None) -> str:
     return text
 
 
-def redact_run(s: RelaySettings, argv: Sequence[str], out=None) -> int:
+def redact_run(s: RelaySettings, argv: Sequence[str], out=None, redactor=None) -> int:
     """Run argv with stdout+stderr merged through redact(), one line at a time
     (the relay unit's ExecStart). SIGTERM/SIGINT/SIGHUP are passed to the child;
     the child's exit status is returned (128+N for a signal). Nothing is
-    buffered past a line, so the journal keeps go2rtc's timing.
-    Implements: LLR-1225, LLR-1226.
+    buffered past a line, so the journal keeps go2rtc's timing. `redactor`
+    replaces redact(line, s) for a process that holds more than one relay's
+    login (camera_remote.py, SR-170). Implements: LLR-1225, LLR-1226.
     """
     out = out or sys.stdout
+    redactor = redactor or (lambda text: redact(text, s))
     proc = subprocess.Popen(list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT)
 
@@ -379,7 +414,7 @@ def redact_run(s: RelaySettings, argv: Sequence[str], out=None) -> int:
             pass
     try:
         for raw in iter(proc.stdout.readline, b""):
-            out.write(redact(raw.decode("utf-8", "replace").rstrip("\r\n"), s) + "\n")
+            out.write(redactor(raw.decode("utf-8", "replace").rstrip("\r\n")) + "\n")
             out.flush()
         rc = proc.wait()
     finally:

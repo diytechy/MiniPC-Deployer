@@ -263,3 +263,27 @@ def test_tc1735_import_password_refuses_empty_multiline_and_oversize(tmp_path, b
     with pytest.raises(cr.Invalid):
         cr.import_password(path, "livingroom", blob)
     assert open(path, encoding="utf-8").read() == before
+
+
+# ── the corner camera's relay (2026-11-13; SN-057's page shows it) ───────────
+
+
+def test_tc1735_the_corner_relay_has_the_same_hardening_and_ships_off_without_sound():
+    block = compose_block("camera-relay-corner")
+    assert "image: ${DOOR_RELAY_IMAGE}" in block
+    assert 'profiles: ["camera-relay-corner"]' in block and 'restart: "no"' in block
+    assert "network_mode: host" in block and "ports:" not in block
+    assert "container_name: %s" % cr.container("corner") in block
+    assert "source: %s/go2rtc.yaml" % cr.run_dir("corner") in block
+    assert "create_host_path: false" in block and "read_only: true" in block
+    assert "cap_drop:\n      - ALL" in block and "driver: none" in block
+    assert "camera-relay-corner" not in (env_example("COMPOSE_PROFILES") or "").split(",")
+    assert env_example("CAMERA_CORNER_RELAY_ENABLED") == "false"
+    assert env_example("CAMERA_CORNER_RELAY_AUDIO") == "false"
+    # private in a public repo: the host, the paths and the code come from HomeHub
+    for key in ("UPSTREAM_HOST", "UPSTREAM_PATH", "MAIN_PATH", "UPSTREAM_PASSWORD"):
+        assert env_example("CAMERA_CORNER_RELAY_" + key) == "", key
+    ports = {env_example("CAMERA_CORNER_RELAY_RTSP_PORT"), env_example("CAMERA_CORNER_RELAY_API_PORT")}
+    assert len(ports) == 2 and ports.isdisjoint({
+        env_example("DOOR_RELAY_RTSP_PORT"), env_example("DOOR_RELAY_API_PORT"),
+        env_example("CAMERA_LIVINGROOM_RELAY_RTSP_PORT"), env_example("CAMERA_LIVINGROOM_RELAY_API_PORT")})

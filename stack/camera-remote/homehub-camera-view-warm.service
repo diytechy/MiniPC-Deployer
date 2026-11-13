@@ -1,0 +1,43 @@
+# homehub-camera-view-warm - keeps the straightened door picture running (SR-174;
+# stack/camera-remote/README.md). The Owner, 2026-11-12: "start evaluations with
+# always on since I do notice a delay".
+#
+# CAMERA_VIEW_DOOR_FLAT_MODE=always (the default once the viewer is enabled):
+# this unit is a consumer of door_flat on the viewer's own API socket that never
+# leaves, so go2rtc keeps the straightening FFmpeg running and a page (or, later,
+# the panel) gets the picture at once - about 30 % of one hub core, all the
+# time (plan 1.5). on_demand: ExecCondition skips it, and the FFmpeg runs only
+# while someone watches.
+#
+# BindsTo the viewer: it stops with it and is started with it (WantedBy below;
+# `systemctl enable` once). It reads one unix socket (root-only directory) and
+# writes nothing; no network namespace of its own is needed for a path socket.
+[Unit]
+Description=Camera page: keep the straightened door picture running (CAMERA_VIEW_DOOR_FLAT_MODE=always)
+Documentation=file:///opt/homehub/stack/camera-remote/README.md
+BindsTo=homehub-camera-view.service
+After=homehub-camera-view.service
+AssertPathExists=/opt/homehub/stack/camera-remote/camera_remote.py
+AssertPathExists=/opt/homehub/stack/.env
+
+[Service]
+Type=simple
+ExecCondition=/usr/bin/python3 /opt/homehub/stack/camera-remote/camera_remote.py --env-file /opt/homehub/stack/.env condition-warm
+ExecStart=/usr/bin/python3 /opt/homehub/stack/camera-remote/camera_remote.py --env-file /opt/homehub/stack/.env keep-warm
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+CapabilityBoundingSet=
+MemoryMax=64M
+Nice=10
+
+[Install]
+WantedBy=homehub-camera-view.service

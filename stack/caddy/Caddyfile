@@ -37,6 +37,8 @@
 #   {$LLM_GATEWAY_HOST}
 #   {$OTTERTUBE_HOST}
 #   {env.OTTERTUBE_SITE_ENABLED}   (read at request time, not at parse time)
+#   {$CAMERA_VIEW_HOST} {$CAMERA_VIEW_AUTH_USER} {$CAMERA_VIEW_AUTH_HASH} {$CAMERA_VIEW_DOOR_OPEN_CIDR}
+#   {env.CAMERA_VIEW_ENABLED}      (read at request time, not at parse time)
 
 {
     # WHERE rate_limit SITS IN THE CHAIN, and it is the whole point of the
@@ -1069,6 +1071,154 @@ ntfy.{$DOMAIN} {
     }
     handle {
         respond "ottertube: LAN only" 403
+    }
+}
+
+# ── {$CAMERA_VIEW_HOST} — the camera page (SN-057, SR-171, IF-087) ───────────
+# The Owner's rulings of 2026-11-12 (HomeHub open-items A89, cameras plan 8.1,
+# 8.2, 8.9): every camera watched from a phone's browser, at home and over the
+# tailnet, BEHIND CADDY'S ONE SHARED LOGIN, because the page shows every camera
+# ("the camera page can be behind a caddy login as it contains all cameras").
+# THE DOOR ALONE stays open WITHOUT a login to the LAN alone
+# ({$CAMERA_VIEW_DOOR_OPEN_CIDR}; "a public view of the front of a house on a
+# closed network"), so the wall panel can take it; a tailnet source always goes
+# through the login. Only go2rtc's player page, its two scripts and its stream
+# websocket pass, MSE only. The viewer is stack/camera-remote's go2rtc, reached
+# on a unix socket (no port anywhere); go2rtc itself registers only its static
+# files and /api/ws (camera_remote.py), so this block is the SECOND of two
+# allow-lists.
+#
+# IN ORDER:
+#   1. the switch, at request time (`true` exactly, from caddy's environment):
+#      off, every request is a 404, on the LAN or off it, before the gate.
+#   2. @lan: LAN_CIDR. On the hub it must pass camera_remote.py's source
+#      allow-list (the LAN, 100.64.0.0/10 and ranges ruled in by name; NEVER
+#      private_ranges): the viewer's unit refuses to start otherwise, and
+#      `check` puts caddy's OWN LAN_CIDR through it. Anything else: 403.
+#   3. throttle (120 requests a minute per address).
+#   4. THE OPEN DOOR, no login, only for a source in CAMERA_VIEW_DOOR_OPEN_CIDR
+#      (the LAN alone; `check` refuses anything else; empty, compose hands
+#      0.0.0.0/32, which no packet comes from): the player page and its two
+#      scripts, and /api/ws with the raw query EXACTLY src=door or
+#      src=door_flat.
+#   5. everything else: basic_auth (one user, a bcrypt hash; the password
+#      never reaches the hub), then exactly these, and 403 for the rest
+#      (/api/streams, /api/config, go2rtc's own pages, stream.html included,
+#      frames, mp4, hls):
+#        /                 the landing page, GET/HEAD: one file,
+#                          stack/camera-remote/www/index.html, bound read-only
+#                          at /srv/camera-page (four tiles; one camera full
+#                          screen on a tap; the operator, 2026-11-13)
+#        /video-stream.js /video-rtc.js   go2rtc's player scripts, GET/HEAD
+#        /api/ws           THE STREAM GATE: the raw query must be EXACTLY
+#                          src=<one of the six names>. go2rtc's handler takes
+#                          `src`, and a src that is not a stream name CREATES a
+#                          stream from it (an rtsp:// URL is accepted), and
+#                          with `name=` it REPLACES an existing stream's source
+#                          (internal/streams GetOrPatch, Patch). So: one `src`,
+#                          canonical spelling, nothing else - absent, repeated,
+#                          percent-encoded, foreign or extra keys are all 403.
+#                          A listed name the viewer does not serve (an indoor
+#                          camera while its relay is off) creates nothing: it
+#                          has no scheme. No method matcher: a browser may open the
+#                          websocket over HTTP/2 as an extended CONNECT.
+#      The names are camera_remote.py's STREAMS and DOOR_STREAMS; the tests
+#      hold the lists equal.
+#   The browser's Authorization (the shared password, base64) and cookies are
+#   stripped before the viewer; go2rtc has no login of its own (its socket's
+#   directory is 0700 root).
+#
+# The site holds its certificate (dns-01) even while off, like OtterTube's;
+# the Technitium record exists only while CAMERA_VIEW_ENABLED is true.
+# DELIVER THIS BLOCK AND docker-compose.yml TOGETHER and recreate caddy: a
+# caddy created from the older compose file has no CAMERA_VIEW_* in its
+# environment. Each variable here also carries a Caddyfile default (review
+# round 5), so that such a caddy, restarted or rebooted before the recreate,
+# still loads every site: the host an .invalid name (no certificate can be
+# had, nothing is served), the open range nobody, the login the lock no
+# password opens. They equal compose's defaults; the tests hold them equal.
+{$CAMERA_VIEW_HOST:cameras.invalid} {
+    import acme_cloudflare
+    @cv_off expression `{env.CAMERA_VIEW_ENABLED} != "true"`
+    handle @cv_off {
+        respond "cameras: off" 404
+    }
+    @lan remote_ip {$LAN_CIDR}
+    handle @lan {
+        import throttle
+        header {
+            Strict-Transport-Security "max-age=31536000"
+            Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' wss://{http.request.host}; media-src 'self' blob:; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+            X-Content-Type-Options nosniff
+            Referrer-Policy no-referrer
+            Cache-Control "no-store"
+            -Server
+        }
+        # The open door: the LAN alone, the door's two streams alone, no login.
+        @cv_door_open {
+            remote_ip {$CAMERA_VIEW_DOOR_OPEN_CIDR:0.0.0.0/32}
+            path /api/ws
+            expression `{query} == "src=door" || {query} == "src=door_flat"`
+        }
+        handle @cv_door_open {
+            reverse_proxy unix//srv/camera-view/api.sock {
+                header_up -Authorization
+                header_up -Cookie
+            }
+        }
+        @cv_player_open {
+            remote_ip {$CAMERA_VIEW_DOOR_OPEN_CIDR:0.0.0.0/32}
+            method GET HEAD
+            path /stream.html /video-stream.js /video-rtc.js
+        }
+        handle @cv_player_open {
+            reverse_proxy unix//srv/camera-view/api.sock {
+                header_up -Authorization
+                header_up -Cookie
+            }
+        }
+        # Everything else: the shared login first.
+        handle {
+            basic_auth {
+                {$CAMERA_VIEW_AUTH_USER:viewer} {$CAMERA_VIEW_AUTH_HASH:bG9ja2Vk}
+            }
+            @cv_stream {
+                path /api/ws
+                expression `{query} in ["src=door", "src=door_flat", "src=livingroom", "src=livingroom-main", "src=corner", "src=corner-main"]`
+            }
+            handle @cv_stream {
+                reverse_proxy unix//srv/camera-view/api.sock {
+                    header_up -Authorization
+                    header_up -Cookie
+                }
+            }
+            @cv_player {
+                method GET HEAD
+                path /video-stream.js /video-rtc.js
+            }
+            handle @cv_player {
+                reverse_proxy unix//srv/camera-view/api.sock {
+                    header_up -Authorization
+                    header_up -Cookie
+                }
+            }
+            # The landing page: the one file, whatever / is asked for with.
+            @cv_page {
+                method GET HEAD
+                path /
+            }
+            handle @cv_page {
+                root * /srv/camera-page
+                rewrite * /index.html
+                file_server
+            }
+            handle {
+                respond "cameras: not here" 403
+            }
+        }
+    }
+    handle {
+        respond "cameras: LAN only" 403
     }
 }
 

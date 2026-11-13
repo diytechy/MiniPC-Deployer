@@ -650,6 +650,18 @@ def test_tc1838_the_reader_takes_split_frames_of_every_length():
         huge.frame()
 
 
+def test_tc1838_a_timeout_part_way_through_a_frame_loses_nothing():
+    import socket as socketmod
+    frame = server_frame(2, b"v" * 300)
+    reader = cr.FrameReader(FakeSock([frame[:3], socketmod.timeout(), frame[3:150], socketmod.timeout(),
+                                      frame[150:] + server_frame(8, b"")]).recv)
+    for _ in range(2):
+        with pytest.raises(socketmod.timeout):
+            reader.frame()
+    assert reader.frame() == (2, b"v" * 300)
+    assert reader.frame() == (8, b"")
+
+
 def test_tc1838_a_session_asks_for_door_flat_in_mse_and_reports_flowing_once():
     sock = FakeSock([UPGRADED, server_frame(1, b'{"type":"mse","value":"video/mp4"}'),
                      server_frame(2, b"a" * 10), server_frame(2, b"b" * 10), server_frame(8, b"")])

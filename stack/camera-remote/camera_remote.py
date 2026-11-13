@@ -693,11 +693,6 @@ class FrameReader:
                 raise EOFError
             self.buf += chunk
 
-    def _take(self, n: int) -> bytes:
-        self._fill(n)
-        out, self.buf = self.buf[:n], self.buf[n:]
-        return out
-
     def head(self) -> int:
         while b"\r\n\r\n" not in self.buf:
             if len(self.buf) > 16384:
@@ -711,16 +706,25 @@ class FrameReader:
         return int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
 
     def frame(self) -> Tuple[int, bytes]:
-        b0, b1 = self._take(2)
-        n = b1 & 0x7F
+        # Nothing is consumed until the whole frame is buffered: a socket
+        # timeout part-way through leaves the buffer as it was, so the next
+        # call starts at the same header instead of reading payload as one.
+        self._fill(2)
+        b0, b1 = self.buf[0], self.buf[1]
+        n, head = b1 & 0x7F, 2
         if n == 126:
-            n = struct.unpack(">H", self._take(2))[0]
+            self._fill(4)
+            n, head = struct.unpack(">H", self.buf[2:4])[0], 4
         elif n == 127:
-            n = struct.unpack(">Q", self._take(8))[0]
+            self._fill(10)
+            n, head = struct.unpack(">Q", self.buf[2:10])[0], 10
         if n > WARM_MAX_FRAME:
             raise ValueError("a %d-byte frame" % n)
-        mask = self._take(4) if b1 & 0x80 else b""
-        data = self._take(n)
+        masked = 4 if b1 & 0x80 else 0
+        self._fill(head + masked + n)
+        mask = self.buf[head:head + masked]
+        data = self.buf[head + masked:head + masked + n]
+        self.buf = self.buf[head + masked + n:]
         if mask:
             data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
         return b0 & 0x0F, data

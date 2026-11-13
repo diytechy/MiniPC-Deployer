@@ -788,3 +788,81 @@ def test_tc1772_the_manifest_pins_the_couch_models():
     manifest = cp.read_manifest()
     for name in ("yolov8n_640.onnx", "yolov8n_448.onnx", couch_settings().couch_model):
         assert re.fullmatch(r"[0-9a-f]{64}", manifest[name]["sha256"])
+
+
+# -- review 2026-11-13 (DeepSeek, part 1): the fixes, each pinned ------------
+
+
+@needs_numpy
+def test_tc1768_a_decoder_start_that_raises_is_retried_not_the_end_of_the_reader(monkeypatch):
+    import io
+    import threading
+    monkeypatch.setattr(cp, "COUCH_RESTART_SEC", 0.01)
+    w, h = 2, 2
+    attempts = []
+    got = threading.Event()
+
+    class Proc:
+        stdout = io.BytesIO(bytes(w * h * 3))
+
+        def kill(self):
+            pass
+
+    def start():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise OSError("docker is not there yet")
+        got.set()
+        return Proc()
+
+    reader = cp.KeyframeReader(start, lambda p: None, w, h, lambda m, warning=False: None)
+    reader.begin()
+    assert got.wait(5)
+    reader.end()
+    assert len(attempts) >= 2 and reader.latest(time.monotonic(), 60) is not None
+
+
+@needs_numpy
+def test_tc1768_end_kills_the_decoder_client_and_returns_promptly():
+    import threading
+    w, h = 2, 2
+    unblock = threading.Event()
+    killed = []
+
+    class Blocking:
+        def read(self, n):
+            unblock.wait(10)
+            return b""
+
+    class Proc:
+        stdout = Blocking()
+
+        def kill(self):
+            killed.append(1)
+            unblock.set()
+
+    reader = cp.KeyframeReader(lambda: Proc(), lambda p: None, w, h, lambda m, warning=False: None)
+    reader.begin()
+    for _ in range(100):
+        if reader.proc is not None:
+            break
+        time.sleep(0.01)
+    started = time.monotonic()
+    reader.end()
+    assert killed and time.monotonic() - started < 3 and not reader.thread.is_alive()
+
+
+@pytest.mark.parametrize("over, key", [
+    ({"CAMERA_LIVINGROOM_PRESENCE_COUCH_CROP": "0.0,0.0,0.05,1.0"}, "COUCH_CROP"),
+    ({"CAMERA_LIVINGROOM_PRESENCE_COUCH_MAX_SEC": "3"}, "COUCH_MAX_SEC"),
+])
+def test_tc1764_a_sliver_crop_and_a_cap_below_the_wait_refuse(over, key):
+    with pytest.raises(cp.Invalid) as err:
+        couch_settings(**over)
+    assert key in str(err.value)
+
+
+def test_tc1765_whole_motion_max_1_is_off():
+    judge = cp.RoomJudge(settings(CAMERA_LIVINGROOM_PRESENCE_WHOLE_MOTION_MAX="1"))
+    assert judge.motion(0.3, 1.0) == 0.3
+    assert cp.RoomJudge(settings()).motion(0.3, 0.5) == 0.0

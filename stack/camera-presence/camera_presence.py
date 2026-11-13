@@ -102,6 +102,7 @@ WHOLE_FRAME = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
 COUCH_W = 960                         # the couch crop's width, as the offline build read it
 COUCH_MAX_AGE_SEC = 4.5               # a couch keyframe older than this is no data (the offline replay's rule)
 COUCH_RESTART_SEC = 15.0              # a couch decoder that ended is started again after this
+MIN_CROP = 0.1                        # the couch crop's least width and height, fractions of the frame
 NO_CAP = 1e9                          # COUCH_MAX_SEC 0: the couch check holds without a cap
 
 
@@ -157,6 +158,9 @@ def parse_crop(text: str, key: str) -> Crop:
     x0, y0, x1, y1 = (float(p) for p in parts)
     if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0):
         raise Invalid("%s must lie inside 0..1 with x0 < x1 and y0 < y1" % key)
+    if x1 - x0 < MIN_CROP or y1 - y0 < MIN_CROP:
+        # A sliver would make the 960-wide image absurdly tall (review 2026-11-13).
+        raise Invalid("%s must be at least %g of the frame each way" % (key, MIN_CROP))
     return x0, y0, x1, y1
 
 
@@ -278,11 +282,18 @@ class PresenceSettings:
         self.whole_motion_max = number("WHOLE_MOTION_MAX", 0.5, 0.01, 1)
         # The couch check (LLR-1525). The crop is the room's geometry, so it is
         # private like the polygons: empty (the template) switches the check off.
+        # Its boxes are mapped to fractions of the MAIN frame and tested against
+        # zones drawn on the SUB frame: right while both streams show the same
+        # view at the same aspect (this camera's 1920x1080 and 768x432, both
+        # 16:9 of one sensor), as the offline build assumed (review 2026-11-13).
         self.couch_crop = parse_crop(text("COUCH_CROP"), k("COUCH_CROP")) if text("COUCH_CROP") else None
         self.couch_conf = number("COUCH_CONF", 0.25, 0.01, 0.99)
         self.couch_after_sec = number("COUCH_AFTER_SEC", 6, 0, 600)
         self.couch_max_bottom = number("COUCH_MAX_BOTTOM", 0.97, 0.5, 1)
         self.couch_max_sec = number("COUCH_MAX_SEC", 0, 0, 86400)
+        if self.couch_max_sec and self.couch_max_sec < self.couch_after_sec:
+            raise Invalid("%s may not be below %s (the check would never run)"
+                          % (k("COUCH_MAX_SEC"), k("COUCH_AFTER_SEC")))
         self.body_mode = text("BODY_MODE", "cascade")
         if self.body_mode not in BODY_MODES:
             raise Invalid("%s must be one of %s" % (k("BODY_MODE"), ", ".join(BODY_MODES)))
@@ -630,7 +641,8 @@ class RoomJudge:
 
     def motion(self, room_motion: float, whole_motion: float) -> float:
         """Room motion, or none when the whole picture changed (a light switched)."""
-        return 0.0 if whole_motion >= self.s.whole_motion_max else room_motion
+        gated = self.s.whole_motion_max < 1 and whole_motion >= self.s.whole_motion_max
+        return 0.0 if gated else room_motion
 
     def wants_couch(self, mono: float) -> bool:
         return self.s.couch_crop is not None and self.held.wants_couch(mono)
@@ -721,33 +733,61 @@ class KeyframeReader:
             return self.newest[0], self.newest[2]
 
     def _run(self) -> None:
+        """The reader thread owns the decoder: it starts it, reads it, and stops
+        it (review 2026-11-13: a start that raises is retried, never the end of
+        the thread; end() only signals)."""
         import numpy as np
         while not self.stopping.is_set():
-            proc = self.proc = self.start_decoder()
             try:
-                while not self.stopping.is_set():
-                    data = proc.stdout.read(self.frame_bytes)
-                    if not data or len(data) < self.frame_bytes:
-                        break
-                    frame = np.frombuffer(data, dtype=np.uint8).reshape(self.height, self.width, 3)
-                    with self.lock:
-                        self.sequence += 1
-                        self.newest = (self.sequence, time.monotonic(), frame)
-            except (OSError, ValueError):
-                pass
-            self.stop_decoder(proc)
+                proc = self.start_decoder()
+            except Exception as exc:  # noqa: BLE001 - a failed start is retried, never fatal
+                proc = None
+                self.log("couch decoder did not start (%s)" % type(exc).__name__, warning=True)
+            if proc is not None:
+                with self.lock:
+                    self.proc = proc
+                if self.stopping.is_set():      # end() came between the start and the handle
+                    self._kill(proc)
+                try:
+                    while not self.stopping.is_set():
+                        data = proc.stdout.read(self.frame_bytes)
+                        if not data or len(data) < self.frame_bytes:
+                            break
+                        frame = np.frombuffer(data, dtype=np.uint8).reshape(self.height, self.width, 3)
+                        with self.lock:
+                            self.sequence += 1
+                            self.newest = (self.sequence, time.monotonic(), frame)
+                except (OSError, ValueError):
+                    pass
+                with self.lock:
+                    self.proc = None
+                try:
+                    self.stop_decoder(proc)
+                except Exception as exc:  # noqa: BLE001 - cleanup must not end the thread
+                    self.log("couch decoder not stopped cleanly (%s)" % type(exc).__name__, warning=True)
             if self.stopping.is_set():
                 return
             self.restarts += 1
             self.log("couch decoder ended; starting it again in %ds" % COUCH_RESTART_SEC, warning=True)
             self.stopping.wait(COUCH_RESTART_SEC)
 
-    def end(self) -> None:
-        """Stop the thread and its decoder; the read it is blocked in ends with it."""
+    @staticmethod
+    def _kill(proc) -> None:
+        try:
+            proc.kill()
+        except (OSError, AttributeError):
+            pass
+
+    def end(self, join_sec: float = 5.0) -> None:
+        """Signal the thread and kill its decoder's client, which ends the read
+        it is blocked in; the thread removes the container itself, and the
+        unit's ExecStopPost does so anyway if the process exits first."""
         self.stopping.set()
-        if self.proc is not None:
-            self.stop_decoder(self.proc)
-        self.thread.join(timeout=15)
+        with self.lock:
+            proc = self.proc
+        if proc is not None:
+            self._kill(proc)
+        self.thread.join(timeout=join_sec)
 
 
 # ── the feed (IF-081): IF-079's listener, with a peer list and state on connect ──

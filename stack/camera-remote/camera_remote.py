@@ -280,11 +280,11 @@ def ruled_in_violations(ruled_in: Dict[str, object], bridges: Sequence[object]) 
         if net.version == 6:
             if not net.subnet_of(TAILNET_V6):
                 reasons.append("ruled-in range %s is IPv6 outside Tailscale's fd7a:115c:a1e0::/48" % name)
-            continue
-        if not any(net.subnet_of(p) for p in PRIVATE_V4) or net.prefixlen < RULED_IN_MAX_V4_PREFIX:
+        elif not any(net.subnet_of(p) for p in PRIVATE_V4) or net.prefixlen < RULED_IN_MAX_V4_PREFIX:
             reasons.append("ruled-in range %s must be a private IPv4 /%d or narrower"
                            % (name, RULED_IN_MAX_V4_PREFIX))
-        if any(net.overlaps(b) for b in bridges if b.version == 4):
+        # Both families (review round 3 F5): docker can give a bridge IPv6 too.
+        if any(net.overlaps(b) for b in bridges if b.version == net.version):
             reasons.append("ruled-in range %s overlaps a docker bridge on this hub" % name)
     return reasons
 
@@ -303,7 +303,8 @@ def source_violations(lan_cidr: str, lan_network: Optional[object], ruled_in: Di
     """
     reasons = []
     if lan_network is None:
-        reasons.append("no interface on this hub holds LAN_IP, so the LAN is unknown")
+        reasons.append("no interface on this hub holds LAN_IP (or `ip -j addr show` could not be read), "
+                       "so the LAN is unknown")
     entries = lan_cidr_entries(lan_cidr)
     if not entries:
         reasons.append("LAN_CIDR is empty")
@@ -496,11 +497,17 @@ def render(s: ViewSettings, out_dir: str, encoder: str = "vaapi") -> List[str]:
 
     Returns the paths written. Implements: LLR-1578.
     """
+    # Both built before either is written (review round 3 F4), and an existing
+    # directory tightened too (F3: makedirs leaves its mode alone).
+    config_bytes = (json.dumps(view_config(s, encoder), indent=1) + "\n").encode("utf-8")
+    document_bytes = ffconcat_document(s)
     os.makedirs(out_dir, mode=0o700, exist_ok=True)
+    if hasattr(os, "fchmod"):   # POSIX; the dev PC's Windows test runner has no modes
+        os.chmod(out_dir, 0o700)
     config = os.path.join(out_dir, CONFIG_NAME)
     document = os.path.join(out_dir, FFCONCAT_NAME)
-    door_relay.write_private(config, (json.dumps(view_config(s, encoder), indent=1) + "\n").encode("utf-8"))
-    door_relay.write_private(document, ffconcat_document(s))
+    door_relay.write_private(config, config_bytes)
+    door_relay.write_private(document, document_bytes)
     return [config, document]
 
 

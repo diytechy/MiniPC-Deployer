@@ -163,6 +163,12 @@ def test_tc1826_ranges_ruled_in_by_name_are_admitted_and_checked():
         assert any(fragment in r for r in reasons), (words, reasons)
 
 
+def test_tc1826_a_ruled_in_ipv6_range_on_an_ipv6_bridge_is_refused():
+    v6_bridge = [ipaddress.ip_network("fd7a:115c:a1e0:ab12::/64")]
+    reasons = cr.ruled_in_violations(cr.parse_ruled_in("tailnet6=fd7a:115c:a1e0::/48"), v6_bridge)
+    assert reasons == ["ruled-in range tailnet6 overlaps a docker bridge on this hub"]
+
+
 def test_tc1826_messages_name_positions_not_the_households_addresses():
     reasons = cr.source_violations("198.51.100.0/24 192.0.2.0/24", LAN, {}, BRIDGES)
     assert reasons and not any("198.51" in r or "192.0.2" in r for r in reasons)
@@ -278,6 +284,7 @@ def test_tc1830_the_input_document_is_the_relays_own(tmp_path):
 @pytest.mark.skipif(not hasattr(os, "fchmod"), reason="POSIX file modes")
 def test_tc1830_render_writes_two_0600_files_in_a_0700_directory(tmp_path):
     out = tmp_path / "run"
+    out.mkdir(mode=0o755)          # an existing, looser directory is tightened
     written = cr.render(settings(tmp_path), str(out))
     assert sorted(Path(p).name for p in written) == ["door.ffconcat", "go2rtc.yaml"]
     assert stat.S_IMODE(out.stat().st_mode) == 0o700

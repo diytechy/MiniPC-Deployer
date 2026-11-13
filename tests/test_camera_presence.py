@@ -95,9 +95,13 @@ def test_tc1736_the_motion_mask_excludes_the_treadmill():
 
 def test_tc1737_defaults_and_the_feed_peer_is_mini_serv():
     s = settings()
-    assert (s.enabled, s.face_model, s.body_model, s.body_mode) == (False, "faceyolo_320.onnx", "yolov8n_256.onnx",
+    assert (s.enabled, s.face_model, s.body_model, s.body_mode) == (False, "faceyolo_320.onnx", "yolov8n_320.onnx",
                                                                     "cascade")
-    assert (s.face_conf, s.body_conf, s.confirm_count, s.confirm_window, s.hold_sec) == (0.15, 0.40, 2, 3, 8)
+    # The settings the Owner adopted 2026-11-12 (HomeHub DECISIONS_RATIFIED, A-2).
+    assert (s.face_conf, s.body_conf, s.confirm_count, s.confirm_window, s.hold_sec) == (0.15, 0.25, 2, 3, 30)
+    assert (s.fps, s.dark_level, s.whole_motion_max) == (0.5, 8, 0.5)
+    assert s.couch_crop is None and s.couch_model == "yolov8n_640.onnx"      # the crop is private: off until set
+    assert (s.couch_conf, s.couch_after_sec, s.couch_max_bottom, s.couch_max_sec) == (0.25, 6, 0.97, 0)
     assert s.feed_port == 0 and s.feed_peers == ["192.0.2.50"] and not s.placeholder
 
 
@@ -218,9 +222,9 @@ def test_tc1740_a_still_person_is_held_by_sparse_positives_for_minutes():
 def test_tc1740_absence_lands_within_the_hold_of_the_last_positive():
     state = cp.PresenceState(settings())
     run(state, 10, lambda t: ROOM_HIT)
-    events = run(state, 20, lambda t: [], start=10)
+    events = run(state, 40, lambda t: [], start=10)
     assert len(events) == 1 and events[0][1]["present"] is False
-    assert events[0][0] - 9 <= 8 + 1        # the plan: absence within about ten seconds
+    assert events[0][0] - 9 <= 30 + 1       # HOLD_SEC 30 (the 2026-11-12 settings)
 
 
 def test_tc1740_the_treadmill_never_makes_presence():
@@ -235,15 +239,15 @@ def test_tc1740_motion_holds_a_present_person_but_never_starts_presence():
     assert run(state, 60, lambda t: [], motion=0.5, start=33) == []
     off = cp.PresenceState(settings(CAMERA_LIVINGROOM_PRESENCE_MOTION_HOLDS="false"))
     run(off, 3, lambda t: ROOM_HIT)
-    assert len(run(off, 20, lambda t: [], motion=0.5, start=3)) == 1
+    assert len(run(off, 40, lambda t: [], motion=0.5, start=3)) == 1
 
 
 def test_tc1740_confidence_is_the_best_score_in_the_hold_and_zero_when_absent():
     state = cp.PresenceState(settings())
     run(state, 3, lambda t: [("body", 0.45, (0.3, 0.6)), ("face", 0.62, (0.3, 0.5))])
     assert state.presence_record(3)["confidence"] == 0.62
-    run(state, 20, lambda t: [], start=3)
-    assert state.presence_record(23)["confidence"] == 0.0
+    run(state, 40, lambda t: [], start=3)
+    assert state.presence_record(43)["confidence"] == 0.0
 
 
 # ── TC-1741 engage ───────────────────────────────────────────────────────────
@@ -254,7 +258,7 @@ def test_tc1741_engage_after_the_couch_is_held_and_off_after_the_hold():
     events = run(state, 40, lambda t: ROOM_HIT)
     engaged = [(t, r) for t, r in events if r["event"] == "living_room.engage"]
     assert engaged and engaged[0][1]["engaged"] is True and engaged[0][0] == 20
-    off = run(state, 20, lambda t: [], start=40)
+    off = run(state, 40, lambda t: [], start=40)
     assert [r["engaged"] for _t, r in off if r["event"] == "living_room.engage"] == [False]
 
 
@@ -371,7 +375,7 @@ def test_tc1743_a_peer_that_is_not_admitted_is_closed():
 # ── TC-1744 the decoder ──────────────────────────────────────────────────────
 
 
-def test_tc1744_the_decoder_is_video_only_one_fps_and_holds_no_credential(tmp_path):
+def test_tc1744_the_decoder_is_video_only_half_an_fps_and_holds_no_credential(tmp_path):
     import camera_relay as cr
     path = tmp_path / "env"
     path.write_text("LAN_IP=192.0.2.10\nCAMERA_LIVINGROOM_RELAY_RTSP_PORT=8564\nCAMERA_LIVINGROOM_RELAY_API_PORT=1994\n"
@@ -383,7 +387,7 @@ def test_tc1744_the_decoder_is_video_only_one_fps_and_holds_no_credential(tmp_pa
     argv, payload = cp.decoder_command(relay, "livingroom")
     joined = "\n".join(argv)
     assert "ABCDEF" not in joined and "rtsp://" not in joined and "192.0.2.69" not in joined
-    assert "-an" in argv and any(a.startswith("fps=1,scale=640:360") for a in argv)
+    assert "-an" in argv and any(a.startswith("fps=0.5,scale=640:360") for a in argv)
     assert argv[argv.index("--cpus") + 1] == "0.3"
     assert b"rtsp://admin:ABCDEF@192.0.2.10:8564/livingroom'" in payload   # the relay, never the camera
     assert b"audio" not in payload
@@ -448,7 +452,7 @@ def test_tc1740_motion_alone_cannot_hold_an_empty_room_past_its_cap():
     run(state, 3, lambda t: ROOM_HIT)                  # last detection at t=2
     events = run(state, 200, lambda t: [], motion=0.5, start=3)
     assert len(events) == 1 and events[0][1]["present"] is False
-    assert events[0][0] <= 2 + 60 + 8 + 1
+    assert events[0][0] <= 2 + 60 + 30 + 1
 
 
 def test_tc1739_a_body_cut_off_by_the_bottom_of_the_frame_still_counts():
@@ -503,3 +507,284 @@ def test_tc1737_a_fractional_confirmation_count_refuses(value):
     with pytest.raises(cp.Invalid) as err:
         settings(CAMERA_LIVINGROOM_PRESENCE_CONFIRM_COUNT=value)
     assert "CONFIRM_COUNT" in str(err.value)
+
+
+
+# == The 2026-11-12 settings (HomeHub DECISIONS_RATIFIED, A-2): TC-1764..TC-1772 ==
+
+LIVING_CROP = "0.03,0.40,0.77,1.00"
+
+
+def couch_settings(**over):
+    return settings(**dict({"CAMERA_LIVINGROOM_PRESENCE_COUCH_CROP": LIVING_CROP}, **over))
+
+
+def judge_run(judge, seconds, evidence, couch=lambda t: None, start=0.0, step=2.0, room_motion=0.0, whole=0.0):
+    """One sample every `step` seconds through RoomJudge, as the service drives it."""
+    events, t = [], start
+    while t < start + seconds:
+        seen = couch(t) if judge.wants_couch(t) else None
+        for record in judge.update(t, 1_700_000_000 + t, evidence(t), room_motion, whole, seen):
+            events.append((t, record))
+        t += step
+    return events
+
+
+# -- TC-1764 the couch crop and the hold configuration ------------------------
+
+
+@pytest.mark.parametrize("text", ["0.1,0.2,0.3", "0.5,0.2,0.4,0.9", "0,0,1,1.5", "a,b,c,d", "0.1,0.9,0.2,0.1"])
+def test_tc1764_a_bad_couch_crop_is_refused_by_key(text):
+    with pytest.raises(cp.Invalid) as err:
+        couch_settings(CAMERA_LIVINGROOM_PRESENCE_COUCH_CROP=text)
+    assert "COUCH_CROP" in str(err.value)
+
+
+def test_tc1764_the_hold_config_is_the_couch_check_only_and_uncapped_by_default():
+    cfg = couch_settings().hold_config()
+    assert cfg.long_hold_sec == 0 and cfg.couch_conf == 0.25 and cfg.couch_after_sec == 6
+    assert cfg.couch_max_bottom == 0.97 and cfg.couch_max_sec >= 1e9
+    assert couch_settings(CAMERA_LIVINGROOM_PRESENCE_COUCH_MAX_SEC="3600").hold_config().couch_max_sec == 3600
+    assert settings().hold_config().couch_conf == 0.0        # no crop: the check is off
+
+
+@pytest.mark.parametrize("over, key", [
+    ({"CAMERA_LIVINGROOM_PRESENCE_FPS": "5"}, "FPS"),
+    ({"CAMERA_LIVINGROOM_PRESENCE_DARK_LEVEL": "300"}, "DARK_LEVEL"),
+    ({"CAMERA_LIVINGROOM_PRESENCE_WHOLE_MOTION_MAX": "0"}, "WHOLE_MOTION_MAX"),
+    ({"CAMERA_LIVINGROOM_PRESENCE_COUCH_MODEL": "../y.onnx"}, "COUCH_MODEL"),
+    ({"CAMERA_LIVINGROOM_PRESENCE_COUCH_MAX_BOTTOM": "0.2"}, "COUCH_MAX_BOTTOM"),
+])
+def test_tc1764_the_new_knobs_refuse_rather_than_default(over, key):
+    with pytest.raises(cp.Invalid) as err:
+        settings(**over)
+    assert key in str(err.value)
+
+
+# -- TC-1765 dark frames and whole-frame motion -------------------------------
+
+
+def test_tc1765_a_dark_frame_is_skipped_and_the_level_is_a_knob():
+    judge = cp.RoomJudge(settings())
+    assert judge.dark(7.9) and not judge.dark(8.0)
+    assert not cp.RoomJudge(settings(CAMERA_LIVINGROOM_PRESENCE_DARK_LEVEL="0")).dark(0.0)
+
+
+def test_tc1765_whole_frame_motion_does_not_hold_presence():
+    """A light switched in an empty room changes the whole picture: it must not
+    stand in for a person."""
+    judge = cp.RoomJudge(settings())
+    judge_run(judge, 6, lambda t: ROOM_HIT)
+    held = judge_run(judge, 120, lambda t: [], start=6, room_motion=0.5, whole=0.2)
+    assert held[0][0] > 4 + 60                                # room motion holds, up to MOTION_MAX_SEC
+    judge = cp.RoomJudge(settings())
+    judge_run(judge, 6, lambda t: ROOM_HIT)
+    gone = judge_run(judge, 60, lambda t: [], start=6, room_motion=0.5, whole=0.6)
+    assert len(gone) == 1 and gone[0][1]["present"] is False and gone[0][0] <= 4 + 30 + 2
+
+
+# -- TC-1766 the couch check --------------------------------------------------
+
+COUCH_BODY = [("body", 0.6, (0.3, 0.8))]
+
+
+def test_tc1766_a_lying_person_seen_only_by_the_couch_check_is_held():
+    judge = cp.RoomJudge(couch_settings())
+    judge_run(judge, 6, lambda t: ROOM_HIT)
+    asked = []
+
+    def couch(t):
+        asked.append(t)
+        return COUCH_BODY
+    assert judge_run(judge, 1200, lambda t: [], couch=couch, start=6) == []     # 20 minutes lying down
+    assert judge.state.present and asked and min(asked) - 4 >= 6               # read only after 6 s quiet
+
+
+def test_tc1766_an_empty_couch_lets_absence_fall_at_the_hold():
+    judge = cp.RoomJudge(couch_settings())
+    judge_run(judge, 6, lambda t: ROOM_HIT)
+    events = judge_run(judge, 60, lambda t: [], couch=lambda t: [], start=6)
+    assert len(events) == 1 and events[0][1]["present"] is False and events[0][0] <= 4 + 30 + 2
+
+
+def test_tc1766_the_couch_check_never_turns_presence_on_and_is_not_read_when_absent():
+    judge = cp.RoomJudge(couch_settings())
+    asked = []
+    assert judge_run(judge, 120, lambda t: [], couch=lambda t: asked.append(t) or COUCH_BODY) == []
+    assert asked == [] and not judge.state.present
+
+
+def test_tc1766_without_a_crop_there_is_no_couch_check():
+    judge = cp.RoomJudge(settings())
+    judge_run(judge, 6, lambda t: ROOM_HIT)
+    assert not judge.wants_couch(20)
+
+
+def holds_bodies(s, boxes):
+    import holds
+    return holds.couch_bodies(boxes, s.hold_config(), s.zones.counts)
+
+
+def test_tc1766_a_body_cut_off_by_the_bottom_edge_and_a_body_on_the_treadmill_are_ignored():
+    s = couch_settings()
+    bottom = (0.6, 0.20, 0.60, 0.40, 0.99)                     # reaches the bottom edge (clothes on the ottoman)
+    treadmill = (0.6, 0.78, 0.30, 0.82, 0.80)
+    seat = (0.6, 0.20, 0.55, 0.40, 0.85)
+    assert holds_bodies(s, [bottom, treadmill]) == []
+    assert len(holds_bodies(s, [seat])) == 1
+
+
+# -- TC-1767 the couch geometry -----------------------------------------------
+
+
+def test_tc1767_couch_boxes_map_the_crop_image_back_to_the_whole_main_frame():
+    crop = (0.03, 0.40, 0.77, 1.00)
+    (box,) = cp.couch_boxes([(0.7, 480.0, 219.0, 96.0, 219.0)], 1.0, 960, 438, crop)
+    score, x0, y0, x1, y1 = box
+    assert score == 0.7
+    assert (x0, x1) == (pytest.approx(0.03 + 432 / 960 * 0.74), pytest.approx(0.03 + 528 / 960 * 0.74))
+    assert (y0, y1) == (pytest.approx(0.40 + 109.5 / 438 * 0.60), pytest.approx(0.40 + 328.5 / 438 * 0.60))
+    (half,) = cp.couch_boxes([(0.7, 240.0, 109.5, 48.0, 109.5)], 0.5, 960, 438, crop)
+    assert half[1:] == pytest.approx(box[1:])                  # the letterbox scale is undone
+
+
+def test_tc1767_the_couch_image_is_960_wide_and_its_height_even():
+    assert cp.couch_height((0.03, 0.40, 0.77, 1.00)) == 438   # the offline build's scale=960:-2 of 1420x648
+    assert cp.couch_height((0.0, 0.0, 1.0, 1.0)) == 540
+
+
+# -- TC-1768 one inference per keyframe ---------------------------------------
+
+
+class FakeSource:
+    def __init__(self):
+        self.frame = None
+
+    def latest(self, mono, max_age):
+        return self.frame
+
+
+@needs_numpy
+def test_tc1768_the_couch_model_runs_once_per_keyframe_and_a_stale_keyframe_is_missing():
+    s = couch_settings()
+    source = FakeSource()
+    detector = FakeDetector([(0.6, 300.0, 200.0, 100.0, 120.0)])
+    check = cp.CouchCheck(s, detector, source)
+    assert check.read(10.0) is None and check.missing == 1 and detector.calls == 0
+    source.frame = (1, np.zeros((438, 960, 3), dtype=np.uint8))
+    first = check.read(12.0)
+    again = check.read(14.0)
+    assert first == again and len(first) == 1 and detector.calls == 1 and check.inferences == 1
+    source.frame = (2, source.frame[1])
+    check.read(16.0)
+    assert detector.calls == 2
+
+
+@needs_numpy
+def test_tc1768_the_reader_keeps_the_newest_frame_and_restarts_its_decoder(monkeypatch):
+    import io
+    import threading
+    monkeypatch.setattr(cp, "COUCH_RESTART_SEC", 0.01)
+    w, h = 4, 2
+    frame = bytes(range(w * h * 3))
+    started, stopped = [], []
+    second = threading.Event()
+
+    class Proc:
+        def __init__(self, data):
+            self.stdout = io.BytesIO(data)
+
+    def start():
+        started.append(1)
+        if len(started) >= 2:
+            second.set()
+        return Proc(frame * 2 + b"\x00")                    # two whole frames, then a cut-off one: it ended
+
+    reader = cp.KeyframeReader(start, stopped.append, w, h, lambda m, warning=False: None)
+    reader.begin()
+    assert second.wait(5)
+    reader.end()
+    seq, latest = reader.latest(time.monotonic(), 60)
+    assert seq >= 2 and latest.shape == (h, w, 3) and latest.tobytes() == frame
+    assert reader.restarts >= 1 and len(stopped) >= 2
+    assert reader.latest(time.monotonic() + 100, 4.5) is None   # too old: no data
+
+
+# -- TC-1769 the couch decoder ------------------------------------------------
+
+
+def relay_env(tmp_path, main=True, extra=""):
+    path = tmp_path / "env"
+    path.write_text("LAN_IP=192.0.2.10\nCAMERA_LIVINGROOM_RELAY_RTSP_PORT=8564\nCAMERA_LIVINGROOM_RELAY_API_PORT=1994\n"
+                    "CAMERA_LIVINGROOM_RELAY_UPSTREAM_HOST=192.0.2.69\n"
+                    "CAMERA_LIVINGROOM_RELAY_UPSTREAM_PATH=/h264/ch1/sub/av_stream\n"
+                    "CAMERA_LIVINGROOM_RELAY_UPSTREAM_PASSWORD=ABCDEF\nCAMERA_LIVINGROOM_RELAY_EXPECT_SIZE=768x432\n"
+                    + ("CAMERA_LIVINGROOM_RELAY_MAIN_PATH=/h264/ch1/main/av_stream\n" if main else "") + extra)
+    return path
+
+
+def test_tc1769_the_couch_decoder_reads_main_keyframes_cropped_video_only_with_no_credential(tmp_path):
+    import camera_relay as cr
+    relay = cr.CameraRelaySettings(str(relay_env(tmp_path)), "livingroom")
+    argv, payload = cp.couch_decoder_command(relay.for_main(), "livingroom", (0.03, 0.40, 0.77, 1.00), 438)
+    joined = "\n".join(argv)
+    assert "ABCDEF" not in joined and "rtsp://" not in joined and "192.0.2.69" not in joined
+    assert argv[argv.index("--name") + 1] == "homehub-camera-presence-livingroom-couch"
+    assert argv[argv.index("-skip_frame") + 1] == "nokey" and "-an" in argv
+    assert argv[argv.index("-fps_mode") + 1] == "passthrough"
+    assert argv[argv.index("-vf") + 1] == "crop=iw*0.7400:ih*0.6000:iw*0.0300:ih*0.4000,scale=960:438"
+    assert argv[argv.index("--cpus") + 1] == "0.3"
+    assert b"@192.0.2.10:8564/livingroom-main'" in payload and b"audio" not in payload
+
+
+def test_tc1769_a_couch_crop_without_the_main_stream_refuses_with_78_and_starts_nothing(tmp_path, monkeypatch):
+    path = relay_env(tmp_path, main=False, extra='CAMERA_LIVINGROOM_PRESENCE_ROOM_POLYGON="%s"\n'
+                     'CAMERA_LIVINGROOM_PRESENCE_EXCLUDE_POLYGONS="%s"\nCAMERA_LIVINGROOM_PRESENCE_COUCH_CROP=%s\n'
+                     % (ROOM, TREADMILL, LIVING_CROP))
+    started = []
+    monkeypatch.setattr(dr, "start_consumer", lambda *a, **k: started.append(a))
+    monkeypatch.setattr(cp.subprocess, "run", lambda *a, **k: started.append(a))
+    assert cp.run_service(str(path), "livingroom", state_dir=str(tmp_path / "state")) == cp.EXIT_REFUSED
+    assert started == []
+
+
+def test_tc1769_the_unit_removes_the_couch_decoder_too():
+    u = (STACK / "camera-presence" / "homehub-camera-presence@.service").read_text(encoding="utf-8")
+    assert "ExecStopPost=-/usr/bin/docker rm -f homehub-camera-presence-%i-couch" in u.splitlines()
+
+
+# -- TC-1770 the cost verdict counts the couch decoder ------------------------
+
+
+def test_tc1770_the_cost_verdict_counts_every_part_and_a_missing_one_fails():
+    parts = {"detector": {"cpu_pct_one_core": 20.0}, "decoder": {"cpu_pct_one_core": 4.0},
+             "decoder_couch": {"cpu_pct_one_core": 2.5}}
+    assert cp.cost_verdict(parts, 30, True) == {"total_cpu_pct_one_core": 26.5, "budget_pct": 30, "pass": True}
+    assert cp.cost_verdict(parts, 25, True)["pass"] is False
+    assert cp.cost_verdict(dict(parts, decoder_couch={"missing": "/x"}), 30, True)["pass"] is False
+    assert cp.cost_verdict(dict(parts, decoder_couch={"missing": "/x"}), 30, False)["total_cpu_pct_one_core"] == 24.0
+
+
+# -- TC-1771 the frame's numbers are the offline build's ----------------------
+
+
+@needs_numpy
+def test_tc1771_brightness_and_whole_frame_motion_as_the_offline_build_computed_them():
+    m = cp.FrameMeasures(settings().zones)
+    dark = np.full((cp.MOTION_H, cp.MOTION_W), 5, dtype=np.uint8)
+    assert m.update(dark) == (5.0, 0.0, 0.0)
+    lit = np.full((cp.MOTION_H, cp.MOTION_W), 200, dtype=np.uint8)
+    bright, room, whole = m.update(lit)
+    assert bright == 200.0 and whole == 1.0 and room == 1.0
+    half = lit.copy()
+    half[:, : cp.MOTION_W // 2] = 0
+    assert m.update(half)[2] == pytest.approx(0.5)
+
+
+# -- TC-1772 the manifest pins the couch model --------------------------------
+
+
+def test_tc1772_the_manifest_pins_the_couch_models():
+    manifest = cp.read_manifest()
+    for name in ("yolov8n_640.onnx", "yolov8n_448.onnx", couch_settings().couch_model):
+        assert re.fullmatch(r"[0-9a-f]{64}", manifest[name]["sha256"])

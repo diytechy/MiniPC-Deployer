@@ -1,6 +1,7 @@
 # homehub-camera-presence@<camera> - room presence from one relayed camera
-# (SR-157..SR-160; stack/camera-presence/README.md). One frame a second from the
-# camera's own relay, video only; state changes on the IF-081 feed and in
+# (SR-157..SR-160; stack/camera-presence/README.md). One frame every two seconds
+# from the camera's own relay, video only (and, with the couch check, the main
+# stream's keyframes cropped to the couch); state changes on the IF-081 feed and in
 # /var/lib/homehub-presence/<camera>/status.json. It writes no frame anywhere.
 #
 # The knob is CAMERA_<CAMERA>_PRESENCE_ENABLED, read by ExecCondition (a clean
@@ -27,6 +28,7 @@ WorkingDirectory=/opt/homehub/stack
 ExecCondition=/usr/bin/python3 /opt/homehub/stack/camera-presence/camera_presence.py --camera %i condition
 ExecStart=/opt/homehub-presence/venv/bin/python /opt/homehub/stack/camera-presence/camera_presence.py --camera %i run
 ExecStopPost=-/usr/bin/docker rm -f homehub-camera-presence-%i
+ExecStopPost=-/usr/bin/docker rm -f homehub-camera-presence-%i-couch
 SyslogIdentifier=homehub-camera-presence
 StateDirectory=homehub-presence
 StateDirectoryMode=0750

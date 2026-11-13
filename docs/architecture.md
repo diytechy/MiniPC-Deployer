@@ -71,6 +71,10 @@ graph LR
   and the public path was retired on 2026-10-15, `f59f796`; HomeHub FOLLOWUPS
   "2026-10-15 — The hub went LAN/tunnel-only". The ddns node is gone from the
   diagram above for the same reason; see "DDNS" below.)*
+  *(Corrected 2026-11-12: a tailnet client reached Caddy but was refused by
+  every `@lan` site until `homehub-tailnet-keep-source.service` (SR-175):
+  tailscaled masquerades all it forwards, so Caddy saw a Docker bridge address.
+  See "A tailnet client at a LAN-only site" below.)*
 - **Auth split (D1/D2):** the tracker host goes through **oauth2-proxy** (Google
   sign-in, allow-list). The tracker container is bridge-only (`expose`, plus a
   loopback publish for the host feeders) so its only network ingress is a Caddy
@@ -1289,4 +1293,35 @@ sequenceDiagram
         end
         L->>L: on a change of state: status file, feed line, journal (SR-169)
     end
+```
+
+### A tailnet client at a LAN-only site, and the exit node beside it (SR-175, LLR-1600, LLR-1601)
+
+The hub's kernel decides what address a container sees. tailscaled marks every
+packet it forwards from `tailscale0` and masquerades every marked packet in nat
+POSTROUTING; Docker DNATs the published port into Caddy. The keep-source rule
+sits in mangle POSTROUTING, which runs first, and clears the mark only on
+packets leaving by a docker bridge. Proven against the real kernel in throwaway
+namespaces (`stack/tailscale/tests/keep-source-netns.test.sh`, TC-1860); the
+hub itself is the coordinator's deploy check.
+
+```mermaid
+sequenceDiagram
+    participant P as phone (tailnet 100.x)
+    participant F as hub filter FORWARD (ts-forward)
+    participant M as hub mangle POSTROUTING (keep-source)
+    participant N as hub nat POSTROUTING (ts-postrouting)
+    participant C as Caddy (on a br- bridge)
+    participant L as LAN host / internet (via eno1)
+    P->>F: SYN to the hub's LAN address :443, DNATed to Caddy
+    F->>F: mark 0x40000 (from tailscale0), ACCEPT
+    F->>M: out br-<id>
+    M->>M: -s 100.64.0.0/10 -o br-+ : clear 0x40000 (SR-175, LLR-1600)
+    M->>N: mark clear, so no MASQUERADE
+    N->>C: source still 100.x : @lan remote_ip {$LAN_CIDR} admits it
+    C-->>P: reply via the bridge gateway (this host), table 52, tailscale0
+    P->>F: exit-node or subnet-route traffic
+    F->>M: out eno1
+    M->>N: -o br-+ does not match, mark kept
+    N->>L: MASQUERADE to the hub's LAN address (unchanged)
 ```

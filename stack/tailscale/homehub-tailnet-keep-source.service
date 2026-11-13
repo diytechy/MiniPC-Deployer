@@ -1,0 +1,26 @@
+[Unit]
+# A tailnet client reaches the stack's published ports with its own address,
+# not the Docker bridge's: one mangle POSTROUTING rule that clears tailscaled's
+# masquerade mark on packets from the tailnet leaving by a docker bridge.
+# tailnet-keep-source.sh has the fault, the rule, what it leaves alone and why
+# no hook on tailscaled or docker is needed (neither touches mangle POSTROUTING).
+Description=Keep tailnet clients' own addresses on connections to the stack's published ports
+Documentation=file:///opt/homehub/stack/tailscale/tailnet-keep-source.sh
+
+# ORDERING ONLY. The rule needs neither daemon to exist (`br-+` is a wildcard
+# matched per packet), so nothing here pulls them in, and no Requires=/PartOf=
+# lets a `systemctl stop docker` (firstboot step 1b) reach this unit.
+After=docker.service tailscaled.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# bash named explicitly, so a delivery that loses the execute bit cannot stop it.
+ExecStart=/bin/bash /opt/homehub/stack/tailscale/tailnet-keep-source.sh apply
+TimeoutStartSec=60
+
+# The rule is NOT removed on stop, like the sibling fences. Rollback is
+# `tailnet-keep-source.sh remove`, or TAILSCALE_KEEP_SOURCE_TO_DOCKER=false.
+
+[Install]
+WantedBy=multi-user.target

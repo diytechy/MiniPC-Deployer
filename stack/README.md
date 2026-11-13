@@ -428,6 +428,12 @@ pinned `admin` network — one REJECT per address family, above Tailscale's
 an ntfy alert on drift. A failed fence does **not** stop Technitium (D-A5): it
 is the household resolver.
 
+A tailnet client reaches every published port with its **own** address, so
+Caddy's `@lan` gate admits it: `stack/tailscale/tailnet-keep-source.sh` keeps one
+mangle rule that stops tailscaled masquerading tailnet traffic into the docker
+bridges (SR-175; knob `TAILSCALE_KEEP_SOURCE_TO_DOCKER`, default true; IPv4 only).
+Its unit is installed by `setup-tailscale.sh`, and `--check-only` reports it.
+
 ### Healthchecks
 
 Each tool's healthcheck has been **run against its pinned image** (2026-08-01).

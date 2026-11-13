@@ -244,6 +244,11 @@ def test_active_policy_matches_the_recorded_digest_sr042():
 
 LAN = "192.168.1.0/24"
 EXIT = ["0.0.0.0/0", "::/0"]
+IPT_STUB = ROOT / "tests" / "fixtures" / "iptables_mangle_stub.py"
+KS_SCRIPT = ROOT / "stack" / "tailscale" / "tailnet-keep-source.sh"
+KS_UNIT = "homehub-tailnet-keep-source.service"
+KS_RULE = ["-s", "100.64.0.0/10", "-o", "br-+", "-m", "comment", "--comment",
+           "homehub-tailnet-keep-source", "-j", "MARK", "--set-xmark", "0x0/0x40000"]
 
 
 def _find_bash():
@@ -325,7 +330,7 @@ class _FakeHub:
     """A stand-in hub: the fake daemon, a no-op systemctl, and a .env."""
 
     def __init__(self, tmp_path, *, knob=None, routes=(LAN,), authorised=True,
-                 corpdns=False, fault=None):
+                 corpdns=False, fault=None, ipt_rules=None):
         py = Path(sys.executable).as_posix()
         self.bin = tmp_path / "bin"
         self.bin.mkdir()
@@ -334,7 +339,11 @@ class _FakeHub:
         shims = {
             "tailscale": 'exec "%s" "%s" "$@"\n' % (py, fake.as_posix()),
             "python3": 'exec "%s" "$@"\n' % py,
-            "systemctl": "exit 0\n",
+            # The keep-source rule (SR-175): a fake mangle table, and a restart
+            # of its unit runs the script's apply as systemd would.
+            "iptables": 'exec "%s" "%s" "$@"\n' % (py, IPT_STUB.as_posix()),
+            "systemctl": ('case "$1" in restart) [ "$2" = %s ] && exec bash "%s" apply ;; esac\n'
+                          'exit 0\n' % (KS_UNIT, KS_SCRIPT.as_posix())),
             "sysctl": "exit 0\n",
         }
         for name, body in shims.items():
@@ -373,6 +382,17 @@ class _FakeHub:
                    TAILSCALE_SYSCTL_FILE=self.sysctl.as_posix(),
                    FAKE_TS_STATE=self.state.as_posix(),
                    FAKE_TS_LOG=self.log.as_posix())
+        # The keep-source rule in place by default, so the exit-node cases
+        # judge the exit node alone; TC-1857 passes other chains.
+        self.ipt_state = tmp_path / "ipt.json"
+        self.ipt_state.write_text(json.dumps({"mangle/POSTROUTING": [list(r) for r in (
+            [KS_RULE] if ipt_rules is None else ipt_rules)]}), encoding="utf-8")
+        self.units = tmp_path / "units"
+        self.units.mkdir()
+        env.update(IPT_STATE=self.ipt_state.as_posix(),
+                   IPT_LOG=(tmp_path / "ipt.jsonl").as_posix(),
+                   TAILNET_KEEP_SOURCE_UNIT_DIR=self.units.as_posix(),
+                   TAILNET_KEEP_SOURCE_LOCK=(tmp_path / "ks.lock").as_posix())
         self.env = env
 
         # Refuse to run anything unless the fake is what `tailscale` means.
@@ -391,6 +411,10 @@ class _FakeHub:
     @property
     def calls(self):
         return [json.loads(l) for l in self.log.read_text(encoding="utf-8").splitlines() if l]
+
+    @property
+    def ipt_rules(self):
+        return json.loads(self.ipt_state.read_text(encoding="utf-8"))["mangle/POSTROUTING"]
 
     @property
     def routes(self):

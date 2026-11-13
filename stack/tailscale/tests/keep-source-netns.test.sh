@@ -44,7 +44,8 @@ pass() { PASS=$((PASS+1)); printf 'PASS  %s\n' "$*"; }
 fail() { FAIL=$((FAIL+1)); printf 'FAIL  %s\n' "$*"; }
 skip() { SKIP=$((SKIP+1)); printf 'SKIP  %s\n' "$*"; }
 check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1: got [$2], want [$3]"; fi; }
-finish() { printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"; [ "$FAIL" -eq 0 ]; exit $?; }
+# The last line is the runner's tally format: "<n> PASS  <n> FAIL  (<n> skipped)".
+finish() { printf '\n%d PASS  %d FAIL  (%d skipped)\n' "$PASS" "$FAIL" "$SKIP"; [ "$FAIL" -eq 0 ]; exit $?; }
 
 if [ "${1:-}" != --inside ]; then
     for t in unshare nsenter ip iptables python3; do

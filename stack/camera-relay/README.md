@@ -34,7 +34,7 @@ every consumer (the URL only in an ffconcat document on stdin), `probe`,
 | Upstream | the sub stream, `/h264/ch1/sub/av_stream` on 554 (768x432, ~10 fps). User `admin`; the password is the camera's verification code in **upper case** (RTSP is case-sensitive). Host T1 and code T3, from HomeHub's config and deploy store |
 | Listeners | RTSP on `LAN_IP:8564`, API on `127.0.0.1:1994`, both behind the camera's login (`local_auth`); WebRTC, SRTP and RTMP off; no Caddy route, no DNS name |
 | Stream | `livingroom` (camera names are knob names: `[a-z][a-z0-9]{0,15}`) |
-| Audio | `CAMERA_LIVINGROOM_RELAY_AUDIO=true`: the source has no media filter, and `default_query: video`. A consumer gets the AAC track only by asking (`/livingroom?video&audio`). No hub consumer asks, and each also passes `-an` |
+| Audio | `CAMERA_LIVINGROOM_RELAY_AUDIO=true`: the source has no media filter, and `default_query: video`. A consumer gets the AAC track only by asking (`/livingroom?video&audio`). No hub consumer asks except the voice listener (`../voice-listener/`, under the Owner's ruling of 2026-11-12, SR-156), and every other also passes `-an` |
 | Recording | **none**. The camera is not in `CAMERAS` (motion clips), and no recorder exists for it until the Owner rules on training capture (HomeHub open-items A81) |
 
 ## Deploy steps (the coordinator's)

@@ -309,8 +309,8 @@ for q in '' '?' '?src=door&src=door' '?src=%64oor' '?src=door%5Fflat' '?src=corn
 done
 # a listed name the viewer does not serve (no living-room relay in the lab): an answer, never video
 lr="$(probe ws "$LAN" "$PORT" "$NAME" '/api/ws?src=livingroom' --auth "$GOOD" --mse 3)"
-[ -z "$refused$unauth" ] && [ "$(echo "$lr" | field binary_bytes)" = 0 ] \
-    && ok "6 refused with the login: 11 other paths and 14 websocket queries (src absent, repeated, encoded, foreign, a URL, SRC, name=, trailing &, ;) -> 403; the same 14 without it from the open range -> 401; src=livingroom with no relay: no video" \
+[ -z "$refused$unauth" ] && [ "$(echo "$lr" | field status)" = 101 ] && [ "$(echo "$lr" | field binary_bytes)" = 0 ] \
+    && ok "6 refused with the login: 11 other paths and 14 websocket queries (src absent, repeated, encoded, foreign, a URL, SRC, name=, trailing &, ;) -> 403; the same 14 without it from the open range -> 401; src=livingroom with no relay: let through (101), no video" \
     || bad "6 not refused:$refused; open range without the login:$unauth; livingroom=$lr"
 
 # ── 7 door_flat as shipped, without the hub's graphics ───────────────────────

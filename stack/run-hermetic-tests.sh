@@ -55,6 +55,11 @@ SUITES=(
     # back over it. The netns half SKIPS where the kernel forbids it. A minute
     # or two; the waits it exercises are real seconds.
     "dns-console/tests/fence.test.sh"
+    # The tailnet keep-source rule (SR-175, TC-1860): a client, a container and a
+    # LAN host in throwaway netns, tailscaled's and Docker's rules imitated, the
+    # real kernel deciding what the container sees. SKIPS without unprivileged
+    # user namespaces. A few seconds.
+    "tailscale/tests/keep-source-netns.test.sh"
     # firstboot step 2b: the admin sign-in file, including the `$$` that
     # Materialize writes and the containers never see.
     "autoinstall/tests/admin-htpasswd.test.sh"

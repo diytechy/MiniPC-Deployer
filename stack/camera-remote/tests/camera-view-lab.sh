@@ -31,7 +31,8 @@
 #      lines: go2rtc holds NO listening socket; on its socket /api/streams,
 #      /api/config and /api are 404 and /stream.html is 200
 #   3  caddy from the compose defaults (no CAMERA_VIEW_* in .env): it loads
-#      (the login handle wired, with the lock) and the site answers 404 (off)
+#      (the login handle wired, with the lock) and the site answers 404 (off); the
+#      site block exactly as shipped (its login list empty) validates
 #   4  on with no login set: the door's page and both door streams open with no
 #      login; a stream behind the login (a lab name put in the shipped empty
 #      list) is a 401 to anyone, the lock's own text included
@@ -57,6 +58,9 @@
 #      unit's output redacted (no credential spelling, no userinfo)
 #  12  `camera_remote.py check` against this lab (caddy's own environment
 #      read back) passes; with caddy's LAN_CIDR made broad it fails
+#  13  where this host runs systemd: the two unit FILES under systemd (runtime
+#      only), the warm unit pulled in by the viewer, back after a viewer
+#      restart, its sandbox reaching the socket, both stopped with the viewer
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CR="$(cd "$HERE/.." && pwd)"
@@ -216,6 +220,13 @@ cut_block() {  # the real Caddyfile's block that starts with $1 at column 0
     cut_block '{$CAMERA_VIEW_HOST} {' | sed 's/{query} in \[\]/{query} in ["src=labprivate"]/'
 } >"$WORK/Caddyfile"
 grep -q 'in \["src=labprivate"\]' "$WORK/Caddyfile" || bad "lab: the login list was not found in the site block"
+# The block exactly as shipped (its login list EMPTY) must validate too: Caddy
+# compiles the CEL `in []` and provisions basic_auth with the compose lock.
+{ sed -n '1,/^}/p' "$WORK/Caddyfile"; printf '(acme_cloudflare) {\n    tls internal\n}\n'; cut_block '(throttle) {'; cut_block '{$CAMERA_VIEW_HOST} {'; } \
+    | sed 's/admin localhost:12019/admin off/' >"$WORK/Caddyfile.shipped"
+shipped_valid="$(docker run --rm -e CAMERA_VIEW_HOST=$NAME -e LAN_CIDR="$LANNET 100.64.0.0/10" -e CAMERA_VIEW_AUTH_USER=viewer \
+    -e CAMERA_VIEW_AUTH_HASH=bG9ja2Vk -v "$WORK/Caddyfile.shipped:/etc/caddy/Caddyfile:ro" "$CADDY_IMAGE" \
+    caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1 | grep -c 'Valid configuration')"
 caddy_env() {  # the caddy service's environment as compose interpolates it from $1
     docker compose -f "$LS/docker-compose.yml" --project-directory "$LS" --env-file "$1" config --format json 2>/dev/null \
       | python3 -c '
@@ -242,8 +253,8 @@ grep -v '^CAMERA_VIEW_' "$LS/.env" >"$WORK/env.defaults"
 start_caddy "$WORK/env.defaults"
 off="$(st /) $(st /stream.html) $(wst '/api/ws?src=door')"
 if grep -qx 'CAMERA_VIEW_AUTH_HASH=bG9ja2Vk' "$WORK/caddy.env" && grep -qx 'CAMERA_VIEW_ENABLED=false' "$WORK/caddy.env" \
-   && [ "$off" = "404 404 404" ]; then
-    ok "3 compose defaults: caddy loads (the login wired, locked) and the site answers 404 ($off)"
+   && [ "$off" = "404 404 404" ] && [ "$shipped_valid" = 1 ]; then
+    ok "3 compose defaults: caddy loads (the login wired, locked) and the site answers 404 ($off); the block as shipped (empty login list) validates"
 else bad "3 defaults: $off; $(docker logs "$CADDY" 2>&1 | tail -n 3)"; fi
 
 # ── 4 on with no hash: the door is open, a login stream is locked ────────────
@@ -324,7 +335,7 @@ if grep -q 'avc1' "$WORK/door.json" && grep -q 'avc1' "$WORK/flat.json" && [ "$(
    && [ "$(bytes "$WORK/flat.json")" -gt 10000 ] && [ "$idle" = 0 ] && [ "${busy:-0}" -ge 1 ] && [ "$after" = 0 ] \
    && ! grep -q LEAK "$WORK/scan.log" && grep -q 'SEEN ffconcat' "$WORK/scan.log"; then
     ok "8 on_demand MSE: door $(bytes "$WORK/door.json") B and door_flat $(bytes "$WORK/flat.json") B of avc1 (first video after $(field first_binary_s <"$WORK/flat.json") s); relay consumers $idle idle, $busy watched, $after after; no credential in any argv, environment or inspect; FFmpeg reads /config/door.ffconcat"
-else bad "8 MSE: door=$(cat "$WORK/door.json") flat=$(cat "$WORK/flat.json") consumers=$idle/$busy/$after scan=$(tr '\n' ' ' <"$WORK/scan.log")"; fi
+else bad "8 MSE: door=$(cat "$WORK/door.json") flat=$(cat "$WORK/flat.json") consumers=$idle/$busy/$after scan=$(tr '\n' ' ' <"$WORK/scan.log") procs=$(docker top homehub-camera-view -eo pid,comm 2>/dev/null | tail -n +2 | awk '{print $2}' | tr '\n' ' ') established=$(ss -Htn state established | grep -c ':18554 ' || true)"; fi
 
 # ── 9 always: the warm unit holds door_flat running, across a viewer restart ──
 stop_warm() {  # the python the unit line exec'd, not only the shell function around it
@@ -353,7 +364,7 @@ if [ "$c_od$c_al" = 10 ] && [ "${held:-0}" -ge 1 ] && [ "$running" -ge 1 ] && [ 
    && [ "$(grep -c 'is flowing' "$WORK/warm.log")" -ge 2 ] && [ "${back:-0}" -ge 1 ] && [ "$gone" = 0 ] \
    && ! grep -qF -f "$PAT" "$WORK/warm.log"; then
     ok "9 always: the warm unit's condition skips on_demand and passes always; with no page open the relay serves $held consumer(s) and FFmpeg runs; a page joining gets video after $(echo "$join" | field first_binary_s) s; the warm unit reconnects after a viewer restart; stopping it leaves 0 consumers"
-else bad "9 always: cond=$c_od/$c_al held=$held ffmpeg=$running join=$join back=$back gone=$gone log=$(tail -n 4 "$WORK/warm.log" | tr '\n' '|')"; fi
+else bad "9 always: cond=$c_od/$c_al held=$held ffmpeg=$running join=$join back=$back gone=$gone procs=$(docker top homehub-camera-view -eo pid,comm 2>/dev/null | tail -n +2 | awk '{print $2}' | tr '\n' ' ') warm=$(pgrep -fc 'camera_remote.py --env-file .* keep-warm' || true) log=$(tail -n 4 "$WORK/warm.log" | tr '\n' '|')"; fi
 sed -i 's/^CAMERA_VIEW_DOOR_FLAT_MODE=.*/CAMERA_VIEW_DOOR_FLAT_MODE=on_demand/' "$LS/.env"
 
 # ── 10 a docker bridge source ────────────────────────────────────────────────
@@ -387,5 +398,47 @@ else
 fi
 
 stop_viewer
+sed -i 's/^CAMERA_VIEW_DOOR_FLAT_MODE=.*/CAMERA_VIEW_DOOR_FLAT_MODE=always/' "$LS/.env"
+# ── 13 the two units under systemd itself (when this host runs systemd) ──────
+# The units as files, at their hub paths (/opt/homehub/stack is the lab stack
+# for the length of this check; refused if anything is there already), runtime
+# enabled only (/run/systemd/system): the viewer from systemd, the warm unit
+# pulled in by WantedBy, a viewer restart taking it down and back (BindsTo), the
+# warm unit's sandbox (no capabilities, no network, AF_UNIX only) reaching the
+# socket and getting a websocket answer, and both stopped with the viewer.
+# door_flat is rendered by the unit as shipped (VA-API), which this host cannot
+# encode, so "ended: error" from the warm unit is the expected answer here.
+if [ "$(ps -p 1 -o comm=)" = systemd ] && [ ! -e /opt/homehub ] && [ ! -e /run/systemd/system/homehub-camera-view.service ]; then
+    mkdir -p /opt/homehub && cp -a "$LS" /opt/homehub/stack   # a copy: the warm unit's PrivateTmp hides /tmp
+    cp "$VIEW_UNIT" "$WARM_UNIT" /run/systemd/system/
+    systemctl daemon-reload
+    systemctl enable --runtime homehub-camera-view-warm >/dev/null 2>&1
+    systemctl start homehub-camera-view
+    for _ in $(seq 1 60); do [ -S "$STATE/api.sock" ] && break; sleep 0.5; done
+    sleep 8
+    v1="$(systemctl is-active homehub-camera-view)"; w1="$(systemctl is-active homehub-camera-view-warm)"
+    systemctl restart homehub-camera-view
+    for _ in $(seq 1 60); do [ -S "$STATE/api.sock" ] && break; sleep 0.5; done
+    sleep 8
+    v2="$(systemctl is-active homehub-camera-view)"; w2="$(systemctl is-active homehub-camera-view-warm)"
+    answered="$(journalctl -u homehub-camera-view-warm --since '-2min' -o cat 2>/dev/null | grep -cE 'is flowing|ended: error' || true)"
+    leaked="$(journalctl -u homehub-camera-view -u homehub-camera-view-warm --since '-2min' -o cat 2>/dev/null | grep -cF -f "$PAT" || true)"
+    systemctl stop homehub-camera-view
+    sleep 2
+    v3="$(systemctl is-active homehub-camera-view)"; w3="$(systemctl is-active homehub-camera-view-warm)"
+    v3rc="$(systemctl show -p ExecMainStatus --value homehub-camera-view)"
+    case "$v3" in failed) v3=inactive;; esac   # stopped; its exit status is reported below
+    systemctl disable --runtime homehub-camera-view-warm >/dev/null 2>&1
+    rm -f /run/systemd/system/homehub-camera-view.service /run/systemd/system/homehub-camera-view-warm.service
+    systemctl daemon-reload; systemctl reset-failed homehub-camera-view homehub-camera-view-warm >/dev/null 2>&1
+    rm -rf /opt/homehub
+    if [ "$v1$w1" = activeactive ] && [ "$v2$w2" = activeactive ] && [ "$v3$w3" = inactiveinactive ] \
+       && [ "${answered:-0}" -ge 1 ] && [ "${leaked:-0}" = 0 ]; then
+        ok "13 under systemd: the viewer starts and pulls in the warm unit; after a viewer restart both are active again; the warm unit's sandbox reached the socket ($answered answer(s)); both stop with the viewer (its main process exited $v3rc); no credential in either journal"
+    else bad "13 systemd: viewer/warm $v1/$w1 then $v2/$w2 then $v3/$w3 answered=$answered leaked=$leaked $(journalctl -u homehub-camera-view-warm --since '-3min' -o cat | tail -n 3 | tr '\n' '|')"; fi
+else
+    echo "SKIP 13 not under systemd here, or /opt/homehub or the units already exist"
+fi
+
 echo "camera-view-lab: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

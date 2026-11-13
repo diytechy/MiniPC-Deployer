@@ -739,7 +739,10 @@ def warm_session(sock, stream: str, clock, on_flowing) -> str:
     """
     sock.sendall(ws_upgrade_request("/api/ws?src=%s" % stream, base64.b64encode(os.urandom(16)).decode()))
     reader = FrameReader(sock.recv)
-    status = reader.head()
+    try:
+        status = reader.head()
+    except EOFError:      # the viewer closed before answering (stopping, or not ready)
+        return "eof"
     if status != 101:
         return "refused %d" % status
     sock.sendall(ws_client_frame(json.dumps({"type": "mse", "value": ""}).encode("utf-8"), os.urandom(4)))
@@ -797,7 +800,7 @@ def keep_warm(socket_path: str, stream: str, log, redact, connect=unix_connect, 
             try:
                 why = warm_session(sock, stream, clock,
                                    lambda: log("camera-view warm: %s is flowing" % stream))
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, EOFError) as exc:
                 why = "dropped (%s)" % type(exc).__name__
             finally:
                 sock.close()

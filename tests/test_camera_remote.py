@@ -135,6 +135,14 @@ def test_tc1826_anything_else_is_refused(lan_cidr, fragment):
     assert any(fragment in r for r in reasons), reasons
 
 
+def test_tc1826_a_quoted_list_reads_as_compose_and_caddy_read_it(tmp_path):
+    # Materialize-Deploy quotes a value holding whitespace (the hub's LAN_CIDR is
+    # three @identity ranges); compose strips the quotes, and so must we.
+    s = settings(tmp_path, LAN_CIDR='"192.0.2.0/24 100.64.0.0/10"')
+    assert s.lan_cidr == "192.0.2.0/24 100.64.0.0/10"
+    assert cr.preflight(s, LAN, BRIDGES) == []
+
+
 def test_tc1826_a_network_overlapping_a_bridge_is_refused_even_inside_the_lan():
     bridges = [ipaddress.ip_network("192.0.2.128/25")]   # a bridge that collides with the LAN
     reasons = cr.source_violations("192.0.2.0/24", LAN, {}, bridges)
@@ -679,6 +687,8 @@ def test_tc1838_a_session_asks_for_door_flat_in_mse_and_reports_flowing_once():
     ([b"HTTP/1.1 403 Forbidden\r\n\r\n"], "refused 403"),
     ([UPGRADED, server_frame(1, b'{"type":"error","value":"mse: streams: exec/pipe: EOF"}')], "error "),
     ([UPGRADED], "eof"),
+    ([], "eof"),                                   # closed before any answer
+    ([b"HTTP/1.1 101 Switching"], "eof"),          # closed part-way through the answer
 ])
 def test_tc1838_a_session_ends_for_each_reason(script, why):
     assert cr.warm_session(FakeSock(script), "door_flat", lambda: 0.0, lambda: None).startswith(why)

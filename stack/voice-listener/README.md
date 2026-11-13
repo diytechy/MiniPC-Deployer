@@ -29,8 +29,10 @@ Owner changes it (HomeHub open-items A86). Until that ruling is recorded and its
 date is in the third key, `run` exits 78 before a reader, an engine or a socket
 starts. Nobody else may fill that key in. The first key is checked by `run` and
 `levels` themselves as well as by the unit's `ExecCondition`: started by hand
-with it false, both refuse the room's sound (review 2026-11-12). When the ruling comes, SR-156 and
-SN-055 are amended in the same change.
+with it false, both refuse the room's sound (review 2026-11-12). **The Owner ruled on
+2026-11-12** (HomeHub open-items A86 Part 1, option C: no end date, memory only, only a
+request's text leaves, to MINI-SERV); SR-156 and SN-055 were amended on 2026-11-13 to make
+this listener their one exception, and the ruling's key is `ratified-2026-11-12`.
 
 `CAMERA_<C>_LISTENER_UNTIL` gives a trial an end: at that UTC instant the
 listener stops itself, and a restart or a reboot after it starts nothing (the

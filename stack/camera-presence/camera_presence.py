@@ -623,7 +623,8 @@ class Evaluator:
 
 
 class Pacer:
-    """Judge at most FPS frames a second of WALL time. The decoder's fps filter
+    """Judge about FPS frames a second of WALL time (at most 1.25 x FPS: the
+    0.8 is tolerance for a steady stream's arrival jitter). The decoder's fps filter
     paces by the stream's timestamps, and a jump in them (an RTP glitch, a camera
     whose clock was set) makes it emit a backlog of duplicates as fast as the
     pipe drains: measured on the hub 2026-11-13, 1.6 frames a second for four
@@ -1128,6 +1129,7 @@ def run_service(env_file: str, camera: str, state_dir: str = STATE_DIR) -> int:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait(timeout=5)
     return code
 
 

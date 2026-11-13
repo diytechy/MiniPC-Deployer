@@ -254,11 +254,11 @@ def test_tc1846_cylindrical_output_keeps_square_pixels(tmp_path):
     assert cr.vertical_fov(960, 540, 110) == cr.vertical_fov(960, 540, 110, "flat") != v
 
 
-def test_tc1828_the_render_line_names_the_living_room_only_when_served():
-    assert cr.living_room_note({"door": "", "door_flat": ""}) == ""
-    assert cr.living_room_note({"door": "", "livingroom": ""}) == ", livingroom video only"
-    assert (cr.living_room_note({"livingroom-main": "", "livingroom": ""})
-            == ", livingroom and livingroom-main video only")
+def test_tc1828_the_render_line_names_the_indoor_streams_only_when_served():
+    assert cr.indoor_note({"door": "", "door_flat": ""}) == ""
+    assert cr.indoor_note({"door": "", "livingroom": ""}) == ", livingroom video only"
+    assert (cr.indoor_note({"livingroom-main": "", "livingroom": "", "corner": ""})
+            == ", livingroom and livingroom-main and corner video only")
 
 
 @pytest.mark.parametrize("over, key", [
@@ -329,13 +329,38 @@ def test_tc1828_the_living_room_is_video_only_through_its_own_relay(tmp_path):
     assert cfg["streams"]["livingroom"] == "rtsp://admin:ABCDEF@192.0.2.10:8564/livingroom#media=video"
     cfg = cr.view_config(settings(tmp_path, CAMERA_LIVINGROOM_RELAY_MAIN_PATH="/h264/ch1/main/av_stream",
                                   **LIVINGROOM))
-    assert set(cfg["streams"]) == set(cr.STREAMS) == {"door", "door_flat", "livingroom", "livingroom-main"}
+    assert set(cfg["streams"]) == {"door", "door_flat", "livingroom", "livingroom-main"}
     assert cfg["streams"]["livingroom-main"] == "rtsp://admin:ABCDEF@192.0.2.10:8564/livingroom-main#media=video"
     for name in ("livingroom", "livingroom-main"):    # never the relay's sound, which it offers on request
         assert "audio" not in cfg["streams"][name] and cfg["streams"][name].endswith("#media=video")
     off = dict(LIVINGROOM, CAMERA_LIVINGROOM_RELAY_ENABLED="false")    # the switch decides, not the main path
     cfg = cr.view_config(settings(tmp_path, CAMERA_LIVINGROOM_RELAY_MAIN_PATH="/h264/ch1/main/av_stream", **off))
     assert set(cfg["streams"]) == {"door", "door_flat"}
+
+
+CORNER = {"CAMERA_CORNER_RELAY_ENABLED": "true", "CAMERA_CORNER_RELAY_RTSP_PORT": "8574",
+          "CAMERA_CORNER_RELAY_API_PORT": "2004", "CAMERA_CORNER_RELAY_UPSTREAM_HOST": "192.0.2.70",
+          "CAMERA_CORNER_RELAY_UPSTREAM_PATH": "/sub", "CAMERA_CORNER_RELAY_MAIN_PATH": "/main",
+          "CAMERA_CORNER_RELAY_UPSTREAM_PASSWORD": "GHIJKL", "CAMERA_CORNER_RELAY_AUDIO": "false",
+          "CAMERA_CORNER_RELAY_EXPECT_SIZE": "512x288"}
+
+
+def test_tc1828_the_corner_camera_is_served_like_the_living_room(tmp_path):
+    cfg = cr.view_config(settings(tmp_path, **CORNER))
+    assert set(cfg["streams"]) == {"door", "door_flat", "corner", "corner-main"}
+    assert cfg["streams"]["corner"] == "rtsp://admin:GHIJKL@192.0.2.10:8574/corner#media=video"
+    assert cfg["streams"]["corner-main"] == "rtsp://admin:GHIJKL@192.0.2.10:8574/corner-main#media=video"
+    both = cr.view_config(settings(tmp_path, CAMERA_LIVINGROOM_RELAY_MAIN_PATH="/h264/ch1/main/av_stream",
+                                   **dict(LIVINGROOM, **CORNER)))
+    assert set(both["streams"]) == set(cr.STREAMS) == {"door", "door_flat", "livingroom", "livingroom-main",
+                                                       "corner", "corner-main"}
+    s = settings(tmp_path, **dict(LIVINGROOM, **CORNER))
+    assert len(s.relays()) == 3
+    out = cr.redact_all("GHIJKL ABCDEF at 192.0.2.70:554 and 192.0.2.69:554", s.relays())
+    for secret in ("GHIJKL", "ABCDEF", "192.0.2.70", "192.0.2.69"):
+        assert secret not in out, secret
+    off = dict(CORNER, CAMERA_CORNER_RELAY_ENABLED="false")
+    assert set(cr.view_config(settings(tmp_path, **off))["streams"]) == {"door", "door_flat"}
 
 
 def test_tc1828_both_relays_logins_are_redacted(tmp_path):
@@ -654,18 +679,48 @@ def test_tc1834_everything_else_is_behind_the_login_and_names_every_stream():
     assert b.count("basic_auth") == 1
 
 
-def test_tc1834_only_the_player_and_the_redirects():
+def test_tc1834_behind_the_login_only_the_page_the_two_scripts_and_the_streams():
     b = site_block()
-    assert re.search(r"@cv_player \{\n\s+method GET HEAD\n\s+path /stream.html /video-stream.js /video-rtc.js\n\s+\}", b)
-    assert "redir * /stream.html?src=door_flat&src=livingroom&mode=mse 302" in handle(b, "/")
-    for path, src in (("/door", "door_flat"), ("/raw", "door"), ("/livingroom", "livingroom"),
-                      ("/livingroom-main", "livingroom-main")):
-        assert "redir * /stream.html?src=%s&mode=mse 302" % src in handle(b, path)
-    assert not re.search(r"redir /", b)        # `redir /x` reads /x as a matcher: every redirect a blank 200
+    login = b[b.index("            basic_auth {"):]
+    assert re.search(r"@cv_player \{\n\s+method GET HEAD\n\s+path /video-stream.js /video-rtc.js\n\s+\}", login)
+    assert "stream.html" not in login            # go2rtc's own page only through the open door (the LAN)
+    assert re.search(r"@cv_page \{\n\s+method GET HEAD\n\s+path /\n\s+\}", login)
+    page = handle(b, "@cv_page")
+    assert "root * /srv/camera-page" in page and "rewrite * /index.html" in page and "file_server" in page
+    assert "browse" not in page and "redir" not in b
     assert b.count("reverse_proxy unix//srv/camera-view/api.sock {") == 4
     for proxy in re.findall(r"reverse_proxy unix//srv/camera-view/api.sock \{[^}]*\}", b):
         assert "header_up -Authorization" in proxy and "header_up -Cookie" in proxy
     assert not re.search(r"handle /api", b)
+
+
+def test_tc1834_the_page_dir_is_bound_read_only_into_caddy():
+    assert "- ./camera-remote/www:/srv/camera-page:ro" in compose_block("caddy")
+
+
+# ── TC-1847 the landing page ─────────────────────────────────────────────────
+
+
+def page_text():
+    return open(cr.PAGE_FILE, encoding="utf-8").read()
+
+
+def test_tc1847_four_tiles_small_streams_full_screen_on_the_main_ones():
+    text = page_text()
+    cams = re.findall(r"\{ label: '([^']+)',\s+tile: '([a-z_-]+)',\s+full: '([a-z_-]+)' \}", text)
+    assert [c[1:] for c in cams] == [("door", "door"), ("door_flat", "door_flat"),
+                                     ("livingroom", "livingroom-main"), ("corner", "corner-main")]
+    assert {name for _, tile, full in cams for name in (tile, full)} == set(cr.STREAMS)
+
+
+def test_tc1847_the_page_asks_for_nothing_the_gate_does_not_pass():
+    text = page_text()
+    assert not re.search(r"https?://|//[a-z0-9.-]+\.[a-z]{2,}/", text, re.I)    # no external URL
+    assert re.findall(r'src="([^"]+)"', text) == ["/video-stream.js"]             # its one script
+    assert "'/api/ws?src=' + encodeURIComponent(stream)" in text                    # one src, nothing else
+    assert "el.mode = 'mse'" in text and "el.media = 'video'" in text               # MSE, never sound
+    assert "requestFullscreen" in text and "position: fixed; inset: 0" in text      # full screen, or the window
+    assert "grid.remove()" in text                                                  # tiles close while one is shown
 
 
 def test_tc1834_every_variable_is_passed_by_caddys_compose_environment():

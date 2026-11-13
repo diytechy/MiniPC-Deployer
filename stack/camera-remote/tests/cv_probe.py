@@ -7,7 +7,8 @@ one JSON line. The certificate is not verified (the lab's Caddy issues from
 its own local CA).
 
     cv_probe.py http ADDRESS PORT NAME PATH [--auth USER:PASS | --auth-stdin]
-        -> {"status": 302, "location": "..."}
+        -> {"status": 200, "location": "...", "content_type": "...",
+            "body_bytes": N, "body_sha256": "..."}   (the body itself is never kept)
     cv_probe.py ws ADDRESS PORT NAME PATH [--auth USER:PASS | --auth-stdin] [--mse SECONDS]
         -> {"status": 101, "text": [...first text frames...], "binary_bytes": N}
            With --mse it sends {"type":"mse"} after the upgrade, as go2rtc's
@@ -20,6 +21,7 @@ On the hub's trial (HomeHub's runbook) the real shared login must not: there,
 """
 
 import base64
+import hashlib
 import json
 import os
 import socket
@@ -66,9 +68,21 @@ def request(sock, name, path, auth, extra=()):
 def http(address, port, name, path, auth):
     sock = connect(address, port, name)
     request(sock, name, path, auth, ["Connection: close"])
-    status, headers, _ = head_lines(sock)
+    status, headers, body = head_lines(sock)
+    # The body is counted and hashed, never kept or printed: the lab and the
+    # trial compare the hash with the shipped page's.
+    try:
+        while len(body) < (1 << 20):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            body += chunk
+    except OSError:
+        pass
     sock.close()
-    return {"status": status, "location": headers.get("location", "")}
+    return {"status": status, "location": headers.get("location", ""),
+            "content_type": headers.get("content-type", ""), "body_bytes": len(body),
+            "body_sha256": hashlib.sha256(body).hexdigest()}
 
 
 def read_exact(sock, n, rest):

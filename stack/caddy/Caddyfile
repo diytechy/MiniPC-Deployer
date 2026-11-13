@@ -1103,22 +1103,24 @@ ntfy.{$DOMAIN} {
 #      src=door_flat.
 #   5. everything else: basic_auth (one user, a bcrypt hash; the password
 #      never reaches the hub), then exactly these, and 403 for the rest
-#      (/api/streams, /api/config, the other go2rtc pages, frames, mp4, hls):
-#        /                 302 to the player with the straightened door and
-#                          the living room side by side
-#        /door /raw /livingroom /livingroom-main   302 to one camera's player
-#        /stream.html /video-stream.js /video-rtc.js   go2rtc's player, GET/HEAD
+#      (/api/streams, /api/config, go2rtc's own pages, stream.html included,
+#      frames, mp4, hls):
+#        /                 the landing page, GET/HEAD: one file,
+#                          stack/camera-remote/www/index.html, bound read-only
+#                          at /srv/camera-page (four tiles; one camera full
+#                          screen on a tap; the operator, 2026-11-13)
+#        /video-stream.js /video-rtc.js   go2rtc's player scripts, GET/HEAD
 #        /api/ws           THE STREAM GATE: the raw query must be EXACTLY
-#                          src=<one of the four names>. go2rtc's handler takes
+#                          src=<one of the six names>. go2rtc's handler takes
 #                          `src`, and a src that is not a stream name CREATES a
 #                          stream from it (an rtsp:// URL is accepted), and
 #                          with `name=` it REPLACES an existing stream's source
 #                          (internal/streams GetOrPatch, Patch). So: one `src`,
 #                          canonical spelling, nothing else - absent, repeated,
 #                          percent-encoded, foreign or extra keys are all 403.
-#                          A listed name the viewer does not serve (the living
-#                          room while its relay is off) creates nothing: it has
-#                          no scheme. No method matcher: a browser may open the
+#                          A listed name the viewer does not serve (an indoor
+#                          camera while its relay is off) creates nothing: it
+#                          has no scheme. No method matcher: a browser may open the
 #                          websocket over HTTP/2 as an extended CONNECT.
 #      The names are camera_remote.py's STREAMS and DOOR_STREAMS; the tests
 #      hold the lists equal.
@@ -1182,7 +1184,7 @@ ntfy.{$DOMAIN} {
             }
             @cv_stream {
                 path /api/ws
-                expression `{query} in ["src=door", "src=door_flat", "src=livingroom", "src=livingroom-main"]`
+                expression `{query} in ["src=door", "src=door_flat", "src=livingroom", "src=livingroom-main", "src=corner", "src=corner-main"]`
             }
             handle @cv_stream {
                 reverse_proxy unix//srv/camera-view/api.sock {
@@ -1192,7 +1194,7 @@ ntfy.{$DOMAIN} {
             }
             @cv_player {
                 method GET HEAD
-                path /stream.html /video-stream.js /video-rtc.js
+                path /video-stream.js /video-rtc.js
             }
             handle @cv_player {
                 reverse_proxy unix//srv/camera-view/api.sock {
@@ -1200,20 +1202,15 @@ ntfy.{$DOMAIN} {
                     header_up -Cookie
                 }
             }
-            handle / {
-                redir * /stream.html?src=door_flat&src=livingroom&mode=mse 302
+            # The landing page: the one file, whatever / is asked for with.
+            @cv_page {
+                method GET HEAD
+                path /
             }
-            handle /door {
-                redir * /stream.html?src=door_flat&mode=mse 302
-            }
-            handle /raw {
-                redir * /stream.html?src=door&mode=mse 302
-            }
-            handle /livingroom {
-                redir * /stream.html?src=livingroom&mode=mse 302
-            }
-            handle /livingroom-main {
-                redir * /stream.html?src=livingroom-main&mode=mse 302
+            handle @cv_page {
+                root * /srv/camera-page
+                rewrite * /index.html
+                file_server
             }
             handle {
                 respond "cameras: not here" 403

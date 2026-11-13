@@ -54,6 +54,9 @@ no relay).
     streams, **video only** (`#media=video`: its camera's sound is never asked
     for), served only while `CAMERA_LIVINGROOM_RELAY_ENABLED` is `true` (the
     main stream only while that relay serves one, `_MAIN_PATH`);
+  - `corner` and `corner-main`: the corner camera's relay
+    (`homehub-camera-relay@corner`, 2026-11-13), the same way, while
+    `CAMERA_CORNER_RELAY_ENABLED` is `true`;
   - `door`: the relay's H.264 copied as it is (the raw 1536x1536 circle);
   - `door_flat`: go2rtc's `exec:` source runs FFmpeg in the same image:
     `fps=10,v360=input=fisheye:output=flat:ih_fov=180:iv_fov=180:h_fov=110:v_fov=77.5521:yaw=0:pitch=0:w=960:h=540:interp=linear`
@@ -145,11 +148,10 @@ one: 401), then exactly
 
 | Request | Answer |
 |---|---|
-| `/` | 302 to `/stream.html?src=door_flat&src=livingroom&mode=mse` (both side by side) |
-| `/door`, `/raw`, `/livingroom`, `/livingroom-main` | 302 to that one stream's player (`/door` the straightened, `/raw` the circle) |
-| `GET`/`HEAD` `/stream.html`, `/video-stream.js`, `/video-rtc.js` | go2rtc's player |
-| `/api/ws` with the raw query **exactly** `src=` one of `door`, `door_flat`, `livingroom`, `livingroom-main` | the stream |
-| anything else | 403 |
+| `GET`/`HEAD` `/` | the landing page (`www/index.html`, below) |
+| `GET`/`HEAD` `/video-stream.js`, `/video-rtc.js` | go2rtc's player scripts |
+| `/api/ws` with the raw query **exactly** `src=` one of `door`, `door_flat`, `livingroom`, `livingroom-main`, `corner`, `corner-main` | the stream |
+| anything else (`/stream.html`, the earlier `/door`, `/raw` redirects included) | 403 |
 
 A listed name the viewer does not serve (the living room while its relay is
 off) creates nothing in go2rtc (it has no scheme): the player shows that tile's
@@ -181,6 +183,24 @@ range, if the Owner rules it in); a ruled-in IPv6 range must lie inside
 Tailscale's `fd7a:115c:a1e0::/48`. Messages name entries by position, never
 by value. `check` puts **caddy's own** `LAN_CIDR` (read with `docker
 inspect`, every other variable dropped) through the same list.
+
+## The landing page (`www/index.html`)
+
+The operator, 2026-11-13: all four views on one page, each shown full screen
+on a tap, viewable remotely (over the tailnet, behind the login). One file,
+bound read-only into caddy at `/srv/camera-page`, served at `/` behind the
+login; no other file and no external URL. Four tiles, each go2rtc's own
+player (`video-stream.js`, MSE, video only) on a camera's **small** stream:
+the door's raw circle (`door`), the door straightened (`door_flat`), the
+living room (`livingroom`), the corner (`corner`). A tap shows that camera
+alone on its **main** stream where one exists (`livingroom-main`,
+`corner-main`; the door's two have one each), in the browser's full screen
+where it allows it and filling the window where it does not (an iPhone's
+Safari, for one). The grid is taken out of the page meanwhile, so its four
+streams close (the player disconnects 5 s after it leaves the page): one
+stream at a time crosses mobile data in that view. The close button, Escape,
+Back or leaving full screen returns to the grid. A camera whose relay is off
+shows its tile's error ("stream not found") and the others play.
 
 ## The open door (`CAMERA_VIEW_DOOR_OPEN_CIDR`)
 

@@ -253,6 +253,9 @@ services:
       # creates the directory if caddy starts first (root 0755; the unit's
       # StateDirectoryMode tightens it to 0700 when it runs).
       - /var/lib/homehub-camera-view:/srv/camera-view:ro
+      # The camera page's landing page (SR-171): one file served behind the
+      # login at /; the directory, so a delivered index.html is seen at once.
+      - ./camera-remote/www:/srv/camera-page:ro
       # THE ACCESS LOG fail2ban READS, and it is a BIND MOUNT rather than a
       # named volume on purpose: fail2ban runs on the HOST and has to be able to
       # tail the file. Only the admin sign-in host and the LLM gateway log here
@@ -1764,6 +1767,40 @@ services:
     volumes:
       - type: bind
         source: /run/homehub-camera-relay-livingroom/go2rtc.yaml
+        target: /config/go2rtc.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    logging:
+      driver: none
+    labels:
+      - "diun.enable=false"
+
+  # ── camera-relay-corner — the corner camera's own relay (SR-155, SR-170) ────
+  #
+  # The living room's relay, line for line, for the corner camera (the
+  # operator, 2026-11-13: the camera page shows all four views). Its camera's
+  # one RTSP session, re-served on the LAN with that camera's own login; sub
+  # and main streams, never its sound (CAMERA_CORNER_RELAY_AUDIO=false).
+  # LIFECYCLE: homehub-camera-relay@corner.service; knob
+  # CAMERA_CORNER_RELAY_ENABLED. NEVER add the profile to COMPOSE_PROFILES.
+  camera-relay-corner:
+    image: ${DOOR_RELAY_IMAGE}
+    container_name: homehub-camera-relay-corner
+    profiles: ["camera-relay-corner"]
+    network_mode: host
+    restart: "no"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.5
+    volumes:
+      - type: bind
+        source: /run/homehub-camera-relay-corner/go2rtc.yaml
         target: /config/go2rtc.yaml
         read_only: true
         bind:

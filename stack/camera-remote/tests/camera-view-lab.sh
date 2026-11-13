@@ -37,9 +37,12 @@
 #      site block as shipped validates
 #   4  on with no login set and no open range: everything is a 401
 #   5  on with the login and the door open to the LAN: the player and both
-#      door streams with no login; /, the living room's streams and the rest
-#      need the login (none or wrong 401, right 101 / 302); with the open
-#      range emptied the door needs the login too
+#      door streams with no login; the landing page, the indoor cameras'
+#      streams and the rest need the login (none or wrong 401; right: the page
+#      200 and byte for byte the shipped www/index.html, the streams 101); the
+#      old redirects and go2rtc's stream.html behind the login are gone (403
+#      from outside the open range); with the open range emptied the door needs
+#      the login too
 #   6  refused (403) even with the login: other API paths and pages, and the
 #      websocket with src absent, repeated, percent-encoded, foreign, an
 #      rtsp:// URL, upper-case SRC, an extra name=, a trailing & or a ;
@@ -250,7 +253,8 @@ start_caddy() {  # $1: an env file for compose
     docker rm -f "$CADDY" >/dev/null 2>&1
     caddy_env "$1" >"$WORK/caddy.env"
     docker run -d --name "$CADDY" --network host --env-file "$WORK/caddy.env" \
-        -v "$WORK/Caddyfile:/etc/caddy/Caddyfile:ro" -v "$STATE:/srv/camera-view:ro" "$CADDY_IMAGE" >/dev/null
+        -v "$WORK/Caddyfile:/etc/caddy/Caddyfile:ro" -v "$STATE:/srv/camera-view:ro" \
+        -v "$LS/camera-remote/www:/srv/camera-page:ro" "$CADDY_IMAGE" >/dev/null   # compose's three camera binds
     for _ in $(seq 1 40); do
         [ "$(probe http "$LAN" "$PORT" "$NAME" / | field status)" != -1 ] && return 0; sleep 0.5
     done
@@ -280,19 +284,20 @@ four="$(st /) $(st /stream.html) $(wst '/api/ws?src=door') $(wst '/api/ws?src=do
 # The lab's requests come from its LAN address, inside the open range.
 start_caddy "$LS/.env"
 root="$(probe http "$LAN" "$PORT" "$NAME" / --auth "$GOOD")"
-raw="$(probe http "$LAN" "$PORT" "$NAME" /raw --auth "$GOOD")"
+page_sha="$(sha256sum "$CR/www/index.html" | awk '{print $1}')"
+gone5="$(st /raw "$GOOD") $(st /door "$GOOD") $(st /livingroom "$GOOD") $(st /index.html "$GOOD")"
 open5="$(st /stream.html) $(st /video-stream.js) $(st /video-rtc.js) $(wst '/api/ws?src=door') $(wst '/api/ws?src=door_flat')"
-login5="$(st /) $(st / 'viewer:wrong') $(echo "$root" | field status) $(wst '/api/ws?src=livingroom') $(wst '/api/ws?src=livingroom' 'viewer:wrong') $(wst '/api/ws?src=livingroom' "$GOOD") $(wst '/api/ws?src=livingroom-main' "$GOOD")"
+login5="$(st /) $(st / 'viewer:wrong') $(echo "$root" | field status) $(wst '/api/ws?src=livingroom') $(wst '/api/ws?src=livingroom' 'viewer:wrong') $(wst '/api/ws?src=livingroom' "$GOOD") $(wst '/api/ws?src=livingroom-main' "$GOOD") $(wst '/api/ws?src=corner') $(wst '/api/ws?src=corner' "$GOOD") $(wst '/api/ws?src=corner-main' "$GOOD")"
 # and with the open range emptied: the door needs the login too
 sed "s|^CAMERA_VIEW_DOOR_OPEN_CIDR=.*|CAMERA_VIEW_DOOR_OPEN_CIDR=|" "$LS/.env" >"$WORK/env.closed"
 start_caddy "$WORK/env.closed"
 closed5="$(st /stream.html) $(wst '/api/ws?src=door') $(wst '/api/ws?src=door' "$GOOD") $(st /stream.html "$GOOD")"
 start_caddy "$LS/.env"
-if [ "$open5" = "200 200 200 101 101" ] && [ "$login5" = "401 401 302 401 401 101 101" ] && [ "$closed5" = "401 401 101 200" ] \
-   && [ "$(echo "$root" | field location)" = "/stream.html?src=door_flat&src=livingroom&mode=mse" ] \
-   && [ "$(echo "$raw" | field location)" = "/stream.html?src=door&mode=mse" ]; then
-    ok "5 the door open to the LAN with no login (player and both door streams: $open5); everything else behind the login ($login5); with the open range empty the door needs it too ($closed5)"
-else bad "5 login/open: open=$open5 login=$login5 closed=$closed5 root=$root raw=$raw"; fi
+if [ "$open5" = "200 200 200 101 101" ] && [ "$login5" = "401 401 200 401 401 101 101 401 101 101" ] \
+   && [ "$closed5" = "401 401 101 403" ] && [ "$gone5" = "403 403 403 403" ] \
+   && [ "$(echo "$root" | field body_sha256)" = "$page_sha" ] && echo "$root" | field content_type | grep -q '^text/html'; then
+    ok "5 the door open to the LAN with no login (player and both door streams: $open5); everything else behind the login ($login5), the page the shipped file byte for byte, the old redirects gone ($gone5); with the open range empty the door needs it too ($closed5)"
+else bad "5 login/open: open=$open5 login=$login5 closed=$closed5 gone=$gone5 root=$root"; fi
 
 # ── 6 refused, even with the login ───────────────────────────────────────────
 refused="" unauth=""
@@ -300,7 +305,7 @@ for p in /api/streams /api/config /api /index.html /add.html /config.html '/api/
          '/api/stream.mp4?src=door' '/api/stream.m3u8?src=door' '/api/frame.jpeg?src=door' /api/log; do
     s="$(st "$p" "$GOOD")"; [ "$s" = 403 ] || refused="$refused $p=$s"
 done
-for q in '' '?' '?src=door&src=door' '?src=%64oor' '?src=door%5Fflat' '?src=corner' \
+for q in '' '?' '?src=door&src=door' '?src=%64oor' '?src=door%5Fflat' '?src=garage' \
          '?src=rtsp%3A%2F%2F127.0.0.1%3A8654%2FH.264' '?SRC=door' '?src=door&name=door' '?name=door&src=door' \
          '?src=door&' '?src=door;name=x' '?src=door_flat&src=door' '?src=livingroom&name=door'; do
     s="$(wst "/api/ws$q" "$GOOD")"; [ "$s" = 403 ] || refused="$refused ws$q=$s"
@@ -309,9 +314,11 @@ for q in '' '?' '?src=door&src=door' '?src=%64oor' '?src=door%5Fflat' '?src=corn
 done
 # a listed name the viewer does not serve (no living-room relay in the lab): an answer, never video
 lr="$(probe ws "$LAN" "$PORT" "$NAME" '/api/ws?src=livingroom' --auth "$GOOD" --mse 3)"
+co="$(probe ws "$LAN" "$PORT" "$NAME" '/api/ws?src=corner-main' --auth "$GOOD" --mse 3)"
 [ -z "$refused$unauth" ] && [ "$(echo "$lr" | field status)" = 101 ] && [ "$(echo "$lr" | field binary_bytes)" = 0 ] \
-    && ok "6 refused with the login: 11 other paths and 14 websocket queries (src absent, repeated, encoded, foreign, a URL, SRC, name=, trailing &, ;) -> 403; the same 14 without it from the open range -> 401; src=livingroom with no relay: let through (101), no video" \
-    || bad "6 not refused:$refused; open range without the login:$unauth; livingroom=$lr"
+    && [ "$(echo "$co" | field status)" = 101 ] && [ "$(echo "$co" | field binary_bytes)" = 0 ] \
+    && ok "6 refused with the login: 11 other paths and 14 websocket queries (src absent, repeated, encoded, foreign, a URL, SRC, name=, trailing &, ;) -> 403; the same 14 without it from the open range -> 401; src=livingroom and src=corner-main with no relay: let through (101), no video" \
+    || bad "6 not refused:$refused; open range without the login:$unauth; livingroom=$lr; corner-main=$co"
 
 # ── 7 door_flat as shipped, without the hub's graphics ───────────────────────
 flat="$(probe ws "$LAN" "$PORT" "$NAME" '/api/ws?src=door_flat' --mse 8)"
@@ -411,7 +418,8 @@ if [ "$CADDY" = caddy ]; then
     sed -i "s|^LAN_CIDR=.*|LAN_CIDR=10.0.0.0/8 100.64.0.0/10|" "$WORK/caddy.env"
     docker rm -f caddy >/dev/null 2>&1
     docker run -d --name caddy --network host --env-file "$WORK/caddy.env" \
-        -v "$WORK/Caddyfile:/etc/caddy/Caddyfile:ro" -v "$STATE:/srv/camera-view:ro" "$CADDY_IMAGE" >/dev/null
+        -v "$WORK/Caddyfile:/etc/caddy/Caddyfile:ro" -v "$STATE:/srv/camera-view:ro" \
+        -v "$LS/camera-remote/www:/srv/camera-page:ro" "$CADDY_IMAGE" >/dev/null   # compose's three camera binds
     cr check >"$WORK/check-broad.json"; rc_broad=$?
     if [ "$rc_ok" = 0 ] && [ "$rc_broad" = 1 ] && grep -q "caddy's own LAN_CIDR entry 1" "$WORK/check-broad.json"; then
         ok "12 check: passes against the lab; fails once caddy's own LAN_CIDR holds 10.0.0.0/8"

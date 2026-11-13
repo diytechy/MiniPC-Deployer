@@ -1,0 +1,164 @@
+<!doctype html>
+<!--
+  The camera page's landing page (SN-057, SR-171; stack/camera-remote/README.md).
+  Served by Caddy at cameras.<domain>/ BEHIND THE SHARED LOGIN, from this file
+  alone: no other file, no external URL. Four tiles, each go2rtc's own player
+  (video-stream.js, MSE only, video only) on a camera's SMALL stream; tapping a
+  tile shows that camera alone, on its MAIN stream where one exists, in the
+  browser's full screen when it allows it and filling the window when it does
+  not (a phone that refuses the Fullscreen API still gets the whole screen).
+  Back, Escape, the close button or leaving full screen returns to the grid.
+  While one camera is shown, the grid is taken out of the page, so its four
+  streams close (go2rtc's player disconnects 5 s after it leaves the page):
+  only one stream crosses mobile data at a time in that view.
+  The stream names are camera_remote.STREAMS; tests/test_camera_remote.py holds
+  this file to them and to Caddy's list.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>Cameras</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #000; color: #eee;
+               font: 15px/1.3 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #grid { display: grid; gap: 4px; padding: 4px; box-sizing: border-box; min-height: 100%;
+          grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); align-content: start; }
+  .tile { position: relative; background: #111; aspect-ratio: 16 / 9; overflow: hidden; cursor: pointer; }
+  .tile video-stream, .view video-stream { display: block; width: 100%; height: 100%; }
+  .tile video, .view video { object-fit: contain; background: #000; }
+  /* Every tap on a tile is ours: the player's own controls never take it. */
+  .tile .tap { position: absolute; inset: 0; z-index: 2; }
+  .label { position: absolute; left: 0; bottom: 0; z-index: 3; padding: 4px 8px; pointer-events: none;
+           background: rgba(0, 0, 0, .55); font-weight: 600; }
+  .view { position: fixed; inset: 0; z-index: 10; background: #000; }
+  .view .label { top: 0; bottom: auto; }
+  .close { position: absolute; top: max(8px, env(safe-area-inset-top)); right: max(8px, env(safe-area-inset-right));
+           z-index: 12; width: 44px; height: 44px; border: 0; border-radius: 22px; font-size: 26px; line-height: 44px;
+           color: #fff; background: rgba(0, 0, 0, .6); cursor: pointer; }
+  /* go2rtc's player prints its own state (mode, status) in a corner: keep it small. */
+  video-stream .info { font-size: 11px; }
+</style>
+<script type="module" src="/video-stream.js"></script>
+</head>
+<body>
+<div id="grid"></div>
+<script type="module">
+  // Each camera: its label, the stream its tile plays, the stream its full view plays.
+  // The door's straightened picture is made once on the hub (960x540); its raw circle
+  // has a single stream; the indoor cameras' tiles take the sub streams, their full
+  // views the main streams.
+  const CAMERAS = [
+    { label: 'Door',                 tile: 'door',       full: 'door' },
+    { label: 'Door, straightened',   tile: 'door_flat',  full: 'door_flat' },
+    { label: 'Living room',          tile: 'livingroom', full: 'livingroom-main' },
+    { label: 'Corner',               tile: 'corner',     full: 'corner-main' },
+  ];
+
+  await customElements.whenDefined('video-stream');
+
+  // One of go2rtc's players on one stream: MSE only, video only, no controls.
+  function player(stream) {
+    const el = document.createElement('video-stream');
+    el.mode = 'mse';
+    el.media = 'video';
+    el.src = new URL('/api/ws?src=' + encodeURIComponent(stream), location.href);
+    return el;
+  }
+
+  function label(text) {
+    const div = document.createElement('div');
+    div.className = 'label';
+    div.textContent = text;
+    return div;
+  }
+
+  // After the player builds its <video>: no native controls, muted, inline.
+  function quiet(el) {
+    if (el.video) { el.video.controls = false; el.video.muted = true; el.video.playsInline = true; }
+  }
+
+  const grid = document.getElementById('grid');
+  for (const cam of CAMERAS) {
+    const tile = document.createElement('div');
+    tile.className = 'tile';
+    const el = player(cam.tile);
+    tile.append(el, label(cam.label));
+    const tap = document.createElement('div');
+    tap.className = 'tap';
+    tap.title = 'Show ' + cam.label + ' full screen';
+    tap.addEventListener('click', () => open(cam));
+    tile.append(tap);
+    grid.append(tile);
+    quiet(el);
+  }
+
+  let view = null;          // the single-camera view while it is shown
+  let leaving = false;      // set while leave() waits for its popstate
+
+  function enterFullscreen(node) {
+    const ask = node.requestFullscreen || node.webkitRequestFullscreen;
+    if (!ask) return;       // e.g. an iPhone: the view already fills the window
+    try {
+      const p = ask.call(node, { navigationUI: 'hide' });
+      if (p && p.catch) p.catch(() => {});
+    } catch (e) { /* refused: the view still fills the window */ }
+  }
+
+  function fullscreenElement() {
+    return document.fullscreenElement || document.webkitFullscreenElement || null;
+  }
+
+  function open(cam) {
+    if (view) return;
+    view = document.createElement('div');
+    view.className = 'view';
+    const el = player(cam.full);
+    const close = document.createElement('button');
+    close.className = 'close';
+    close.type = 'button';
+    close.setAttribute('aria-label', 'Back to all cameras');
+    close.textContent = '×';
+    close.addEventListener('click', () => leave());
+    view.append(el, label(cam.label), close);
+    grid.remove();          // the four tile streams close while one camera is shown
+    document.body.append(view);
+    quiet(el);
+    history.pushState({ camera: cam.full }, '');
+    enterFullscreen(view);
+  }
+
+  // Back to the grid. From the close button or Escape: leave full screen, then
+  // the history entry open() pushed (its popstate does the rest).
+  function leave() {
+    if (!view || leaving) return;
+    leaving = true;         // leaving full screen below fires fullscreenchange: not twice
+    if (fullscreenElement()) {
+      try { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } catch (e) { /* gone */ }
+    }
+    if (history.state && history.state.camera) {
+      history.back();
+      setTimeout(() => { if (view) showGrid(); }, 600);   // a browser that drops the popstate
+    } else {
+      showGrid();
+    }
+  }
+
+  function showGrid() {
+    if (!view) return;
+    view.remove();
+    view = null;
+    leaving = false;
+    document.body.append(grid);
+  }
+
+  window.addEventListener('popstate', () => showGrid());
+  for (const ev of ['fullscreenchange', 'webkitfullscreenchange']) {
+    document.addEventListener(ev, () => { if (view && !leaving && !fullscreenElement()) leave(); });
+  }
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && view) leave(); });
+</script>
+</body>
+</html>

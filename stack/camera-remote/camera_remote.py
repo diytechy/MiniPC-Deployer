@@ -11,8 +11,10 @@ decoded and straightened on the processor and H.264-encoded on the graphics.
 THE PAGE IS BEHIND CADDY'S ONE SHARED LOGIN, because it shows every camera
 (about 19:00: "the camera page can be behind a caddy login as it contains all
 cameras"; 8.2 answered: all cameras on the page, behind that login): the door,
-straightened and raw, and the living room's two relay streams, VIDEO ONLY,
-never its sound. THE DOOR ALONE stays open WITHOUT a login to the LAN alone
+straightened and raw, and each indoor camera's relay streams (the living room,
+the corner: the operator, 2026-11-13), VIDEO ONLY, never their sound. THE PAGE
+at / is one file, www/index.html: four tiles on the small streams; a tap shows
+one camera full screen on its main stream. THE DOOR ALONE stays open WITHOUT a login to the LAN alone
 (CAMERA_VIEW_DOOR_OPEN_CIDR; the earlier ruling, "a public view of the front of
 a house on a closed network"), so the wall panel can take it; a tailnet source
 always goes through the login. THE PROJECTION is knobs with the panel's values
@@ -31,7 +33,9 @@ secret):
     livingroom       the living-room relay's sub stream, video only, and
     livingroom-main  its main stream, video only - both only while
                      CAMERA_LIVINGROOM_RELAY_ENABLED is true (the main stream
-                     only when that relay serves one).
+                     only when that relay serves one);
+    corner           the corner camera's relay, the same way, while
+    corner-main      CAMERA_CORNER_RELAY_ENABLED is true.
 go2rtc opens a producer only when a consumer asks. With `on_demand` the
 relay session and the straightening FFmpeg exist only while someone watches.
 With `always`, homehub-camera-view-warm.service (`keep-warm`) is a consumer of
@@ -137,12 +141,22 @@ RENDER_NODE = "/dev/dri/renderD128"
 # The streams the page may offer. Caddy's websocket gate names exactly these
 # (tests/test_camera_remote.py holds the lists equal). A name the config does
 # not define creates nothing in go2rtc (it has no scheme), so the gate may name
-# the living room's two even while its relay is off.
+# an indoor camera's two even while its relay is off.
 STREAM_RAW = "door"
 STREAM_FLAT = "door_flat"
 STREAM_LIVINGROOM = "livingroom"
 STREAM_LIVINGROOM_MAIN = "livingroom-main"
-STREAMS = (STREAM_FLAT, STREAM_RAW, STREAM_LIVINGROOM, STREAM_LIVINGROOM_MAIN)
+STREAM_CORNER = "corner"
+STREAM_CORNER_MAIN = "corner-main"
+STREAMS = (STREAM_FLAT, STREAM_RAW, STREAM_LIVINGROOM, STREAM_LIVINGROOM_MAIN, STREAM_CORNER, STREAM_CORNER_MAIN)
+# The indoor cameras, each on its own relay (stack/camera-relay; the relay's
+# camera name, its switch): served, video only, only while the switch is
+# exactly true. The page's name for each is the camera's; its main stream is
+# "<name>-main" (the full-screen view), served while the relay serves one.
+INDOOR = ((STREAM_LIVINGROOM, "CAMERA_LIVINGROOM_RELAY_ENABLED"), (STREAM_CORNER, "CAMERA_CORNER_RELAY_ENABLED"))
+# The landing page (stack/camera-remote/www/index.html), served by Caddy behind
+# the login: one tile per camera on its small stream, full screen on its main.
+PAGE_FILE = os.path.join(HERE, "www", "index.html")
 # Every stream is behind the shared login (the Owner, about 19:00); the door's
 # two are ALSO open, without a login, to CAMERA_VIEW_DOOR_OPEN_CIDR (the LAN).
 LOGIN_STREAMS = STREAMS
@@ -230,8 +244,9 @@ class ViewSettings:
                CAMERA_VIEW_DOOR_FLAT_MODE (always | on_demand; empty: always);
                CAMERA_VIEW_DOOR_OPEN_CIDR (the LAN alone, whitespace words;
                empty: the door needs the login everywhere); the projection
-               (FlatProjection); and, while CAMERA_LIVINGROOM_RELAY_ENABLED is
-               true, the living-room relay's fields (camera_relay).
+               (FlatProjection); and, for each indoor camera (INDOOR) whose
+               CAMERA_<C>_RELAY_ENABLED is exactly true, that relay's fields
+               (camera_relay.CameraRelaySettings).
                [stack/.env]
       Raises:  Invalid naming the key, never its value.
     Implements: LLR-1575.
@@ -253,12 +268,16 @@ class ViewSettings:
             raise Invalid("CAMERA_VIEW_DOOR_FLAT_MODE must be always or on_demand")
         self.door_open = env.get(DOOR_OPEN_KEY, "").strip()
         self.flat = FlatProjection(env)
-        self.livingroom = (camera_relay.CameraRelaySettings(env_file, "livingroom")
-                           if env.get("CAMERA_LIVINGROOM_RELAY_ENABLED", "") == "true" else None)
+        # Each indoor camera's relay settings while its switch is exactly true
+        # (the repo's knob convention, as the relay's own condition), else None.
+        self.indoor = {name: (camera_relay.CameraRelaySettings(env_file, name) if env.get(switch, "") == "true"
+                              else None) for name, switch in INDOOR}
+        self.livingroom = self.indoor[STREAM_LIVINGROOM]
+        self.corner = self.indoor[STREAM_CORNER]
 
     def relays(self) -> List[object]:
         """Every relay this viewer reads, for redaction and the credential scan."""
-        return [self.relay] + ([self.livingroom] if self.livingroom else [])
+        return [self.relay] + [relay for relay in self.indoor.values() if relay]
 
 
 def _number(env: Dict[str, str], key: str, default: float, low: float, high: float) -> float:
@@ -629,24 +648,27 @@ def view_config(s: ViewSettings, encoder: str = "vaapi") -> Dict[str, object]:
 
 
 def view_streams(s: ViewSettings, encoder: str = "vaapi") -> Dict[str, str]:
-    """The streams: the door's two, and the living room's video while its relay
-    is on. Every relay source is `#media=video`: no sound is ever asked for (the
-    living-room relay offers its camera's sound only to a consumer that asks).
+    """The streams: the door's two, and each indoor camera's video while its
+    relay is on (its sub stream as <name>, its main as <name>-main when the relay
+    serves one). Every relay source is `#media=video`: no sound is ever asked for
+    (a relay offers its camera's sound only to a consumer that asks).
     Implements: SR-170, LLR-1576.
     """
     streams = {STREAM_RAW: s.relay.consumer_url() + "#media=video",
                STREAM_FLAT: flat_source(encoder, s.flat)}
-    if s.livingroom:
-        streams[STREAM_LIVINGROOM] = s.livingroom.consumer_url() + "#media=video"
-        if s.livingroom.main_stream:
-            streams[STREAM_LIVINGROOM_MAIN] = s.livingroom.for_main().consumer_url() + "#media=video"
+    for name, _switch in INDOOR:
+        relay = s.indoor[name]
+        if relay:
+            streams[name] = relay.consumer_url() + "#media=video"
+            if relay.main_stream:
+                streams[name + "-main"] = relay.for_main().consumer_url() + "#media=video"
     return streams
 
 
-def living_room_note(streams: Dict[str, str]) -> str:
-    """The render line's words for the living room's streams, if any are served."""
-    living = [name for name in (STREAM_LIVINGROOM, STREAM_LIVINGROOM_MAIN) if name in streams]
-    return ", %s video only" % " and ".join(living) if living else ""
+def indoor_note(streams: Dict[str, str]) -> str:
+    """The render line's words for the indoor cameras' streams, if any are served."""
+    indoor = [name for name in STREAMS if name in streams and name not in DOOR_STREAMS]
+    return ", %s video only" % " and ".join(indoor) if indoor else ""
 
 
 def redact_all(text: str, relays: Sequence[object]) -> str:
@@ -1087,7 +1109,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                "%dx%d at %d fps, h264_vaapi; mode %s)%s, each read from its relay while it has a consumer"
                % (tag, " and ".join(written), "/".join(API_PATHS), ",".join(MODULES), STREAM_RAW, STREAM_FLAT,
                   s.flat.width, s.flat.height, FLAT_FPS, s.flat_mode,
-                  living_room_note(view_streams(s))))
+                  indoor_note(view_streams(s))))
         return 0
     record = check(s, lan_network, bridges, read_caddy_env(), warm_unit_enabled())
     door_relay.emit(record)
